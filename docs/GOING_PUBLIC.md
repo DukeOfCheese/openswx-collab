@@ -19,12 +19,10 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
 - [x] **The commercial layer is out of this repository** (2026-11-23): it lives in the private
       `openswx-collab-ee`.
 - [x] **History squashed** (2026-11-23): `main` is one commit with no trace of the commercial layer.
-- [ ] **Two old pull-request references still hold the old history, seat-limit code included.** GitHub keeps
-      `refs/pull/1/head` and `refs/pull/2/head` (Dependabot's first two pull requests, now closed) for good,
-      and they cannot be deleted with git. Before switching, either delete this repository on GitHub and
-      push `main` to a new one of the same name (this also drops the old CI history), or ask GitHub Support
-      to remove those references. Check with `git ls-remote origin`: only `HEAD` and branches should be
-      listed, and any `refs/pull/*` must belong to pull requests opened after the squash.
+- [x] **No old history left on GitHub** (2026-11-23): the repository was deleted and created again with the
+      squashed `main`, which removed the pull-request references (`refs/pull/*`) that still held the old
+      history. Check again just before switching with `git ls-remote origin`: any `refs/pull/*` listed must
+      belong to pull requests opened since.
 - [ ] **The name.** The same question as openswx's ("SW"): this repository follows whatever openswx decides,
       and the package names (`openswx-collab-protocol`, `openswx-collab-server`) and the `OSWX_COLLAB_`
       settings prefix would change with it. Cheapest before the first release.
@@ -34,8 +32,11 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
 
 ## Repository settings (GitHub → Settings)
 
-- [x] Description (set when the repository was created). Topics: `cad`, `collaboration`, `real-time`,
-      `self-hosted`, `openswx`.
+- [x] Description and topics (set 2026-11-23). Description: "Self-hostable live collaboration for openswx:
+      several people editing one CAD model at once, with cursors, feature locks, edit history, named
+      versions and assemblies that pin part versions." Topics: `cad`, `parametric-cad`,
+      `mechanical-engineering`, `collaboration`, `real-time-collaboration`, `self-hosted`, `websocket`,
+      `fastapi`, `python`, `openswx`. Like openswx's, they leave SOLIDWORKS out.
 - [ ] **General**: turn on *Discussions*; turn off *Wiki*. Merge button: *squash merging* only, with the PR
       title as the commit message, and *automatically delete head branches*.
 - [ ] **Branch protection** for `main` (Settings → Rules → Rulesets): require a pull request, require the
