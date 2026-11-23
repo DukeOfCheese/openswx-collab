@@ -10,13 +10,17 @@ they publish).
 
 ```
 python -m venv .venv
-.venv/bin/python -m pip install ./protocol ./server
+.venv/bin/python -m pip install openswx-collab-server          # or ./protocol ./server from a checkout
 OSWX_COLLAB_PUBLIC_URL=https://collab.example.org .venv/bin/openswx-collab-server serve --host 127.0.0.1 --port 8787
 ```
 
 Data goes to `./data` (SQLite database and files). Back up that folder.
 
 ## Docker Compose (server + Postgres)
+
+The Compose file runs the published image, `ghcr.io/dukeofcheese/openswx-collab-server` (amd64 and
+arm64); pin a version with `OSWX_COLLAB_VERSION` in `deploy/.env`. Add `-f deploy/docker-compose.build.yml`
+to build it from your checkout instead.
 
 ```
 cp deploy/.env.example deploy/.env        # set PUBLIC_URL and POSTGRES_PASSWORD

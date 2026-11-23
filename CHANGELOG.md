@@ -6,7 +6,10 @@ protocol or the database; the change is listed here).
 
 ## Unreleased
 
-Nothing has been released yet. What exists so far:
+## 0.1.0 - 2026-11-23
+
+The first release: the server and the protocol. The openswx side (the in-app toggle, sync and live
+cursors) is not released yet; it is being built on openswx's `dev/openswx-collab` branch.
 
 ### Added
 - The wire protocol (`openswx-collab-protocol`): id-keyed operations on features, components and mates,

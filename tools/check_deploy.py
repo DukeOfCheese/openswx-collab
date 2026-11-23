@@ -69,9 +69,12 @@ def static_checks() -> tuple[str, dict]:
     offered = set(re.findall(r"^([A-Z0-9_]+)=", example, re.M))
     check(wanted <= offered, f".env.example offers every variable the Compose files read "
                              f"(missing: {sorted(wanted - offered) or 'none'})")
-    check(base["services"]["server"]["build"] == {"context": "..", "dockerfile": "deploy/Dockerfile"}
+    build = yaml.safe_load((ROOT / "deploy/docker-compose.build.yml").read_text(encoding="utf-8"))
+    check(build["services"]["server"]["build"] == {"context": "..", "dockerfile": "deploy/Dockerfile"}
           and all((ROOT / p).is_dir() for p in re.findall(r"^COPY (\S+) ", docker, re.M)),
           "the build context and every COPY source exist")
+    check(base["services"]["server"]["image"].startswith("ghcr.io/dukeofcheese/openswx-collab-server:"),
+          "the Compose file runs the published image")
     check("volumes" in base and set(base["volumes"]) == {"storage", "db"} and {"garage-meta", "garage-data"} <= set(s3["volumes"]),
           "the named volumes are declared")
     pip = re.search(r"^RUN pip install (.+)$", docker, re.M).group(1)
