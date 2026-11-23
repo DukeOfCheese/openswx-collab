@@ -26,6 +26,14 @@ class Settings:
     max_change_bytes: int = 8 * 2**20
     max_blob_bytes: int = 256 * 2**20
     presence_rate: int = 60  # presence/draft messages per second per client before they are dropped
+    smtp_host: str = ""  # email is sent only when this and smtp_from are set
+    smtp_port: int = 587
+    smtp_security: str = "starttls"  # starttls | ssl | none
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""  # the sender address
+    smtp_from_name: str = "openswx collaboration"
+    reset_minutes: int = 60  # how long a password reset link works
     google_client_id: str = ""
     google_client_secret: str = ""
     github_client_id: str = ""

@@ -30,3 +30,5 @@ Nothing has been released yet. What exists so far:
   and `db-status` for operators who turn that off.
 - Deleting your account (your work stays with the organisation) and exporting your data; deleting an
   organisation with everything in it, and exporting it as a zip.
+- Optional email over SMTP: invites made for an address are emailed, and people can reset a forgotten
+  password themselves.

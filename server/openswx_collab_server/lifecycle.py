@@ -29,7 +29,8 @@ from openswx_collab_protocol.ops import blob_refs
 
 from .access import current_user, get_db, need_org
 from .auth import _confirm
-from .db import (Document, LoginCode, OAuthIdentity, Op, Org, OrgMember, Project, ProjectMember, Session, Snapshot,
+from .db import (Document, LoginCode, OAuthIdentity, Op, Org, OrgMember, PasswordReset, Project, ProjectMember,
+                 Session, Snapshot,
                  User, Version, now)
 from .storage import blob_key
 
@@ -69,7 +70,7 @@ async def delete_account(body: ConfirmIn, request: Request, user: User = Depends
             raise HTTPException(409, "you are this server's only admin; make someone else admin first "
                                 "(openswx-collab-server create-admin)")
     orgs = [o for o, in (await db.execute(select(OrgMember.org_id).where(OrgMember.user_id == me.id))).all()]
-    for table in (Session, OAuthIdentity, LoginCode, OrgMember, ProjectMember):
+    for table in (Session, OAuthIdentity, LoginCode, PasswordReset, OrgMember, ProjectMember):
         await db.execute(delete(table).where(table.user_id == me.id))
     me.email = f"deleted-{me.id}@deleted.invalid"  # (frees the address; .invalid can never be delivered to)
     me.name = DELETED_NAME

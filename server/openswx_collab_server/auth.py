@@ -36,7 +36,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .access import bearer, current_user, get_db
-from .db import LoginCode, OAuthIdentity, OAuthState, Session, User, now
+from .db import LoginCode, OAuthIdentity, OAuthState, PasswordReset, Session, User, now
 from .orgs import accept_invite, find_invite, user_out
 from .security import clean_email, hash_password, new_token, token_hash, verify_password
 
@@ -414,3 +414,61 @@ async def unlink_provider(name: str, body: UnlinkIn, request: Request, user: Use
     for r in mine:
         await db.delete(r)
     await db.commit()
+
+
+# ------------------------------------------------------------------ forgotten passwords (needs email)
+class ResetIn(BaseModel):
+    email: str
+
+
+@router.post("/auth/password-reset", status_code=202)
+async def request_reset(body: ResetIn, request: Request, db: AsyncSession = Depends(get_db)):
+    """Email a link to choose a new password. The answer is the same whether or not there is such an
+    account (so it cannot be used to find out who has one)."""
+    mailer, settings = request.app.state.mailer, request.app.state.settings
+    if not mailer.enabled:
+        raise HTTPException(501, "this server cannot send email: ask its operator to reset your password")
+    email = clean_email(body.email) or ""
+    limiter = request.app.state.reset_limiter
+    key = f"{email}|{request.client.host if request.client else ''}"
+    answer = {"message": "if there is an account for this address, a link is on its way"}
+    if limiter.blocked(key) or limiter.blocked(email):
+        return answer
+    limiter.fail(key)
+    limiter.fail(email)
+    user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
+    if user is None or user.disabled:
+        return answer
+    await db.execute(delete(PasswordReset).where((PasswordReset.user_id == user.id) | (PasswordReset.expires_at < now())))
+    token = new_token()
+    db.add(PasswordReset(token_hash=token_hash(token), user_id=user.id,
+                         expires_at=now() + settings.reset_minutes * 60))
+    await db.commit()
+    from .mail import reset_text  # noqa: PLC0415
+    subject, text = reset_text(f"{settings.public_url.rstrip('/')}/reset-password/{token}", settings.reset_minutes)
+    await mailer.send(user.email, subject, text)
+    return answer
+
+
+class ResetConfirmIn(BaseModel):
+    token: str
+    password: str = Field(min_length=8, max_length=200)
+
+
+@router.post("/auth/password-reset/confirm")
+async def confirm_reset(body: ResetConfirmIn, request: Request, db: AsyncSession = Depends(get_db)):
+    reset = await db.get(PasswordReset, token_hash(body.token))
+    if reset is None or reset.expires_at < now():
+        raise HTTPException(400, "this link has expired or was already used; ask for a new one")
+    user = await db.get(User, reset.user_id)
+    await db.delete(reset)
+    if user is None or user.disabled:
+        await db.commit()
+        raise HTTPException(400, "this link has expired or was already used; ask for a new one")
+    user.password_hash = hash_password(body.password)
+    user.email_verified = True  # (they read mail sent to it: the address is theirs)
+    await db.execute(delete(Session).where(Session.user_id == user.id))  # (signed out everywhere)
+    await db.execute(delete(PasswordReset).where(PasswordReset.user_id == user.id))
+    await db.commit()
+    request.app.state.hub.drop_account(user.id)
+    return {"message": "your password is set; sign in again in openswx"}

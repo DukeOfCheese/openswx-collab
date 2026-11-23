@@ -88,6 +88,22 @@ All are environment variables starting `OSWX_COLLAB_`.
 | `LOCK_TTL` / `LOCK_GRACE` | `45` / `60` | seconds |
 | `MAX_CHANGE_BYTES` / `MAX_BLOB_BYTES` | 8 MB / 256 MB | |
 
+## Email
+
+Optional. Without it, invites are links you pass on yourself and forgotten passwords are reset by you
+(`openswx-collab-server reset-password`). With it, an invite made for an address is emailed, and people can
+reset a forgotten password themselves through a link that works for an hour.
+
+| Variable | |
+|---|---|
+| `SMTP_HOST`, `SMTP_PORT` | your mail provider's SMTP server (port 587 by default) |
+| `SMTP_SECURITY` | `starttls` (default), `ssl` (usually port 465) or `none` |
+| `SMTP_USER`, `SMTP_PASSWORD` | the login, if the server needs one |
+| `SMTP_FROM`, `SMTP_FROM_NAME` | the sender address (must be one your provider lets you send from) and name |
+
+Any provider works: your own mail server, Google Workspace, Microsoft 365, Postmark, Amazon SES. If the mail
+server cannot be reached, invites still work (the link is in the answer) and the failure is in the log.
+
 ## Leaving
 
 People can delete their own account (their work stays with the organisation, credited to "Deleted
@@ -118,7 +134,5 @@ server's extension hooks (`server/openswx_collab_server/hooks.py`). Without it t
   several workers or replicas.
 - **Locks are in memory.** A restart releases them; edits are never lost, because every accepted change
   is in the database before it is acknowledged.
-- **No email is sent.** Invites are links you pass on yourself; forgotten passwords are reset by the
-  operator.
 - **Deleted documents stay in the database** (marked deleted) and their files stay in storage. A deleted
   assembly no longer counts as using its parts; if an operator brings one back by hand, its parts may be gone.
