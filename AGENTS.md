@@ -15,7 +15,7 @@ openswx client lives in the openswx repository, not here.
   - `documents.py`: REST for documents, blobs, history, versions; the WebSocket endpoint.
   - `assemblies.py`: components that reference parts.
   - `auth.py`, `orgs.py`, `access.py`, `security.py`: accounts, organisations, roles.
-  - `db.py`: tables. `storage.py`: files. `hooks.py`: extension points (seat limits and the like plug in from outside).
+  - `db.py`: tables; `migrate.py` + `migrations/versions/`: how the schema gets there. `storage.py`: files. `hooks.py`: extension points (seat limits and the like plug in from outside).
 - `tests/` — pytest, with a real app per test (`conftest.py`: `World`, `Live`).
 - `tools/` — `e2e_two_peers.py`, `test_postgres.py`, `check_deploy.py`.
 - `docs/protocol.md` is the contract with the client. Keep it true.
@@ -37,7 +37,10 @@ openswx client lives in the openswx repository, not here.
 6. **A project you cannot open does not exist for you**: answer 404, not 403, and do not put its name in a
    message that other people receive.
 7. **Tokens are stored hashed.** Never log a token, a password, an invite or a login code.
-8. **One process.** Rooms and locks live in memory. Do not add anything that assumes several workers.
+8. **Every table change comes with a migration.** Change `db.py`, then generate a revision against a
+   database at the current head and read what it wrote (`tests/test_migrations.py` fails while the models
+   and the migrations disagree). Never edit a revision that has been released.
+9. **One process.** Rooms and locks live in memory. Do not add anything that assumes several workers.
 
 ## Before you finish
 

@@ -15,7 +15,7 @@
 - [ ] Tests added or updated; `python -m pytest -q` passes locally
 - [ ] Changes to `hub.py` or `ops.py`: `tests/test_convergence.py` passes, and `targets()` names everything `apply()` touches
 - [ ] Protocol changes (messages, operations, REST routes, close codes): `docs/protocol.md` updated, and it says whether older clients keep working
-- [ ] Table changes (`db.py`): how an existing database gets there is described
+- [ ] Table changes (`db.py`): a migration in `migrations/versions/`, and `tests/test_migrations.py` passes
 - [ ] No token, password, invite or document content is logged
 - [ ] Third-party code: licence compatible with Apache-2.0 and listed in `NOTICE`
 - [ ] User-visible change noted in `CHANGELOG.md` under *Unreleased*

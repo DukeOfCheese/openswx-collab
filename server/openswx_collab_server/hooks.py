@@ -23,6 +23,11 @@ class Hooks:
     async def member_removed(self, db: Any, org: Any, user_id: str) -> None:
         pass
 
+    def prepare_db(self, connection: Any) -> None:
+        """Create or upgrade the extension's own tables (a synchronous SQLAlchemy connection, inside a
+        transaction), after the server's migrations have run. The server's migrations never touch tables
+        they do not know."""
+
     def routers(self) -> list:
         """Extra FastAPI routers to mount (admin console, billing webhooks, SSO)."""
         return []

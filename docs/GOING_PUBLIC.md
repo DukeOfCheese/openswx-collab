@@ -55,8 +55,7 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
       arm64, so self-hosters do not have to build it. The Compose file then points at the image.
 - [ ] **PyPI** for `openswx-collab-protocol` first: the openswx client depends on it, so it has to be
       installable before openswx can ship the client. Use trusted publishing, set up before the first tag.
-- [ ] **A database migration tool** before the first release anyone is asked to keep data on
-      (`docs/self-hosting.md` lists this limit).
+- [x] **Database migrations** (Alembic; the server upgrades on start, `openswx-collab-server migrate`).
 - [ ] Cross-link the two READMEs.
 - [ ] Optional: a public `DukeOfCheese/.github` repository holding the Code of Conduct and security policy
       for every repository of the account, so the two projects cannot drift apart.

@@ -15,6 +15,7 @@ class Settings:
     public_url: str = "http://localhost:8787"  # how clients and browsers reach this server (OAuth callbacks)
     open_registration: bool = False  # False: the first account is the server admin, everyone else needs an invite
     session_days: int = 30
+    auto_migrate: bool = True  # upgrade the database schema on start (off: refuse to start until `migrate` is run)
     snapshot_every: int = 200  # a full copy of the document is stored every this many changes
     lock_ttl: float = 45.0  # a connected client that stays silent this long loses its locks
     lock_grace: float = 60.0  # a disconnected client keeps its locks this long

@@ -62,8 +62,8 @@ issue: see [SECURITY.md](SECURITY.md).
 - **A change to the protocol** (`protocol/`, message or operation shapes, REST routes, close codes) updates
   `docs/protocol.md` in the same pull request and says whether older clients keep working. Bump
   `PROTOCOL_VERSION` when they do not.
-- **A change to the tables** (`server/openswx_collab_server/db.py`) says how an existing database gets
-  there. There is no migration tool yet; until there is, such changes need agreeing first.
+- **A change to the tables** (`server/openswx_collab_server/db.py`) comes with an Alembic revision in
+  `server/openswx_collab_server/migrations/versions/` (AGENTS.md says how to make one).
 - **The server never runs a geometry kernel** and never depends on openswx. Anything that needs geometry
   belongs in the openswx client.
 - CI must pass: the suite on SQLite and PostgreSQL, and the Docker image build.

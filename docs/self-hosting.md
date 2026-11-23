@@ -83,9 +83,23 @@ All are environment variables starting `OSWX_COLLAB_`.
 | `PUBLIC_URL` | `http://localhost:8787` | how clients reach the server |
 | `OPEN_REGISTRATION` | `false` | |
 | `SESSION_DAYS` | `30` | |
+| `AUTO_MIGRATE` | `true` | upgrade the database on start |
 | `SNAPSHOT_EVERY` | `200` | full copy of a document every N changes |
 | `LOCK_TTL` / `LOCK_GRACE` | `45` / `60` | seconds |
 | `MAX_CHANGE_BYTES` / `MAX_BLOB_BYTES` | 8 MB / 256 MB | |
+
+## Upgrading
+
+New versions may change the database. The server upgrades it on start; back the database up before you
+start a new version. To control when that happens, set `OSWX_COLLAB_AUTO_MIGRATE=false`: the server then
+refuses to start on an older database until you run
+
+```
+openswx-collab-server migrate        # docker compose ... run --rm server openswx-collab-server migrate
+openswx-collab-server db-status      # where the database is, and what this version needs
+```
+
+A database written by a newer version is never opened by an older one.
 
 ## Seat limits
 
@@ -98,8 +112,6 @@ server's extension hooks (`server/openswx_collab_server/hooks.py`). Without it t
   several workers or replicas.
 - **Locks are in memory.** A restart releases them; edits are never lost, because every accepted change
   is in the database before it is acknowledged.
-- **No schema migrations yet.** The tables are created on first start. Upgrades that change them will
-  come with a migration tool.
 - **No email is sent.** Invites are links you pass on yourself; forgotten passwords are reset by the
   operator.
 - **Deleted documents stay in the database** (marked deleted) and their files stay in storage. A deleted
