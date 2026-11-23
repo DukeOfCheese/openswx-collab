@@ -1,0 +1,131 @@
+# A release, on a version tag (v*): the Python packages, the Docker image and the GitHub release.
+#
+#   python tools/release_notes.py 0.2.0      # check the CHANGELOG section first
+#   git tag -a v0.2.0 -m "openswx-collab 0.2.0" && git push origin v0.2.0
+#
+# PyPI publishing uses trusted publishing (no stored token) and is skipped until it is set up:
+#   1. On pypi.org: Account -> Publishing -> Add a new pending publisher, once for each of the projects
+#      "openswx-collab-protocol" and "openswx-collab-server": owner "DukeOfCheese", repository
+#      "openswx-collab", workflow "release.yml", environment "pypi".
+#   2. On GitHub: the environment "pypi" (Settings -> Environments) and the repository variable
+#      PYPI_PUBLISH = true (Settings -> Secrets and variables -> Actions -> Variables).
+# The image goes to ghcr.io/dukeofcheese/openswx-collab-server with the GitHub token; nothing to set up.
+# Everything except publishing also runs by hand from the Actions tab, so a broken build shows before a tag.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build protocol --outdir dist
+          python -m build server --outdir dist
+          python -m twine check --strict dist/*
+      - name: The tag matches every version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          for p in protocol server; do
+            v=$(python -c "import tomllib; print(tomllib.load(open('$p/pyproject.toml','rb'))['project']['version'])")
+            test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} but $p/pyproject.toml says $v"; exit 1; }
+          done
+      - name: The wheels install from nothing and the server starts
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/v/bin/python -c "import openswx_collab_protocol as p, openswx_collab_server as s; print(p.__version__, s.__version__)"
+          OSWX_COLLAB_DATABASE_URL=sqlite+aiosqlite:////tmp/r.db OSWX_COLLAB_STORAGE_URL=/tmp/files \
+            /tmp/v/bin/openswx-collab-server serve --port 8787 & pid=$!
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/server && break; sleep 1; done
+          kill $pid
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-packages
+          path: dist/
+
+  pypi:
+    needs: packages
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/openswx-collab-server/
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: python-packages
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/dukeofcheese/openswx-collab-server
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=openswx-collab-server
+            org.opencontainers.image.description=Self-hostable live collaboration server for openswx
+            org.opencontainers.image.licenses=Apache-2.0
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    needs: [packages, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v5
+        with:
+          name: python-packages
+          path: dist/
+      - name: Release with the changelog section as its notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tools/release_notes.py "${GITHUB_REF_NAME}" > notes.md
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "openswx-collab ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag

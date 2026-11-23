@@ -51,10 +51,11 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
 
 ## Worth doing soon after
 
-- [ ] **A published Docker image** (GitHub Container Registry), built by a release workflow for amd64 and
-      arm64, so self-hosters do not have to build it. The Compose file then points at the image.
-- [ ] **PyPI** for `openswx-collab-protocol` first: the openswx client depends on it, so it has to be
-      installable before openswx can ship the client. Use trusted publishing, set up before the first tag.
+- [x] **Releases** (`.github/workflows/release.yml`): on a `v*` tag, the Docker image for amd64 and arm64
+      to GHCR, the Python packages (to PyPI once trusted publishing is set up), and the GitHub release.
+- [ ] **PyPI**: `release.yml` builds and checks both packages on every tag; publishing waits for the two
+      pending publishers on pypi.org and `PYPI_PUBLISH=true` (the steps are at the top of `release.yml`).
+      The openswx client depends on `openswx-collab-protocol` being there.
 - [x] **Database migrations** (Alembic; the server upgrades on start, `openswx-collab-server migrate`).
 - [ ] Cross-link the two READMEs.
 - [ ] Optional: a public `DukeOfCheese/.github` repository holding the Code of Conduct and security policy

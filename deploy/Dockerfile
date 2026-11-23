@@ -1,6 +1,8 @@
+# Published as ghcr.io/dukeofcheese/openswx-collab-server (amd64, arm64) by .github/workflows/release.yml.
 # Build from the repository root:  docker build -f deploy/Dockerfile -t openswx-collab-server .
 FROM python:3.15-slim
 
+LABEL org.opencontainers.image.source=https://github.com/DukeOfCheese/openswx-collab
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY protocol /app/protocol
