@@ -91,7 +91,7 @@ jobs:
             echo "GARAGE_RPC_SECRET=$(openssl rand -hex 32)"
           } > deploy/.env
       - name: Build and start
-        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env up -d --build --wait --wait-timeout 180
+        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env up -d --build --wait --wait-timeout 180
       - name: The server answers, signs someone up and stores a document in the bucket
         run: |
           set -euo pipefail
@@ -104,9 +104,9 @@ jobs:
           project=$(curl -fsS $base/api/orgs/$org/projects -H "$auth" -H 'content-type: application/json' -d '{"name":"P"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
           doc=$(curl -fsS $base/api/projects/$project/documents -H "$auth" -H 'content-type: application/json' \
             -d '{"name":"Part","content":{"version":3,"features":[]}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env restart server
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env restart server
           for i in $(seq 1 30); do curl -fsS $base/api/health >/dev/null 2>&1 && break; sleep 2; done
           curl -fsS "$base/api/documents/$doc/content" -H "$auth" | grep -q '"features":\[\]'
       - name: Logs
         if: always()
-        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env logs --tail 80
+        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env logs --tail 80

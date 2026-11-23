@@ -1,0 +1,8 @@
+# Build the server image from this checkout instead of pulling the published one:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml --env-file deploy/.env up -d --build
+services:
+  server:
+    image: openswx-collab-server:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
