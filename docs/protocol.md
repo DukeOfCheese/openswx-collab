@@ -56,13 +56,16 @@ synced. `next_id` and `counters` belong to the server.
 ## The WebSocket
 
 First frame: `hello {token, client_id, format_version, last_seq}`. `client_id` is one random string per
-installed app, kept across reconnects. The answer is `welcome` (or `error` and a close).
+running app (make a new one each time the app starts; keep it across reconnects of that run). Two apps
+connecting with the same `client_id` keep disconnecting each other (4409). The answer is `welcome` (or
+`error` and a close).
 
 The server knows you as `<your user id>.<client_id>`: that is `welcome.you.client_id`, and the form every
 other message uses (peers, locks, presence, the `client_id` on changes). Use it to recognise yourself.
 
-`welcome` carries `seq`, your role, whether you are read-only and why, the other `peers` (with their last
-presence and draft), all `locks`, `broken` features, and either `content` (the whole document) or, when
+`welcome` carries `seq`, the `project_id` (blobs are fetched through it), your role, whether you are read-only and why, the other `peers` (with their last
+presence and draft), all `locks`, `broken` features, the ids and names you still have `reserved` (after a
+short disconnect; a server restart forgets them), and either `content` (the whole document) or, when
 `last_seq` was recent enough, `changes` since then.
 
 You are read-only when you are a viewer, or when your `format_version` differs from the document's.
@@ -85,7 +88,9 @@ your changes the server has not answered yet).
    `ops.absorb_ids(confirmed)`, rebuild the live document. You never receive your own changes back,
    except in a reconnect catch-up, where `client_id` + `change_id` identify them.
 
-Resending a `change_id` is safe: the server answers with the sequence number it already has.
+Resending a `change_id` is safe: the server answers with the sequence number it already has. That also
+means a `change_id` must never be used twice for different changes by the same client and user, ever:
+the server remembers them in the history for good. Use a UUID.
 
 Two changes conflict only if they share a target (`ops.targets`): a feature id, a top-level key, or the
 feature order. Edits to different features from the same base both go in.
@@ -102,7 +107,9 @@ of a change, not after each operation, so one change can swap two names. A clien
 
 Before a command that creates features, ask `ids.reserve {features: n, names: ["Sketch", …]}` and make
 openswx use the returned ids and names. Reserved ids cannot be used by anyone else. Creating a feature
-therefore needs a connection.
+therefore needs a connection. A refused reservation is an `error` (`bad_reserve`, or `read_only`) carrying
+the `request_id` you sent. Reservations survive a disconnect for the lock grace period, and `welcome` lists
+the ones you still have; reserving ahead skips numbers in names when ids go unused.
 
 ### Locks
 
@@ -136,7 +143,9 @@ clears a preview.
 
 After applying a change and rebuilding, send `rebuild.report {seq, errors: {feature id: message}}`. The
 server pins new failures on the change that came in since the previous report and tells everyone:
-`rebuild.status {broken: {feature id: {error, by_seq, by_name, command}}}`.
+`rebuild.status {broken: {feature id: {error, by_seq, by_name, command}}}`. Failures already there in the
+first report after the document is opened on the server are listed without a cause (there is nothing to
+compare them with).
 
 The server checks every 30 s that each open connection still has a valid session and the role it joined
 with, and closes it (4401 or 4403) otherwise. A password change closes that account's connections at once.
