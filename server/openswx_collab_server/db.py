@@ -47,6 +47,7 @@ class User(Base):
     # (An invite proves nothing: whoever makes an invite also holds its link.)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[float] = mapped_column(Float, default=now)
+    deleted_at: Mapped[float | None] = mapped_column(Float, nullable=True)  # set: the person deleted the account
 
 
 class OAuthIdentity(Base):

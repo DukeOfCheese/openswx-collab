@@ -82,3 +82,18 @@ def test_the_whole_server_on_s3(s3, make_client):
     for seq, depth in ((0, 10), (2, 2), (5, 5), (7, 7)):
         got = again.get(f"/api/documents/{doc}/content", params={"seq": seq}, headers=H(w.admin)).json()["content"]
         assert got["features"][1]["params"]["depth"] == depth and got["features"][2]["params"]["brep"]["$blob"] == sha
+
+
+def prefix_removal(store):
+    async def go():
+        for key in ("orgs/a/blobs/1", "orgs/a/blobs/sub/2", "orgs/ab/blobs/3", "orgs/b/x"):
+            await store.put(key, b"x")
+        await store.delete_prefix("orgs/a/")
+        await store.delete_prefix("orgs/nothing-here/")  # (nothing to remove is fine)
+        return [await store.exists(k) for k in ("orgs/a/blobs/1", "orgs/a/blobs/sub/2", "orgs/ab/blobs/3", "orgs/b/x")]
+    assert asyncio.run(go()) == [False, False, True, True]
+
+
+def test_removing_everything_under_a_prefix(tmp_path, s3):
+    prefix_removal(make_storage(str(tmp_path / "files")))
+    prefix_removal(make_storage("s3://collab/team"))
