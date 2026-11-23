@@ -131,6 +131,8 @@ class Welcome(_M):
     peers: list[Peer] = Field(default_factory=list)
     locks: dict[str, LockHolder] = Field(default_factory=dict)
     broken: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    project_id: str | None = None  # (blobs in the content are fetched through the project)
+    reserved: dict[str, list[str]] = Field(default_factory=dict)  # {ids, names} this client still holds
     content: dict[str, Any] | None = None  # the whole document at `seq` ...
     changes: list[ChangeEvent] | None = None  # ... or the changes since the client's last_seq
 
@@ -235,6 +237,7 @@ class Error(_M):
     type: Literal["error"] = "error"
     code: str
     message: str = ""
+    request_id: str | None = None  # set when it answers a request that carried one (ids.reserve)
 
 
 ServerMessage = Annotated[

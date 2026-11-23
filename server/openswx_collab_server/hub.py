@@ -272,6 +272,11 @@ class Room:
                 "format_version": self.format_version, "you": conn.peer(), "role": role,
                 "read_only_reason": reason, "peers": [c.peer() for c in self.conns.values()],
                 "locks": {t: lk.holder() for t, lk in self.locks.items()}, "broken": self.broken,
+                "project_id": self.project_id,
+                # what this client still has from before a disconnect (kept for the grace period; a server
+                # restart forgets them): ids and names it may still use
+                "reserved": {"ids": sorted(i for i, o in self.reserved_ids.items() if o == cid),
+                             "names": sorted(n for n, o in self.reserved_names.items() if o == cid)},
             }
             last = hello.last_seq
             if last is not None and 0 <= last <= self.head and self.head - last <= self.hub.settings.catchup_limit:
@@ -395,14 +400,16 @@ class Room:
             if self.evicted:
                 return
             if conn.read_only:
-                conn.send({"type": "error", "code": "read_only", "message": conn.reason or ""})
+                conn.send({"type": "error", "code": "read_only", "message": conn.reason or "",
+                           "request_id": msg.request_id})
                 return
             counters = self.state.get("counters") or {}
             mine_ids = sum(1 for o in self.reserved_ids.values() if o == conn.client_id)
             mine_names = sum(1 for o in self.reserved_names.values() if o == conn.client_id)
             if mine_ids + msg.features > MAX_RESERVED or mine_names + len(msg.names) > MAX_RESERVED \
                     or not all(_stem_ok(x) for x in msg.names):
-                conn.send({"type": "error", "code": "bad_reserve", "message": "too many reserved ids or names, or a "
+                conn.send({"type": "error", "code": "bad_reserve", "request_id": msg.request_id,
+                           "message": "too many reserved ids or names, or a "
                            "name stem that is empty, longer than 40 characters or ends in a digit"})
                 return
             feats = self.state.get("features") or []
@@ -483,7 +490,9 @@ class Room:
             return no("invalid", "malformed operations")
         self._expire_locks()
         check = set(tg) | ({STRUCTURE} if is_structural(ops) else set())
-        locked = {t: self.locks[t].holder() for t in check if t in self.locks and self.locks[t].client_id != client_id}
+        def blocks(lk: Lock) -> bool:  # (a change made outside any connection - a restore - is its author's)
+            return lk.client_id != client_id and not (client_id is None and lk.user_id == user.id)
+        locked = {t: self.locks[t].holder() for t in check if t in self.locks and blocks(self.locks[t])}
         if locked:
             who = ", ".join(sorted({h["name"] for h in locked.values()}))
             return no("locked", f"being edited by {who}", locked)
@@ -671,7 +680,7 @@ class Room:
             conn.send({"type": "change.revert.result", "request_id": msg.request_id, "ok": True, "seq": res["seq"],
                        "ops": row.inverse_ops})
 
-    async def restore(self, user: User, seq: int) -> tuple[bool, dict]:
+    async def restore(self, user: User, seq: int) -> tuple[bool, dict]:  # noqa: C901
         """Put the document back to how it was after change `seq`, as one new change."""
         async with self.lock:
             if self.evicted:
@@ -684,9 +693,10 @@ class Room:
             if not ops:
                 return True, {"seq": self.head}
             self._expire_locks()
-            if self.locks:
-                return False, {"code": "locked", "message": "people are editing this document; restore needs every "
-                               "lock released", "conflicts": {t: lk.holder() for t, lk in self.locks.items()}}
+            others = {t: lk.holder() for t, lk in self.locks.items() if lk.user_id != user.id}
+            if others:  # (your own locks do not stop you)
+                return False, {"code": "locked", "message": "other people are editing this document; restore needs "
+                               "their locks released", "conflicts": others}
             return await self._commit(user=user, client_id=None, change_id=None, base_seq=self.head, ops=ops,
                                       command=f"restore to {seq}", args=None, check_stale=False,
                                       from_history=True)
