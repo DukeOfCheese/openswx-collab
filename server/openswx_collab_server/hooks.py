@@ -20,6 +20,9 @@ class Hooks:
     async def member_added(self, db: Any, org: Any, user: Any) -> None:
         pass
 
+    async def before_org_delete(self, db: Any, org: Any) -> None:
+        """Raise an HTTPException to refuse deleting the organisation (it still has a paid subscription, say)."""
+
     async def member_removed(self, db: Any, org: Any, user_id: str) -> None:
         pass
 
