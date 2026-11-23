@@ -12,20 +12,25 @@ wire protocol; the in-app toggle and sync client live in openswx (branch `dev/op
 
 ## Status
 
+**0.1.0 is released** (2026-11-23): `pip install openswx-collab-server`, or the Docker image
+`ghcr.io/dukeofcheese/openswx-collab-server` (amd64 and arm64). See the
+[release](https://github.com/DukeOfCheese/openswx-collab/releases/tag/v0.1.0) and [CHANGELOG.md](CHANGELOG.md).
+
 | Piece | State |
 |---|---|
-| Shared protocol (`protocol/`) | Done, tested |
-| Server: accounts, Google/GitHub sign-in, organisations, invites, project roles | Done, tested. Providers are faked in tests; the endpoints match what Google and GitHub publish, but no real sign-in has been done (needs OAuth app credentials) |
-| Server: live documents — ordering, locks, id hand-out, conflicts, reconnect, presence | Done, tested |
-| Server: history, undo/revert, who-broke-what, named versions, restore, snapshots | Done, tested |
-| Server: assembly documents (components pinned to a part's version, where-used, update notices) | Done, tested. The openswx side of assemblies is not designed yet |
-| Seat limits | Done, tested, in a separate private package (not part of the open server). Set by the server admin; no billing |
-| End to end with two real openswx processes (`tools/e2e_two_peers.py`) | Passes |
-| PostgreSQL | Whole suite passes on PostgreSQL 16 (`tools/test_postgres.py`) |
-| S3 storage | Tested against a fake S3 (`tests/test_storage.py`) and against a real S3 server (Garage 2.5, in the Compose stack) |
-| Docker deployment (`deploy/`) | Image built and the Compose stack run on a Raspberry Pi (arm64, Debian 13): PostgreSQL alone, and PostgreSQL + Garage. The two-openswx check passes against it and data survives a restart. CI builds and starts it on every push |
-| openswx client (toggle, sync, cursors, previews) | Not started |
-| Assemblies in openswx, SSO, billing, browser-only viewers | Later; see `docs/` |
+| Shared protocol (`protocol/`, on PyPI) | Done, tested |
+| Accounts: email + password, Google/GitHub sign-in, organisations, invites, project roles | Done, tested. Providers are faked in tests; no real Google or GitHub sign-in has been tried yet |
+| Live documents: ordering, locks, id hand-out, conflicts, reconnect, presence | Done, tested |
+| History: undo/revert, who-broke-what, named versions, restore, snapshots | Done, tested |
+| Assembly documents (components pinned to a part's version, where-used, update notices) | Done, tested on the server. The openswx side of assemblies is not designed yet |
+| Leaving: account and organisation deletion, data export | Done, tested |
+| Email (invites, password reset), optional SMTP | Done, tested against a local SMTP server |
+| Database migrations (Alembic) | Done; the server upgrades on start |
+| Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Whole suite passes on both databases; S3 tested with a fake and with Garage |
+| Docker deployment (`deploy/`) | Published image; Compose stack run on a Raspberry Pi (arm64) and in CI on every change |
+| openswx client (toggle, sync, cursors, previews) | In progress on openswx's `dev/openswx-collab` branch: sync and commands done and reviewed, UI being built |
+| Hosted service extras (seat limits, Stripe billing) | In a separate private package; billing not yet tried against Stripe's test mode |
+| Assemblies in openswx, company SSO, browser-only viewers | Later |
 
 ## How it works
 
