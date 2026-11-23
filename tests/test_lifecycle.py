@@ -123,3 +123,20 @@ def test_deleting_an_organisation_removes_everything_in_it(world, client, tmp_pa
     assert not (tmp_path / "storage" / "docs" / doc / "snapshots" / "0000000000.json.gz").exists()
     assert client.get("/api/me", headers=H(bob)).status_code == 200  # (people keep their accounts)
     del bob_id
+
+
+def test_an_extension_can_refuse_deleting_an_organisation(make_client):
+    from fastapi import HTTPException
+
+    from openswx_collab_server.hooks import Hooks
+
+    class StillPaying(Hooks):
+        async def before_org_delete(self, db, org):
+            raise HTTPException(409, f"{org.name} still has a paid subscription")
+
+    client = make_client(hooks=StillPaying())
+    w = World(client)
+    r = client.request("DELETE", f"/api/orgs/{w.org}", json={"confirm_name": "Robotics", "current_password": "correct horse"},
+                       headers=H(w.admin))
+    assert r.status_code == 409 and "paid subscription" in r.text
+    assert [o["id"] for o in client.get("/api/orgs", headers=H(w.admin)).json()] == [w.org]

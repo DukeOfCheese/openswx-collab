@@ -127,6 +127,7 @@ async def delete_org(org_id: str, body: DeleteOrgIn, request: Request, user: Use
     org = await db.get(Org, org_id)
     if body.confirm_name.strip() != org.name:
         raise HTTPException(422, "type the organisation's name exactly to confirm")
+    await request.app.state.hooks.before_org_delete(db, org)
     docs = list((await db.execute(select(Document.id).join(Project, Project.id == Document.project_id)
                                   .where(Project.org_id == org_id))).scalars())
     snapshots = list((await db.execute(select(Snapshot.key).where(Snapshot.document_id.in_(docs)))).scalars()) \
