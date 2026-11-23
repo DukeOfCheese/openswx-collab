@@ -53,10 +53,10 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
 
 - [x] **Releases** (`.github/workflows/release.yml`): on a `v*` tag, the Docker image for amd64 and arm64
       to GHCR, the Python packages (to PyPI once trusted publishing is set up), and the GitHub release.
-- [ ] **PyPI**: `release.yml` builds and checks both packages on every tag; publishing waits for the two
-      pending publishers on pypi.org (environments `pypi` and `pypi-server`) and `PYPI_PUBLISH=true` (the
-      steps are at the top of `release.yml`).
-      The openswx client depends on `openswx-collab-protocol` being there.
+- [x] **PyPI** (2026-11-23): `openswx-collab-protocol` and `openswx-collab-server` 0.1.0, published by
+      `release.yml` with trusted publishing (environments `pypi` and `pypi-server`).
+- [x] **First release, v0.1.0** (2026-11-23): PyPI, the image on GHCR (public, amd64 + arm64) and the
+      GitHub release.
 - [x] **Database migrations** (Alembic; the server upgrades on start, `openswx-collab-server migrate`).
 - [ ] Cross-link the two READMEs.
 - [ ] Optional: a public `DukeOfCheese/.github` repository holding the Code of Conduct and security policy
