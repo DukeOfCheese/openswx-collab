@@ -23,7 +23,7 @@ For whoever writes a client (the openswx module, first of all). Message and oper
 | `GET/POST /api/orgs/{id}/invites` · `DELETE …/invites/{id}` · `POST /api/invites/accept` `{token}` | an invite with an `email` is emailed when the server can (`send_email: false` to skip); the answer says `emailed` |
 | `GET/POST /api/orgs/{id}/projects` · `PATCH/DELETE /api/projects/{id}` · `GET …/members` · `PUT/DELETE …/members/{user}` | |
 | `POST /api/projects/{id}/blobs/missing` `[sha256…]` · `PUT/GET /api/projects/{id}/blobs/{sha256}` | large strings |
-| `GET/POST /api/projects/{id}/documents` | create = turn collaboration on for a file |
+| `GET/POST /api/projects/{id}/documents` | create = turn collaboration on for a file; the list gives each document `online: [{name, colour}]` (who has it open now, one entry per person, in the order they joined, at most 8) and `online_count` (all of them); `[]` and `0` when nobody has it open |
 | `GET/PATCH/DELETE /api/documents/{id}` | |
 | `GET /api/documents/{id}/content?seq=\|version=` | the document at any point (backups, pinned versions) |
 | `GET /api/documents/{id}/history?before=&after=&limit=` | newest first |

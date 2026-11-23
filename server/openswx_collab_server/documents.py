@@ -119,12 +119,29 @@ def _check_content(content: dict, kind: str = "part") -> dict:
     return content
 
 
+MAX_ONLINE = 8  # people listed per document in the project's list; online_count has them all
+
+
+def online(hub, document_id: str) -> dict:
+    """Who has the document open right now: one entry per person (several apps of one person count once), in
+    the order they joined. Read from the open room in memory; a document nobody has open lists no one."""
+    room = hub.rooms.get(document_id)
+    people: dict[str, dict] = {}
+    if room is not None and not room.evicted:
+        for c in list(room.conns.values()):
+            if not c.closed:
+                people.setdefault(c.user.id, {"name": c.user.name, "colour": c.colour})
+    return {"online": list(people.values())[:MAX_ONLINE], "online_count": len(people)}
+
+
 @router.get("/projects/{project_id}/documents")
-async def list_documents(project_id: str, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+async def list_documents(project_id: str, request: Request, user: User = Depends(current_user),
+                         db: AsyncSession = Depends(get_db)):
     _, role = await need_project(db, user, project_id)
     rows = (await db.execute(select(Document).where(Document.project_id == project_id, Document.deleted_at.is_(None))
                              .order_by(Document.name))).scalars()
-    return [doc_out(d, role) for d in rows]
+    hub = request.app.state.hub
+    return [doc_out(d, role) | online(hub, d.id) for d in rows]
 
 
 @router.post("/projects/{project_id}/documents", status_code=201)

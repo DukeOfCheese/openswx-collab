@@ -6,6 +6,10 @@ protocol or the database; the change is listed here).
 
 ## Unreleased
 
+### Added
+- `GET /api/projects/{id}/documents` says who is in each document right now: `online` (name and
+  colour, one entry per person, at most 8) and `online_count`.
+
 ## 0.1.0 - 2026-11-23
 
 The first release: the server and the protocol. The openswx side (the in-app toggle, sync and live
