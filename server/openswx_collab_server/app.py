@@ -26,7 +26,7 @@ def create_app(settings: Settings | None = None, hooks: Hooks | None = None, htt
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         engine = make_engine(settings.database_url)
-        await init_db(engine)
+        await init_db(engine, settings.auto_migrate, app.state.hooks)
         app.state.db = async_sessionmaker(engine, expire_on_commit=False)
         app.state.hub = Hub(settings, app.state.db, app.state.storage)
         await app.state.hub.start()

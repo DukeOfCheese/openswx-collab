@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, event
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SCHEMA_VERSION = 1
 
 
 def new_id() -> str:
@@ -29,6 +28,7 @@ class Base(DeclarativeBase):
 
 
 class Meta(Base):
+    """Unused since migrations took over the schema version (alembic_version); kept so old databases match."""
     __tablename__ = "meta"
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
@@ -220,14 +220,13 @@ def make_engine(url: str) -> AsyncEngine:
     return create_async_engine(url, pool_pre_ping=True)
 
 
-async def init_db(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as s:
-        row = await s.get(Meta, "schema_version")
-        if row is None:
-            s.add(Meta(key="schema_version", value=str(SCHEMA_VERSION)))
-            await s.commit()
-        elif int(row.value) > SCHEMA_VERSION:
-            raise RuntimeError(f"the database was written by a newer server (schema {row.value})")
+async def init_db(engine: AsyncEngine, auto_migrate: bool = True, hooks=None) -> str:
+    """Create or upgrade the schema (see migrate.py), then let an installed extension set up its own tables.
+    Returns the schema revision."""
+    from .migrate import upgrade  # noqa: PLC0415
+
+    revision = await upgrade(engine, allow=auto_migrate)
+    if hooks is not None:
+        async with engine.begin() as conn:
+            await conn.run_sync(hooks.prepare_db)
+    return revision
