@@ -16,13 +16,15 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
       git log --all -p | grep -nE "ghp_|github_pat_|sk-ant-|AKIA[0-9A-Z]{16}|PRIVATE KEY|C:\\\\Users"
       ```
       Both should print nothing.
-- [ ] **Squash the history, or decide the seat-limit code may be public.** The early commits carry the
-      commercial layer (see above), a throwaway spike, several rounds of review fixes and, briefly, build
-      output (`server/build/`, removed since). Squashing rewrites the branch, so do it before anyone else
-      has cloned.
 - [x] **The commercial layer is out of this repository** (2026-11-23): it lives in the private
-      `openswx-collab-ee`. **Its code is still in this repository's history** (the commits before the move),
-      so the history must be squashed before switching unless that code is meant to be public.
+      `openswx-collab-ee`.
+- [x] **History squashed** (2026-11-23): `main` is one commit with no trace of the commercial layer.
+- [ ] **Two old pull-request references still hold the old history, seat-limit code included.** GitHub keeps
+      `refs/pull/1/head` and `refs/pull/2/head` (Dependabot's first two pull requests, now closed) for good,
+      and they cannot be deleted with git. Before switching, either delete this repository on GitHub and
+      push `main` to a new one of the same name (this also drops the old CI history), or ask GitHub Support
+      to remove those references. Check with `git ls-remote origin`: only `HEAD` and branches should be
+      listed, and any `refs/pull/*` must belong to pull requests opened after the squash.
 - [ ] **The name.** The same question as openswx's ("SW"): this repository follows whatever openswx decides,
       and the package names (`openswx-collab-protocol`, `openswx-collab-server`) and the `OSWX_COLLAB_`
       settings prefix would change with it. Cheapest before the first release.
