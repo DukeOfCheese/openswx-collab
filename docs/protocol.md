@@ -154,8 +154,8 @@ person making the change must be able to open it, and it must have that state. T
 each part with `GET /api/documents/{part}/content?seq=<seq>`.
 
 Editing a part never changes an assembly. When a part gets a new named version, everyone in an assembly
-that uses an older state receives `reference.update {document, version: {id, seq}, components}` (ids only:
-not everyone in the assembly may be allowed to know the part's name), and
+that uses an older state receives `reference.update {document, components}` (nothing more: not everyone in
+the assembly may be allowed to know about the part), and
 `GET .../references` reports `update_available`, `latest_version`, `newer_edits` and
 `changes_since_pinned` per component. To update, change the component's `ref` like any other edit (it can
 be undone); choosing a part, or another state of one, needs access to that part, while moving, removing or

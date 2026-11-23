@@ -274,12 +274,17 @@ async def delete_project(project_id: str, request: Request, user: User = Depends
     p, _ = await need_project(db, user, project_id, "owner")
     from .assemblies import used_outside, visible  # noqa: PLC0415
     from .db import Document  # noqa: PLC0415
+    # As for one document (documents.delete_document): take the locks by marking its documents deleted,
+    # then look for users outside, in one transaction.
+    doc_ids = list((await db.execute(select(Document.id).where(Document.project_id == p.id))).scalars())
+    await db.execute(update(Document).where(Document.project_id == p.id, Document.deleted_at.is_(None))
+                     .values(deleted_at=now()))
     outside = await used_outside(db, p.id)
     if outside:  # (assemblies elsewhere are built from parts in here)
         shown, hidden = await visible(db, user, outside)
+        await db.rollback()
         raise HTTPException(409, {"message": "assemblies in other projects use parts of this project",
                                   "assemblies": shown, "in_projects_you_cannot_open": hidden})
-    doc_ids = list((await db.execute(select(Document.id).where(Document.project_id == p.id))).scalars())
     await db.delete(p)
     await db.commit()
     for d in doc_ids:

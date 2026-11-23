@@ -46,26 +46,28 @@ def ref_rows(content: dict) -> dict[str, tuple[str, int]]:
 
 
 async def check_refs(db: AsyncSession, org_id: str, user: User, components: list[dict],
-                     access_for: set[str] | None = None, allow_deleted: bool = False) -> None:
+                     access_for: set[str] | None = None, allow_deleted: bool | set[str] = False) -> None:
     """Each of these components must use a part of the same organisation, at a state that part has.
     For the components in `access_for` (all of them when None) `user` must also be able to open the part:
     that is asked when someone chooses a part or a state of it, not every time a component that already
-    uses it is moved, removed or put back. `allow_deleted`: for undo and restore, which may bring back a
-    component whose part has since been deleted. Raises OpError; its text names a part only to someone
-    who can open it."""
-    seen: dict[tuple[str, bool], Document | None] = {}
+    uses it is moved, removed or put back. `allow_deleted` (all components, or the ids in it): a part that has
+    been deleted is fine - for undo and restore, which may bring back a component whose part has gone since,
+    and for moving such a component afterwards without changing what it points at. Raises OpError; its text
+    names a part only to someone who can open it."""
+    seen: dict[tuple[str, bool, bool], Document | None] = {}
     for c in components:
         part_id, seq = _ref(c)
         need = access_for is None or c["id"] in access_for
-        if (part_id, need) not in seen:
+        gone_ok = allow_deleted is True or (isinstance(allow_deleted, set) and c["id"] in allow_deleted)
+        if (part_id, need, gone_ok) not in seen:
             doc = await db.get(Document, part_id)
-            live = doc is not None and (doc.deleted_at is None or allow_deleted)
+            live = doc is not None and (doc.deleted_at is None or gone_ok)
             project = await db.get(Project, doc.project_id) if live else None
             ok = project is not None and project.org_id == org_id
             if ok and need:
                 ok = await project_role(db, user, project) is not None
-            seen[(part_id, need)] = doc if ok else None  # (one answer for "missing" and "not yours": no probing)
-        doc = seen[(part_id, need)]
+            seen[(part_id, need, gone_ok)] = doc if ok else None  # (one answer for "missing" and "not yours")
+        doc = seen[(part_id, need, gone_ok)]
         if doc is None:
             raise OpError(f"component {c['id']}: there is no part {part_id} you can use")
         label = doc.name if need else "that document"

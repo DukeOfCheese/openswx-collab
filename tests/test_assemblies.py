@@ -107,10 +107,9 @@ def test_editing_a_part_never_changes_an_assembly_until_someone_updates_it(world
         assert p.change(set_depth(20 + n), n)["seq"] == n + 1
     assert all(m["type"] not in ("change", "reference.update") for m in b.drain())  # the assembly is untouched
     assert refs(client, asm, bob)["c1"]["update_available"] is False  # edits alone are not an "update"
-    v = client.post(f"/api/documents/{part}/versions", json={"name": "Rev B"}, headers=H(world.admin)).json()
+    client.post(f"/api/documents/{part}/versions", json={"name": "Rev B"}, headers=H(world.admin))
     ev = b.recv("reference.update")
-    assert ev == {"type": "reference.update", "document": part, "components": ["c1", "c2"],
-                  "version": {"id": v["id"], "seq": 3}}  # ids only: /references says what each person may know
+    assert ev == {"type": "reference.update", "document": part, "components": ["c1", "c2"]}  # /references says more
     got = refs(client, asm, bob)["c1"]
     assert got["update_available"] and got["latest_version"]["name"] == "Rev B" and got["changes_since_pinned"] == 3
     # what changed in between, for the client's "which mates would break" check
@@ -331,6 +330,51 @@ def test_undo_and_restore_still_work_after_a_part_they_bring_back_was_deleted(wo
     assert client.post(f"/api/documents/{asm}/restore", json={"seq": 0}, headers=H(world.admin)).json() == {"seq": 3}
     got = refs(client, asm, world.admin)
     assert set(got) == {"c1", "c2"} and got["c2"]["document"]["deleted"] is True
-    # but nobody can newly choose a deleted part
+    # it can still be moved, as long as it keeps pointing where it did ...
+    move2 = [{"op": "item.update", "in": "components", "id": "c2", "set": [[["x"], [0, 5, 0, 0, 0, 0]]], "unset": []}]
+    assert a.change(move2, 3)["seq"] == 4
+    # (and relabelled: same part, same state)
+    assert a.change(set_ref("c2", 0, "relabelled"), 4)["seq"] == 5
+    # ... but nobody can newly choose a deleted part, for a new component or by repointing one
     add = [{"op": "item.add", "in": "components", "after": None, "item": comp("c9", doomed, 0)}]
-    assert a.change(add, 3)["code"] == "invalid"
+    assert a.change(add, 5)["code"] == "invalid"
+    repoint = [{"op": "item.update", "in": "components", "id": "c1", "set": [[["ref", "document"], doomed]], "unset": []}]
+    assert a.change(repoint, 5)["code"] == "invalid"
+
+
+def test_a_delete_locks_before_it_looks_for_users(world, client, monkeypatch):
+    """A part deleted at the very moment someone adds it to an assembly: the delete marks the part deleted
+    (taking the row lock) before it asks whether anything uses it, and the change locks the same row before
+    it records the use, so one always sees the other. Checked here by looking at what the delete has
+    already written when it asks."""
+    from openswx_collab_server import assemblies as A
+    from openswx_collab_server import documents as D
+    from openswx_collab_server import orgs as O
+    from openswx_collab_server.db import Document
+    part = world.document()
+    seen = {}
+
+    async def watching_used_in(db, part_id):
+        seen["deleted_when_checked"] = (await db.get(Document, part_id)).deleted_at is not None
+        return await A.used_in(db, part_id)
+    monkeypatch.setattr(D, "used_in", watching_used_in)
+    asm = make(client, world, assembly(comp("c1", part, 0))).json()["id"]
+    assert client.delete(f"/api/documents/{part}", headers=H(world.admin)).status_code == 409
+    assert seen["deleted_when_checked"] is True
+    assert client.get(f"/api/documents/{part}", headers=H(world.admin)).status_code == 200  # rolled back
+    lib = client.post(f"/api/orgs/{world.org}/projects", json={"name": "Lib"}, headers=H(world.admin)).json()["id"]
+    bolt = client.post(f"/api/projects/{lib}/documents", json={"name": "Bolt", "content": {"features": []}},
+                       headers=H(world.admin)).json()["id"]
+    a = Live(client, asm, world.admin)
+    assert a.change([{"op": "item.add", "in": "components", "after": "c1", "item": comp("c2", bolt, 0)}], 0)["seq"] == 1
+
+    original_used_outside = A.used_outside
+
+    async def watching_used_outside(db, project_id):
+        seen["project_parts_deleted_when_checked"] = (await db.get(Document, bolt)).deleted_at is not None
+        return await original_used_outside(db, project_id)
+    monkeypatch.setattr(A, "used_outside", watching_used_outside)
+    assert client.delete(f"/api/projects/{lib}", headers=H(world.admin)).status_code == 409
+    assert seen["project_parts_deleted_when_checked"] is True
+    assert client.get(f"/api/documents/{bolt}", headers=H(world.admin)).status_code == 200  # rolled back
+    del O

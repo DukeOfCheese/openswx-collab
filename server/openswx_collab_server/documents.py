@@ -183,12 +183,18 @@ async def rename_document(document_id: str, body: RenameIn, user: User = Depends
 async def delete_document(document_id: str, request: Request, user: User = Depends(current_user),
                           db: AsyncSession = Depends(get_db)):
     doc, _, _ = await need_document(db, user, document_id, "owner")
+    # Mark it deleted first, then look for users, in one transaction. The write locks the part's row (the
+    # whole database on SQLite), and a change that adds a use of the part locks that row too before it
+    # records the use (hub.Room._commit): one of the two waits for the other, so a part can never end up
+    # deleted with a new user that this check did not see.
+    doc.deleted_at = now()  # (kept in the database: a deleted document can be brought back by the operator)
+    await db.flush()
     users = await used_in(db, document_id)
     if users:  # (assemblies pinned to it would lose the part they are built from)
         shown, hidden = await visible(db, user, users)  # (not the names of assemblies the asker cannot open)
+        await db.rollback()
         raise HTTPException(409, {"message": "assemblies use this part; remove it from them first",
                                   "assemblies": shown, "in_projects_you_cannot_open": hidden})
-    doc.deleted_at = now()  # (kept in the database: a deleted document can be brought back by the operator)
     await db.commit()
     await request.app.state.hub.close_document(document_id, "the document was deleted")
 
@@ -270,8 +276,7 @@ async def create_version(document_id: str, body: VersionIn, request: Request, us
     # everyone with an assembly open that uses an older state of this part hears about it
     for assembly_id, components in (await where_pinned_older(db, document_id, seq)).items():
         # ids only: someone in the assembly may not be allowed to open the part, or know what it is called
-        hub.notify(assembly_id, {"type": "reference.update", "document": document_id,
-                                 "version": {"id": v.id, "seq": seq}, "components": components})
+        hub.notify(assembly_id, {"type": "reference.update", "document": document_id, "components": components})
     return _version_out(v, {user.id: user.name})
 
 

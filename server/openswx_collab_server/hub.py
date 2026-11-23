@@ -528,7 +528,10 @@ class Room:
             chosen = set() if from_history else {c["id"] for c in changed if was.get(c["id"]) != pin(c)}
             try:
                 async with self.hub.db() as s:
-                    await check_refs(s, self.org_id, user, changed, access_for=chosen, allow_deleted=from_history)
+                    # (a component that keeps pointing where it did may be moved even if its part has gone)
+                    kept = {c["id"] for c in changed if c["id"] in was and was[c["id"]] == pin(c)}
+                    await check_refs(s, self.org_id, user, changed, access_for=chosen,
+                                     allow_deleted=True if from_history else kept)
                 refs = ref_rows(new_state)
             except OpError as exc:
                 return no("invalid", str(exc))
@@ -569,9 +572,7 @@ class Room:
                         alive = set((await s.execute(select(Document.id).where(
                             Document.id.in_(wanted), Document.deleted_at.is_(None)).with_for_update())).scalars())
                         gone = wanted - alive
-                        touched = {c["id"] for c in new_state.get("components") or []
-                                   if f"i:components:{c['id']}" in tg}
-                        if any(refs[c][0] in gone for c in touched if c in refs):
+                        if any(refs[c][0] in gone for c in chosen if c in refs):  # (newly pointed at it)
                             await s.rollback()
                             return no("invalid", "a part this change uses has just been deleted")
                     await s.execute(delete(AssemblyRef).where(AssemblyRef.assembly_id == self.doc_id))

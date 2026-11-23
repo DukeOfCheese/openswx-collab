@@ -219,11 +219,10 @@ class VersionEvent(_M):
 
 
 class ReferenceEvent(_M):
-    """Sent to everyone in an assembly when a part it uses gets a new named version. Ids only: ask
-    GET /documents/{assembly}/references for names (it tells each person what they are allowed to know)."""
+    """Sent to everyone in an assembly when a part it uses gets a new named version. Nothing about the part
+    beyond its id: ask GET /documents/{assembly}/references, which tells each person what they may know."""
     type: Literal["reference.update"] = "reference.update"
     document: str  # the part
-    version: dict[str, Any]  # {id, seq}
     components: list[str]  # ids of the components that are pinned to something older
 
 
