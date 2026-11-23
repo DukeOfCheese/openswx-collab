@@ -1,0 +1,64 @@
+name: Bug report
+description: The server gives a wrong result, an error or a crash, or people's copies of a document differ.
+labels: ["bug", "needs-repro"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One problem per issue. The most useful thing you can give is the requests and messages that show it.
+        Security problems go to SECURITY.md, not here. Remove tokens, email addresses and anything from your
+        documents that you do not want public before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: One or two sentences. Include the error message as text.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: The response or message you expected and the one you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: |
+        The REST calls and WebSocket messages, in order, as text (docs/protocol.md describes them). For a sync
+        problem: what each client sent and what each received.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log
+      description: The lines around the time it happened, as text.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: From GET /api/server, or the commit you run.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How it is deployed
+      options: ["Docker Compose", "Plain Python", "Other"]
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database
+      options: ["PostgreSQL", "SQLite"]
+    validations:
+      required: true
+  - type: dropdown
+    id: storage
+    attributes:
+      label: File storage
+      options: ["Local folder / volume", "S3-compatible (say which above)"]

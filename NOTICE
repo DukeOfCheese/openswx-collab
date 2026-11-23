@@ -1,0 +1,33 @@
+openswx-collab
+Copyright 2026 the openswx authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+openswx-collab is the collaboration server for openswx, a clean-room implementation. It contains no
+SOLIDWORKS code or artwork and is not affiliated with or endorsed by Dassault Systemes. SOLIDWORKS is a
+trademark of Dassault Systemes.
+
+Nothing from third parties is bundled in this source tree.
+
+Used as dependencies (installed separately; included in the Docker image)
+-------------------------------------------------------------------------
+FastAPI              MIT
+Starlette            BSD-3-Clause
+Pydantic             MIT
+Uvicorn              BSD-3-Clause
+SQLAlchemy           MIT
+aiosqlite            MIT
+HTTPX                BSD-3-Clause
+asyncpg              Apache-2.0        (optional: PostgreSQL)
+boto3 / botocore     Apache-2.0        (optional: S3 storage)
+
+The Docker image is built on the official Python image (Python Software Foundation License; Debian
+packages under their own licences).
+
+Used only by the tests and tools (never shipped)
+------------------------------------------------
+pytest               MIT
+moto                 Apache-2.0
+pixeltable-pgserver  Apache-2.0; carries PostgreSQL (PostgreSQL License)
+PyYAML               MIT
+websockets           BSD-3-Clause

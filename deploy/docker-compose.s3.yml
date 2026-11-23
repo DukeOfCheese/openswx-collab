@@ -1,0 +1,39 @@
+# Optional: keep files in an S3-compatible store instead of the local volume. This runs Garage
+# (https://garagehq.deuxfleurs.fr), a small open-source S3 server, as a single node next to the server.
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env up -d
+# Set S3_ACCESS_KEY, S3_SECRET_KEY and GARAGE_RPC_SECRET in deploy/.env first (see .env.example for how to
+# make them). Garage creates the bucket and the key by itself on first start.
+#
+# To use a store you already have (AWS S3, Cloudflare R2, ...) you do not need this file: set
+# OSWX_COLLAB_STORAGE_URL=s3://bucket/prefix, OSWX_COLLAB_S3_ENDPOINT if it is not AWS, and the usual
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION on the server service.
+services:
+  server:
+    depends_on:
+      garage:
+        condition: service_started
+    environment:
+      OSWX_COLLAB_STORAGE_URL: s3://${S3_BUCKET:-openswx-collab}
+      OSWX_COLLAB_S3_ENDPOINT: http://garage:3900
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: garage
+
+  garage:
+    image: dxflrs/garage:v2.5.0
+    restart: unless-stopped
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?set GARAGE_RPC_SECRET}
+      GARAGE_DEFAULT_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      GARAGE_DEFAULT_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      GARAGE_DEFAULT_BUCKET: ${S3_BUCKET:-openswx-collab}
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    # no ports: only the server talks to it, over the Compose network
+
+volumes:
+  garage-meta:
+  garage-data:

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openswx-collab-server"
+version = "0.1.0"
+description = "Live collaboration server for openswx: accounts, organisations, cloud documents, real-time editing"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "openswx-collab-protocol==0.1.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.29"]
+s3 = ["boto3>=1.34"]
+dev = ["pytest>=8"]
+# for tests/test_storage.py (S3), tools/test_postgres.py and tools/check_deploy.py
+test = ["pytest>=8", "asyncpg>=0.29", "boto3>=1.34", "moto[server]>=5", "pixeltable-pgserver>=0.7", "pyyaml>=6",
+        "websockets>=12"]
+
+[project.scripts]
+openswx-collab-server = "openswx_collab_server.__main__:main"
+
+[tool.setuptools]
+packages = ["openswx_collab_server"]

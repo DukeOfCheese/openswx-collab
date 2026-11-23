@@ -1,0 +1,33 @@
+name: Feature request
+description: Something the collaboration server or protocol should do.
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A good request reads like a small spec. Describe behaviour in your own words; do not paste another
+        product's documentation or protocol. Features of the openswx app itself belong in the openswx tracker.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Behaviour
+      description: "What the server should do: who may do it, what is sent and received, what happens on conflict or disconnect."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Checks that show it works, ideally ones a test can run.
+  - type: dropdown
+    id: who
+    attributes:
+      label: Who needs it
+      options: ["Self-hosters", "Hosted service", "Both"]
