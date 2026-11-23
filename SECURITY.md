@@ -35,6 +35,11 @@ about:
   server for everyone.
 - **Stored files** (`storage.py`): reading or writing outside the storage folder or bucket prefix.
 - **Extension hooks** (`hooks.py`): getting past a limit an installed extension sets, such as seats.
+- **Through the server to other people's apps**: a presence, draft, name or message that makes another
+  person's openswx run a command, touch a file, show injected markup or lock up. The server relays these
+  unchecked, so such a report usually concerns the openswx client and belongs on
+  [openswx's security page](https://github.com/DukeOfCheese/openswx/security/advisories/new) as well; report
+  it to either and we will move it.
 
 Out of scope: anything that needs an attacker to already control the server, its database or its storage;
 denial of service by sheer volume from many machines (put a rate-limiting proxy in front); a server run
