@@ -1,6 +1,7 @@
 """The collaboration server application."""
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 
 import httpx
@@ -16,8 +17,33 @@ from .config import Settings
 from .db import init_db, make_engine
 from .hooks import Hooks, load_hooks
 from .hub import Hub
+from .mail import Mailer
 from .security import Limiter
 from .storage import make_storage
+
+
+_RESET_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
+<meta name=referrer content=no-referrer><title>Choose a new password</title>
+<body style="font:16px system-ui;max-width:28em;margin:4em auto;padding:0 1em">
+<h1>Choose a new password</h1>
+<form id=f><p><label>New password<br><input id=p type=password minlength=8 required autocomplete=new-password
+style="width:100%;font:inherit;padding:.4em"></label></p>
+<p><label>Again<br><input id=q type=password minlength=8 required autocomplete=new-password
+style="width:100%;font:inherit;padding:.4em"></label></p>
+<p><button style="font:inherit;padding:.4em 1em">Set password</button></p></form><p id=m role=status></p>
+<script>
+const token = __TOKEN__;
+document.getElementById("f").onsubmit = async (e) => {
+  e.preventDefault();
+  const m = document.getElementById("m"), p = document.getElementById("p").value;
+  if (p !== document.getElementById("q").value) { m.textContent = "The two passwords differ."; return; }
+  const r = await fetch("/api/auth/password-reset/confirm", {method: "POST",
+    headers: {"content-type": "application/json"}, body: JSON.stringify({token, password: p})});
+  const d = await r.json().catch(() => ({}));
+  m.textContent = r.ok ? d.message : (typeof d.detail === "string" ? d.detail : "That did not work.");
+  if (r.ok) document.getElementById("f").remove();
+};
+</script></body>"""
 
 
 def create_app(settings: Settings | None = None, hooks: Hooks | None = None, http_client=None) -> FastAPI:
@@ -41,6 +67,8 @@ def create_app(settings: Settings | None = None, hooks: Hooks | None = None, htt
     app.state.hooks = hooks or load_hooks()
     app.state.storage = make_storage(settings.storage_url, settings.s3_endpoint)
     app.state.login_limiter = Limiter()
+    app.state.reset_limiter = Limiter(limit=5, window=3600)
+    app.state.mailer = Mailer(settings)
     app.state.http_client = http_client or (lambda: httpx.AsyncClient(timeout=15))
 
     @app.get("/api/health")
@@ -52,7 +80,8 @@ def create_app(settings: Settings | None = None, hooks: Hooks | None = None, htt
         """What a client needs to draw its sign-in dialog."""
         return {"name": "openswx-collab", "version": __version__, "protocol": PROTOCOL_VERSION,
                 "registration": await auth.registration_mode(db, settings),
-                "oauth": settings.oauth_providers(), "edition": app.state.hooks.name,
+                "oauth": settings.oauth_providers(), "email": app.state.mailer.enabled,
+                "edition": app.state.hooks.name,
                 **app.state.hooks.server_info()}
 
     @app.get("/invite/{token}", response_class=HTMLResponse)
@@ -63,6 +92,11 @@ def create_app(settings: Settings | None = None, hooks: Hooks | None = None, htt
                 "<h1>You have been invited to collaborate in openswx</h1>"
                 "<p>Open openswx, choose <b>Collaborate &rsaquo; Join with invite</b>, and paste this page's "
                 "address. You can create your account there.</p></body>")
+
+    @app.get("/reset-password/{token}", response_class=HTMLResponse)
+    async def reset_page(token: str):
+        """Where a reset link lands: a small form that posts to /api/auth/password-reset/confirm."""
+        return _RESET_PAGE.replace("__TOKEN__", json.dumps(token))
 
     app.include_router(auth.router)
     app.include_router(orgs.router)

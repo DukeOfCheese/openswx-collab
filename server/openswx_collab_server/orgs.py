@@ -166,6 +166,7 @@ class InviteIn(BaseModel):
     role: Literal["admin", "member"] = "member"
     projects: list[Grant] = Field(default_factory=list)
     days: int = Field(default=7, ge=1, le=90)
+    send_email: bool = True  # (when the server can send email and the invite names an address)
 
 
 def _invite_out(inv: Invite) -> dict:
@@ -197,7 +198,13 @@ async def create_invite(org_id: str, body: InviteIn, request: Request, user: Use
     db.add(inv)
     await db.commit()
     base = request.app.state.settings.public_url.rstrip("/")
-    return {**_invite_out(inv), "token": token, "url": f"{base}/invite/{token}"}  # (the token is shown once)
+    url = f"{base}/invite/{token}"
+    emailed = False
+    if email and body.send_email:
+        from .mail import invite_text  # noqa: PLC0415
+        subject, text = invite_text(org.name, user.name, url, body.days)
+        emailed = await request.app.state.mailer.send(email, subject, text)
+    return {**_invite_out(inv), "token": token, "url": url, "emailed": emailed}  # (the token is shown once)
 
 
 @router.get("/orgs/{org_id}/invites")

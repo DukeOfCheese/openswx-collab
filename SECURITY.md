@@ -25,7 +25,8 @@ about:
 
 - **Accounts and sessions** (`auth.py`, `security.py`): signing in as someone else, keeping access after a
   password change or sign-out, taking over an account through Google/GitHub sign-in or an invite, and
-  anything that turns the browser sign-in flow into a way to redirect a code to another machine.
+  anything that turns the browser sign-in flow into a way to redirect a code to another machine; using a
+  password reset link that was not sent to you, or finding out who has an account.
 - **Access between people** (`access.py`, `orgs.py`, `documents.py`, `assemblies.py`): reading or changing a
   document, blob, version or history in a project or organisation you are not in; raising your own role;
   learning the name or content of something you cannot open.

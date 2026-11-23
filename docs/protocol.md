@@ -7,10 +7,12 @@ For whoever writes a client (the openswx module, first of all). Message and oper
 
 | | |
 |---|---|
-| `GET /api/server` | registration mode (`first_user`, `invite`, `open`), sign-in providers, protocol version |
+| `GET /api/server` | registration mode (`first_user`, `invite`, `open`), sign-in providers, whether it can send `email`, protocol version |
 | `POST /api/auth/register` `{email, password, name, invite?}` | → `{token, user}` |
 | `DELETE /api/me` `{current_password?}` | delete your account (password, or a sign-in from the last 10 minutes); refused (409) while you are an organisation's only owner or the server's last admin |
 | `GET /api/me/export` | everything the server holds about you, as JSON |
+| `POST /api/auth/password-reset` `{email}` | emails a link to `/reset-password/<token>` (a page that sets the password); always 202, 501 when the server cannot send email |
+| `POST /api/auth/password-reset/confirm` `{token, password}` | sets it, signs out everywhere |
 | `POST /api/auth/login` `{email, password}` · `POST /api/auth/logout` · `GET/PATCH /api/me` | |
 | `GET /api/auth/oauth/{google\|github}/start?redirect_uri=http://127.0.0.1:<port>/…&code_challenge=&invite=` | browser sign-in; ends on the loopback address with `?code=` or `?error=` |
 | `POST /api/auth/exchange` `{code, code_verifier}` | → `{token, user}` |
@@ -18,7 +20,7 @@ For whoever writes a client (the openswx module, first of all). Message and oper
 | `GET/POST /api/orgs` · `GET /api/orgs/{id}/members` · `PATCH/DELETE …/members/{user}` | |
 | `DELETE /api/orgs/{id}` `{confirm_name, current_password?}` | owners: delete the organisation and everything in it |
 | `GET /api/orgs/{id}/export` | owners: a zip of every document (content, history, versions), the members and the blobs |
-| `GET/POST /api/orgs/{id}/invites` · `DELETE …/invites/{id}` · `POST /api/invites/accept` `{token}` | |
+| `GET/POST /api/orgs/{id}/invites` · `DELETE …/invites/{id}` · `POST /api/invites/accept` `{token}` | an invite with an `email` is emailed when the server can (`send_email: false` to skip); the answer says `emailed` |
 | `GET/POST /api/orgs/{id}/projects` · `PATCH/DELETE /api/projects/{id}` · `GET …/members` · `PUT/DELETE …/members/{user}` | |
 | `POST /api/projects/{id}/blobs/missing` `[sha256…]` · `PUT/GET /api/projects/{id}/blobs/{sha256}` | large strings |
 | `GET/POST /api/projects/{id}/documents` | create = turn collaboration on for a file |

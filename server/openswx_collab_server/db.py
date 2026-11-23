@@ -91,6 +91,14 @@ class LoginCode(Base):
     expires_at: Mapped[float] = mapped_column(Float)
 
 
+class PasswordReset(Base):
+    """A password reset link that was emailed and not yet used."""
+    __tablename__ = "password_resets"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    expires_at: Mapped[float] = mapped_column(Float)
+
+
 class Org(Base):
     __tablename__ = "orgs"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
