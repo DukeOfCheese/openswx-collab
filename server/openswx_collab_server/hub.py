@@ -826,6 +826,12 @@ class Hub:
                     if not ok or await project_role(s, user, project) != c.role:
                         c.close(4403, "your access changed")
 
+    def forget_user(self, user_id: str, name: str) -> None:
+        """An account was deleted: open documents show its changes under `name` from now on."""
+        for room in self.rooms.values():
+            if user_id in room.names:
+                room.names[user_id] = name
+
     def drop_account(self, user_id: str) -> None:
         """Disconnect every open document of an account whose sessions were just ended."""
         for room in list(self.rooms.values()):

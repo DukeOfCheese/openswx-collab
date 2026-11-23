@@ -18,6 +18,19 @@ def run(coro):
     return asyncio.run(coro)
 
 
+async def make_pre_migration_database(url: str) -> None:
+    """A database as development versions left it: the baseline tables and no alembic_version."""
+    from alembic import command
+
+    from openswx_collab_server.migrate import config
+
+    engine = make_engine(url)
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda c: command.upgrade(config(c), BASELINE))
+        await conn.execute(text("DROP TABLE alembic_version"))
+    await engine.dispose()
+
+
 def test_the_migrations_build_exactly_the_tables_the_code_uses(settings):
     """Fails when db.py changed without a migration (or a migration without db.py)."""
     async def go():
@@ -34,9 +47,9 @@ def test_the_migrations_build_exactly_the_tables_the_code_uses(settings):
 
 def test_a_database_made_before_migrations_is_adopted_with_its_data(settings, make_client):
     async def old_style():
+        await make_pre_migration_database(settings.database_url)
         engine = make_engine(settings.database_url)
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)  # (how development versions made it)
             await conn.execute(text("INSERT INTO orgs (id, name, created_at) VALUES ('o1', 'Kept', 0)"))
         await engine.dispose()
     run(old_style())
@@ -65,9 +78,8 @@ def test_a_database_made_before_migrations_is_adopted_with_its_data(settings, ma
 
 def test_with_automatic_upgrades_off_an_older_database_is_refused(settings):
     async def go():
+        await make_pre_migration_database(settings.database_url)
         engine = make_engine(settings.database_url)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
         try:
             with pytest.raises(SchemaError, match="openswx-collab-server migrate"):
                 await init_db(engine, auto_migrate=False)

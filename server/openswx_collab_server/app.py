@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from openswx_collab_protocol import PROTOCOL_VERSION
 
-from . import __version__, assemblies, auth, documents, orgs
+from . import __version__, assemblies, auth, documents, lifecycle, orgs
 from .access import get_db
 from .config import Settings
 from .db import init_db, make_engine
@@ -68,6 +68,7 @@ def create_app(settings: Settings | None = None, hooks: Hooks | None = None, htt
     app.include_router(orgs.router)
     app.include_router(documents.router)
     app.include_router(assemblies.router)
+    app.include_router(lifecycle.router)
     for r in app.state.hooks.routers():
         app.include_router(r)
     return app

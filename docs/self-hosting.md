@@ -88,6 +88,12 @@ All are environment variables starting `OSWX_COLLAB_`.
 | `LOCK_TTL` / `LOCK_GRACE` | `45` / `60` | seconds |
 | `MAX_CHANGE_BYTES` / `MAX_BLOB_BYTES` | 8 MB / 256 MB | |
 
+## Leaving
+
+People can delete their own account (their work stays with the organisation, credited to "Deleted
+user") and export what the server holds about them. Organisation owners can export everything in the
+organisation as a zip, and delete it, which also removes its stored files.
+
 ## Upgrading
 
 New versions may change the database. The server upgrades it on start; back the database up before you

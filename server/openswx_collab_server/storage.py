@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import re
 import tempfile
 from pathlib import Path
@@ -53,6 +54,11 @@ class LocalStorage:
     async def delete(self, key: str) -> None:
         await asyncio.to_thread(lambda: self._path(key).unlink(missing_ok=True))
 
+    async def delete_prefix(self, prefix: str) -> None:
+        """Remove everything under a folder-like prefix ("orgs/<id>/")."""
+        path = self._path(prefix.rstrip("/"))
+        await asyncio.to_thread(lambda: shutil.rmtree(path) if path.is_dir() else None)
+
 
 class S3Storage:
     """S3 or anything that speaks its API (MinIO, R2). Needs the `s3` extra (boto3)."""
@@ -92,6 +98,17 @@ class S3Storage:
 
     async def delete(self, key: str) -> None:
         await asyncio.to_thread(self.s3.delete_object, Bucket=self.bucket, Key=self._key(key))
+
+    def _delete_prefix(self, prefix: str) -> None:
+        pages = self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=self._key(prefix))
+        for page in pages:
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            for n in range(0, len(keys), 1000):
+                self.s3.delete_objects(Bucket=self.bucket, Delete={"Objects": keys[n:n + 1000], "Quiet": True})
+
+    async def delete_prefix(self, prefix: str) -> None:
+        """Remove every object whose key starts with this prefix ("orgs/<id>/")."""
+        await asyncio.to_thread(self._delete_prefix, prefix)
 
 
 def make_storage(url: str, s3_endpoint: str = ""):
