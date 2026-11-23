@@ -4,11 +4,13 @@
 #   git tag -a v0.2.0 -m "openswx-collab 0.2.0" && git push origin v0.2.0
 #
 # PyPI publishing uses trusted publishing (no stored token) and is skipped until it is set up:
-#   1. On pypi.org: Account -> Publishing -> Add a new pending publisher, once for each of the projects
-#      "openswx-collab-protocol" and "openswx-collab-server": owner "DukeOfCheese", repository
-#      "openswx-collab", workflow "release.yml", environment "pypi".
-#   2. On GitHub: the environment "pypi" (Settings -> Environments) and the repository variable
-#      PYPI_PUBLISH = true (Settings -> Secrets and variables -> Actions -> Variables).
+#   1. On pypi.org: Account -> Publishing -> Add a new pending publisher, once per project, owner
+#      "DukeOfCheese", repository "openswx-collab", workflow "release.yml", and the environment:
+#        project "openswx-collab-protocol"  environment "pypi"
+#        project "openswx-collab-server"    environment "pypi-server"
+#      (PyPI allows one pending publisher per repository + workflow + environment, hence two environments.)
+#   2. On GitHub: the environments "pypi" and "pypi-server" (Settings -> Environments) and the repository
+#      variable PYPI_PUBLISH = true (Settings -> Secrets and variables -> Actions -> Variables).
 # The image goes to ghcr.io/dukeofcheese/openswx-collab-server with the GitHub token; nothing to set up.
 # Everything except publishing also runs by hand from the Actions tab, so a broken build shows before a tag.
 name: release
@@ -57,12 +59,30 @@ jobs:
           name: python-packages
           path: dist/
 
-  pypi:
+  pypi-protocol:
     needs: packages
     if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
+      url: https://pypi.org/project/openswx-collab-protocol/
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: python-packages
+          path: dist/
+      - run: mkdir up && mv dist/openswx_collab_protocol-* up/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: up/
+
+  pypi-server:
+    needs: pypi-protocol  # (the server's wheel needs the protocol on PyPI to install)
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-server
       url: https://pypi.org/project/openswx-collab-server/
     permissions:
       id-token: write  # trusted publishing
@@ -71,7 +91,10 @@ jobs:
         with:
           name: python-packages
           path: dist/
+      - run: mkdir up && mv dist/openswx_collab_server-* up/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: up/
 
   image:
     runs-on: ubuntu-latest

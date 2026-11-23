@@ -54,7 +54,8 @@ NOTICE, CHANGELOG, issue forms, pull request template, CODEOWNERS, Dependabot, l
 - [x] **Releases** (`.github/workflows/release.yml`): on a `v*` tag, the Docker image for amd64 and arm64
       to GHCR, the Python packages (to PyPI once trusted publishing is set up), and the GitHub release.
 - [ ] **PyPI**: `release.yml` builds and checks both packages on every tag; publishing waits for the two
-      pending publishers on pypi.org and `PYPI_PUBLISH=true` (the steps are at the top of `release.yml`).
+      pending publishers on pypi.org (environments `pypi` and `pypi-server`) and `PYPI_PUBLISH=true` (the
+      steps are at the top of `release.yml`).
       The openswx client depends on `openswx-collab-protocol` being there.
 - [x] **Database migrations** (Alembic; the server upgrades on start, `openswx-collab-server migrate`).
 - [ ] Cross-link the two READMEs.
