@@ -2,9 +2,8 @@
 
 What has been run: the whole test suite on SQLite and on PostgreSQL 16; the Docker image and both Compose
 stacks below on a Raspberry Pi (arm64, Debian 13, Docker 26), with two real openswx sessions editing through
-it and the data surviving a restart; file storage in a folder, a fake S3 and Garage. What has not: AWS S3
-itself, and a real Google or GitHub sign-in (the providers are faked in the tests; the addresses match what
-they publish).
+it and the data surviving a restart; file storage in a folder, a fake S3 and Garage; real Google and GitHub sign-in through openswx against a server on
+localhost. What has not: AWS S3 itself.
 
 ## Smallest install
 

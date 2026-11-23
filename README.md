@@ -19,7 +19,7 @@ wire protocol; the in-app toggle and sync client live in openswx (branch `dev/op
 | Piece | State |
 |---|---|
 | Shared protocol (`protocol/`, on PyPI) | Done, tested |
-| Accounts: email + password, Google/GitHub sign-in, organisations, invites, project roles | Done, tested. Providers are faked in tests; no real Google or GitHub sign-in has been tried yet |
+| Accounts: email + password, Google/GitHub sign-in, organisations, invites, project roles | Done, tested. Google and GitHub also checked by hand with real OAuth apps through openswx: first sign-in, refusal of an address takeover, adding a provider to an account with and without a password |
 | Live documents: ordering, locks, id hand-out, conflicts, reconnect, presence | Done, tested |
 | History: undo/revert, who-broke-what, named versions, restore, snapshots | Done, tested |
 | Assembly documents (components pinned to a part's version, where-used, update notices) | Done, tested on the server. The openswx side of assemblies is not designed yet |
