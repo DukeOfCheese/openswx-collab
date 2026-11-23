@@ -139,6 +139,14 @@ inside), limited to 60 a second, 16 KB per presence and 128 KB per draft, and ne
 (3D point + persistent face name), `selection` (persistent names), `tool`, `camera`. `draft {data: null}`
 clears a preview.
 
+**Treat presence and drafts as hostile input.** They come from other people (any project member, viewers
+included) and the server passes them on unchecked. A client must never run what a draft names: to preview
+someone's unfinished feature, accept only the commands that create features, with plain data arguments,
+and nothing that reads or writes files, runs scripts or acts on documents. Check every number before using
+it (a camera or point can be NaN or enormous), cap how much work previews cause (one in flight per person,
+a time limit), and escape every string before it reaches a page. The same goes for names, messages and
+anything else other people chose, in every message type.
+
 ### Rebuild reports
 
 After applying a change and rebuilding, send `rebuild.report {seq, errors: {feature id: message}}`. The
