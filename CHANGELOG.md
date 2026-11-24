@@ -6,6 +6,11 @@ protocol or the database; the change is listed here).
 
 ## Unreleased
 
+## 0.1.1 - 2026-11-24
+
+The document list says who is in each document right now, for openswx's Home page, and the password-reset page
+is fixed. The protocol is unchanged (version 1); openswx 0.3 and 0.4 work with this server.
+
 ### Added
 - `GET /api/projects/{id}/documents` says who is in each document right now: `online` (name and
   colour, one entry per person, at most 8) and `online_count`.
