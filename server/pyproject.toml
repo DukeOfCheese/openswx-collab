@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openswx-collab-server"
-version = "0.1.1"
+version = "0.1.2"
 description = "Live collaboration server for openswx: accounts, organisations, cloud documents, real-time editing"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "openswx-collab-protocol==0.1.1",
+    "openswx-collab-protocol==0.1.2",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "sqlalchemy[asyncio]>=2.0",

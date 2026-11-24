@@ -6,6 +6,11 @@ protocol or the database; the change is listed here).
 
 ## Unreleased
 
+## 0.1.2 - 2026-11-24
+
+A faster server: each message is encoded once for everyone, big documents no longer hold up the others, and a
+client is no longer dropped after receiving one very large message. The protocol is unchanged (version 1).
+
 ### Changed
 - The server does less work per message: a change, cursor or preview is encoded once for everyone in the
   document instead of once per person.

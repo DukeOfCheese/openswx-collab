@@ -12,9 +12,9 @@ wire protocol; the in-app toggle and sync client live in openswx (branch `dev/op
 
 ## Status
 
-**0.1.1 is released** (2026-11-24): `pip install openswx-collab-server`, or the Docker image
+**0.1.2 is released** (2026-11-24): `pip install openswx-collab-server`, or the Docker image
 `ghcr.io/dukeofcheese/openswx-collab-server` (amd64 and arm64). See the
-[release](https://github.com/DukeOfCheese/openswx-collab/releases/tag/v0.1.1) and [CHANGELOG.md](CHANGELOG.md).
+[release](https://github.com/DukeOfCheese/openswx-collab/releases/tag/v0.1.2) and [CHANGELOG.md](CHANGELOG.md).
 
 | Piece | State |
 |---|---|
