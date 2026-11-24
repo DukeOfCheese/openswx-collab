@@ -137,7 +137,9 @@ undoing the undo. openswx's own whole-document undo must be off for cloud docume
 `presence {data}` and `draft {data}` are relayed to everyone else as they are (the server does not look
 inside), limited to 60 a second, 16 KB per presence and 128 KB per draft, and never stored. Suggested `presence.data`: `pointer`
 (3D point + persistent face name), `selection` (persistent names), `tool`, `camera`. `draft {data: null}`
-clears a preview.
+clears a preview. openswx also sends `pointer.plane: true` when the pointer is over empty background: the point
+is then where the ray meets a plane through the view's centre, facing the viewer, and is drawn without hiding
+it behind the model.
 
 **Treat presence and drafts as hostile input.** They come from other people (any project member, viewers
 included) and the server passes them on unchecked. A client must never run what a draft names: to preview
