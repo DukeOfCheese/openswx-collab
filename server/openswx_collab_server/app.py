@@ -1,7 +1,6 @@
 """The collaboration server application."""
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 
 import httpx
@@ -32,7 +31,7 @@ style="width:100%;font:inherit;padding:.4em"></label></p>
 style="width:100%;font:inherit;padding:.4em"></label></p>
 <p><button style="font:inherit;padding:.4em 1em">Set password</button></p></form><p id=m role=status></p>
 <script>
-const token = __TOKEN__;
+const token = decodeURIComponent(location.pathname.split("/").pop() || "");  // (never written into the page)
 document.getElementById("f").onsubmit = async (e) => {
   e.preventDefault();
   const m = document.getElementById("m"), p = document.getElementById("p").value;
@@ -94,9 +93,10 @@ def create_app(settings: Settings | None = None, hooks: Hooks | None = None, htt
                 "address. You can create your account there.</p></body>")
 
     @app.get("/reset-password/{token}", response_class=HTMLResponse)
-    async def reset_page(token: str):
-        """Where a reset link lands: a small form that posts to /api/auth/password-reset/confirm."""
-        return _RESET_PAGE.replace("__TOKEN__", json.dumps(token))
+    async def reset_page(token: str):  # (unused: the page reads it from its own address)
+        """Where a reset link lands: a small form that posts to /api/auth/password-reset/confirm. The page is the
+        same for every link: nothing from the address is written into it."""
+        return HTMLResponse(_RESET_PAGE, headers={"Cache-Control": "no-store"})
 
     app.include_router(auth.router)
     app.include_router(orgs.router)
