@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +44,7 @@ from .storage import blob_key, snapshot_key
 _TARGET = re.compile(r"^(f:.{1,200}|i:(components|mates):.{1,200}|k:.{1,64}|structure)$")
 MAX_LOCKS = 256      # per client
 MAX_RESERVED = 256   # ids, and names, a client may hold unused
+BLOB_CHECKS = 16     # storage look-ups a change may have in flight at once
 
 
 def _stem_ok(x: object) -> bool:
@@ -62,6 +64,14 @@ def unpack(data: bytes) -> dict:
     return json.loads(gzip.decompress(data).decode("utf-8"))
 
 
+def encode(msg: dict) -> str | None:
+    """A message as the text every recipient gets, or None when it is not JSON (NaN, infinity)."""
+    try:
+        return json.dumps(msg, separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return None
+
+
 @dataclass
 class Lock:
     client_id: str
@@ -79,6 +89,7 @@ class Conn:
                  colour: str, max_buffer: int = 32 * 2**20):
         self.ws, self.user, self.client_id, self.role = ws, user, client_id, role
         self.max_buffer, self.buffered = max_buffer, 0  # bytes waiting to be written to this socket
+        self._sizes: deque[int] = deque()  # the size of each of those frames, oldest first
         self.read_only, self.reason, self.colour = read_only, reason, colour
         self.presence: dict | None = None
         self.draft: dict | None = None
@@ -95,19 +106,29 @@ class Conn:
     def send(self, msg: dict) -> None:
         if self.closed:
             return
-        try:
-            text = json.dumps(msg, separators=(",", ":"), allow_nan=False)
-        except ValueError:
+        text = encode(msg)
+        if text is None:
             # Something that is not JSON got this far. Dropping the frame would leave this client out of step
             # without knowing: closing makes it reconnect and catch up.
             return self.close(4408, "resync")
-        if self.buffered and self.buffered + len(text) > self.max_buffer:
+        self.send_text(text)
+
+    def send_text(self, text: str) -> None:
+        """Queue an already encoded message (a broadcast encodes once for everyone)."""
+        if self.closed:
+            return
+        # The oldest frame waiting may be any size (a welcome carries the whole document); what queues up
+        # behind it is held to max_buffer. So one big frame is never "too slow" by itself, and the memory a
+        # socket can hold is that frame plus max_buffer.
+        behind = self.buffered - self._sizes[0] if self._sizes else None
+        if behind is not None and behind + len(text) > self.max_buffer:
             return self.close(4408, "too slow")  # (it reconnects and catches up from the history)
         try:
             self.queue.put_nowait(text)
-            self.buffered += len(text)
         except asyncio.QueueFull:
-            self.close(4408, "too slow")
+            return self.close(4408, "too slow")
+        self.buffered += len(text)
+        self._sizes.append(len(text))
 
     def close(self, code: int = 1000, reason: str = "") -> None:
         if self.closed:
@@ -140,7 +161,7 @@ class Conn:
                 if item is None:
                     return
                 await self.ws.send_text(item)
-                self.buffered -= len(item)
+                self.buffered -= self._sizes.popleft()
         except Exception:  # noqa: BLE001 - the socket died: the reader notices and leaves the room
             pass
 
@@ -190,7 +211,7 @@ class Room:
             data = await self.hub.storage.get(snap.key)
             if data is None:
                 raise RuntimeError(f"snapshot {snap.key} is missing from storage")
-            self.state, self.snap_seq, self.head = unpack(data), snap.seq, snap.seq
+            self.state, self.snap_seq, self.head = await asyncio.to_thread(unpack, data), snap.seq, snap.seq
             for seq, tg, client_id, author in (await s.execute(
                     select(Op.seq, Op.targets, Op.client_id, Op.author_id).where(Op.document_id == self.doc_id)
                     .order_by(Op.seq))).all():
@@ -211,7 +232,7 @@ class Room:
         async with self.hub.db() as s:
             snap = (await s.execute(select(Snapshot).where(Snapshot.document_id == self.doc_id, Snapshot.seq <= seq)
                                     .order_by(Snapshot.seq.desc()).limit(1))).scalar_one()
-            state = unpack(await self.hub.storage.get(snap.key))
+            state = await asyncio.to_thread(unpack, await self.hub.storage.get(snap.key))
             for (ops,) in (await s.execute(select(Op.ops).where(
                     Op.document_id == self.doc_id, Op.seq > snap.seq, Op.seq <= seq).order_by(Op.seq))).all():
                 apply(state, ops)
@@ -222,18 +243,28 @@ class Room:
         """Store a full copy of the current state (call with the room lock held)."""
         if self.head <= self.snap_seq:
             return
-        key, data = snapshot_key(self.doc_id, self.head), pack(self.state)
+        head = self.head
+        # Packed in a thread (it is the whole document), from a copy of the top level: the room's state is
+        # replaced, never altered, so nothing below that can change while the thread reads it.
+        key, data = snapshot_key(self.doc_id, head), await asyncio.to_thread(pack, dict(self.state))
         await self.hub.storage.put(key, data)
         async with self.hub.db() as s:
-            s.add(Snapshot(document_id=self.doc_id, seq=self.head, key=key, size=len(data)))
+            s.add(Snapshot(document_id=self.doc_id, seq=head, key=key, size=len(data)))
             await s.commit()
-        self.snap_seq = self.head
+        self.snap_seq = head
 
     # ------------------------------------------------------------------ people
     def broadcast(self, msg: dict, skip: str | None = None) -> None:
+        self.broadcast_text(encode(msg), skip)
+
+    def broadcast_text(self, text: str | None, skip: str | None = None) -> None:
+        """Send one encoded message to everyone (None: it was not JSON, and everyone resyncs, as send does)."""
         for cid, c in list(self.conns.items()):
             if cid != skip:
-                c.send(msg)
+                if text is None:
+                    c.close(4408, "resync")
+                else:
+                    c.send_text(text)
 
     async def join(self, ws: WebSocket, user: User, role: str, hello: M.Hello) -> Conn:
         # The id everything is keyed by (locks, reserved ids, resent changes) starts with the user's id:
@@ -312,8 +343,10 @@ class Room:
 
     async def _changes_since(self, seq: int) -> list[dict]:
         async with self.hub.db() as s:
-            rows = (await s.execute(select(Op).where(Op.document_id == self.doc_id, Op.seq > seq)
-                                    .order_by(Op.seq))).scalars().all()
+            # (only what a change event carries: not the inverses, arguments or rebuild failures)
+            rows = (await s.execute(select(Op.seq, Op.author_id, Op.client_id, Op.change_id, Op.created_at, Op.ops,
+                                           Op.command, Op.reverts).where(Op.document_id == self.doc_id, Op.seq > seq)
+                                    .order_by(Op.seq))).all()
             await self._load_names(s, {r.author_id for r in rows})
         return [self._event(r.seq, r.author_id, r.client_id, r.change_id, r.created_at, r.ops, r.command, r.reverts)
                 for r in rows]
@@ -422,7 +455,7 @@ class Room:
                 ids.append(f"f{nid}")
                 self.reserved_ids[f"f{nid}"] = conn.client_id
                 nid += 1
-            self.state["next_id"] = nid
+            self.state = {**self.state, "next_id": nid}  # (replaced, not altered: a snapshot may be reading it)
             for prefix in msg.names:
                 have = counters.get(prefix, 0)
                 n = (have if isinstance(have, int) else 0) + 1
@@ -547,16 +580,26 @@ class Room:
             except Exception:  # noqa: BLE001
                 logging.getLogger("openswx_collab").exception("could not check references of %s", self.doc_id)
                 return no("server_error", "the server could not check the change; try again")
-        missing = []
-        try:
-            for sha in blob_refs(ops) - self.known_blobs:
-                if re.fullmatch(r"[0-9a-f]{64}", sha) and await self.hub.storage.exists(blob_key(self.org_id, sha)):
+        unknown = sorted(blob_refs(ops) - self.known_blobs)
+        missing = [sha for sha in unknown if not re.fullmatch(r"[0-9a-f]{64}", sha)]
+        asks = [sha for sha in unknown if sha not in missing]
+        if asks:  # (asked all at once, a few at a time, rather than one after another under the room lock)
+            gate = asyncio.Semaphore(BLOB_CHECKS)
+
+            async def there(sha: str) -> bool:
+                async with gate:
+                    return await self.hub.storage.exists(blob_key(self.org_id, sha))
+            found = await asyncio.gather(*(there(sha) for sha in asks), return_exceptions=True)
+            failed = [r for r in found if isinstance(r, BaseException)]
+            if failed:
+                logging.getLogger("openswx_collab").error("could not reach storage for %s", self.doc_id,
+                                                          exc_info=failed[0])
+                return no("server_error", "the server could not check the change; try again")
+            for sha, ok in zip(asks, found):
+                if ok:
                     self.known_blobs.add(sha)
                 else:
                     missing.append(sha)
-        except Exception:  # noqa: BLE001
-            logging.getLogger("openswx_collab").exception("could not reach storage for %s", self.doc_id)
-            return no("server_error", "the server could not check the change; try again")
         if missing:
             return no("missing_blob", "upload these blobs first", {"blobs": missing})
         seq, t = self.head + 1, now()
@@ -737,16 +780,19 @@ class Room:
     def presence(self, conn: Conn, msg: M.Presence | M.Draft) -> None:
         if not conn.allow(self.hub.settings.presence_rate):
             return
-        try:
-            json.dumps(msg.data, allow_nan=False)
-        except ValueError:  # (NaN: other clients could not parse it)
+        presence = isinstance(msg, M.Presence)
+        if not presence and conn.read_only:
             return
-        if isinstance(msg, M.Presence):
+        # Encoded once for everyone; what cannot be encoded (NaN: other clients could not parse it) is dropped
+        # here, and never kept for the welcome either.
+        text = encode({"type": "presence" if presence else "draft", "client_id": conn.client_id, "data": msg.data})
+        if text is None:
+            return
+        if presence:
             conn.presence = msg.data
-            self.broadcast({"type": "presence", "client_id": conn.client_id, "data": msg.data}, skip=conn.client_id)
-        elif not conn.read_only:
+        else:
             conn.draft = msg.data
-            self.broadcast({"type": "draft", "client_id": conn.client_id, "data": msg.data}, skip=conn.client_id)
+        self.broadcast_text(text, skip=conn.client_id)
 
 
 class Hub:

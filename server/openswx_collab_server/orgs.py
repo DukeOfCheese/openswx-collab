@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from .access import current_user, get_db, need_org, need_project, org_role, visible_projects
 from .db import Invite, Org, OrgMember, Project, ProjectMember, User, now
@@ -76,9 +77,12 @@ class OrgIn(BaseModel):
 
 @router.get("/orgs")
 async def list_orgs(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(Org, OrgMember.role).join(OrgMember, OrgMember.org_id == Org.id)
-                             .where(OrgMember.user_id == user.id).order_by(Org.name))).all()
-    return [{"id": o.id, "name": o.name, "role": role, "members": await member_count(db, o.id)} for o, role in rows]
+    mine, everyone = aliased(OrgMember), aliased(OrgMember)  # (one query, whatever the number of organisations)
+    rows = (await db.execute(
+        select(Org.id, Org.name, mine.role, func.count(everyone.user_id))
+        .join(mine, mine.org_id == Org.id).join(everyone, everyone.org_id == Org.id)
+        .where(mine.user_id == user.id).group_by(Org.id, Org.name, mine.role).order_by(Org.name, Org.id))).all()
+    return [{"id": oid, "name": name, "role": role, "members": n} for oid, name, role, n in rows]
 
 
 @router.post("/orgs", status_code=201)
