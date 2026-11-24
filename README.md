@@ -2,7 +2,8 @@
 
 Live collaboration for [openswx](https://github.com/DukeOfCheese/openswx): several people in the same part at once, with
 cursors, feature locks, full edit history and named versions. This repository holds the server and the
-wire protocol; the in-app toggle and sync client live in openswx (branch `dev/openswx-collab`).
+wire protocol; the client shipped in openswx 0.4.0 (refined in 0.4.1): it is in the desktop installers, and from
+source it is `pip install openswx[collab]`.
 
 > **Not affiliated with Dassault Systèmes.** openswx and openswx-collab are independent open-source projects.
 > They are not affiliated with, endorsed by, sponsored by or connected to Dassault Systèmes or SOLIDWORKS
@@ -28,7 +29,7 @@ wire protocol; the in-app toggle and sync client live in openswx (branch `dev/op
 | Database migrations (Alembic) | Done; the server upgrades on start |
 | Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Whole suite passes on both databases; S3 tested with a fake and with Garage |
 | Docker deployment (`deploy/`) | Published image; Compose stack run on a Raspberry Pi (arm64) and in CI on every change |
-| openswx client (toggle, sync, cursors, previews) | In progress on openswx's `dev/openswx-collab` branch: sync and commands done and reviewed, UI being built |
+| openswx client (toggle, sync, cursors, previews) | Shipped in openswx 0.4.0, refined in 0.4.1: Home → Cloud tab (sign-in, organisations, projects, team), New Cloud Part and Collaborate → Move to Cloud, live pointers, feature locks, history and named versions |
 | Hosted service extras (seat limits, Stripe billing) | In a separate private package; billing not yet tried against Stripe's test mode |
 | Assemblies in openswx, company SSO, browser-only viewers | Later |
 
