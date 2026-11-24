@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -228,11 +229,18 @@ async def get_content(document_id: str, request: Request, seq: int | None = None
             raise HTTPException(404, f"no version named {version!r}")
         seq = v.seq
     room = await request.app.state.hub.room(document_id)
+    if seq is None or seq == room.head:
+        # Now: no copy of the document, and the encoding (the whole document) in a thread. The top level is
+        # copied here, on the event loop; everything below it is replaced, never altered, once it is current.
+        head, state = room.head, dict(room.state)
+        out = {"document": jsonable_encoder(doc_out(doc)), "seq": head, "content": state}
+        body = await asyncio.to_thread(json.dumps, out, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        return Response(body, media_type="application/json")
     try:
-        state = await room.state_at(room.head if seq is None else seq)
+        state = await room.state_at(seq)
     except LookupError as exc:
         raise HTTPException(404, f"the document has no state {seq}") from exc
-    return {"document": doc_out(doc), "seq": room.head if seq is None else seq, "content": state}
+    return {"document": doc_out(doc), "seq": seq, "content": state}
 
 
 @router.get("/documents/{document_id}/history")

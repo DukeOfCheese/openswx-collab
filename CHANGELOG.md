@@ -6,6 +6,19 @@ protocol or the database; the change is listed here).
 
 ## Unreleased
 
+### Changed
+- The server does less work per message: a change, cursor or preview is encoded once for everyone in the
+  document instead of once per person.
+- Large documents no longer hold up everyone else in them: saving a snapshot, loading one, and downloading a
+  document's current content happen off the server's main loop, and the current content is no longer copied
+  first.
+- Reconnecting reads only what it needs from the history, a change that uses several imported bodies checks
+  them all at once, and the list of organisations counts members in one query however many there are.
+
+### Fixed
+- A client that had just received one very large message (a welcome with a big document) could be dropped
+  as "too slow" by the next small message. Only what waits behind a message counts now.
+
 ## 0.1.1 - 2026-11-24
 
 The document list says who is in each document right now, for openswx's Home page, and the password-reset page

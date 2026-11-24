@@ -192,3 +192,6 @@ in between. A part that assemblies use cannot be deleted (409 with the list).
 
 4400 bad hello · 4401 sign in again · 4403 your access changed · 4404 document gone · 4408 too slow,
 reconnect · 4409 the same client connected again · 4426 protocol version.
+
+A socket is "too slow" when the messages waiting behind the one being written add up to more than four times
+the largest change the server takes. One big message by itself (a welcome with a large document) never is.
