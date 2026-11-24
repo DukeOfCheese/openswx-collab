@@ -46,7 +46,7 @@ From the load test in [docs/benchmarks/collaboration-load.md](docs/benchmarks/co
 
 No change was lost or reordered and no error was logged at any of these loads, and a real openswx app in the
 part stayed in sync throughout. Measured on one Windows laptop (Intel Core i7-11800H, 16 GB) running the server
-and every simulated person at once, a dedicated Linux server (which also gets the faster uvloop) is expected to do better. The limit is the server relaying pointers and waiting on each document's lock, not the database; the
+and every simulated person at once; a dedicated Linux server (which also gets the faster uvloop) is expected to do better. The limit is the server relaying pointers and waiting on each document's lock, not the database; the
 write-up has the profile and the fixes that would raise it.
 
 ## How it works
