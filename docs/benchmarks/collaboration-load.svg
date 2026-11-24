@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" font-family="sans-serif" font-size="12">
+<rect width="760" height="420" fill="white"/>
+<line x1="60" x2="530" y1="370.0" y2="370.0" stroke="#e5e7eb"/><text x="54" y="374.0" text-anchor="end">1 ms</text>
+<line x1="60" x2="530" y1="288.6" y2="288.6" stroke="#e5e7eb"/><text x="54" y="292.6" text-anchor="end">10 ms</text>
+<line x1="60" x2="530" y1="207.2" y2="207.2" stroke="#e5e7eb"/><text x="54" y="211.2" text-anchor="end">100 ms</text>
+<line x1="60" x2="530" y1="125.9" y2="125.9" stroke="#e5e7eb"/><text x="54" y="129.9" text-anchor="end">1 s</text>
+<line x1="60" x2="530" y1="44.5" y2="44.5" stroke="#e5e7eb"/><text x="54" y="48.5" text-anchor="end">10 s</text>
+<line x1="60" x2="530" y1="125.9" y2="125.9" stroke="#111" stroke-dasharray="5,4"/><text x="526" y="120.9" text-anchor="end">limit: p95 1 s</text>
+<text x="117.1" y="386" text-anchor="middle">2</text>
+<text x="192.6" y="386" text-anchor="middle">5</text>
+<text x="249.7" y="386" text-anchor="middle">10</text>
+<text x="283.1" y="386" text-anchor="middle">15</text>
+<text x="306.9" y="386" text-anchor="middle">20</text>
+<text x="325.2" y="386" text-anchor="middle">25</text>
+<text x="340.3" y="386" text-anchor="middle">30</text>
+<text x="364.0" y="386" text-anchor="middle">40</text>
+<text x="382.4" y="386" text-anchor="middle">50</text>
+<text x="397.4" y="386" text-anchor="middle">60</text>
+<text x="415.8" y="386" text-anchor="middle">75</text>
+<text x="439.5" y="386" text-anchor="middle">100</text>
+<text x="496.6" y="386" text-anchor="middle">200</text>
+<text x="530.0" y="386" text-anchor="middle">300</text>
+<text x="295.0" y="410" text-anchor="middle">people in one part</text>
+<text x="14" y="195.0" transform="rotate(-90 14 195.0)" text-anchor="middle">p95 latency to the others</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" points="117.1,286.1 192.6,299.4 249.7,305.6 283.1,288.9 306.9,277.7 325.2,269.3 340.3,241.3 364.0,187.4 382.4,102.7"/>
+<circle cx="117.1" cy="286.1" r="3" fill="#2563eb"/>
+<circle cx="192.6" cy="299.4" r="3" fill="#2563eb"/>
+<circle cx="249.7" cy="305.6" r="3" fill="#2563eb"/>
+<circle cx="283.1" cy="288.9" r="3" fill="#2563eb"/>
+<circle cx="306.9" cy="277.7" r="3" fill="#2563eb"/>
+<circle cx="325.2" cy="269.3" r="3" fill="#2563eb"/>
+<circle cx="340.3" cy="241.3" r="3" fill="#2563eb"/>
+<circle cx="364.0" cy="187.4" r="3" fill="#2563eb"/>
+<circle cx="382.4" cy="102.7" r="3" fill="#2563eb"/>
+<rect x="544" y="20" width="12" height="3" fill="#2563eb"/><text x="562" y="25">edit (postgres)</text>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" points="117.1,302.8 192.6,302.8 249.7,300.0 283.1,288.9 306.9,270.6 325.2,257.4 340.3,245.5 364.0,174.8 382.4,74.7"/>
+<circle cx="117.1" cy="302.8" r="3" fill="#dc2626"/>
+<circle cx="192.6" cy="302.8" r="3" fill="#dc2626"/>
+<circle cx="249.7" cy="300.0" r="3" fill="#dc2626"/>
+<circle cx="283.1" cy="288.9" r="3" fill="#dc2626"/>
+<circle cx="306.9" cy="270.6" r="3" fill="#dc2626"/>
+<circle cx="325.2" cy="257.4" r="3" fill="#dc2626"/>
+<circle cx="340.3" cy="245.5" r="3" fill="#dc2626"/>
+<circle cx="364.0" cy="174.8" r="3" fill="#dc2626"/>
+<circle cx="382.4" cy="74.7" r="3" fill="#dc2626"/>
+<rect x="544" y="38" width="12" height="3" fill="#dc2626"/><text x="562" y="43">edit (sqlite)</text>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" points="364.0,253.9 382.4,211.9 397.4,175.5 415.8,86.6"/>
+<circle cx="364.0" cy="253.9" r="3" fill="#16a34a"/>
+<circle cx="382.4" cy="211.9" r="3" fill="#16a34a"/>
+<circle cx="397.4" cy="175.5" r="3" fill="#16a34a"/>
+<circle cx="415.8" cy="86.6" r="3" fill="#16a34a"/>
+<rect x="544" y="56" width="12" height="3" fill="#16a34a"/><text x="562" y="61">edit (sqlite, no deflate)</text>
+<polyline fill="none" stroke="#9333ea" stroke-width="2" points="249.7,295.9 325.2,299.4 382.4,286.1 439.5,253.9 496.6,130.0 530.0,74.0"/>
+<circle cx="249.7" cy="295.9" r="3" fill="#9333ea"/>
+<circle cx="325.2" cy="299.4" r="3" fill="#9333ea"/>
+<circle cx="382.4" cy="286.1" r="3" fill="#9333ea"/>
+<circle cx="439.5" cy="253.9" r="3" fill="#9333ea"/>
+<circle cx="496.6" cy="130.0" r="3" fill="#9333ea"/>
+<circle cx="530.0" cy="74.0" r="3" fill="#9333ea"/>
+<rect x="544" y="74" width="12" height="3" fill="#9333ea"/><text x="562" y="79">edit-only (postgres)</text>
+<polyline fill="none" stroke="#ea580c" stroke-width="2" points="249.7,285.4 325.2,294.5 382.4,284.7 439.5,253.9 496.6,114.6"/>
+<circle cx="249.7" cy="285.4" r="3" fill="#ea580c"/>
+<circle cx="325.2" cy="294.5" r="3" fill="#ea580c"/>
+<circle cx="382.4" cy="284.7" r="3" fill="#ea580c"/>
+<circle cx="439.5" cy="253.9" r="3" fill="#ea580c"/>
+<circle cx="496.6" cy="114.6" r="3" fill="#ea580c"/>
+<rect x="544" y="92" width="12" height="3" fill="#ea580c"/><text x="562" y="97">edit-only (sqlite)</text>
+<polyline fill="none" stroke="#0891b2" stroke-width="2" points="117.1,370.0 192.6,353.2 249.7,337.9 306.9,318.3 340.3,288.9 364.0,254.6 382.4,190.2 397.4,130.7 415.8,62.8"/>
+<circle cx="117.1" cy="370.0" r="3" fill="#0891b2"/>
+<circle cx="192.6" cy="353.2" r="3" fill="#0891b2"/>
+<circle cx="249.7" cy="337.9" r="3" fill="#0891b2"/>
+<circle cx="306.9" cy="318.3" r="3" fill="#0891b2"/>
+<circle cx="340.3" cy="288.9" r="3" fill="#0891b2"/>
+<circle cx="364.0" cy="254.6" r="3" fill="#0891b2"/>
+<circle cx="382.4" cy="190.2" r="3" fill="#0891b2"/>
+<circle cx="397.4" cy="130.7" r="3" fill="#0891b2"/>
+<circle cx="415.8" cy="62.8" r="3" fill="#0891b2"/>
+<rect x="544" y="110" width="12" height="3" fill="#0891b2"/><text x="562" y="115">presence (postgres)</text>
+<polyline fill="none" stroke="#4b5563" stroke-width="2" points="117.1,369.3 192.6,357.4 249.7,341.3 306.9,317.6 340.3,291.6 364.0,263.0 382.4,119.5"/>
+<circle cx="117.1" cy="369.3" r="3" fill="#4b5563"/>
+<circle cx="192.6" cy="357.4" r="3" fill="#4b5563"/>
+<circle cx="249.7" cy="341.3" r="3" fill="#4b5563"/>
+<circle cx="306.9" cy="317.6" r="3" fill="#4b5563"/>
+<circle cx="340.3" cy="291.6" r="3" fill="#4b5563"/>
+<circle cx="364.0" cy="263.0" r="3" fill="#4b5563"/>
+<circle cx="382.4" cy="119.5" r="3" fill="#4b5563"/>
+<rect x="544" y="128" width="12" height="3" fill="#4b5563"/><text x="562" y="133">presence (sqlite)</text>
+<polyline fill="none" stroke="#ca8a04" stroke-width="2" points="382.4,296.6 397.4,284.0 415.8,242.7 439.5,121.6"/>
+<circle cx="382.4" cy="296.6" r="3" fill="#ca8a04"/>
+<circle cx="397.4" cy="284.0" r="3" fill="#ca8a04"/>
+<circle cx="415.8" cy="242.7" r="3" fill="#ca8a04"/>
+<circle cx="439.5" cy="121.6" r="3" fill="#ca8a04"/>
+<rect x="544" y="146" width="12" height="3" fill="#ca8a04"/><text x="562" y="151">presence (sqlite, no deflate)</text>
+</svg>

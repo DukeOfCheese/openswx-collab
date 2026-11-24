@@ -52,6 +52,7 @@ python -m venv .venv
 .venv/Scripts/python tools/test_postgres.py                           # the same tests on a throwaway PostgreSQL
 .venv/Scripts/python tools/check_deploy.py                            # the Dockerfile and Compose settings, without Docker
 .venv/Scripts/python tools/e2e_two_peers.py ../openswx                # needs an openswx checkout with its .venv
+.venv/Scripts/python tools/load_test.py run --backend sqlite          # how many people one document takes (docs/benchmarks/)
 ```
 
 The first account created on a server is its admin; everyone else joins through an invite link.
@@ -63,7 +64,7 @@ Self-hosting with Docker, Postgres, TLS and Google/GitHub sign-in: `docs/self-ho
   the server and the client
 - `server/` — `openswx_collab_server`: the FastAPI app
 - `deploy/` — Dockerfile and Compose files
-- `tools/` — the end-to-end check, the PostgreSQL test runner and the deployment check
+- `tools/` — the end-to-end check, the PostgreSQL test runner, the deployment check and the load test
 - `spike/` — the throwaway experiment that proved the approach; kept for reference
 - `tests/`
 

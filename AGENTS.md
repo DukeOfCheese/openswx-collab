@@ -17,7 +17,8 @@ openswx client lives in the openswx repository, not here.
   - `auth.py`, `orgs.py`, `access.py`, `security.py`: accounts, organisations, roles.
   - `db.py`: tables; `migrate.py` + `migrations/versions/`: how the schema gets there. `storage.py`: files. `hooks.py`: extension points (seat limits and the like plug in from outside).
 - `tests/` — pytest, with a real app per test (`conftest.py`: `World`, `Live`).
-- `tools/` — `e2e_two_peers.py`, `test_postgres.py`, `check_deploy.py`.
+- `tools/` — `e2e_two_peers.py`, `test_postgres.py`, `check_deploy.py`, and `load_test.py` (how many people one
+  document takes; results in `docs/benchmarks/`).
 - `docs/protocol.md` is the contract with the client. Keep it true.
 
 ## Rules that are easy to break
