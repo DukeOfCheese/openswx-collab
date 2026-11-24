@@ -10,6 +10,10 @@ protocol or the database; the change is listed here).
 - `GET /api/projects/{id}/documents` says who is in each document right now: `online` (name and
   colour, one entry per person, at most 8) and `online_count`.
 
+### Security
+- The password-reset page no longer writes the token from its address into the page (a crafted link
+  could run script there). The page reads the token itself, and is never cached.
+
 ## 0.1.0 - 2026-11-23
 
 The first release: the server and the protocol. The openswx side (the in-app toggle, sync and live

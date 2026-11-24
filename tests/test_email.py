@@ -122,7 +122,10 @@ def test_a_forgotten_password(mailing):
     url = link_in(sent["message"])
     token = url.rsplit("/", 1)[1]
     page = client.get(f"/reset-password/{token}")
-    assert page.status_code == 200 and "Choose a new password" in page.text and token in page.text
+    assert page.status_code == 200 and "Choose a new password" in page.text
+    assert token not in page.text and page.headers["cache-control"] == "no-store"  # (read from the address)
+    hostile = client.get("/reset-password/" + '%22%3E%3C%5Cscript%3E%3Cscript%3Ealert(1)%3C%5Cscript%3E')
+    assert hostile.status_code == 200 and "alert(1)" not in hostile.text and hostile.text == page.text
     assert client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "short"}).status_code == 422
     r = client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "a brand new one"})
     assert r.status_code == 200
