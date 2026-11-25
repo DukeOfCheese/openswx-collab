@@ -11,8 +11,10 @@
 //!    memory does not hold is new, and is judged at once (the hot path asks the store nothing). For
 //!    any other client a miss is looked up by `(document, client, change id)` first, off the task.
 //!    So a duplicate reaches the journal (whose unique key is the backstop) only through a race.
-//!    Older entries are forgotten (past [`RECENT_KEEP`], those before the last snapshot; past the
-//!    room's maximum, any), and their clients stop being complete.
+//!    Entries are forgotten, oldest first, only past the room's maximum
+//!    ([`super::MAX_REMEMBERED`]), and their clients stop being complete; a client also stops being
+//!    complete when it leaves (worked out again at its next join) and whenever the journal refuses
+//!    one of its changes as a duplicate.
 //! 2. **Read-only** connections are refused (`read_only`), after the memory check, and are never
 //!    looked up in the journal. Then **locks** (the `locks` module): a change touching what another
 //!    client holds a lock on is refused (`locked`), against the lock table of the moment it is
@@ -73,8 +75,7 @@ use crate::snapshot::SERVER_CLIENT;
 pub const BIG_OPS: usize = 256;
 /// A change in a frame longer than this is judged off the room's task.
 pub const BIG_FRAME: usize = 256 * 1024;
-/// Durable change ids kept in memory beyond those since the last snapshot.
-pub const RECENT_KEEP: usize = 5000;
+
 /// The most distinct blob references one change may hold.
 pub const MAX_BLOB_REFS: usize = 4096;
 /// How long a blob found missing is answered missing without asking storage again, in seconds.
@@ -157,7 +158,16 @@ impl Recent {
 
     /// Remembers that the client's change `change_id` is durable as `seq`.
     pub(super) fn remember(&mut self, client: &ClientId, change_id: &str, seq: Seq) {
-        self.durable((client.clone(), Arc::from(change_id)), seq);
+        let key = (client.clone(), Arc::from(change_id));
+        // A change still being written (or whose seq is being looked up) is settled by its own
+        // outcome, never by a row read meanwhile.
+        if matches!(
+            self.map.get(&key),
+            Some(Seen::Tentative(_) | Seen::Checking(_))
+        ) {
+            return;
+        }
+        self.durable(key, seq);
     }
 
     fn durable(&mut self, key: Key, seq: Seq) {
@@ -173,24 +183,20 @@ impl Recent {
         self.order.clear();
     }
 
+    /// How many clients are complete.
+    pub(super) fn complete_clients(&self) -> usize {
+        self.complete.len()
+    }
+
     /// How many ids are remembered, and how long the order of forgetting is.
     pub(super) fn sizes(&self) -> (usize, usize) {
         (self.map.len(), self.order.len())
     }
 
-    /// Forgets the oldest durable entries: past [`RECENT_KEEP`] those at or before
-    /// `snapshot_seq`, and past the hard maximum any. A client whose entry is forgotten is no
-    /// longer complete.
-    pub(super) fn trim(&mut self, snapshot_seq: Seq) {
-        loop {
-            let over_soft = self.order.len() > RECENT_KEEP
-                && self
-                    .order
-                    .front()
-                    .is_some_and(|(seq, _)| *seq <= snapshot_seq);
-            if !over_soft && self.order.len() <= self.max {
-                break;
-            }
+    /// Forgets the oldest durable entries past the room's maximum (and only then: forgetting makes
+    /// the entry's client incomplete, and its later unknown ids cost a journal lookup).
+    pub(super) fn trim(&mut self) {
+        while self.order.len() > self.max {
             let Some((seq, key)) = self.order.pop_front() else {
                 break;
             };
@@ -511,10 +517,17 @@ impl Room {
     // ------------------------------------------------------------------ arriving
 
     pub(super) fn on_change(&mut self, conn: ConnId, change: Change, size: usize) {
+        let Some(c) = self.conns.get(&conn) else {
+            return;
+        };
+        let seen = self.recent.get(&c.client, &change.change_id);
+        if matches!(seen, Some(Seen::Tentative(_) | Seen::Checking(_))) && self.replies_full(conn) {
+            return; // (resent over and over while it is written: closed as too slow)
+        }
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
         };
-        match self.recent.get(&c.client, &change.change_id) {
+        match seen {
             Some(Seen::Durable(seq)) => return self.accept_again(conn, &change.change_id, seq),
             Some(Seen::Tentative(ticket)) => {
                 // Still being written: answered with the change itself, when it is.
@@ -580,6 +593,7 @@ impl Room {
                     // Remembered, so that a further resend needs no lookup.
                     let client = c.client.clone();
                     self.recent.remember(&client, &change.change_id, seq);
+                    self.recent.trim();
                 }
                 self.accept_again(conn, &change.change_id, seq);
             }
@@ -1113,7 +1127,7 @@ impl Room {
         self.broadcast(&p.event, &p.item.waiters);
         if let Some(key) = p.item.key() {
             self.recent.durable(key, seq);
-            self.recent.trim(self.snapshot_seq);
+            self.recent.trim();
         }
         self.answer_accepted(p.item, seq);
         metrics::change_accepted();
@@ -1143,7 +1157,9 @@ impl Room {
         match (duplicate, front.item.key(), front.item.ticket) {
             (true, Some(key), Some(ticket)) => {
                 // Find the seq the journal holds for it, and answer that. Meanwhile it counts as
-                // accepted for the changes that build on it.
+                // accepted for the changes that build on it. Memory clearly missed one of this
+                // client's ids: its unknown ids are looked up from now on.
+                self.recent.set_complete(&key.0, false);
                 self.recent.map.insert(key, Seen::Checking(ticket));
                 let user = front.item.author.user.clone();
                 if self.duplicates.add(&user) > MAX_DUPLICATES {
@@ -1242,15 +1258,17 @@ impl Room {
                 let seq = Seq::try_from(seq).unwrap_or_default();
                 if let Some((client, id)) = item.key() {
                     self.recent.remember(&client, &id, seq);
-                    self.recent.trim(self.snapshot_seq);
+                    self.recent.trim();
                 }
                 self.answer_accepted(item, seq);
             }
             Ok(None) | Err(_) => {
-                if let Some(key) = item.key()
-                    && matches!(self.recent.map.get(&key), Some(Seen::Checking(_)))
-                {
-                    self.recent.map.remove(&key);
+                if let Some(key) = item.key() {
+                    if matches!(self.recent.map.get(&key), Some(Seen::Checking(_))) {
+                        self.recent.map.remove(&key);
+                    }
+                    // (The journal may hold it after all: look this client's ids up.)
+                    self.recent.set_complete(&key.0, false);
                 }
                 self.answer_refused(item, RejectCode::ServerError, NOT_STORED, Vec::new(), None);
             }

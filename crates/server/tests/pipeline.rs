@@ -98,7 +98,9 @@ async fn a_refused_record_is_answered_alone_and_the_rest_are_judged_again() {
 
 #[tokio::test]
 async fn a_resend_of_an_id_memory_forgot_is_answered_and_hurts_nobody() {
-    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow(300)).await;
+    // (The one path left to a journal duplicate: memory lost an id it believed it held, as a race
+    // would leave it. The others' changes in the same batch are judged again.)
+    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow(300)).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
@@ -110,6 +112,7 @@ async fn a_resend_of_an_id_memory_forgot_is_answered_and_hurts_nobody() {
     c.drain().await;
     // The room no longer remembers it; A sends it again on the current head.
     server.room(&doc).forget_change_ids().await;
+    let duplicates = flaky.duplicate_inserts();
     let b1 = b.make_change(1, vec![var("b", 1)]);
     b.send_change(&b1).await;
     let mut again = x.clone();
@@ -141,6 +144,11 @@ async fn a_resend_of_an_id_memory_forgot_is_answered_and_hurts_nobody() {
         ids.iter().collect::<BTreeSet<_>>().len(),
         5,
         "one row per change id"
+    );
+    assert_eq!(
+        flaky.duplicate_inserts(),
+        duplicates + 1,
+        "it went through the journal's duplicate refusal and the re-judging"
     );
     // Everyone converges on the same document.
     let head = server.room(&doc).durable_head().await.unwrap();
@@ -735,4 +743,136 @@ async fn once_memory_forgets_a_clients_id_its_next_unknown_id_is_looked_up() {
         Outcome::Accepted(_)
     ));
     assert_eq!(flaky.change_lookups(), lookups + 1);
+}
+
+// ------------------------------------------------------------------ fix round 3
+
+#[tokio::test]
+async fn a_reconnect_whose_preload_raced_a_lost_room_still_knows_its_changes() {
+    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow(300)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut c1 = Live::connect_with(&server, &doc, &world.admin, Hello::client("flaky-net")).await;
+    // Four changes wait in the journal's batch; that batch will land but report an error, so the
+    // room is lost (4410).
+    let mut changes = Vec::new();
+    for n in 0..4 {
+        let change = c1.make_change(0, vec![var(&format!("x{n}"), n)]);
+        c1.send_change(&change).await;
+        changes.push(change);
+    }
+    flaky.commit_then_fail(true);
+    // The client reconnects meanwhile; its preload reads before the batch lands, and answers late.
+    flaky.preload_delay(Duration::from_millis(1000));
+    let reconnect = Live::connect_with(&server, &doc, &world.admin, Hello::client("flaky-net"));
+    let lost = async {
+        assert_eq!(c1.closed().await.0, 4410);
+        flaky.commit_then_fail(false);
+    };
+    let (mut c2, ()) = tokio::join!(reconnect, lost);
+    flaky.preload_delay(Duration::ZERO);
+    let duplicates = flaky.duplicate_inserts();
+    for (n, change) in changes.iter().enumerate() {
+        let mut again = change.clone();
+        again.base = c2.seq;
+        assert_eq!(c2.resend(&again).await, Outcome::Accepted(n as Seq + 1));
+    }
+    assert_eq!(flaky.duplicate_inserts(), duplicates);
+    assert!(c2.closed.is_none(), "{:?}", c2.closed);
+    assert_eq!(head_seq(&server, &doc).await, 4);
+}
+
+#[tokio::test]
+async fn a_long_standing_client_stays_complete_through_thousands_of_changes() {
+    let (server, flaky) = TestServer::start_flaky(|s| s.snapshot_every = 100).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("long-standing")).await;
+    assert!(matches!(
+        a.change(vec![var("a", 0)], vec![], vec![]).await,
+        Outcome::Accepted(_)
+    ));
+    // Someone else makes more changes than the room used to keep before a snapshot.
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    many_changes(&mut b, 5200, "b").await;
+    assert!(
+        server.room_status(&doc).await.snapshot_seq >= 1000,
+        "snapshots were written"
+    );
+    a.drain().await;
+    let lookups = flaky.change_lookups();
+    assert!(matches!(
+        a.change(vec![var("a", 1)], vec![], vec![]).await,
+        Outcome::Accepted(_)
+    ));
+    assert_eq!(
+        flaky.change_lookups(),
+        lookups,
+        "still no store lookup for it"
+    );
+}
+
+#[tokio::test]
+async fn a_preload_never_turns_a_change_being_written_into_a_durable_one() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut c1 = Live::connect_with(&server, &doc, &world.admin, Hello::client("racing-1")).await;
+    let x = c1.make_change(0, vec![var("x", 1)]);
+    // The journal's commit lands at once but is reported a second later.
+    flaky.commit_delay(Duration::from_millis(1000));
+    c1.send_change(&x).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A reconnect now reads X from the journal; the room still has it as being written.
+    let mut c2 = Live::connect_with(&server, &doc, &world.admin, Hello::client("racing-1")).await;
+    flaky.commit_delay(Duration::ZERO);
+    let sent = std::time::Instant::now();
+    assert_eq!(c2.resend(&x).await, Outcome::Accepted(1));
+    assert!(
+        sent.elapsed() >= Duration::from_millis(300),
+        "answered when the journal reported it, not from the preload ({:?})",
+        sent.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn clients_that_leave_are_not_kept_as_complete() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let _watcher = Live::connect(&server, &doc, &world.admin).await;
+    for _ in 0..30 {
+        let live = Live::connect(&server, &doc, &world.admin).await;
+        live.close().await;
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while server.room_status(&doc).await.complete_clients != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} complete clients",
+            server.room_status(&doc).await.complete_clients
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn resending_one_change_over_and_over_while_it_is_written_is_bounded() {
+    // (A batch that lands only after 5 s: the answers wait that long.)
+    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow(5000)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let x = a.make_change(0, vec![var("x", 1)]);
+    let started = std::time::Instant::now();
+    for _ in 0..2100 {
+        a.send_change(&x).await;
+    }
+    // Closed as soon as its waiting answers pass the bound, not when they are all sent at once.
+    assert_eq!(a.closed().await.0, 4408);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
 }

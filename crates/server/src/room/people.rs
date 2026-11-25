@@ -50,9 +50,25 @@ impl Room {
         };
         if c.replies.is_empty() {
             self.send_to(conn, frame);
-        } else {
+        } else if !self.replies_full(conn)
+            && let Some(c) = self.conns.get_mut(&conn)
+        {
             c.replies.push_back(Reply::Ready(frame));
         }
+    }
+
+    /// Whether the connection's waiting answers are at [`super::MAX_REPLIES`]; if so it is closed as
+    /// too slow (a client resending one change over and over while it is being written, say).
+    pub(super) fn replies_full(&mut self, conn: ConnId) -> bool {
+        let Some(c) = self.conns.get(&conn) else {
+            return true;
+        };
+        if c.replies.len() < super::MAX_REPLIES {
+            return false;
+        }
+        c.outbox.close_now(close::TOO_SLOW, "too slow");
+        self.slow.push(conn);
+        true
     }
 
     /// Settles the connection's answer that waits for `ticket`, and sends what is now first in line.
@@ -94,6 +110,11 @@ impl Room {
     pub(super) fn join(&mut self, req: JoinRequest) {
         if let Some(c) = &self.closing {
             req.outbox.close(c.code, &c.reason);
+            return;
+        }
+        if req.room != self.id {
+            // Its preload was read for another room: it reconnects and reads again.
+            req.outbox.close(close::MOVED, "reconnect");
             return;
         }
         if let Some(old) = self.by_client.get(&req.client).copied() {
@@ -176,7 +197,7 @@ impl Room {
             self.recent.remember(&req.client, &change_id, seq);
         }
         self.recent.set_complete(&req.client, req.ids_complete);
-        self.recent.trim(self.snapshot_seq);
+        self.recent.trim();
         self.by_client.insert(req.client, req.conn);
         self.conns.insert(req.conn, conn);
         self.publish_online();
@@ -219,6 +240,8 @@ impl Room {
         let registered = self.by_client.get(&c.client) == Some(&conn);
         if registered {
             self.by_client.remove(&c.client);
+            // Worked out again at its next join (client ids can be made up at will).
+            self.recent.set_complete(&c.client, false);
         }
         self.publish_online();
         // For this task the refused ids are forgotten when the connection goes (TASK 12: after a

@@ -6,9 +6,10 @@
 //! a longer one is refused by the layer without being read, and closed 1002 (which a client still
 //! sending the rest of that frame usually loses to the reset, seeing the connection drop). A frame
 //! within the limit that is not a `change` and is over 512 KiB is answered with an `error`
-//! (`too_large`) in its turn and the connection kept. On joining, the client's 1,000 most recent
-//! change ids in the document are read from the journal and handed to the room, so that its resends
-//! are recognised whatever base they carry.
+//! (`too_large`) in its turn and the connection kept. On joining, once the room is open (and so holds
+//! the document's lease), the client's 1,000 most recent change ids in the document are read from the
+//! journal and handed to that room (another room refuses them), so that its resends are recognised
+//! whatever base they carry; this is repeated if the join has to be tried again.
 //!
 //! The handshake (inventory §5 "Handshake", in v2): the first frame must come within
 //! [`HELLO_TIMEOUT`] and be a `hello`; then, each refusal being an `error` frame and a close:
@@ -184,35 +185,7 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         }
     };
 
-    // What this client already sent to the document, so that the room recognises its resends (a
-    // viewer cannot send changes: nothing to load, and the room never looks its ids up).
     let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
-    let preload = if role == ProjectRole::Viewer {
-        Ok(None)
-    } else {
-        state
-            .store
-            .recent_change_ids(&document_id, &client, RECENT_IDS)
-            .await
-            .map(Some)
-    };
-    let (recent_ids, ids_complete): (Vec<(String, u64)>, bool) = match preload {
-        Ok(None) => (Vec::new(), false),
-        Ok(Some(ids)) => {
-            // Fewer than asked for: these are all of them.
-            let complete = (ids.len() as i64) < RECENT_IDS;
-            let ids = ids
-                .into_iter()
-                .filter_map(|(id, seq)| Some((id, u64::try_from(seq).ok()?)))
-                .collect();
-            (ids, complete)
-        }
-        Err(e) => {
-            server_error(e);
-            return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
-        }
-    };
-
     let (sink, stream) = socket.split();
     let outbox = Outbox::new(4 * state.settings.max_change_bytes);
     tokio::spawn(conn::write(sink, outbox.clone()));
@@ -228,8 +201,9 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         client,
         format_version,
         last_seq,
-        recent_ids,
-        ids_complete,
+        recent_ids: Vec::new(),
+        ids_complete: false,
+        room: 0,
     };
     let mut joined = None;
     for _ in 0..JOIN_TRIES {
@@ -250,6 +224,31 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
                 return drain(stream).await;
             }
         };
+        // What this client already sent to the document, read only now that this room holds the
+        // lease (no earlier room can commit any more), so that the room recognises its resends. A
+        // viewer cannot send changes: nothing to load, and the room never looks its ids up.
+        if role != ProjectRole::Viewer {
+            match state
+                .store
+                .recent_change_ids(&document_id, &request.client, RECENT_IDS)
+                .await
+            {
+                Ok(ids) => {
+                    // Fewer than asked for: these are all of them.
+                    request.ids_complete = (ids.len() as i64) < RECENT_IDS;
+                    request.recent_ids = ids
+                        .into_iter()
+                        .filter_map(|(id, seq)| Some((id, u64::try_from(seq).ok()?)))
+                        .collect();
+                }
+                Err(e) => {
+                    server_error(e);
+                    send_refusal(&outbox, "server_error", "try again", close::SERVER_ERROR);
+                    return drain(stream).await;
+                }
+            }
+        }
+        request.room = room.id();
         match room.join(request).await {
             Ok(()) => {
                 joined = Some(room);

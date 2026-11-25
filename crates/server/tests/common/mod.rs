@@ -530,6 +530,8 @@ pub struct FlakyStore {
     lookup_delay: Mutex<Duration>,
     duplicate_inserts: Arc<AtomicUsize>,
     preloads: AtomicUsize,
+    preload_delay: Mutex<Duration>,
+    commit_delay: Arc<Mutex<Duration>>,
 }
 
 impl FlakyStore {
@@ -548,6 +550,8 @@ impl FlakyStore {
             lookup_delay: Mutex::new(Duration::ZERO),
             duplicate_inserts: Arc::new(AtomicUsize::new(0)),
             preloads: AtomicUsize::new(0),
+            preload_delay: Mutex::new(Duration::ZERO),
+            commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
         }
     }
 
@@ -571,6 +575,23 @@ impl FlakyStore {
     /// How many journal inserts found the change id already there (a duplicate reaching the journal).
     pub fn duplicate_inserts(&self) -> usize {
         self.duplicate_inserts.load(Ordering::SeqCst)
+    }
+
+    /// Makes every [`Store::recent_change_ids`] wait this long after it has read its answer (so the
+    /// answer can be stale by the time the caller gets it).
+    pub fn preload_delay(&self, d: Duration) {
+        *self
+            .preload_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = d;
+    }
+
+    /// Makes every transaction's successful `commit` wait this long before it reports success.
+    pub fn commit_delay(&self, d: Duration) {
+        *self
+            .commit_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = d;
     }
 
     /// How many times [`Store::recent_change_ids`] was asked.
@@ -661,6 +682,7 @@ impl Store for FlakyStore {
             hang_commit: self.hang_commit.clone(),
             refuse_change: self.refuse_change.clone(),
             duplicate_inserts: self.duplicate_inserts.clone(),
+            commit_delay: self.commit_delay.clone(),
         }))
     }
 
@@ -809,9 +831,16 @@ impl Store for FlakyStore {
         limit: i64,
     ) -> anyhow::Result<Vec<(String, i64)>> {
         self.preloads.fetch_add(1, Ordering::SeqCst);
-        self.inner()
+        let found = self
+            .inner()
             .recent_change_ids(document_id, client_id, limit)
-            .await
+            .await;
+        let delay = *self
+            .preload_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tokio::time::sleep(delay).await;
+        found
     }
 
     async fn change_seq_by_client(
@@ -865,6 +894,7 @@ pub struct FlakyTx {
     hang_commit: Arc<AtomicBool>,
     refuse_change: Arc<Mutex<Option<String>>>,
     duplicate_inserts: Arc<AtomicUsize>,
+    commit_delay: Arc<Mutex<Duration>>,
 }
 
 #[async_trait]
@@ -881,7 +911,13 @@ impl Tx for FlakyTx {
             self.inner.commit().await?;
             anyhow::bail!("the flaky store committed, then was told to report an error");
         }
-        self.inner.commit().await
+        let delay = *self
+            .commit_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.inner.commit().await?;
+        tokio::time::sleep(delay).await;
+        Ok(())
     }
 
     async fn rollback(self: Box<Self>) -> anyhow::Result<()> {

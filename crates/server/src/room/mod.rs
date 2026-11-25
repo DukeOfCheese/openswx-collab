@@ -108,6 +108,8 @@ const MAX_TENTATIVE: usize = 4096;
 /// The most messages of one connection that may wait for its earlier one (a blob check, a journal
 /// lookup); past it the connection is closed as too slow.
 const MAX_PARKED: usize = 1024;
+/// The most answers one connection may have waiting; past it the connection is closed as too slow.
+pub const MAX_REPLIES: usize = 2000;
 /// How many users' journal duplicates a room counts (the oldest forgotten first).
 const DUPLICATE_USERS: usize = 1024;
 /// How long closing waits for the journal's answers to changes in flight.
@@ -210,6 +212,8 @@ pub struct RoomStatus {
     pub encodes: u64,
     /// Change ids remembered, and the entries of the order they are forgotten in.
     pub remembered: (usize, usize),
+    /// Clients whose every change id is in memory.
+    pub complete_clients: usize,
     /// Locks held, and how many of them wait for their client to come back.
     pub locks: (usize, usize),
     pub connections: Vec<ConnStatus>,
@@ -242,6 +246,9 @@ pub struct JoinRequest {
     /// `recent_ids` are all the ids this client ever journaled here (the journal had fewer than a
     /// join loads).
     pub ids_complete: bool,
+    /// The room (`RoomHandle::id`) whose lease was held when `recent_ids` were read; another room
+    /// refuses the join (the client reconnects and they are read again).
+    pub room: u64,
 }
 
 /// A command for a room.
@@ -759,7 +766,7 @@ impl Room {
                 self.snapshot_task = None;
                 if ok {
                     self.snapshot_seq = self.snapshot_seq.max(seq);
-                    self.recent.trim(self.snapshot_seq);
+                    self.recent.trim();
                 }
                 // Changes that became durable while it was written were not snapshotted: look
                 // again now (a failed one is tried again only once something new is durable).
@@ -788,6 +795,7 @@ impl Room {
             epoch: self.epoch,
             encodes: self.encodes.load(Ordering::Relaxed),
             remembered: self.recent.sizes(),
+            complete_clients: self.recent.complete_clients(),
             locks: (self.locks.len(), self.locks.detached_count()),
             connections,
         }
