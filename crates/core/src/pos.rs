@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-const MAX_LEN: usize = 1024;
+/// Longest position `parse` accepts, in digits.
+pub const MAX_LEN: usize = 1024;
 const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,12 +35,24 @@ impl Pos {
     /// 60 inserts, and repeated insertion in one gap by about one digit per 6.
     ///
     /// Panics if `a >= b`. Items that share a position are not placed with this; callers keep them
-    /// in id order.
+    /// in id order. Also panics if the result would be longer than `MAX_LEN` (only possible when a
+    /// neighbour is about that long already); `try_between` answers `None` instead.
     pub fn between(a: Option<&Pos>, b: Option<&Pos>) -> Pos {
-        let a = a.map(Pos::as_str);
-        let b = b.map(Pos::as_str);
         if let (Some(a), Some(b)) = (a, b) {
             assert!(a < b, "Pos::between needs a < b, got {a:?} and {b:?}");
+        }
+        Pos::try_between(a, b).expect("Pos::between: the result is longer than MAX_LEN")
+    }
+
+    /// As `between`, without panicking: `None` when `a >= b` or when the result would be longer
+    /// than `MAX_LEN` (so that `parse` would refuse it).
+    pub fn try_between(a: Option<&Pos>, b: Option<&Pos>) -> Option<Pos> {
+        let a = a.map(Pos::as_str);
+        let b = b.map(Pos::as_str);
+        if let (Some(a), Some(b)) = (a, b)
+            && a >= b
+        {
+            return None;
         }
         let digits = match (a, b) {
             (None, None) => vec![MID],
@@ -47,7 +60,8 @@ impl Pos {
             (None, Some(b)) => below(b.as_bytes()),
             (Some(a), Some(b)) => midpoint(a.as_bytes(), b.as_bytes()),
         };
-        Pos(Arc::from(String::from_utf8(digits).expect("ascii digits")))
+        (digits.len() <= MAX_LEN)
+            .then(|| Pos(Arc::from(String::from_utf8(digits).expect("ascii digits"))))
     }
 
     /// `n` strictly increasing positions with room between neighbours, and before the first and

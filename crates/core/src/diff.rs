@@ -14,6 +14,10 @@
 //! that is new or out of place, in final list order, then the recursive diffs of the items present
 //! on both sides. Applied in this order every operation finds what it needs.
 //!
+//! A new position never exceeds `pos::MAX_LEN`: when one would, the whole list is spread out again
+//! instead (every item to `Pos::spread` positions in final order: survivors moved, new items
+//! inserted there).
+//!
 //! Complexity: one pass over both documents, O(n log n) in the size of the keyed lists (map
 //! lookups and a longest increasing subsequence), plus the size of what has to be sent. Unchanged
 //! parts are compared by walking them; nothing is shared between the two sides to skip on.
@@ -186,8 +190,26 @@ fn diff_keyed(before: &KeyedList, after: &KeyedList, path: &mut Path, ops: &mut 
     }
 
     let before_pos = |i: usize| before.pos(fin[i].0).expect("a survivor").clone();
+    let place_op = |i: usize, pos: Pos| {
+        let (id, item) = fin[i];
+        if rank.contains_key(&**id) {
+            Op::Move {
+                list: path.clone(),
+                id: id.clone(),
+                pos,
+            }
+        } else {
+            Op::Insert {
+                list: path.clone(),
+                item: item.clone(),
+                pos,
+            }
+        }
+    };
+    let mut placed = Vec::new();
     let mut prev: Option<Pos> = None;
     let mut next = 0; // the nearest stable index after the current one; only ever moves right
+    let mut fits = true;
     for i in 0..fin.len() {
         if stable[i] {
             prev = Some(before_pos(i));
@@ -206,24 +228,29 @@ fn diff_keyed(before: &KeyedList, after: &KeyedList, path: &mut Path, ops: &mut 
                 stable[next] = false;
                 continue;
             }
-            break Pos::between(prev.as_ref(), upper.as_ref());
+            break Pos::try_between(prev.as_ref(), upper.as_ref());
         };
-        let (id, item) = fin[i];
-        ops.push(if rank.contains_key(&**id) {
-            Op::Move {
-                list: path.clone(),
-                id: id.clone(),
-                pos: place.clone(),
-            }
-        } else {
-            Op::Insert {
-                list: path.clone(),
-                item: item.clone(),
-                pos: place.clone(),
-            }
-        });
+        // Neighbours at the length cap leave no room: the whole list is spread out again.
+        let Some(place) = place else {
+            fits = false;
+            break;
+        };
+        placed.push(place_op(i, place.clone()));
         prev = Some(place);
     }
+    if !fits {
+        // Every item to its evenly spread place in final order: new items inserted there,
+        // survivors moved there unless they are there already.
+        placed = Pos::spread(fin.len())
+            .into_iter()
+            .enumerate()
+            .filter(|(i, pos)| {
+                !rank.contains_key(&**fin[*i].0) || before.pos(fin[*i].0) != Some(pos)
+            })
+            .map(|(i, pos)| place_op(i, pos))
+            .collect();
+    }
+    ops.extend(placed);
 
     // Items on both sides are maps; an item's `id` is what identifies it, so it never differs.
     for (id, _, a) in after.iter() {

@@ -265,6 +265,54 @@ fn neighbours_with_equal_positions() {
     assert_eq!(reach(&before, &ops).to_plain(), after);
 }
 
+/// Every position in every keyed list of `v` is one `Pos::parse` accepts.
+fn positions_parse(v: &Value) -> bool {
+    match v {
+        Value::Keyed(k) => k
+            .iter()
+            .all(|(_, p, c)| Pos::parse(p.as_str()).is_some() && positions_parse(c)),
+        Value::Map(m) => m.values().all(positions_parse),
+        Value::List(l) => l.iter().all(positions_parse),
+        _ => true,
+    }
+}
+
+#[test]
+fn neighbours_at_the_length_cap_respread_the_list() {
+    let p = |s: String| Pos::parse(&s).unwrap();
+    let top = p(format!("V{}", "z".repeat(1023)));
+    let (lo, hi) = (p("V".repeat(1023) + "1"), p("V".repeat(1023) + "2"));
+    let cases = [
+        // Appending after a position of 1024 digits ending in the top digit.
+        (
+            doc_with_list(vec![("a", &top)]),
+            json!({"l": [{"id": "a"}, {"id": "n"}]}),
+        ),
+        // Inserting between two 1024-digit positions one apart.
+        (
+            doc_with_list(vec![("a", &lo), ("c", &hi)]),
+            json!({"l": [{"id": "a"}, {"id": "n"}, {"id": "c"}]}),
+        ),
+        // Both, with an item gone and a reordering.
+        (
+            doc_with_list(vec![("a", &lo), ("c", &hi), ("d", &top)]),
+            json!({"l": [{"id": "c"}, {"id": "a"}, {"id": "n"}, {"id": "d"}, {"id": "m"}]}),
+        ),
+    ];
+    for (before, after) in cases {
+        let after = to_plain(after);
+        let ops = diff(&before, &after).unwrap();
+        // Every op survives the wire, positions included.
+        for op in &ops {
+            assert_eq!(Op::from_wire(&op.to_wire()).as_ref(), Ok(op), "{op:?}");
+        }
+        let got = reach(&before, &ops);
+        assert_eq!(got.to_plain(), after);
+        assert!(positions_parse(&got));
+        assert_eq!(diff(&got, &got.to_plain()).unwrap(), vec![]);
+    }
+}
+
 #[test]
 fn empty_ids_send_the_list_whole() {
     let ops = check(

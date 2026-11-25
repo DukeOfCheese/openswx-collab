@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use oswx_core::pos::MAX_LEN;
 use oswx_core::{KeyedList, Pos, Value};
 use proptest::prelude::*;
 
@@ -147,4 +148,25 @@ fn equal_positions_order_by_id() {
         .inserted(Arc::from("a.1.1"), at, Value::Null);
     let ids: Vec<&str> = list.iter().map(|(id, _, _)| id.as_ref()).collect();
     assert_eq!(ids, ["a.1.1", "b.1.1"]);
+}
+
+#[test]
+fn try_between_never_panics_and_respects_the_cap() {
+    let p = |s: &str| Pos::parse(s).unwrap();
+    assert_eq!(MAX_LEN, 1024);
+    assert_eq!(Pos::try_between(Some(&p("1")), Some(&p("3"))), Some(p("2")));
+    assert_eq!(Pos::try_between(None, None), Some(Pos::between(None, None)));
+    // Bounds out of order or equal: None, where `between` panics.
+    assert_eq!(Pos::try_between(Some(&p("3")), Some(&p("1"))), None);
+    assert_eq!(Pos::try_between(Some(&p("3")), Some(&p("3"))), None);
+    // A result longer than `MAX_LEN` is None: `parse` would refuse it.
+    let top = format!("V{}", "z".repeat(MAX_LEN - 1));
+    assert_eq!(Pos::try_between(Some(&p(&top)), None), None);
+    let (a, b) = ("V".repeat(MAX_LEN - 1) + "1", "V".repeat(MAX_LEN - 1) + "2");
+    assert_eq!(Pos::try_between(Some(&p(&a)), Some(&p(&b))), None);
+    // Room left: a result of exactly `MAX_LEN` passes.
+    let short = format!("V{}", "z".repeat(MAX_LEN - 2));
+    let got = Pos::try_between(Some(&p(&short)), None).unwrap();
+    assert_eq!(got.as_str().len(), MAX_LEN);
+    assert_eq!(Pos::parse(got.as_str()), Some(got));
 }
