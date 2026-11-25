@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{arb_doc_and_ops, load, path};
+use common::{arb_doc_and_ops, load, path, to_plain};
 use oswx_core::{Applied, Op, OpError, Pos, Rules, Value, apply, diff};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -391,16 +391,54 @@ fn insert_respects_the_depth_limit() {
 }
 
 #[test]
-fn ids_inside_plain_lists_are_always_checked() {
-    // A keyed list inside a plain list has no path, so the check cannot tell that it was there
-    // before: re-setting the same content from a client is refused. Deliberately conservative.
-    let doc = load(json!({"grid": [[{"id": "x2"}]]}));
-    let same = json!([[{"id": "x2"}]]);
-    assert_eq!(
-        client(&doc, &[set(&["grid"], same.clone())]).err(),
-        Some(OpError::ForeignId(Arc::from("x2")))
+fn ids_already_under_a_set_path_are_not_new() {
+    // An edit inside a plain list diffs to a Set of the whole list; the ids it carries were there.
+    let doc = load(json!({"loops": [{"segs": [{"id": "L1"}, {"id": "L2"}], "closed": false}]}));
+    let target = json!({"loops": [{"segs": [{"id": "L1"}, {"id": "L2"}], "closed": true}]});
+    let ops = diff(&doc, &to_plain(target.clone())).unwrap();
+    assert!(
+        matches!(ops.as_slice(), [Op::Set { path: p, .. }] if p == &path(&["loops"])),
+        "{ops:?}"
     );
-    run(&doc, &[set(&["grid"], same)]).unwrap();
+    let a = client(&doc, &ops).unwrap();
+    assert_eq!(a.doc.to_plain(), to_plain(target));
+    // Re-setting the same content passes too.
+    let grid = load(json!({"grid": [[{"id": "x2"}]]}));
+    client(&grid, &[set(&["grid"], json!([[{"id": "x2"}]]))]).unwrap();
+    // A brand-new foreign id inside a plain list is still refused; the client's own is not.
+    let with = |id: &str| json!([{"segs": [{"id": "L1"}, {"id": id}], "closed": true}]);
+    assert_eq!(
+        client(&doc, &[set(&["loops"], with("x9"))]).err(),
+        Some(OpError::ForeignId(Arc::from("x9")))
+    );
+    client(&doc, &[set(&["loops"], with("u1.c1.7"))]).unwrap();
+    // Ids under another path are not exempt.
+    assert_eq!(
+        client(&doc, &[set(&["other"], json!([[{"id": "L1"}]]))]).err(),
+        Some(OpError::ForeignId(Arc::from("L1")))
+    );
+    // A plain list becoming keyed, and a keyed list becoming plain.
+    let dup = load(json!({"m": [{"id": "L1"}, {"id": "L1"}]}));
+    client(&dup, &[set(&["m"], json!([{"id": "L1"}]))]).unwrap();
+    let nested = load(json!({"m": [{"id": "a", "s": [{"id": "L1"}]}]}));
+    client(
+        &nested,
+        &[set(&["m"], json!([[{"id": "L1"}, {"id": "a"}]]))],
+    )
+    .unwrap();
+    // Exempt only for the Set whose path held them before the change: an id the same change
+    // put there first is judged where it was put.
+    assert_eq!(
+        client(
+            &grid,
+            &[
+                set(&["grid"], json!([[{"id": "x2"}, {"id": "x3"}]])),
+                set(&["grid"], json!([[{"id": "x3"}]])),
+            ]
+        )
+        .err(),
+        Some(OpError::ForeignId(Arc::from("x3")))
+    );
 }
 
 #[test]

@@ -57,7 +57,7 @@ pub fn apply(
         out = next;
         inverse.push(undo);
         if id_prefix.is_some() {
-            introduced.note(op);
+            introduced.note(doc, op);
         }
         for ((list, field), t) in rules.unique.iter().zip(&mut touched) {
             t.note(op, list, field);
@@ -94,6 +94,29 @@ fn get<'a>(v: &'a Value, path: &[Id]) -> Option<&'a Value> {
 
 fn has_item(v: &Value, list: &[Id], id: &str) -> bool {
     matches!(get(v, list), Some(Value::Keyed(k)) if k.get(id).is_some())
+}
+
+/// Adds to `out` the id of every item under `v`: keyed-list items, and maps with a string `id`
+/// that are elements of plain lists (an item of a list that might become keyed).
+fn ids_under(v: &Value, out: &mut HashSet<Id>) {
+    match v {
+        Value::Map(m) => m.values().for_each(|c| ids_under(c, out)),
+        Value::Keyed(k) => {
+            for (id, _, item) in k.iter() {
+                out.insert(id.clone());
+                ids_under(item, out);
+            }
+        }
+        Value::List(items) => {
+            for item in items.iter() {
+                if let Some(id) = item_id(item) {
+                    out.insert(id.clone());
+                }
+                ids_under(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The id of an item: a map with a non-empty string `id`.
@@ -270,55 +293,67 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
 }
 
 /// Item ids a change may introduce, gathered from what it inserts and sets: walking only those
-/// values keeps the check proportional to the change.
+/// values (and, for a Set, the value it replaces) keeps the check proportional to the change.
 #[derive(Default)]
 struct Introduced {
     /// (keyed list, id).
     at: BTreeSet<(Path, Id)>,
-    /// Ids in keyed lists inside plain lists. No path reaches them, so there is nothing to compare
-    /// with the document before: they are deliberately always treated as new and checked, even
-    /// when the same content was there already.
+    /// Ids in keyed lists inside plain lists. No path reaches them, so they are treated as new
+    /// unless the Set that writes them replaces a value that already held them.
     unreachable: Vec<Id>,
 }
 
 impl Introduced {
-    fn note(&mut self, op: &Op) {
+    /// `before` is the document before the whole change.
+    fn note(&mut self, before: &Value, op: &Op) {
         match op {
-            Op::Set { path, value } => self.walk(value, &mut path.clone(), true),
+            Op::Set { path, value } => {
+                // Ids anywhere under the Set's path before the change are not new for it, wherever
+                // the new value puts them: an edit inside a plain list sets the whole list, and a
+                // list may turn from plain to keyed or back.
+                let mut held = HashSet::new();
+                if let Some(old) = get(before, path) {
+                    ids_under(old, &mut held);
+                }
+                self.walk(value, &mut path.clone(), true, &held);
+            }
             Op::Insert { list, item, .. } => {
                 if let Some(id) = item_id(item) {
                     self.at.insert((list.clone(), id.clone()));
-                    self.walk(item, &mut child(list, id), true);
+                    self.walk(item, &mut child(list, id), true, &HashSet::new());
                 }
             }
             Op::Unset { .. } | Op::Remove { .. } | Op::Move { .. } => {}
         }
     }
 
-    fn walk(&mut self, v: &Value, path: &mut Path, reachable: bool) {
+    /// Notes the item ids in `v`, which sits at `path`, except those in `held`.
+    fn walk(&mut self, v: &Value, path: &mut Path, reachable: bool, held: &HashSet<Id>) {
         match v {
             Value::Map(m) => {
                 for (k, child) in m.iter() {
                     path.push(k.clone());
-                    self.walk(child, path, reachable);
+                    self.walk(child, path, reachable, held);
                     path.pop();
                 }
             }
             Value::Keyed(k) => {
                 for (id, _, item) in k.iter() {
-                    if reachable {
+                    if held.contains(id) {
+                        // Was there before.
+                    } else if reachable {
                         self.at.insert((path.clone(), id.clone()));
                     } else {
                         self.unreachable.push(id.clone());
                     }
                     path.push(id.clone());
-                    self.walk(item, path, reachable);
+                    self.walk(item, path, reachable, held);
                     path.pop();
                 }
             }
             Value::List(items) => {
                 for item in items.iter() {
-                    self.walk(item, path, false);
+                    self.walk(item, path, false, held);
                 }
             }
             _ => {}
