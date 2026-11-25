@@ -398,19 +398,21 @@ impl Index {
                 .is_some_and(|node| !node.removed.is_empty())
     }
 
-    /// Bases below this are too old to judge.
+    /// Bases below this are too old to judge: marks at or below it may have been pruned.
     pub fn floor(&self) -> Seq {
         self.floor
     }
 
-    /// Drop removals and reads at or below `floor`, which becomes the floor unless it is lower.
-    /// Writes and moves are kept.
+    /// Drop every mark (write, move, removal, read) at or below `floor`, which becomes the floor
+    /// unless it is lower, and the nodes left empty. Nothing is lost for judging: `check` counts
+    /// only marks above a change's base, and bases below the floor are refused as too old. A
+    /// dropped removal no longer lets its item be put back (`removed_at`).
     pub fn prune(&self, floor: Seq) -> Index {
         fn pruned(node: &Node, floor: Seq) -> Option<Node> {
             let n = Node {
-                wrote: node.wrote.clone(),
+                wrote: node.wrote.above(floor),
                 removed: node.removed.above(floor),
-                moved: node.moved.clone(),
+                moved: node.moved.above(floor),
                 read: node.read.above(floor),
                 children: node
                     .children

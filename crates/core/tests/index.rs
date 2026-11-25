@@ -511,23 +511,30 @@ fn removed_at_names_exactly_the_removed_path() {
 }
 
 #[test]
-fn prune_keeps_writes_drops_old_removals() {
+fn prune_drops_every_mark_at_or_below_the_floor() {
     let ix = record(
         &Index::default(),
         3,
         "uA.c1",
         &Ch::new().remove("features/f1"),
     );
-    let ix = record(&ix, 4, "uA.c1", &Ch::new().set(DEPTH));
+    let ix = record(&ix, 4, "uA.c1", &Ch::new().set(DEPTH).mv("features", "f2"));
     let ix = record(&ix, 4, "uB.c1", &Ch::new().read("features/f3"));
     let ix = record(&ix, 5, "uB.c1", &Ch::new().read("features/f4"));
+    let ix = record(&ix, 5, "uA.c1", &Ch::new().set("variables/w"));
     assert_eq!(ix.floor(), 0);
     let pruned = ix.prune(4);
     assert_eq!(pruned.floor(), 4);
-    // The write at 4 is kept; the removal at 3 and the read at 4 are gone; the read at 5 stays.
-    // (`check` is only asked about bases at or above the floor, so this is seen in the wire form.)
-    let kept = record(&Index::default(), 4, "uA.c1", &Ch::new().set(DEPTH));
-    let kept = record(&kept, 5, "uB.c1", &Ch::new().read("features/f4")).prune(4);
+    // The removal at 3, and the write, move and read at 4, are gone; the marks at 5 stay. A mark
+    // at or below the floor can never conflict: `check` only counts marks above a base, and
+    // bases are at or above the floor. (So this is seen in the wire form.)
+    let kept = record(
+        &Index::default(),
+        5,
+        "uB.c1",
+        &Ch::new().read("features/f4"),
+    );
+    let kept = record(&kept, 5, "uA.c1", &Ch::new().set("variables/w")).prune(4);
     assert_eq!(pruned.to_wire(), kept.to_wire());
     assert_eq!(
         check(&pruned, 4, "uC.c1", &Ch::new().remove("features/f4")),
@@ -544,6 +551,30 @@ fn prune_keeps_writes_drops_old_removals() {
             );
         }
     }
+}
+
+#[test]
+fn pruning_everything_leaves_an_empty_index_at_the_floor() {
+    // Set then unset of many new keys must not grow the index forever.
+    let mut ix = Index::default();
+    for seq in 1..=50 {
+        let ch = (0..20).fold(Ch::new(), |ch, k| ch.set(&format!("k{seq}_{k}")));
+        ix = record(&ix, seq, "uA.c1", &ch);
+    }
+    let ix = record(
+        &ix,
+        51,
+        "uB.c1",
+        &Ch::new().remove("features/f1").read("features/f2"),
+    );
+    let ix = record(&ix, 52, "uB.c1", &Ch::new().mv("features", "f3"));
+    let all = ix.prune(52);
+    let empty = Plain::Map(vec![
+        (Plain::from("floor"), Plain::from(52)),
+        (Plain::from("root"), Plain::Map(vec![])),
+    ]);
+    assert_eq!(all.to_wire(), empty);
+    assert_eq!(all.to_wire(), Index::default().prune(52).to_wire());
 }
 
 // ---- The trie against a naive model ----
@@ -623,8 +654,7 @@ impl Naive {
     fn prune(&mut self, floor: Seq) {
         self.floor = self.floor.max(floor);
         let f = self.floor;
-        self.marks
-            .retain(|m| matches!(m.kind, K::Wrote | K::Moved) || m.seq > f);
+        self.marks.retain(|m| m.seq > f);
     }
 
     fn check(&self, base: Seq, client: &str, ch: &Ch) -> Vec<Conflict> {
