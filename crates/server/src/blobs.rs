@@ -96,6 +96,10 @@ pub trait Blobs: Send + Sync + 'static {
     /// organisation is deleted). Removing nothing is fine.
     async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()>;
 
+    /// Removes the value under `key` (a snapshot whose database row was never committed). Removing
+    /// nothing is fine.
+    async fn delete(&self, key: &str) -> anyhow::Result<()>;
+
     /// Answers when the storage can be written (`GET /api/ready`).
     async fn health(&self) -> anyhow::Result<()>;
 }
@@ -421,6 +425,15 @@ impl Blobs for LocalBlobs {
             Ok(()) => Ok(()),
             Err(err) if is_absent(&err) => Ok(()),
             Err(err) => Err(anyhow::Error::new(err).context(format!("removing {prefix}"))),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        let path = self.path(key)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_absent(&err) => Ok(()),
+            Err(err) => Err(anyhow::Error::new(err).context(format!("removing {key}"))),
         }
     }
 

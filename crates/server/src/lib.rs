@@ -8,6 +8,7 @@ pub mod access;
 pub mod blobs;
 pub mod clock;
 pub mod config;
+pub mod content;
 pub mod error;
 pub mod ext;
 pub mod hub;
@@ -15,6 +16,7 @@ pub mod mail;
 pub mod routes;
 pub mod security;
 pub mod sessions;
+pub mod snapshot;
 pub mod state;
 pub mod store;
 

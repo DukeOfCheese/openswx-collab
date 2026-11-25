@@ -294,6 +294,51 @@ pub struct ProjectWithRole {
     pub role: String,
 }
 
+/// A document (`documents`): a part or an assembly. Its content lives in snapshots and the journal.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Document {
+    pub id: Id,
+    pub project_id: Id,
+    /// The folder it is in; `None` at the top of the project.
+    pub folder_id: Option<Id>,
+    pub name: String,
+    /// `part` or `assembly`.
+    pub kind: String,
+    /// The content's top-level `version` when it was created, if that was an integer.
+    pub format_version: Option<i64>,
+    /// The seq of its newest change (0 for one nobody has changed).
+    pub head_seq: i64,
+    pub created_by: Id,
+    pub created_at: f64,
+    /// When its content last changed.
+    pub updated_at: f64,
+    /// Set when it was deleted (the row stays).
+    pub deleted_at: Option<f64>,
+}
+
+/// A folder in a project (`folders`). Folders nest; `parent_id` is `None` at the top.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Folder {
+    pub id: Id,
+    pub project_id: Id,
+    pub parent_id: Option<Id>,
+    pub name: String,
+    pub created_at: f64,
+}
+
+/// A stored snapshot of a document (`snapshots`): `key` names it in blob storage.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct SnapshotRow {
+    pub document_id: Id,
+    /// The room lease epoch it was written under.
+    pub epoch: i64,
+    pub seq: i64,
+    pub key: String,
+    /// Its size in storage, in bytes.
+    pub size: i64,
+    pub created_at: f64,
+}
+
 /// The database. One method per query; see the module documentation for how to add one.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
@@ -371,6 +416,21 @@ pub trait Store: Send + Sync + 'static {
 
     /// An organisation's invites that are unused and expire after `now`, oldest first.
     async fn open_invites(&self, org_id: &str, now: f64) -> anyhow::Result<Vec<Invite>>;
+
+    /// The document with this id, deleted or not.
+    async fn document_by_id(&self, id: &str) -> anyhow::Result<Option<Document>>;
+
+    /// A project's documents that are not deleted, by name then id.
+    async fn documents_in_project(&self, project_id: &str) -> anyhow::Result<Vec<Document>>;
+
+    /// A document's newest snapshot (highest seq, then highest epoch).
+    async fn latest_snapshot(&self, document_id: &str) -> anyhow::Result<Option<SnapshotRow>>;
+
+    /// The folder with this id.
+    async fn folder_by_id(&self, id: &str) -> anyhow::Result<Option<Folder>>;
+
+    /// A project's folders, by name then id.
+    async fn folders_in_project(&self, project_id: &str) -> anyhow::Result<Vec<Folder>>;
 }
 
 /// A write transaction (or a savepoint within one). Dropping it without [`Tx::commit`] rolls it
@@ -534,4 +594,57 @@ pub trait Tx: Send {
         project_id: &str,
         now: f64,
     ) -> anyhow::Result<()>;
+
+    /// Adds a document.
+    async fn insert_document(&mut self, document: &Document) -> anyhow::Result<()>;
+
+    /// Records a snapshot written to storage.
+    async fn insert_snapshot(&mut self, snapshot: &SnapshotRow) -> anyhow::Result<()>;
+
+    /// [`Store::document_by_id`], seeing this transaction's writes.
+    async fn document_by_id(&mut self, id: &str) -> anyhow::Result<Option<Document>>;
+
+    async fn set_document_name(&mut self, id: &str, name: &str) -> anyhow::Result<()>;
+
+    /// Moves a document into a folder (`None`: the top of its project).
+    async fn set_document_folder(
+        &mut self,
+        id: &str,
+        folder_id: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    /// Marks a document deleted at `now`; `false` if it was already deleted (or is gone).
+    async fn mark_document_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool>;
+
+    async fn insert_folder(&mut self, folder: &Folder) -> anyhow::Result<()>;
+
+    /// [`Store::folder_by_id`], seeing this transaction's writes.
+    async fn folder_by_id(&mut self, id: &str) -> anyhow::Result<Option<Folder>>;
+
+    /// [`Store::folders_in_project`], seeing this transaction's writes.
+    async fn folders_in_project(&mut self, project_id: &str) -> anyhow::Result<Vec<Folder>>;
+
+    async fn set_folder_name(&mut self, id: &str, name: &str) -> anyhow::Result<()>;
+
+    /// Moves a folder into another (`None`: the top of its project).
+    async fn set_folder_parent(&mut self, id: &str, parent_id: Option<&str>) -> anyhow::Result<()>;
+
+    /// Moves every folder directly inside `folder_id` into `parent_id` (`None`: the top).
+    async fn move_child_folders(
+        &mut self,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    /// Moves every document directly inside `folder_id` (deleted ones too) into `parent_id`
+    /// (`None`: the top).
+    async fn move_folder_documents(
+        &mut self,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    /// Deletes a folder. Move what is inside it first: the database deletes folders inside it with
+    /// it and moves documents inside it to the top of the project.
+    async fn delete_folder(&mut self, id: &str) -> anyhow::Result<()>;
 }

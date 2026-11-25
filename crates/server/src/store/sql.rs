@@ -228,3 +228,81 @@ pub const PROJECT_DOCUMENT_IDS: &str = "SELECT id FROM documents WHERE project_i
 /// [`super::Tx::mark_project_documents_deleted`].
 pub const MARK_PROJECT_DOCUMENTS_DELETED: &str =
     "UPDATE documents SET deleted_at = $2 WHERE project_id = $1 AND deleted_at IS NULL";
+
+// ------------------------------------------------------------------ documents
+
+/// The columns of [`super::Document`], in order.
+macro_rules! document_columns {
+    () => {
+        "id, project_id, folder_id, name, kind, format_version, head_seq, created_by, created_at, \
+         updated_at, deleted_at"
+    };
+}
+
+/// [`super::Tx::insert_document`].
+pub const INSERT_DOCUMENT: &str = concat!(
+    "INSERT INTO documents (",
+    document_columns!(),
+    ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+);
+
+/// [`super::Store::document_by_id`], [`super::Tx::document_by_id`].
+pub const DOCUMENT_BY_ID: &str = concat!(
+    "SELECT ",
+    document_columns!(),
+    " FROM documents WHERE id = $1"
+);
+
+/// [`super::Store::documents_in_project`].
+pub const DOCUMENTS_IN_PROJECT: &str = concat!(
+    "SELECT ",
+    document_columns!(),
+    " FROM documents WHERE project_id = $1 AND deleted_at IS NULL ORDER BY name, id"
+);
+
+/// [`super::Tx::set_document_name`].
+pub const SET_DOCUMENT_NAME: &str = "UPDATE documents SET name = $2 WHERE id = $1";
+
+/// [`super::Tx::set_document_folder`].
+pub const SET_DOCUMENT_FOLDER: &str = "UPDATE documents SET folder_id = $2 WHERE id = $1";
+
+/// [`super::Tx::mark_document_deleted`].
+pub const MARK_DOCUMENT_DELETED: &str =
+    "UPDATE documents SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL";
+
+/// [`super::Tx::insert_snapshot`].
+pub const INSERT_SNAPSHOT: &str = "INSERT INTO snapshots (document_id, epoch, seq, key, size, \
+     created_at) VALUES ($1, $2, $3, $4, $5, $6)";
+
+/// [`super::Store::latest_snapshot`].
+pub const LATEST_SNAPSHOT: &str = "SELECT document_id, epoch, seq, key, size, created_at \
+     FROM snapshots WHERE document_id = $1 ORDER BY seq DESC, epoch DESC LIMIT 1";
+
+// ------------------------------------------------------------------ folders
+
+/// [`super::Tx::insert_folder`].
+pub const INSERT_FOLDER: &str = "INSERT INTO folders (id, project_id, parent_id, name, created_at) \
+     VALUES ($1, $2, $3, $4, $5)";
+
+/// [`super::Store::folder_by_id`], [`super::Tx::folder_by_id`].
+pub const FOLDER_BY_ID: &str =
+    "SELECT id, project_id, parent_id, name, created_at FROM folders WHERE id = $1";
+
+/// [`super::Store::folders_in_project`], [`super::Tx::folders_in_project`].
+pub const FOLDERS_IN_PROJECT: &str = "SELECT id, project_id, parent_id, name, created_at \
+     FROM folders WHERE project_id = $1 ORDER BY name, id";
+
+/// [`super::Tx::set_folder_name`].
+pub const SET_FOLDER_NAME: &str = "UPDATE folders SET name = $2 WHERE id = $1";
+
+/// [`super::Tx::set_folder_parent`].
+pub const SET_FOLDER_PARENT: &str = "UPDATE folders SET parent_id = $2 WHERE id = $1";
+
+/// [`super::Tx::move_child_folders`].
+pub const MOVE_CHILD_FOLDERS: &str = "UPDATE folders SET parent_id = $2 WHERE parent_id = $1";
+
+/// [`super::Tx::move_folder_documents`].
+pub const MOVE_FOLDER_DOCUMENTS: &str = "UPDATE documents SET folder_id = $2 WHERE folder_id = $1";
+
+/// [`super::Tx::delete_folder`].
+pub const DELETE_FOLDER: &str = "DELETE FROM folders WHERE id = $1";

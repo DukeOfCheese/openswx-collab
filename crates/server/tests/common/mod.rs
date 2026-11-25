@@ -12,8 +12,9 @@ use oswx_server::hub::Hub;
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
-    ProjectWithRole, SchemaStatus, Session, SqliteStore, Store, Tx, User,
+    Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project,
+    ProjectMember, ProjectWithRole, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx,
+    User,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -605,6 +606,26 @@ impl Store for FlakyStore {
     async fn open_invites(&self, org_id: &str, now: f64) -> anyhow::Result<Vec<Invite>> {
         self.inner().open_invites(org_id, now).await
     }
+
+    async fn document_by_id(&self, id: &str) -> anyhow::Result<Option<Document>> {
+        self.inner().document_by_id(id).await
+    }
+
+    async fn documents_in_project(&self, project_id: &str) -> anyhow::Result<Vec<Document>> {
+        self.inner().documents_in_project(project_id).await
+    }
+
+    async fn latest_snapshot(&self, document_id: &str) -> anyhow::Result<Option<SnapshotRow>> {
+        self.inner().latest_snapshot(document_id).await
+    }
+
+    async fn folder_by_id(&self, id: &str) -> anyhow::Result<Option<Folder>> {
+        self.inner().folder_by_id(id).await
+    }
+
+    async fn folders_in_project(&self, project_id: &str) -> anyhow::Result<Vec<Folder>> {
+        self.inner().folders_in_project(project_id).await
+    }
 }
 
 /// [`FlakyStore`]'s transaction. Every [`Tx`] method delegates; add yours when you add one.
@@ -845,6 +866,74 @@ impl Tx for FlakyTx {
             .mark_project_documents_deleted(project_id, now)
             .await
     }
+
+    async fn insert_document(&mut self, document: &Document) -> anyhow::Result<()> {
+        self.inner.insert_document(document).await
+    }
+
+    async fn insert_snapshot(&mut self, snapshot: &SnapshotRow) -> anyhow::Result<()> {
+        self.inner.insert_snapshot(snapshot).await
+    }
+
+    async fn document_by_id(&mut self, id: &str) -> anyhow::Result<Option<Document>> {
+        self.inner.document_by_id(id).await
+    }
+
+    async fn set_document_name(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.inner.set_document_name(id, name).await
+    }
+
+    async fn set_document_folder(
+        &mut self,
+        id: &str,
+        folder_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.inner.set_document_folder(id, folder_id).await
+    }
+
+    async fn mark_document_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool> {
+        self.inner.mark_document_deleted(id, now).await
+    }
+
+    async fn insert_folder(&mut self, folder: &Folder) -> anyhow::Result<()> {
+        self.inner.insert_folder(folder).await
+    }
+
+    async fn folder_by_id(&mut self, id: &str) -> anyhow::Result<Option<Folder>> {
+        self.inner.folder_by_id(id).await
+    }
+
+    async fn folders_in_project(&mut self, project_id: &str) -> anyhow::Result<Vec<Folder>> {
+        self.inner.folders_in_project(project_id).await
+    }
+
+    async fn set_folder_name(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.inner.set_folder_name(id, name).await
+    }
+
+    async fn set_folder_parent(&mut self, id: &str, parent_id: Option<&str>) -> anyhow::Result<()> {
+        self.inner.set_folder_parent(id, parent_id).await
+    }
+
+    async fn move_child_folders(
+        &mut self,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.inner.move_child_folders(folder_id, parent_id).await
+    }
+
+    async fn move_folder_documents(
+        &mut self,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.inner.move_folder_documents(folder_id, parent_id).await
+    }
+
+    async fn delete_folder(&mut self, id: &str) -> anyhow::Result<()> {
+        self.inner.delete_folder(id).await
+    }
 }
 
 /// A server admin (Ada, `ada@example.com`, the first account) who owns an organisation, "Robotics",
@@ -927,6 +1016,42 @@ impl World {
         self.invite(server, email, None, Some("editor"), "member")
             .await
     }
+
+    /// Creates a document in the project, as the Python `World.document`: `content` (default
+    /// [`part`]) named `name` (default "Bracket"), by `token` (default the admin). Answers its id;
+    /// panics unless the server answers 201.
+    pub async fn document(
+        &self,
+        server: &TestServer,
+        content: Option<Value>,
+        name: Option<&str>,
+        token: Option<&str>,
+    ) -> Id {
+        let (status, body) = server
+            .post(
+                &format!("/api/projects/{}/documents", self.project),
+                Some(token.unwrap_or(&self.admin)),
+                json!({"name": name.unwrap_or("Bracket"), "content": content.unwrap_or_else(part)}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["id"].as_str().expect("an id").to_owned()
+    }
+}
+
+/// The Python test suite's `PART`: a small openswx part (a sketch and an extrusion).
+pub fn part() -> Value {
+    json!({
+        "format": "openswx-part", "version": 3, "name": "Bracket", "units": "mm",
+        "material": {"name": null, "density": 1000.0}, "rollback": null, "active_config": "Default",
+        "next_id": 3, "counters": {"Sketch": 1, "Boss-Extrude": 1}, "variables": {},
+        "features": [
+            {"id": "f1", "name": "Sketch1", "type": "sketch", "suppressed": false,
+             "params": {"plane": "Top", "sketch": {"points": {"P1": [0, 0]}, "entities": {}, "counter": 1}}},
+            {"id": "f2", "name": "Boss-Extrude1", "type": "extrude", "suppressed": false,
+             "params": {"sketch": "Sketch1", "depth": 10}},
+        ],
+    })
 }
 
 /// A server with a [`World`] on it.

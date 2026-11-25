@@ -49,8 +49,9 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
-    ProjectWithRole, SchemaError, SchemaStatus, Session, Store, Tx, User, sql,
+    Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project,
+    ProjectMember, ProjectWithRole, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx,
+    User, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -365,6 +366,26 @@ impl Store for SqliteStore {
     async fn open_invites(&self, org_id: &str, now: f64) -> Result<Vec<Invite>> {
         q::open_invites(&mut *self.reader().await?, org_id, now).await
     }
+
+    async fn document_by_id(&self, id: &str) -> Result<Option<Document>> {
+        q::document_by_id(&mut *self.reader().await?, id).await
+    }
+
+    async fn documents_in_project(&self, project_id: &str) -> Result<Vec<Document>> {
+        q::documents_in_project(&mut *self.reader().await?, project_id).await
+    }
+
+    async fn latest_snapshot(&self, document_id: &str) -> Result<Option<SnapshotRow>> {
+        q::latest_snapshot(&mut *self.reader().await?, document_id).await
+    }
+
+    async fn folder_by_id(&self, id: &str) -> Result<Option<Folder>> {
+        q::folder_by_id(&mut *self.reader().await?, id).await
+    }
+
+    async fn folders_in_project(&self, project_id: &str) -> Result<Vec<Folder>> {
+        q::folders_in_project(&mut *self.reader().await?, project_id).await
+    }
 }
 
 /// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
@@ -607,6 +628,66 @@ impl Tx for SqliteTx<'_> {
 
     async fn mark_project_documents_deleted(&mut self, project_id: &str, now: f64) -> Result<()> {
         q::mark_project_documents_deleted(self.conn(), project_id, now).await
+    }
+
+    async fn insert_document(&mut self, document: &Document) -> Result<()> {
+        q::insert_document(self.conn(), document).await
+    }
+
+    async fn insert_snapshot(&mut self, snapshot: &SnapshotRow) -> Result<()> {
+        q::insert_snapshot(self.conn(), snapshot).await
+    }
+
+    async fn document_by_id(&mut self, id: &str) -> Result<Option<Document>> {
+        q::document_by_id(self.conn(), id).await
+    }
+
+    async fn set_document_name(&mut self, id: &str, name: &str) -> Result<()> {
+        q::set_document_name(self.conn(), id, name).await
+    }
+
+    async fn set_document_folder(&mut self, id: &str, folder_id: Option<&str>) -> Result<()> {
+        q::set_document_folder(self.conn(), id, folder_id).await
+    }
+
+    async fn mark_document_deleted(&mut self, id: &str, now: f64) -> Result<bool> {
+        q::mark_document_deleted(self.conn(), id, now).await
+    }
+
+    async fn insert_folder(&mut self, folder: &Folder) -> Result<()> {
+        q::insert_folder(self.conn(), folder).await
+    }
+
+    async fn folder_by_id(&mut self, id: &str) -> Result<Option<Folder>> {
+        q::folder_by_id(self.conn(), id).await
+    }
+
+    async fn folders_in_project(&mut self, project_id: &str) -> Result<Vec<Folder>> {
+        q::folders_in_project(self.conn(), project_id).await
+    }
+
+    async fn set_folder_name(&mut self, id: &str, name: &str) -> Result<()> {
+        q::set_folder_name(self.conn(), id, name).await
+    }
+
+    async fn set_folder_parent(&mut self, id: &str, parent_id: Option<&str>) -> Result<()> {
+        q::set_folder_parent(self.conn(), id, parent_id).await
+    }
+
+    async fn move_child_folders(&mut self, folder_id: &str, parent_id: Option<&str>) -> Result<()> {
+        q::move_child_folders(self.conn(), folder_id, parent_id).await
+    }
+
+    async fn move_folder_documents(
+        &mut self,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        q::move_folder_documents(self.conn(), folder_id, parent_id).await
+    }
+
+    async fn delete_folder(&mut self, id: &str) -> Result<()> {
+        q::delete_folder(self.conn(), id).await
     }
 }
 
@@ -1159,6 +1240,181 @@ mod q {
             .bind(now)
             .execute(c)
             .await?;
+        Ok(())
+    }
+
+    pub async fn insert_document(c: &mut SqliteConnection, d: &Document) -> Result<()> {
+        sqlx::query(sql::INSERT_DOCUMENT)
+            .bind(&d.id)
+            .bind(&d.project_id)
+            .bind(&d.folder_id)
+            .bind(&d.name)
+            .bind(&d.kind)
+            .bind(d.format_version)
+            .bind(d.head_seq)
+            .bind(&d.created_by)
+            .bind(d.created_at)
+            .bind(d.updated_at)
+            .bind(d.deleted_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn document_by_id(c: &mut SqliteConnection, id: &str) -> Result<Option<Document>> {
+        Ok(sqlx::query_as(sql::DOCUMENT_BY_ID)
+            .bind(id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn documents_in_project(
+        c: &mut SqliteConnection,
+        project_id: &str,
+    ) -> Result<Vec<Document>> {
+        Ok(sqlx::query_as(sql::DOCUMENTS_IN_PROJECT)
+            .bind(project_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn set_document_name(c: &mut SqliteConnection, id: &str, name: &str) -> Result<()> {
+        sqlx::query(sql::SET_DOCUMENT_NAME)
+            .bind(id)
+            .bind(name)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_document_folder(
+        c: &mut SqliteConnection,
+        id: &str,
+        folder_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_DOCUMENT_FOLDER)
+            .bind(id)
+            .bind(folder_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_document_deleted(
+        c: &mut SqliteConnection,
+        id: &str,
+        now: f64,
+    ) -> Result<bool> {
+        let done = sqlx::query(sql::MARK_DOCUMENT_DELETED)
+            .bind(id)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn insert_snapshot(c: &mut SqliteConnection, s: &SnapshotRow) -> Result<()> {
+        sqlx::query(sql::INSERT_SNAPSHOT)
+            .bind(&s.document_id)
+            .bind(s.epoch)
+            .bind(s.seq)
+            .bind(&s.key)
+            .bind(s.size)
+            .bind(s.created_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn latest_snapshot(
+        c: &mut SqliteConnection,
+        document_id: &str,
+    ) -> Result<Option<SnapshotRow>> {
+        Ok(sqlx::query_as(sql::LATEST_SNAPSHOT)
+            .bind(document_id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn insert_folder(c: &mut SqliteConnection, f: &Folder) -> Result<()> {
+        sqlx::query(sql::INSERT_FOLDER)
+            .bind(&f.id)
+            .bind(&f.project_id)
+            .bind(&f.parent_id)
+            .bind(&f.name)
+            .bind(f.created_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn folder_by_id(c: &mut SqliteConnection, id: &str) -> Result<Option<Folder>> {
+        Ok(sqlx::query_as(sql::FOLDER_BY_ID)
+            .bind(id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn folders_in_project(
+        c: &mut SqliteConnection,
+        project_id: &str,
+    ) -> Result<Vec<Folder>> {
+        Ok(sqlx::query_as(sql::FOLDERS_IN_PROJECT)
+            .bind(project_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn set_folder_name(c: &mut SqliteConnection, id: &str, name: &str) -> Result<()> {
+        sqlx::query(sql::SET_FOLDER_NAME)
+            .bind(id)
+            .bind(name)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_folder_parent(
+        c: &mut SqliteConnection,
+        id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_FOLDER_PARENT)
+            .bind(id)
+            .bind(parent_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn move_child_folders(
+        c: &mut SqliteConnection,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(sql::MOVE_CHILD_FOLDERS)
+            .bind(folder_id)
+            .bind(parent_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn move_folder_documents(
+        c: &mut SqliteConnection,
+        folder_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(sql::MOVE_FOLDER_DOCUMENTS)
+            .bind(folder_id)
+            .bind(parent_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_folder(c: &mut SqliteConnection, id: &str) -> Result<()> {
+        sqlx::query(sql::DELETE_FOLDER).bind(id).execute(c).await?;
         Ok(())
     }
 }

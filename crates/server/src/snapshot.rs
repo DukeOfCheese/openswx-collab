@@ -1,0 +1,354 @@
+//! Document snapshots: the whole document and its conflict index at one point of its journal.
+//!
+//! A snapshot is a zstd-compressed MessagePack map
+//!
+//! ```text
+//! {"v": 1, "seq": <u64>, "doc": <Value wire form>, "index": <Index wire form>}
+//! ```
+//!
+//! stored as a whole value ([`crate::blobs::Blobs::put`]) under [`snapshot_key`], with a
+//! `snapshots` row naming it. [`decode`] refuses anything else (another `v`, a missing or extra
+//! field, a wrong type, bytes after the end, a document or index the core would not read back) with
+//! a [`SnapshotError`], never a panic, and stops decompressing past [`MAX_DECOMPRESSED`].
+//!
+//! Encoding and decoding a large document takes a while: call [`encode`] and [`decode`] on the
+//! blocking pool (`tokio::task::spawn_blocking`), as [`load_head_doc`] does.
+
+use std::io::{self, BufRead, Read};
+
+use anyhow::{Context, bail};
+use bytes::Bytes;
+use oswx_core::{Index, Plain, Seq, Value};
+
+use crate::blobs::Blobs;
+use crate::store::Store;
+
+/// The snapshot format this server writes and reads.
+pub const FORMAT: u64 = 1;
+/// The most a snapshot may decompress to; a bigger one is refused while it is being read.
+pub const MAX_DECOMPRESSED: u64 = 512 << 20;
+/// The zstd level snapshots are written with.
+const LEVEL: i32 = 3;
+
+/// Why a snapshot could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SnapshotError {
+    /// The bytes are not one zstd frame, or the frame is damaged.
+    #[error("the snapshot is not valid zstd data")]
+    Compression,
+    /// It decompresses to more than [`MAX_DECOMPRESSED`].
+    #[error("the snapshot decompresses to more than {MAX_DECOMPRESSED} bytes")]
+    TooLarge,
+    /// Bytes follow the zstd frame or the MessagePack value.
+    #[error("the snapshot has bytes after its end")]
+    TrailingBytes,
+    /// The MessagePack is malformed, or is not the snapshot map.
+    #[error("the snapshot is not a snapshot map")]
+    Shape,
+    /// A snapshot format this server does not know.
+    #[error("the snapshot has format {0}, which this server does not read")]
+    Version(u64),
+    /// The document is not a document the core reads back.
+    #[error("the snapshot's document is malformed")]
+    Document,
+    /// The index is not an index the core reads back.
+    #[error("the snapshot's index is malformed")]
+    Index,
+}
+
+/// The storage key of a document's snapshot at `seq`, written under lease `epoch`:
+/// `docs/<doc>/snapshots/<epoch, 10 digits>-<seq, 10 digits>.mpk.zst`.
+pub fn snapshot_key(doc: &str, epoch: u64, seq: Seq) -> String {
+    format!("docs/{doc}/snapshots/{epoch:010}-{seq:010}.mpk.zst")
+}
+
+/// The snapshot of `doc` with `index` at `seq`.
+pub fn encode(doc: &Value, index: &Index, seq: Seq) -> Bytes {
+    let map = Plain::Map(vec![
+        (Plain::from("v"), Plain::from(FORMAT)),
+        (Plain::from("seq"), Plain::from(seq)),
+        (Plain::from("doc"), doc.to_wire()),
+        (Plain::from("index"), index.to_wire()),
+    ]);
+    let mut packed = Vec::new();
+    rmpv::encode::write_value(&mut packed, &map).expect("writing to a Vec cannot fail");
+    let compressed = zstd::stream::encode_all(packed.as_slice(), LEVEL)
+        .expect("compressing a slice cannot fail");
+    Bytes::from(compressed)
+}
+
+/// The document, index and seq a snapshot holds.
+pub fn decode(bytes: &[u8]) -> Result<(Value, Index, Seq), SnapshotError> {
+    let packed = decompress(bytes, MAX_DECOMPRESSED)?;
+    let mut rest = packed.as_slice();
+    let plain = rmpv::decode::read_value(&mut rest).map_err(|_| SnapshotError::Shape)?;
+    if !rest.is_empty() {
+        return Err(SnapshotError::TrailingBytes);
+    }
+    let Plain::Map(pairs) = plain else {
+        return Err(SnapshotError::Shape);
+    };
+    let mut fields: [Option<Plain>; 4] = [None, None, None, None];
+    for (k, v) in pairs {
+        let slot = match k.as_str() {
+            Some("v") => 0,
+            Some("seq") => 1,
+            Some("doc") => 2,
+            Some("index") => 3,
+            _ => return Err(SnapshotError::Shape),
+        };
+        if fields[slot].replace(v).is_some() {
+            return Err(SnapshotError::Shape);
+        }
+    }
+    let [Some(v), Some(seq), Some(doc), Some(index)] = fields else {
+        return Err(SnapshotError::Shape);
+    };
+    match v.as_u64() {
+        Some(FORMAT) => {}
+        Some(other) => return Err(SnapshotError::Version(other)),
+        None => return Err(SnapshotError::Shape),
+    }
+    let seq = seq.as_u64().ok_or(SnapshotError::Shape)?;
+    let doc = Value::from_wire(&doc).map_err(|_| SnapshotError::Document)?;
+    if !matches!(doc, Value::Map(_)) {
+        return Err(SnapshotError::Document);
+    }
+    let index = Index::from_wire(&index).ok_or(SnapshotError::Index)?;
+    Ok((doc, index, seq))
+}
+
+/// One zstd frame, decompressed, refused once it passes `limit` bytes (reading stops there) and if
+/// anything follows it.
+fn decompress(bytes: &[u8], limit: u64) -> Result<Vec<u8>, SnapshotError> {
+    let decoder = zstd::stream::read::Decoder::with_buffer(bytes)
+        .map_err(|_| SnapshotError::Compression)?
+        .single_frame();
+    let mut out = Vec::new();
+    let mut limited = decoder.take(limit + 1);
+    limited
+        .read_to_end(&mut out)
+        .map_err(|_| SnapshotError::Compression)?;
+    if out.len() as u64 > limit {
+        return Err(SnapshotError::TooLarge);
+    }
+    let mut rest = limited.into_inner().finish();
+    if !rest.fill_buf().map_err(io_error)?.is_empty() {
+        return Err(SnapshotError::TrailingBytes);
+    }
+    Ok(out)
+}
+
+fn io_error(_: io::Error) -> SnapshotError {
+    SnapshotError::Compression
+}
+
+/// The document as it is now: its newest snapshot, decoded on the blocking pool. Answers the
+/// document, its index and the seq it is at. A document without a snapshot row, or whose snapshot
+/// file is missing or unreadable, is an error (the server wrote both when it created the document).
+///
+/// TASK 8: this also replays the journal after the snapshot.
+pub async fn load_head_doc(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+    doc_id: &str,
+) -> anyhow::Result<(Value, Index, Seq)> {
+    let Some(row) = store.latest_snapshot(doc_id).await? else {
+        bail!("document {doc_id} has no snapshot");
+    };
+    let Some(bytes) = blobs.get(&row.key).await? else {
+        bail!("the snapshot {} of document {doc_id} is missing", row.key);
+    };
+    let decoded = tokio::task::spawn_blocking(move || decode(&bytes))
+        .await
+        .context("decoding a snapshot")?
+        .with_context(|| format!("reading the snapshot {}", row.key))?;
+    if i64::try_from(decoded.2).ok() != Some(row.seq) {
+        bail!(
+            "the snapshot {} holds seq {}, its row says {}",
+            row.key,
+            decoded.2,
+            row.seq
+        );
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use oswx_core::Write;
+    use serde_json::json;
+
+    use super::*;
+    use crate::blobs::check_key;
+    use crate::content::plain_from_json;
+
+    fn sample() -> (Value, Index) {
+        let doc = Value::from_plain(&plain_from_json(&json!({
+            "version": 3,
+            "features": [
+                {"id": "f1", "name": "Sketch1", "params": {"sketch": {"entities": [
+                    {"id": "e1", "kind": "line"}, {"id": "e2", "kind": "arc"}]}}},
+                {"id": "f2", "name": "Boss-Extrude1", "params": {"depth": 10.5}},
+            ],
+            "plain": [1, 2, [3, {"x": null}]],
+        })))
+        .unwrap();
+        let path = |segs: &[&str]| {
+            segs.iter()
+                .map(|s| Arc::<str>::from(*s))
+                .collect::<Vec<_>>()
+        };
+        let writes: BTreeSet<Write> = [
+            Write::At(path(&["features", "f2", "params", "depth"])),
+            Write::Position(path(&["features"]), Arc::from("f1")),
+        ]
+        .into_iter()
+        .collect();
+        let removed: BTreeSet<Vec<Arc<str>>> = [path(&["features", "f3"])].into_iter().collect();
+        let reads: BTreeSet<Vec<Arc<str>>> = [path(&["features", "f1"])].into_iter().collect();
+        let index = Index::default()
+            .record(
+                4,
+                &Arc::from("u.c"),
+                &writes,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .record(7, &Arc::from("v.d"), &BTreeSet::new(), &removed, &reads);
+        (doc, index)
+    }
+
+    #[test]
+    fn a_snapshot_round_trips() {
+        let (doc, index) = sample();
+        let bytes = encode(&doc, &index, 7);
+        let (doc2, index2, seq) = decode(&bytes).unwrap();
+        assert_eq!(doc2, doc);
+        assert_eq!(index2.to_wire(), index.to_wire());
+        assert_ne!(
+            index.to_wire(),
+            Index::default().to_wire(),
+            "the index is not empty"
+        );
+        assert_eq!(seq, 7);
+    }
+
+    fn refused(bytes: &[u8]) -> Option<SnapshotError> {
+        decode(bytes).err()
+    }
+
+    fn pack(map: Vec<(&str, Plain)>) -> Vec<u8> {
+        let map = Plain::Map(map.into_iter().map(|(k, v)| (Plain::from(k), v)).collect());
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &map).unwrap();
+        zstd::stream::encode_all(out.as_slice(), 3).unwrap()
+    }
+
+    fn good_fields() -> Vec<(&'static str, Plain)> {
+        let (doc, index) = sample();
+        vec![
+            ("v", Plain::from(1)),
+            ("seq", Plain::from(3)),
+            ("doc", doc.to_wire()),
+            ("index", index.to_wire()),
+        ]
+    }
+
+    #[test]
+    fn a_damaged_snapshot_is_an_error() {
+        let (doc, index) = sample();
+        let bytes = encode(&doc, &index, 7).to_vec();
+        for i in 0..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[i] ^= 0x5a;
+            // Any answer but a panic; most flips are refused.
+            let _ = decode(&flipped);
+        }
+        let mut flipped = bytes.clone();
+        flipped[0] ^= 0xff;
+        assert_eq!(refused(&flipped), Some(SnapshotError::Compression));
+        for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
+            assert!(decode(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(refused(&longer), Some(SnapshotError::TrailingBytes));
+        let mut two = bytes.clone();
+        two.extend_from_slice(&bytes);
+        assert_eq!(refused(&two), Some(SnapshotError::TrailingBytes));
+        assert_eq!(refused(b""), Some(SnapshotError::Compression));
+    }
+
+    #[test]
+    fn anything_but_the_snapshot_map_is_refused() {
+        assert!(decode(&pack(good_fields())).is_ok());
+        let with = |key: &str, v: Plain| {
+            let mut f = good_fields();
+            f.iter_mut().find(|(k, _)| *k == key).unwrap().1 = v;
+            refused(&pack(f))
+        };
+        assert_eq!(with("v", Plain::from(2)), Some(SnapshotError::Version(2)));
+        assert_eq!(with("v", Plain::from("1")), Some(SnapshotError::Shape));
+        assert_eq!(with("seq", Plain::from(-1)), Some(SnapshotError::Shape));
+        assert_eq!(with("seq", Plain::from("3")), Some(SnapshotError::Shape));
+        assert_eq!(with("doc", Plain::from(1)), Some(SnapshotError::Document));
+        assert_eq!(
+            with(
+                "doc",
+                Plain::Map(vec![(Plain::from("$list"), Plain::from(1))])
+            ),
+            Some(SnapshotError::Document)
+        );
+        assert_eq!(with("index", Plain::from(1)), Some(SnapshotError::Index));
+        let mut missing = good_fields();
+        missing.pop();
+        assert_eq!(refused(&pack(missing)), Some(SnapshotError::Shape));
+        let mut extra = good_fields();
+        extra.push(("more", Plain::Nil));
+        assert_eq!(refused(&pack(extra)), Some(SnapshotError::Shape));
+        let mut repeated = good_fields();
+        repeated.push(("v", Plain::from(1)));
+        assert_eq!(refused(&pack(repeated)), Some(SnapshotError::Shape));
+        let not_a_map = zstd::stream::encode_all(&[0x01u8][..], 3).unwrap();
+        assert_eq!(refused(&not_a_map), Some(SnapshotError::Shape));
+        let mut trailing = Vec::new();
+        rmpv::encode::write_value(&mut trailing, &Plain::Map(vec![])).unwrap();
+        trailing.push(0xc0);
+        let trailing = zstd::stream::encode_all(trailing.as_slice(), 3).unwrap();
+        assert_eq!(refused(&trailing), Some(SnapshotError::TrailingBytes));
+    }
+
+    #[test]
+    fn a_snapshot_that_decompresses_too_far_is_refused_while_reading() {
+        // 64 MiB of zeros compress to a few kilobytes; reading stops one byte past the limit.
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        let chunk = vec![0u8; 1 << 20];
+        for _ in 0..64 {
+            io::Write::write_all(&mut encoder, &chunk).unwrap();
+        }
+        let bomb = encoder.finish().unwrap();
+        assert!(bomb.len() < 1 << 20);
+        assert_eq!(
+            decompress(&bomb, 1 << 20).err(),
+            Some(SnapshotError::TooLarge)
+        );
+        assert_eq!(decompress(&bomb, 64 << 20).map(|v| v.len()), Ok(64 << 20));
+    }
+
+    #[test]
+    fn snapshot_keys_sort_by_epoch_then_seq_and_are_valid_storage_keys() {
+        let doc = "0123456789abcdef0123456789abcdef";
+        let key = snapshot_key(doc, 0, 0);
+        assert_eq!(
+            key,
+            format!("docs/{doc}/snapshots/0000000000-0000000000.mpk.zst")
+        );
+        check_key(&key).unwrap();
+        check_key(&snapshot_key(doc, u64::from(u32::MAX), u64::MAX)).unwrap();
+        assert!(snapshot_key(doc, 1, 2) < snapshot_key(doc, 1, 10));
+    }
+}
