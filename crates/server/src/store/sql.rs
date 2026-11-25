@@ -306,3 +306,83 @@ pub const MOVE_FOLDER_DOCUMENTS: &str = "UPDATE documents SET folder_id = $2 WHE
 
 /// [`super::Tx::delete_folder`].
 pub const DELETE_FOLDER: &str = "DELETE FROM folders WHERE id = $1";
+
+// ------------------------------------------------------------------ journal
+
+/// The columns of [`super::ChangeRow`], in order.
+macro_rules! change_columns {
+    () => {
+        "document_id, seq, parent_seq, branch_id, epoch, author_id, client_id, change_id, \
+         created_at, command, ops, inverse, paths, reads, undo_of, reverts, reverted_by, broke"
+    };
+}
+
+/// [`super::Tx::insert_change`]. A row with the same `(document_id, client_id, change_id)` makes
+/// it insert nothing (and say so) instead of failing the transaction.
+pub const INSERT_CHANGE: &str = concat!(
+    "INSERT INTO changes (",
+    change_columns!(),
+    ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+     ON CONFLICT (document_id, client_id, change_id) DO NOTHING"
+);
+
+/// [`super::Store::changes_between`].
+pub const CHANGES_BETWEEN: &str = concat!(
+    "SELECT ",
+    change_columns!(),
+    " FROM changes WHERE document_id = $1 AND seq > $2 AND seq <= $3 ORDER BY seq LIMIT $4"
+);
+
+/// [`super::Store::change_by_seq`].
+pub const CHANGE_BY_SEQ: &str = concat!(
+    "SELECT ",
+    change_columns!(),
+    " FROM changes WHERE document_id = $1 AND seq = $2"
+);
+
+/// [`super::Tx::set_document_head`].
+pub const SET_DOCUMENT_HEAD: &str =
+    "UPDATE documents SET head_seq = $2, updated_at = $3 WHERE id = $1";
+
+/// [`super::Tx::set_reverted_by`]: only a row not yet reverted.
+pub const SET_REVERTED_BY: &str = "UPDATE changes SET reverted_by = $3 \
+     WHERE document_id = $1 AND seq = $2 AND reverted_by IS NULL";
+
+/// [`super::Tx::replace_assembly_refs`], first statement.
+pub const DELETE_ASSEMBLY_REFS: &str = "DELETE FROM assembly_refs WHERE assembly_id = $1";
+
+/// [`super::Tx::replace_assembly_refs`], once per row.
+pub const INSERT_ASSEMBLY_REF: &str = "INSERT INTO assembly_refs (assembly_id, component_id, \
+     part_id, seq) VALUES ($1, $2, $3, $4)";
+
+/// [`super::Store::assembly_refs`].
+pub const ASSEMBLY_REFS: &str = "SELECT assembly_id, component_id, part_id, seq FROM assembly_refs \
+     WHERE assembly_id = $1 ORDER BY component_id";
+
+/// [`super::Store::snapshot_at_or_before`]: the highest seq not above `$2`, then the highest epoch.
+pub const SNAPSHOT_AT_OR_BEFORE: &str = "SELECT document_id, epoch, seq, key, size, created_at \
+     FROM snapshots WHERE document_id = $1 AND seq <= $2 ORDER BY seq DESC, epoch DESC LIMIT 1";
+
+/// [`super::Store::snapshot_row`], [`super::Tx::snapshot_row`].
+pub const SNAPSHOT_ROW: &str = "SELECT document_id, epoch, seq, key, size, created_at \
+     FROM snapshots WHERE document_id = $1 AND epoch = $2 AND seq = $3";
+
+// ------------------------------------------------------------------ room leases
+
+/// [`super::Store::room_lease`], [`super::Tx::room_lease`].
+pub const ROOM_LEASE: &str =
+    "SELECT document_id, node_id, epoch, expires_at FROM room_leases WHERE document_id = $1";
+
+/// [`super::Tx::insert_room_lease`].
+pub const INSERT_ROOM_LEASE: &str = "INSERT INTO room_leases (document_id, node_id, epoch, \
+     expires_at) VALUES ($1, $2, $3, $4)";
+
+/// [`super::Tx::lock_room_lease`]: an update that changes nothing, so that the row is locked
+/// until the transaction ends (PostgreSQL; SQLite's write transaction already excludes every other
+/// writer), answering the epoch.
+pub const LOCK_ROOM_LEASE: &str =
+    "UPDATE room_leases SET epoch = epoch WHERE document_id = $1 RETURNING epoch";
+
+/// [`super::Tx::take_room_lease`]: the next epoch, for `$2` until `$3`.
+pub const TAKE_ROOM_LEASE: &str = "UPDATE room_leases SET node_id = $2, epoch = epoch + 1, \
+     expires_at = $3 WHERE document_id = $1 RETURNING epoch";

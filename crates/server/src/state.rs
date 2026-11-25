@@ -9,9 +9,10 @@ use crate::clock::Clock;
 use crate::config::{Database, Settings, Storage};
 use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
+use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::sessions::Sessions;
-use crate::store::{SqliteStore, Store};
+use crate::store::{SqliteStore, Store, new_id};
 
 /// The server's shared state. Cloning is cheap: every field is shared.
 #[derive(Clone)]
@@ -24,16 +25,26 @@ pub struct AppState {
     pub settings: Arc<Settings>,
     pub sessions: Sessions,
     pub clock: Clock,
+    /// Makes accepted changes durable; started on `store` by [`AppState::new`].
+    pub journal: JournalWriter,
+    /// This process, as room leases name it: random per process.
+    pub node_id: String,
 }
 
 impl AppState {
     /// State over a store and blob storage, with no extensions, the system clock and a
     /// [`MemoryMailer`] (which keeps messages rather than sending them; it reports itself as
     /// configured exactly when the settings name a mail server and a sender). Replace any public
-    /// field afterwards to change it. A running server is built with [`AppState::from_settings`].
+    /// field afterwards to change it (after replacing `store`, start a new `journal` on it). A
+    /// running server is built with [`AppState::from_settings`].
+    ///
+    /// Starts the journal writer, so it must be called inside a tokio runtime.
     pub fn new(settings: Settings, store: Arc<dyn Store>, blobs: Arc<dyn Blobs>) -> Self {
         let mailer = Arc::new(MemoryMailer::new(settings.email_configured()));
+        let journal = JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT);
         Self {
+            journal,
+            node_id: new_id(),
             store,
             blobs,
             hub: Hub::default(),

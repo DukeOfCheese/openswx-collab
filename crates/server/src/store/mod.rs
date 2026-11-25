@@ -339,6 +339,61 @@ pub struct SnapshotRow {
     pub created_at: f64,
 }
 
+/// One accepted change in a document's journal (`changes`). `ops`, `inverse`, `paths` and `reads`
+/// are MessagePack in the forms [`crate::record`] writes.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ChangeRow {
+    pub document_id: Id,
+    pub seq: i64,
+    /// The seq it follows (`seq - 1` on the one branch there is).
+    pub parent_seq: i64,
+    /// Always `main` for now.
+    pub branch_id: String,
+    /// The room lease epoch it was written under.
+    pub epoch: i64,
+    pub author_id: Id,
+    /// The connection that sent it (`<user id>.<client id>`, as the conflict index knows it);
+    /// `None` for a change the server made (a restore).
+    pub client_id: Option<String>,
+    /// The sender's id for it; unique per document and `client_id`.
+    pub change_id: Option<String>,
+    pub created_at: f64,
+    pub command: String,
+    pub ops: Vec<u8>,
+    pub inverse: Vec<u8>,
+    pub paths: Vec<u8>,
+    pub reads: Vec<u8>,
+    /// The seq of the change it undoes.
+    pub undo_of: Option<i64>,
+    /// The seq of the change it reverts (from history).
+    pub reverts: Option<i64>,
+    /// The seq of the change that reverted it.
+    pub reverted_by: Option<i64>,
+    /// JSON: what a rebuild found it broke (later tasks).
+    pub broke: Option<String>,
+}
+
+/// A component of an assembly and the part it refers to (`assembly_refs`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct AssemblyRefRow {
+    pub assembly_id: Id,
+    pub component_id: String,
+    pub part_id: Id,
+    /// The seq of the change that recorded it.
+    pub seq: i64,
+}
+
+/// Which node holds a document's room, under which epoch (`room_leases`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RoomLease {
+    pub document_id: Id,
+    pub node_id: String,
+    /// Bumped by every acquisition; journal writes carry it and are refused when it moved on.
+    pub epoch: i64,
+    /// A hint for other nodes (project 3), never the guard.
+    pub expires_at: f64,
+}
+
 /// The database. One method per query; see the module documentation for how to add one.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
@@ -431,6 +486,40 @@ pub trait Store: Send + Sync + 'static {
 
     /// A project's folders, by name then id.
     async fn folders_in_project(&self, project_id: &str) -> anyhow::Result<Vec<Folder>>;
+
+    /// A document's journal rows with `after < seq <= upto`, in seq order, at most `limit` of them.
+    async fn changes_between(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeRow>>;
+
+    /// One journal row.
+    async fn change_by_seq(&self, document_id: &str, seq: i64)
+    -> anyhow::Result<Option<ChangeRow>>;
+
+    /// A document's snapshot with the highest seq not above `seq` (then the highest epoch).
+    async fn snapshot_at_or_before(
+        &self,
+        document_id: &str,
+        seq: i64,
+    ) -> anyhow::Result<Option<SnapshotRow>>;
+
+    /// The snapshot row of a document at `(epoch, seq)`.
+    async fn snapshot_row(
+        &self,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> anyhow::Result<Option<SnapshotRow>>;
+
+    /// A document's room lease.
+    async fn room_lease(&self, document_id: &str) -> anyhow::Result<Option<RoomLease>>;
+
+    /// An assembly's component references, by component id.
+    async fn assembly_refs(&self, assembly_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>>;
 }
 
 /// A write transaction (or a savepoint within one). Dropping it without [`Tx::commit`] rolls it
@@ -647,4 +736,57 @@ pub trait Tx: Send {
     /// Deletes a folder. Move what is inside it first: the database deletes folders inside it with
     /// it and moves documents inside it to the top of the project.
     async fn delete_folder(&mut self, id: &str) -> anyhow::Result<()>;
+
+    /// Adds a journal row; `false` (and nothing written, the transaction still usable) when the
+    /// document already has a row with the same `client_id` and `change_id`.
+    async fn insert_change(&mut self, change: &ChangeRow) -> anyhow::Result<bool>;
+
+    /// Sets a document's head seq and when its content last changed.
+    async fn set_document_head(
+        &mut self,
+        id: &str,
+        head_seq: i64,
+        updated_at: f64,
+    ) -> anyhow::Result<()>;
+
+    /// Marks the journal row `seq` as reverted by `by`; `false` if it is missing or already reverted.
+    async fn set_reverted_by(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+        by: i64,
+    ) -> anyhow::Result<bool>;
+
+    /// Replaces every component reference of an assembly with `rows`.
+    async fn replace_assembly_refs(
+        &mut self,
+        assembly_id: &str,
+        rows: &[AssemblyRefRow],
+    ) -> anyhow::Result<()>;
+
+    /// [`Store::snapshot_row`], seeing this transaction's writes.
+    async fn snapshot_row(
+        &mut self,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> anyhow::Result<Option<SnapshotRow>>;
+
+    /// [`Store::room_lease`], seeing this transaction's writes.
+    async fn room_lease(&mut self, document_id: &str) -> anyhow::Result<Option<RoomLease>>;
+
+    /// Locks a document's lease row until the transaction ends and answers its epoch (`None`: no
+    /// row).
+    async fn lock_room_lease(&mut self, document_id: &str) -> anyhow::Result<Option<i64>>;
+
+    async fn insert_room_lease(&mut self, lease: &RoomLease) -> anyhow::Result<()>;
+
+    /// Gives a document's existing lease to `node_id` until `expires_at` under the next epoch, and
+    /// answers that epoch (`None`: no row).
+    async fn take_room_lease(
+        &mut self,
+        document_id: &str,
+        node_id: &str,
+        expires_at: f64,
+    ) -> anyhow::Result<Option<i64>>;
 }

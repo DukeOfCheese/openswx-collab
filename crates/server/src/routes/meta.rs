@@ -63,12 +63,17 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-/// 200 when the database and the storage answer, else 503. Why is logged, not told.
+/// 200 when the database and the storage answer and the journal writer runs, else 503. Why is
+/// logged, not told.
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let store = tokio::time::timeout(READY_TIMEOUT, state.store.health());
     let blobs = tokio::time::timeout(READY_TIMEOUT, state.blobs.health());
     let (store, blobs) = tokio::join!(store, blobs);
     let mut ok = true;
+    if !state.journal.healthy() {
+        tracing::warn!("not ready: the journal writer is not running");
+        ok = false;
+    }
     for (what, outcome) in [("database", store), ("storage", blobs)] {
         match outcome {
             Ok(Ok(())) => {}

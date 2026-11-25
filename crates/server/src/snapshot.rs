@@ -15,13 +15,15 @@
 //! blocking pool (`tokio::task::spawn_blocking`), as [`load_head_doc`] does.
 
 use std::io::{self, BufRead, Read};
+use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use bytes::Bytes;
-use oswx_core::{Index, Plain, Seq, Value};
+use oswx_core::{ClientId, Head, Index, OpError, Plain, Rules, Seq, Value, apply};
 
 use crate::blobs::Blobs;
-use crate::store::Store;
+use crate::record::{RecordError, decode_ops, decode_paths, decode_reads};
+use crate::store::{ChangeRow, SnapshotRow, Store};
 
 /// The snapshot format this server writes and reads.
 pub const FORMAT: u64 = 1;
@@ -149,35 +151,201 @@ fn io_error(_: io::Error) -> SnapshotError {
     SnapshotError::Compression
 }
 
-/// The document as it is now: its newest snapshot, decoded on the blocking pool. Answers the
-/// document, its index and the seq it is at. A document without a snapshot row, or whose snapshot
-/// file is missing or unreadable, is an error (the server wrote both when it created the document).
-///
-/// TASK 8: this also replays the journal after the snapshot.
+/// The document as it is now ([`load_head`]): the document, its index and the seq it is at.
 pub async fn load_head_doc(
     store: &dyn Store,
     blobs: &dyn Blobs,
     doc_id: &str,
 ) -> anyhow::Result<(Value, Index, Seq)> {
-    let Some(row) = store.latest_snapshot(doc_id).await? else {
-        bail!("document {doc_id} has no snapshot");
-    };
-    let Some(bytes) = blobs.get(&row.key).await? else {
-        bail!("the snapshot {} of document {doc_id} is missing", row.key);
-    };
+    let (head, _) = load_head(store, blobs, doc_id).await?;
+    Ok((head.doc, head.index, head.seq))
+}
+
+/// The client id under which the conflict index records a change the server made (a journal row
+/// with no `client_id`, such as a restore). A real client is `<user id>.<client id>`, which never
+/// starts with `~`.
+pub const SERVER_CLIENT: &str = "~server";
+
+/// How many journal rows loading reads at a time.
+const REPLAY_PAGE: i64 = 500;
+
+/// Why a document could not be loaded. Each is an error, never a panic, and never a silently
+/// shorter document.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("there is no such document")]
+    NoDocument,
+    /// `state_at` was asked for a seq below 0 or above the head.
+    #[error("the document has no state {0}")]
+    NoState(i64),
+    #[error("the document has no snapshot at or before seq {0}")]
+    NoSnapshot(i64),
+    #[error("the snapshot {0} is missing from storage")]
+    SnapshotMissing(String),
+    #[error("the snapshot {key} cannot be read: {error}")]
+    Snapshot { key: String, error: SnapshotError },
+    #[error("the snapshot {key} holds seq {found}, its row says {row}")]
+    SnapshotSeq { key: String, found: Seq, row: i64 },
+    /// The journal has no row with this seq, though the document's head is at or above it.
+    #[error("the journal has no change {0}")]
+    Gap(Seq),
+    #[error("the journal's change {seq} is damaged: {error}")]
+    Damaged { seq: Seq, error: RecordError },
+    #[error("the journal's change {seq} does not apply: {error}")]
+    DoesNotApply { seq: Seq, error: OpError },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+/// A document's head, as the room had it in memory when it wrote its last change, and the epoch of
+/// the snapshot it started from.
+///
+/// It reads the snapshot with the greatest seq at or below `documents.head_seq` (ties: the greatest
+/// epoch), decodes it on the blocking pool, then replays every journal row after it in order: the
+/// stored operations are applied with [`oswx_core::apply()`] (`Rules::default()`, no id prefix:
+/// these changes were judged when they were accepted) and the stored writes, removals and reads are
+/// recorded into the index under the stored `client_id` ([`SERVER_CLIENT`] for none). A document
+/// created and never acquired has a snapshot at epoch 0.
+pub async fn load_head(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+    doc: &str,
+) -> Result<(Head, u64), LoadError> {
+    let document = store
+        .document_by_id(doc)
+        .await?
+        .ok_or(LoadError::NoDocument)?;
+    let (head, epoch) = replay_to(store, blobs, doc, document.head_seq, true).await?;
+    let epoch = u64::try_from(epoch).map_err(anyhow::Error::from)?;
+    Ok((head, epoch))
+}
+
+/// The document as it was at `seq`: the nearest snapshot at or before it, and the journal replayed
+/// up to it. A seq below 0 or above the head is [`LoadError::NoState`].
+pub async fn state_at(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+    doc: &str,
+    seq: i64,
+) -> Result<Value, LoadError> {
+    let document = store
+        .document_by_id(doc)
+        .await?
+        .ok_or(LoadError::NoDocument)?;
+    if seq < 0 || seq > document.head_seq {
+        return Err(LoadError::NoState(seq));
+    }
+    Ok(replay_to(store, blobs, doc, seq, false).await?.0.doc)
+}
+
+/// The nearest snapshot at or before `target`, with the journal replayed up to `target` (the index
+/// too when `with_index`); and the snapshot's epoch.
+async fn replay_to(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+    doc: &str,
+    target: i64,
+    with_index: bool,
+) -> Result<(Head, i64), LoadError> {
+    let row = store
+        .snapshot_at_or_before(doc, target)
+        .await?
+        .ok_or(LoadError::NoSnapshot(target))?;
+    let bytes = blobs
+        .get(&row.key)
+        .await?
+        .ok_or_else(|| LoadError::SnapshotMissing(row.key.clone()))?;
     let decoded = tokio::task::spawn_blocking(move || decode(&bytes))
         .await
-        .context("decoding a snapshot")?
-        .with_context(|| format!("reading the snapshot {}", row.key))?;
-    if i64::try_from(decoded.2).ok() != Some(row.seq) {
-        bail!(
-            "the snapshot {} holds seq {}, its row says {}",
-            row.key,
-            decoded.2,
-            row.seq
-        );
+        .context("decoding a snapshot")?;
+    let (doc_value, index, seq) = decoded.map_err(|error| LoadError::Snapshot {
+        key: row.key.clone(),
+        error,
+    })?;
+    if i64::try_from(seq).ok() != Some(row.seq) {
+        return Err(LoadError::SnapshotSeq {
+            key: row.key,
+            found: seq,
+            row: row.seq,
+        });
     }
-    Ok(decoded)
+    let mut head = Head {
+        seq,
+        doc: doc_value,
+        index,
+    };
+    let mut at = row.seq;
+    while at < target {
+        let rows = store.changes_between(doc, at, target, REPLAY_PAGE).await?;
+        if rows.is_empty() {
+            return Err(LoadError::Gap(head.seq + 1));
+        }
+        head = tokio::task::spawn_blocking(move || replay(head, rows, with_index))
+            .await
+            .context("replaying the journal")??;
+        at = i64::try_from(head.seq).map_err(anyhow::Error::from)?;
+    }
+    Ok((head, row.epoch))
+}
+
+/// `head` with `rows` applied, in order; each must be the next seq.
+fn replay(mut head: Head, rows: Vec<ChangeRow>, with_index: bool) -> Result<Head, LoadError> {
+    for row in rows {
+        let seq = head.seq + 1;
+        if i64::try_from(seq).ok() != Some(row.seq) {
+            return Err(LoadError::Gap(seq));
+        }
+        let damaged = |error| LoadError::Damaged { seq, error };
+        let ops = decode_ops(&row.ops).map_err(damaged)?;
+        let doc = apply(&head.doc, &ops, &Rules::default(), None)
+            .map_err(|error| LoadError::DoesNotApply { seq, error })?
+            .doc;
+        let index = if with_index {
+            let (writes, removed) = decode_paths(&row.paths).map_err(damaged)?;
+            let reads = decode_reads(&row.reads).map_err(damaged)?;
+            let client: ClientId = Arc::from(row.client_id.as_deref().unwrap_or(SERVER_CLIENT));
+            head.index.record(seq, &client, &writes, &removed, &reads)
+        } else {
+            head.index
+        };
+        head = Head { seq, doc, index };
+    }
+    Ok(head)
+}
+
+/// Writes a snapshot of `head`, a version the room has published, under lease `epoch`: encoded on
+/// the blocking pool, stored under [`snapshot_key`], then its `snapshots` row inserted. Writing one
+/// that already has its row does nothing. Older snapshots are never deleted.
+pub async fn write_snapshot(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+    doc: &str,
+    epoch: u64,
+    head: &Head,
+    now: f64,
+) -> anyhow::Result<()> {
+    let (epoch_i, seq_i) = (i64::try_from(epoch)?, i64::try_from(head.seq)?);
+    if store.snapshot_row(doc, epoch_i, seq_i).await?.is_some() {
+        return Ok(());
+    }
+    let key = snapshot_key(doc, epoch, head.seq);
+    let (value, index, seq) = (head.doc.clone(), head.index.clone(), head.seq);
+    let bytes = tokio::task::spawn_blocking(move || encode(&value, &index, seq)).await?;
+    let row = SnapshotRow {
+        document_id: doc.to_owned(),
+        epoch: epoch_i,
+        seq: seq_i,
+        key: key.clone(),
+        size: i64::try_from(bytes.len())?,
+        created_at: now,
+    };
+    blobs.put(&key, bytes).await?;
+    let mut tx = store.begin().await?;
+    if tx.snapshot_row(doc, epoch_i, seq_i).await?.is_none() {
+        tx.insert_snapshot(&row).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]

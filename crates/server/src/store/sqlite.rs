@@ -49,9 +49,9 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project,
-    ProjectMember, ProjectWithRole, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx,
-    User, sql,
+    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary,
+    PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus,
+    Session, SnapshotRow, Store, Tx, User, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -386,6 +386,45 @@ impl Store for SqliteStore {
     async fn folders_in_project(&self, project_id: &str) -> Result<Vec<Folder>> {
         q::folders_in_project(&mut *self.reader().await?, project_id).await
     }
+
+    async fn changes_between(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeRow>> {
+        q::changes_between(&mut *self.reader().await?, document_id, after, upto, limit).await
+    }
+
+    async fn change_by_seq(&self, document_id: &str, seq: i64) -> Result<Option<ChangeRow>> {
+        q::change_by_seq(&mut *self.reader().await?, document_id, seq).await
+    }
+
+    async fn snapshot_at_or_before(
+        &self,
+        document_id: &str,
+        seq: i64,
+    ) -> Result<Option<SnapshotRow>> {
+        q::snapshot_at_or_before(&mut *self.reader().await?, document_id, seq).await
+    }
+
+    async fn snapshot_row(
+        &self,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> Result<Option<SnapshotRow>> {
+        q::snapshot_row(&mut *self.reader().await?, document_id, epoch, seq).await
+    }
+
+    async fn room_lease(&self, document_id: &str) -> Result<Option<RoomLease>> {
+        q::room_lease(&mut *self.reader().await?, document_id).await
+    }
+
+    async fn assembly_refs(&self, assembly_id: &str) -> Result<Vec<AssemblyRefRow>> {
+        q::assembly_refs(&mut *self.reader().await?, assembly_id).await
+    }
 }
 
 /// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
@@ -688,6 +727,56 @@ impl Tx for SqliteTx<'_> {
 
     async fn delete_folder(&mut self, id: &str) -> Result<()> {
         q::delete_folder(self.conn(), id).await
+    }
+
+    async fn insert_change(&mut self, change: &ChangeRow) -> Result<bool> {
+        q::insert_change(self.conn(), change).await
+    }
+
+    async fn set_document_head(&mut self, id: &str, head_seq: i64, updated_at: f64) -> Result<()> {
+        q::set_document_head(self.conn(), id, head_seq, updated_at).await
+    }
+
+    async fn set_reverted_by(&mut self, document_id: &str, seq: i64, by: i64) -> Result<bool> {
+        q::set_reverted_by(self.conn(), document_id, seq, by).await
+    }
+
+    async fn replace_assembly_refs(
+        &mut self,
+        assembly_id: &str,
+        rows: &[AssemblyRefRow],
+    ) -> Result<()> {
+        q::replace_assembly_refs(self.conn(), assembly_id, rows).await
+    }
+
+    async fn snapshot_row(
+        &mut self,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> Result<Option<SnapshotRow>> {
+        q::snapshot_row(self.conn(), document_id, epoch, seq).await
+    }
+
+    async fn room_lease(&mut self, document_id: &str) -> Result<Option<RoomLease>> {
+        q::room_lease(self.conn(), document_id).await
+    }
+
+    async fn lock_room_lease(&mut self, document_id: &str) -> Result<Option<i64>> {
+        q::lock_room_lease(self.conn(), document_id).await
+    }
+
+    async fn insert_room_lease(&mut self, lease: &RoomLease) -> Result<()> {
+        q::insert_room_lease(self.conn(), lease).await
+    }
+
+    async fn take_room_lease(
+        &mut self,
+        document_id: &str,
+        node_id: &str,
+        expires_at: f64,
+    ) -> Result<Option<i64>> {
+        q::take_room_lease(self.conn(), document_id, node_id, expires_at).await
     }
 }
 
@@ -1416,5 +1505,190 @@ mod q {
     pub async fn delete_folder(c: &mut SqliteConnection, id: &str) -> Result<()> {
         sqlx::query(sql::DELETE_FOLDER).bind(id).execute(c).await?;
         Ok(())
+    }
+
+    pub async fn insert_change(c: &mut SqliteConnection, r: &ChangeRow) -> Result<bool> {
+        let done = sqlx::query(sql::INSERT_CHANGE)
+            .bind(&r.document_id)
+            .bind(r.seq)
+            .bind(r.parent_seq)
+            .bind(&r.branch_id)
+            .bind(r.epoch)
+            .bind(&r.author_id)
+            .bind(&r.client_id)
+            .bind(&r.change_id)
+            .bind(r.created_at)
+            .bind(&r.command)
+            .bind(&r.ops)
+            .bind(&r.inverse)
+            .bind(&r.paths)
+            .bind(&r.reads)
+            .bind(r.undo_of)
+            .bind(r.reverts)
+            .bind(r.reverted_by)
+            .bind(&r.broke)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn changes_between(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeRow>> {
+        Ok(sqlx::query_as(sql::CHANGES_BETWEEN)
+            .bind(document_id)
+            .bind(after)
+            .bind(upto)
+            .bind(limit)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn change_by_seq(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        seq: i64,
+    ) -> Result<Option<ChangeRow>> {
+        Ok(sqlx::query_as(sql::CHANGE_BY_SEQ)
+            .bind(document_id)
+            .bind(seq)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn set_document_head(
+        c: &mut SqliteConnection,
+        id: &str,
+        head_seq: i64,
+        updated_at: f64,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_DOCUMENT_HEAD)
+            .bind(id)
+            .bind(head_seq)
+            .bind(updated_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_reverted_by(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        seq: i64,
+        by: i64,
+    ) -> Result<bool> {
+        let done = sqlx::query(sql::SET_REVERTED_BY)
+            .bind(document_id)
+            .bind(seq)
+            .bind(by)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn replace_assembly_refs(
+        c: &mut SqliteConnection,
+        assembly_id: &str,
+        rows: &[AssemblyRefRow],
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_ASSEMBLY_REFS)
+            .bind(assembly_id)
+            .execute(&mut *c)
+            .await?;
+        for r in rows {
+            sqlx::query(sql::INSERT_ASSEMBLY_REF)
+                .bind(&r.assembly_id)
+                .bind(&r.component_id)
+                .bind(&r.part_id)
+                .bind(r.seq)
+                .execute(&mut *c)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn assembly_refs(
+        c: &mut SqliteConnection,
+        assembly_id: &str,
+    ) -> Result<Vec<AssemblyRefRow>> {
+        Ok(sqlx::query_as(sql::ASSEMBLY_REFS)
+            .bind(assembly_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn snapshot_at_or_before(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        seq: i64,
+    ) -> Result<Option<SnapshotRow>> {
+        Ok(sqlx::query_as(sql::SNAPSHOT_AT_OR_BEFORE)
+            .bind(document_id)
+            .bind(seq)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn snapshot_row(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> Result<Option<SnapshotRow>> {
+        Ok(sqlx::query_as(sql::SNAPSHOT_ROW)
+            .bind(document_id)
+            .bind(epoch)
+            .bind(seq)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn room_lease(
+        c: &mut SqliteConnection,
+        document_id: &str,
+    ) -> Result<Option<RoomLease>> {
+        Ok(sqlx::query_as(sql::ROOM_LEASE)
+            .bind(document_id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn lock_room_lease(
+        c: &mut SqliteConnection,
+        document_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(sql::LOCK_ROOM_LEASE)
+            .bind(document_id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn insert_room_lease(c: &mut SqliteConnection, l: &RoomLease) -> Result<()> {
+        sqlx::query(sql::INSERT_ROOM_LEASE)
+            .bind(&l.document_id)
+            .bind(&l.node_id)
+            .bind(l.epoch)
+            .bind(l.expires_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn take_room_lease(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        node_id: &str,
+        expires_at: f64,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(sql::TAKE_ROOM_LEASE)
+            .bind(document_id)
+            .bind(node_id)
+            .bind(expires_at)
+            .fetch_optional(c)
+            .await?)
     }
 }

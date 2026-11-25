@@ -2,19 +2,20 @@
 #![allow(dead_code)] // each test file uses part of the harness
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use oswx_server::blobs::{Blobs, LocalBlobs};
 use oswx_server::hub::Hub;
+use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project,
-    ProjectMember, ProjectWithRole, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx,
-    User,
+    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary,
+    PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session,
+    SnapshotRow, SqliteStore, Store, Tx, User,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -104,6 +105,10 @@ impl TestServer {
         let plain: Arc<dyn Store> = Arc::new(db.clone());
         let mut app_state = AppState::new(s, plain.clone(), blobs);
         state(&mut app_state);
+        if !std::ptr::addr_eq(Arc::as_ptr(&app_state.store), Arc::as_ptr(&plain)) {
+            // The test put in a store of its own: the journal writes through it too.
+            app_state.journal = new_journal(&app_state.store);
+        }
         let store_kind = if std::ptr::addr_eq(Arc::as_ptr(&app_state.store), Arc::as_ptr(&plain)) {
             StoreKind::Plain
         } else {
@@ -144,6 +149,7 @@ impl TestServer {
     /// (around the reopened database). The port changes; use the new `base`.
     pub async fn restart(mut self) -> Self {
         self.shutdown().await;
+        self.state.journal.close().await;
         self.db.close().await;
         let mut state = self.state.clone();
         state.hub = Hub::default();
@@ -155,6 +161,8 @@ impl TestServer {
             StoreKind::Flaky(flaky) => flaky.set_inner(reopened),
             StoreKind::Custom => panic!("restart() cannot reopen a store the test put in itself"),
         }
+        state.journal = new_journal(&state.store);
+        state.node_id = oswx_server::store::new_id();
         Self::serve(state, db, self.store_kind.clone(), self.dir.clone()).await
     }
 
@@ -343,6 +351,11 @@ impl TestServer {
     }
 }
 
+/// A journal writer on `store` with the server's batch settings.
+pub fn new_journal(store: &Arc<dyn Store>) -> JournalWriter {
+    JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT)
+}
+
 /// The password [`TestServer::register`] gives accounts.
 pub const PASSWORD: &str = "correct horse";
 
@@ -470,6 +483,8 @@ pub struct FlakyStore {
     fail_commit: Arc<AtomicBool>,
     commit_then_fail: Arc<AtomicBool>,
     fail_document_reads: AtomicBool,
+    panic_on_begin: AtomicBool,
+    begins: AtomicUsize,
 }
 
 impl FlakyStore {
@@ -480,7 +495,20 @@ impl FlakyStore {
             fail_commit: Arc::new(AtomicBool::new(false)),
             commit_then_fail: Arc::new(AtomicBool::new(false)),
             fail_document_reads: AtomicBool::new(false),
+            panic_on_begin: AtomicBool::new(false),
+            begins: AtomicUsize::new(0),
         }
+    }
+
+    /// Makes [`Store::begin`] panic (`true`), as a bug in the caller's task would, or delegate
+    /// again (`false`).
+    pub fn panic_on_begin(&self, panic: bool) {
+        self.panic_on_begin.store(panic, Ordering::SeqCst);
+    }
+
+    /// How many transactions [`Store::begin`] has opened so far.
+    pub fn begins(&self) -> usize {
+        self.begins.load(Ordering::SeqCst)
     }
 
     /// The store this one delegates to.
@@ -533,6 +561,10 @@ impl Store for FlakyStore {
     }
 
     async fn begin(&self) -> anyhow::Result<Box<dyn Tx>> {
+        if self.panic_on_begin.load(Ordering::SeqCst) {
+            panic!("the flaky store was told to panic in begin");
+        }
+        self.begins.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FlakyTx {
             inner: self.inner().begin().await?,
             fail_commit: self.fail_commit.clone(),
@@ -644,6 +676,51 @@ impl Store for FlakyStore {
 
     async fn folders_in_project(&self, project_id: &str) -> anyhow::Result<Vec<Folder>> {
         self.inner().folders_in_project(project_id).await
+    }
+
+    async fn changes_between(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeRow>> {
+        self.inner()
+            .changes_between(document_id, after, upto, limit)
+            .await
+    }
+
+    async fn change_by_seq(
+        &self,
+        document_id: &str,
+        seq: i64,
+    ) -> anyhow::Result<Option<ChangeRow>> {
+        self.inner().change_by_seq(document_id, seq).await
+    }
+
+    async fn snapshot_at_or_before(
+        &self,
+        document_id: &str,
+        seq: i64,
+    ) -> anyhow::Result<Option<SnapshotRow>> {
+        self.inner().snapshot_at_or_before(document_id, seq).await
+    }
+
+    async fn snapshot_row(
+        &self,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> anyhow::Result<Option<SnapshotRow>> {
+        self.inner().snapshot_row(document_id, epoch, seq).await
+    }
+
+    async fn room_lease(&self, document_id: &str) -> anyhow::Result<Option<RoomLease>> {
+        self.inner().room_lease(document_id).await
+    }
+
+    async fn assembly_refs(&self, assembly_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>> {
+        self.inner().assembly_refs(assembly_id).await
     }
 }
 
@@ -957,6 +1034,68 @@ impl Tx for FlakyTx {
 
     async fn delete_folder(&mut self, id: &str) -> anyhow::Result<()> {
         self.inner.delete_folder(id).await
+    }
+
+    async fn insert_change(&mut self, change: &ChangeRow) -> anyhow::Result<bool> {
+        self.inner.insert_change(change).await
+    }
+
+    async fn set_document_head(
+        &mut self,
+        id: &str,
+        head_seq: i64,
+        updated_at: f64,
+    ) -> anyhow::Result<()> {
+        self.inner.set_document_head(id, head_seq, updated_at).await
+    }
+
+    async fn set_reverted_by(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+        by: i64,
+    ) -> anyhow::Result<bool> {
+        self.inner.set_reverted_by(document_id, seq, by).await
+    }
+
+    async fn replace_assembly_refs(
+        &mut self,
+        assembly_id: &str,
+        rows: &[AssemblyRefRow],
+    ) -> anyhow::Result<()> {
+        self.inner.replace_assembly_refs(assembly_id, rows).await
+    }
+
+    async fn snapshot_row(
+        &mut self,
+        document_id: &str,
+        epoch: i64,
+        seq: i64,
+    ) -> anyhow::Result<Option<SnapshotRow>> {
+        self.inner.snapshot_row(document_id, epoch, seq).await
+    }
+
+    async fn room_lease(&mut self, document_id: &str) -> anyhow::Result<Option<RoomLease>> {
+        self.inner.room_lease(document_id).await
+    }
+
+    async fn lock_room_lease(&mut self, document_id: &str) -> anyhow::Result<Option<i64>> {
+        self.inner.lock_room_lease(document_id).await
+    }
+
+    async fn insert_room_lease(&mut self, lease: &RoomLease) -> anyhow::Result<()> {
+        self.inner.insert_room_lease(lease).await
+    }
+
+    async fn take_room_lease(
+        &mut self,
+        document_id: &str,
+        node_id: &str,
+        expires_at: f64,
+    ) -> anyhow::Result<Option<i64>> {
+        self.inner
+            .take_room_lease(document_id, node_id, expires_at)
+            .await
     }
 }
 
