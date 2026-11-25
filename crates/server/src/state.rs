@@ -80,6 +80,13 @@ impl AppState {
         state.mailer = mailer;
         Ok(state)
     }
+
+    /// The orderly end of a server, once it has stopped accepting requests: closes the rooms and
+    /// connections, then writes what the journal still has queued and stops it.
+    pub async fn shutdown(&self) {
+        self.hub.shutdown().await;
+        self.journal.close().await;
+    }
 }
 
 /// The whole HTTP application for this state.

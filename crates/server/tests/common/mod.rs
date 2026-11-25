@@ -13,9 +13,9 @@ use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary,
-    PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session,
-    SnapshotRow, SqliteStore, Store, Tx, User,
+    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange, Org, OrgMember,
+    OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus,
+    Session, SnapshotRow, SqliteStore, Store, Tx, User,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -149,7 +149,6 @@ impl TestServer {
     /// (around the reopened database). The port changes; use the new `base`.
     pub async fn restart(mut self) -> Self {
         self.shutdown().await;
-        self.state.journal.close().await;
         self.db.close().await;
         let mut state = self.state.clone();
         state.hub = Hub::default();
@@ -198,7 +197,8 @@ impl TestServer {
         }
     }
 
-    /// Stops accepting, gives open requests a moment to finish, then closes the hub.
+    /// Stops accepting, gives open requests a moment to finish, then shuts the state down (the hub,
+    /// then the journal, which writes what it has queued).
     async fn shutdown(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -212,7 +212,7 @@ impl TestServer {
                 abort.abort();
             }
         }
-        self.state.hub.shutdown().await;
+        self.state.shutdown().await;
     }
 
     /// The test database as this server opened it.
@@ -484,6 +484,7 @@ pub struct FlakyStore {
     commit_then_fail: Arc<AtomicBool>,
     fail_document_reads: AtomicBool,
     panic_on_begin: AtomicBool,
+    hang_commit: Arc<AtomicBool>,
     begins: AtomicUsize,
 }
 
@@ -496,6 +497,7 @@ impl FlakyStore {
             commit_then_fail: Arc::new(AtomicBool::new(false)),
             fail_document_reads: AtomicBool::new(false),
             panic_on_begin: AtomicBool::new(false),
+            hang_commit: Arc::new(AtomicBool::new(false)),
             begins: AtomicUsize::new(0),
         }
     }
@@ -504,6 +506,12 @@ impl FlakyStore {
     /// again (`false`).
     pub fn panic_on_begin(&self, panic: bool) {
         self.panic_on_begin.store(panic, Ordering::SeqCst);
+    }
+
+    /// Makes every transaction's `commit` never return (`true`), as a database that stopped
+    /// answering; or delegate again (`false`). A transaction dropped while hanging rolls back.
+    pub fn hang_commit(&self, hang: bool) {
+        self.hang_commit.store(hang, Ordering::SeqCst);
     }
 
     /// How many transactions [`Store::begin`] has opened so far.
@@ -569,6 +577,7 @@ impl Store for FlakyStore {
             inner: self.inner().begin().await?,
             fail_commit: self.fail_commit.clone(),
             commit_then_fail: self.commit_then_fail.clone(),
+            hang_commit: self.hang_commit.clone(),
         }))
     }
 
@@ -729,11 +738,15 @@ pub struct FlakyTx {
     inner: Box<dyn Tx>,
     fail_commit: Arc<AtomicBool>,
     commit_then_fail: Arc<AtomicBool>,
+    hang_commit: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl Tx for FlakyTx {
     async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        if self.hang_commit.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_commit.load(Ordering::SeqCst) {
             self.inner.rollback().await?;
             anyhow::bail!("the flaky store was told to fail commits");
@@ -1036,7 +1049,7 @@ impl Tx for FlakyTx {
         self.inner.delete_folder(id).await
     }
 
-    async fn insert_change(&mut self, change: &ChangeRow) -> anyhow::Result<bool> {
+    async fn insert_change(&mut self, change: &NewChange<'_>) -> anyhow::Result<bool> {
         self.inner.insert_change(change).await
     }
 

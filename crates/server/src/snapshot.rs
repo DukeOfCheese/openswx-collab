@@ -164,6 +164,9 @@ pub async fn load_head_doc(
 /// The client id under which the conflict index records a change the server made (a journal row
 /// with no `client_id`, such as a restore). A real client is `<user id>.<client id>`, which never
 /// starts with `~`.
+///
+/// The room must decide a change it makes itself (`oswx_core::decide`) under this client id, and
+/// journal it with `client_id: None`, so that a reload rebuilds the same index the room had.
 pub const SERVER_CLIENT: &str = "~server";
 
 /// How many journal rows loading reads at a time.
@@ -206,6 +209,10 @@ pub enum LoadError {
 /// these changes were judged when they were accepted) and the stored writes, removals and reads are
 /// recorded into the index under the stored `client_id` ([`SERVER_CLIENT`] for none). A document
 /// created and never acquired has a snapshot at epoch 0.
+///
+/// The epoch returned is the snapshot's, which says where loading started; it is **not** an epoch
+/// to write under. A room calls [`crate::lease::acquire`] before it loads and puts the epoch that
+/// gives in every record (and passes it to [`write_snapshot`]).
 pub async fn load_head(
     store: &dyn Store,
     blobs: &dyn Blobs,
@@ -313,9 +320,26 @@ fn replay(mut head: Head, rows: Vec<ChangeRow>, with_index: bool) -> Result<Head
     Ok(head)
 }
 
+/// Why [`write_snapshot`] did not record a snapshot.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteSnapshotError {
+    #[error("there is no such document")]
+    NoDocument,
+    /// The head is ahead of the journal (a tentative version, not yet durable): a snapshot of it
+    /// could hold changes that are never written.
+    #[error("the snapshot's seq {seq} is ahead of the document's head seq {head_seq}")]
+    AheadOfJournal { seq: Seq, head_seq: i64 },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
 /// Writes a snapshot of `head`, a version the room has published, under lease `epoch`: encoded on
 /// the blocking pool, stored under [`snapshot_key`], then its `snapshots` row inserted. Writing one
 /// that already has its row does nothing. Older snapshots are never deleted.
+///
+/// A head whose seq is above `documents.head_seq` is refused ([`WriteSnapshotError::AheadOfJournal`],
+/// checked again inside the transaction that inserts the row): only durable versions are
+/// snapshotted.
 pub async fn write_snapshot(
     store: &dyn Store,
     blobs: &dyn Blobs,
@@ -323,24 +347,47 @@ pub async fn write_snapshot(
     epoch: u64,
     head: &Head,
     now: f64,
-) -> anyhow::Result<()> {
-    let (epoch_i, seq_i) = (i64::try_from(epoch)?, i64::try_from(head.seq)?);
+) -> Result<(), WriteSnapshotError> {
+    let epoch_i = i64::try_from(epoch).map_err(anyhow::Error::from)?;
+    let seq_i = i64::try_from(head.seq).map_err(anyhow::Error::from)?;
+    let ahead = |head_seq: i64| WriteSnapshotError::AheadOfJournal {
+        seq: head.seq,
+        head_seq,
+    };
+    // Before any work: nothing is stored for a head the journal has not reached.
+    let document = store
+        .document_by_id(doc)
+        .await?
+        .ok_or(WriteSnapshotError::NoDocument)?;
+    if seq_i > document.head_seq {
+        return Err(ahead(document.head_seq));
+    }
     if store.snapshot_row(doc, epoch_i, seq_i).await?.is_some() {
         return Ok(());
     }
     let key = snapshot_key(doc, epoch, head.seq);
     let (value, index, seq) = (head.doc.clone(), head.index.clone(), head.seq);
-    let bytes = tokio::task::spawn_blocking(move || encode(&value, &index, seq)).await?;
+    let bytes = tokio::task::spawn_blocking(move || encode(&value, &index, seq))
+        .await
+        .map_err(anyhow::Error::from)?;
     let row = SnapshotRow {
         document_id: doc.to_owned(),
         epoch: epoch_i,
         seq: seq_i,
         key: key.clone(),
-        size: i64::try_from(bytes.len())?,
+        size: i64::try_from(bytes.len()).map_err(anyhow::Error::from)?,
         created_at: now,
     };
     blobs.put(&key, bytes).await?;
     let mut tx = store.begin().await?;
+    let head_seq = tx
+        .document_by_id(doc)
+        .await?
+        .ok_or(WriteSnapshotError::NoDocument)?
+        .head_seq;
+    if seq_i > head_seq {
+        return Err(ahead(head_seq)); // dropping `tx` rolls it back
+    }
     if tx.snapshot_row(doc, epoch_i, seq_i).await?.is_none() {
         tx.insert_snapshot(&row).await?;
     }

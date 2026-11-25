@@ -49,9 +49,9 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, Org, OrgMember, OrgSummary,
-    PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus,
-    Session, SnapshotRow, Store, Tx, User, sql,
+    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange, Org, OrgMember,
+    OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError,
+    SchemaStatus, Session, SnapshotRow, Store, Tx, User, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -729,7 +729,7 @@ impl Tx for SqliteTx<'_> {
         q::delete_folder(self.conn(), id).await
     }
 
-    async fn insert_change(&mut self, change: &ChangeRow) -> Result<bool> {
+    async fn insert_change(&mut self, change: &NewChange<'_>) -> Result<bool> {
         q::insert_change(self.conn(), change).await
     }
 
@@ -1507,26 +1507,26 @@ mod q {
         Ok(())
     }
 
-    pub async fn insert_change(c: &mut SqliteConnection, r: &ChangeRow) -> Result<bool> {
+    pub async fn insert_change(c: &mut SqliteConnection, r: &NewChange<'_>) -> Result<bool> {
         let done = sqlx::query(sql::INSERT_CHANGE)
-            .bind(&r.document_id)
+            .bind(r.document_id)
             .bind(r.seq)
             .bind(r.parent_seq)
-            .bind(&r.branch_id)
+            .bind(r.branch_id)
             .bind(r.epoch)
-            .bind(&r.author_id)
-            .bind(&r.client_id)
-            .bind(&r.change_id)
+            .bind(r.author_id)
+            .bind(r.client_id)
+            .bind(r.change_id)
             .bind(r.created_at)
-            .bind(&r.command)
-            .bind(&r.ops)
-            .bind(&r.inverse)
-            .bind(&r.paths)
-            .bind(&r.reads)
+            .bind(r.command)
+            .bind(r.ops)
+            .bind(r.inverse)
+            .bind(r.paths)
+            .bind(r.reads)
             .bind(r.undo_of)
             .bind(r.reverts)
             .bind(r.reverted_by)
-            .bind(&r.broke)
+            .bind(r.broke)
             .execute(c)
             .await?;
         Ok(done.rows_affected() == 1)

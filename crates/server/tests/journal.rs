@@ -3,17 +3,19 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use common::{FlakyStore, TestServer, World, new_journal};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use oswx_core::{
     Accepted, Change, ClientId, Head, Known, Op, Path, Pos, Rules, Value, Write, decide,
 };
 use oswx_server::journal::{
-    AssemblyRef, Extra, JournalError, JournalWriter, LoadError, Record, SERVER_CLIENT, load_head,
-    state_at, write_snapshot,
+    AssemblyRef, Extra, JournalError, JournalWriter, LoadError, Record, RefusedWhy, SERVER_CLIENT,
+    WriteSnapshotError, load_head, state_at, write_snapshot,
 };
 use oswx_server::lease::acquire;
 use oswx_server::record::{encode_ops, encode_paths, encode_reads};
@@ -93,11 +95,11 @@ fn slow_writer(server: &TestServer) -> JournalWriter {
     JournalWriter::start(server.state.store.clone(), 256, Duration::from_millis(200))
 }
 
-fn refused(why: &str) -> Result<(), JournalError> {
-    Err(JournalError::Refused(why.into()))
+fn refused(why: RefusedWhy) -> Result<(), JournalError> {
+    Err(JournalError::Refused(why))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_thousand_appends_from_fifty_tasks_land_in_order_in_few_transactions() {
     let (server, flaky, world) = setup().await;
     let writer = new_journal(&server.state.store);
@@ -105,12 +107,8 @@ async fn a_thousand_appends_from_fifty_tasks_land_in_order_in_few_transactions()
     for i in 0..10 {
         let doc = new_doc(&server, &world, &format!("D{i}")).await;
         let epoch = lease(&server, &doc).await;
-        // Per document: the next seq, and the receipts in the order they were submitted.
-        docs.push(Arc::new((
-            doc,
-            epoch,
-            tokio::sync::Mutex::new((1u64, Vec::new())),
-        )));
+        // Per document: the next seq, taken and submitted under the lock (as a room orders them).
+        docs.push(Arc::new((doc, epoch, tokio::sync::Mutex::new(1u64))));
     }
     let begins = flaky.begins();
     let mut tasks = Vec::new();
@@ -118,45 +116,35 @@ async fn a_thousand_appends_from_fifty_tasks_land_in_order_in_few_transactions()
         let d = docs[t % docs.len()].clone();
         let writer = writer.clone();
         tasks.push(tokio::spawn(async move {
+            let mut mine = Vec::new();
             for _ in 0..20 {
-                // As a room does: take the seq and submit under the room's own order.
-                let mut state = d.2.lock().await;
-                let seq = state.0;
-                state.0 += 1;
-                let receipt = writer.submit(simple(&d.0, seq, d.1)).await;
-                state.1.push((seq, receipt));
+                let mut next = d.2.lock().await;
+                let seq = *next;
+                *next += 1;
+                mine.push((seq, writer.submit(simple(&d.0, seq, d.1)).await));
             }
+            // This task's own results arrive in the order it submitted them (its seqs ascend):
+            // FuturesUnordered yields each as soon as it is answered.
+            let mut pending: FuturesUnordered<_> = mine
+                .into_iter()
+                .map(|(seq, receipt)| async move { (seq, receipt.outcome().await) })
+                .collect();
+            let mut arrived = Vec::new();
+            while let Some((seq, outcome)) = pending.next().await {
+                assert_eq!(outcome, Ok(()), "seq {seq}");
+                arrived.push(seq);
+            }
+            let mut sorted = arrived.clone();
+            sorted.sort_unstable();
+            assert_eq!(arrived, sorted, "results arrive in seq order");
+            arrived.len()
         }));
     }
+    let mut total = 0;
     for t in tasks {
-        t.await.unwrap();
+        total += t.await.unwrap();
     }
-    // Await every receipt in its own task; results of one document must arrive in seq order.
-    let arrivals: Arc<Mutex<Vec<(usize, u64)>>> = Arc::default();
-    let mut waiters = Vec::new();
-    for (i, d) in docs.iter().enumerate() {
-        let receipts = std::mem::take(&mut d.2.lock().await.1);
-        for (seq, receipt) in receipts {
-            let arrivals = arrivals.clone();
-            waiters.push(tokio::spawn(async move {
-                assert_eq!(receipt.outcome().await, Ok(()), "seq {seq}");
-                arrivals.lock().unwrap().push((i, seq));
-            }));
-        }
-    }
-    for w in waiters {
-        w.await.unwrap();
-    }
-    let arrivals = arrivals.lock().unwrap().clone();
-    assert_eq!(arrivals.len(), 1000);
-    for i in 0..docs.len() {
-        let seqs: Vec<u64> = arrivals
-            .iter()
-            .filter(|(d, _)| *d == i)
-            .map(|(_, s)| *s)
-            .collect();
-        assert_eq!(seqs, (1..=100).collect::<Vec<_>>(), "document {i}");
-    }
+    assert_eq!(total, 1000);
     let transactions = flaky.begins() - begins;
     assert!(
         transactions < 1000 / 5,
@@ -213,7 +201,7 @@ async fn every_acquisition_bumps_the_epoch_and_the_old_epoch_is_refused() {
     let writer = slow_writer(&server);
     let ra = writer.submit(simple(&a, 1, 2)).await;
     let rb = writer.submit(simple(&b, 1, eb)).await;
-    assert_eq!(ra.outcome().await, refused("lease"));
+    assert_eq!(ra.outcome().await, refused(RefusedWhy::Lease));
     assert_eq!(rb.outcome().await, Ok(()));
     assert_eq!(
         (head_seq(&server, &a).await, row_count(&server, &a).await),
@@ -238,9 +226,15 @@ async fn a_document_never_acquired_takes_epoch_zero_records_only() {
     assert_eq!(row.epoch, 0);
     // The first acquisition then moves it on, and epoch 0 is refused.
     assert_eq!(lease(&server, &a).await, 1);
-    assert_eq!(writer.append(simple(&a, 2, 0)).await, refused("lease"));
+    assert_eq!(
+        writer.append(simple(&a, 2, 0)).await,
+        refused(RefusedWhy::Lease)
+    );
     // Without a row, any other epoch is refused.
-    assert_eq!(writer.append(simple(&b, 1, 5)).await, refused("lease"));
+    assert_eq!(
+        writer.append(simple(&b, 1, 5)).await,
+        refused(RefusedWhy::Lease)
+    );
     assert_eq!(store(&server).room_lease(&b).await.unwrap(), None);
 }
 
@@ -271,11 +265,11 @@ async fn a_gap_or_wrong_parent_refuses_that_record_and_its_successors_only() {
         outcomes,
         vec![
             Ok(()),
-            refused("out of order"),
-            refused("out of order"),
+            refused(RefusedWhy::OutOfOrder),
+            refused(RefusedWhy::OutOfOrder),
             Ok(()),
-            refused("out of order"),
-            refused("out of order"),
+            refused(RefusedWhy::OutOfOrder),
+            refused(RefusedWhy::OutOfOrder),
         ]
     );
     assert_eq!(head_seq(&server, &a).await, 1);
@@ -284,7 +278,7 @@ async fn a_gap_or_wrong_parent_refuses_that_record_and_its_successors_only() {
     // A later batch cannot slip them in out of order either: seq 3 is still refused, 2 goes in.
     assert_eq!(
         writer.append(simple(&a, 3, ea)).await,
-        refused("out of order")
+        refused(RefusedWhy::OutOfOrder)
     );
     assert_eq!(writer.append(simple(&a, 2, ea)).await, Ok(()));
 }
@@ -306,7 +300,7 @@ async fn a_duplicate_change_id_is_refused_without_failing_the_batch() {
     other_client.client_id = Some("v.c".into());
     let ra = writer.submit(again).await;
     let rb = writer.submit(simple(&b, 1, eb)).await;
-    assert_eq!(ra.outcome().await, refused("duplicate"));
+    assert_eq!(ra.outcome().await, refused(RefusedWhy::Duplicate));
     assert_eq!(rb.outcome().await, Ok(()));
     // The same change id from another client is another change.
     assert_eq!(writer.append(other_client).await, Ok(()));
@@ -346,14 +340,17 @@ async fn extra_writes_run_in_their_own_savepoint() {
     twice.extra = vec![Extra::SetRevertedBy { seq: 1 }];
     let ra = writer.submit(twice).await;
     let rb = writer.submit(simple(&b, 1, eb)).await;
-    assert_eq!(ra.outcome().await, refused("already reverted"));
+    assert_eq!(ra.outcome().await, refused(RefusedWhy::AlreadyReverted));
     assert_eq!(rb.outcome().await, Ok(()));
     assert_eq!(head_seq(&server, &a).await, 2);
     assert_eq!(row_count(&server, &a).await, 2);
     // A record reverting a seq that does not exist is refused the same way.
     let mut missing = simple(&a, 3, ea);
     missing.extra = vec![Extra::SetRevertedBy { seq: 99 }];
-    assert_eq!(writer.append(missing).await, refused("already reverted"));
+    assert_eq!(
+        writer.append(missing).await,
+        refused(RefusedWhy::AlreadyReverted)
+    );
 
     // Assembly references are replaced whole, with the record's seq.
     let refs = |ids: &[(&str, &str)]| Extra::AssemblyRefs {
@@ -433,7 +430,7 @@ async fn a_commit_that_reports_an_error_after_taking_effect_is_unknown_and_reloa
     // Writing it again is refused (its seq is taken); the next one goes in.
     assert_eq!(
         writer.append(simple(&a, 1, ea)).await,
-        refused("out of order")
+        refused(RefusedWhy::OutOfOrder)
     );
     assert_eq!(
         writer.append(simple(&a, 2, ea)).await,
@@ -529,7 +526,10 @@ async fn a_record_breaking_a_column_limit_is_refused_before_it_is_queued() {
     cases.push(r);
     for r in cases {
         assert!(
-            matches!(writer.append(r.clone()).await, Err(JournalError::Refused(why)) if why.starts_with("invalid record")),
+            matches!(
+                writer.append(r.clone()).await,
+                Err(JournalError::Refused(RefusedWhy::Invalid(_)))
+            ),
             "{r:?}"
         );
     }
@@ -962,7 +962,182 @@ async fn a_record_for_a_document_that_does_not_exist_is_refused_alone() {
     let ghost = "0123456789abcdef0123456789abcdef";
     let rg = writer.submit(simple(ghost, 1, 0)).await;
     let ra = writer.submit(simple(&a, 1, ea)).await;
-    assert_eq!(rg.outcome().await, refused("no such document"));
+    assert_eq!(rg.outcome().await, refused(RefusedWhy::NoDocument));
     assert_eq!(ra.outcome().await, Ok(()));
     assert_eq!(store(&server).room_lease(ghost).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_batch_that_never_commits_times_out_unknown_and_the_next_batch_works() {
+    let (server, flaky, world) = setup().await;
+    let (a, b) = (
+        new_doc(&server, &world, "A").await,
+        new_doc(&server, &world, "B").await,
+    );
+    let (ea, eb) = (lease(&server, &a).await, lease(&server, &b).await);
+    let writer = JournalWriter::start_with_timeout(
+        server.state.store.clone(),
+        256,
+        Duration::from_millis(50),
+        Duration::from_millis(300),
+    );
+    flaky.hang_commit(true);
+    let ra = writer.submit(simple(&a, 1, ea)).await;
+    let rb = writer.submit(simple(&b, 1, eb)).await;
+    let outcomes = tokio::time::timeout(Duration::from_secs(10), async {
+        (ra.outcome().await, rb.outcome().await)
+    })
+    .await
+    .expect("the batch times out");
+    assert_eq!(
+        outcomes,
+        (Err(JournalError::Unknown), Err(JournalError::Unknown))
+    );
+    flaky.hang_commit(false);
+    assert_eq!(
+        (head_seq(&server, &a).await, row_count(&server, &a).await),
+        (0, 0)
+    );
+    assert!(writer.healthy());
+    assert_eq!(writer.append(simple(&a, 1, ea)).await, Ok(()));
+    assert_eq!(writer.append(simple(&b, 1, eb)).await, Ok(()));
+}
+
+#[tokio::test]
+async fn a_snapshot_of_a_head_the_journal_has_not_reached_is_refused() {
+    let (server, _flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "Room").await;
+    let (heads, epoch) = play_room(&server, &doc, 5, 3).await;
+    let blobs = server.state.blobs.as_ref();
+    let durable = heads.last().unwrap().clone();
+    // A tentative head: decided, not journaled.
+    let change = Change {
+        change_id: Arc::from("tentative"),
+        base: durable.seq,
+        ops: vec![Op::Set {
+            path: p(&["variables", "t"]),
+            value: Value::Int(1),
+        }],
+        reads: BTreeSet::new(),
+        depends: Vec::new(),
+        undo_of: None,
+        command: Arc::from("edit"),
+    };
+    let a = decide(
+        &durable,
+        &Arc::from("u1.c1"),
+        &change,
+        &|_| Known::Accepted,
+        None,
+        &Rules::openswx(),
+    )
+    .unwrap();
+    let tentative = Head {
+        seq: a.seq,
+        doc: a.doc,
+        index: a.index,
+    };
+    let err = write_snapshot(store(&server), blobs, &doc, epoch, &tentative, 9.0)
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(
+            err,
+            WriteSnapshotError::AheadOfJournal {
+                seq: 6,
+                head_seq: 5
+            }
+        ),
+        "{err}"
+    );
+    assert!(
+        store(&server)
+            .snapshot_row(&doc, epoch as i64, 6)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (loaded, snapshot_epoch) = load_head(store(&server), blobs, &doc).await.unwrap();
+    assert_eq!(snapshot_epoch, 0);
+    assert_same_head(&loaded, &durable);
+    // The durable head is accepted, once.
+    write_snapshot(store(&server), blobs, &doc, epoch, &durable, 9.0)
+        .await
+        .unwrap();
+    write_snapshot(store(&server), blobs, &doc, epoch, &durable, 10.0)
+        .await
+        .unwrap();
+    let row = store(&server)
+        .snapshot_row(&doc, epoch as i64, 5)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.created_at, 9.0);
+    assert!(matches!(
+        write_snapshot(
+            store(&server),
+            blobs,
+            "0123456789abcdef0123456789abcdef",
+            1,
+            &durable,
+            9.0
+        )
+        .await,
+        Err(WriteSnapshotError::NoDocument)
+    ));
+}
+
+#[tokio::test]
+async fn loading_replays_a_journal_longer_than_one_page() {
+    let (server, _flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "Long").await;
+    let (heads, _) = play_room(&server, &doc, 1100, 5).await;
+    let blobs = server.state.blobs.as_ref();
+    let (loaded, _) = load_head(store(&server), blobs, &doc).await.unwrap();
+    assert_same_head(&loaded, heads.last().unwrap());
+    for seq in [0, 499, 500, 501, 999, 1000, 1001, 1100] {
+        let at = state_at(store(&server), blobs, &doc, seq as i64)
+            .await
+            .unwrap();
+        assert_eq!(at, heads[seq].doc, "state at seq {seq}");
+    }
+}
+
+#[tokio::test]
+async fn a_record_submitted_just_before_shutdown_is_durable_after_it() {
+    let (server, _flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "A").await;
+    let epoch = lease(&server, &doc).await;
+    let receipt = server.state.journal.submit(simple(&doc, 1, epoch)).await;
+    // An orderly stop: the hub, then the journal, which writes what it has queued.
+    let server = server.restart().await;
+    assert_eq!(receipt.outcome().await, Ok(()));
+    assert_eq!(head_seq(&server, &doc).await, 1);
+    let (head, _) = load_head(store(&server), server.state.blobs.as_ref(), &doc)
+        .await
+        .unwrap();
+    assert_eq!(head.doc.at(&["n"]), Some(&Value::Int(1)));
+}
+
+#[test]
+fn refusals_read_as_before() {
+    let cases = [
+        (RefusedWhy::Lease, "lease"),
+        (RefusedWhy::OutOfOrder, "out of order"),
+        (RefusedWhy::Duplicate, "duplicate"),
+        (RefusedWhy::AlreadyReverted, "already reverted"),
+        (RefusedWhy::ExtraFailed, "extra writes failed"),
+        (RefusedWhy::NoDocument, "no such document"),
+        (
+            RefusedWhy::Invalid("command is too long".into()),
+            "invalid record: command is too long",
+        ),
+    ];
+    for (why, text) in cases {
+        assert_eq!(why.to_string(), text);
+    }
+    assert_eq!(
+        JournalError::Refused(RefusedWhy::Lease).to_string(),
+        "the journal refused the change: lease"
+    );
 }

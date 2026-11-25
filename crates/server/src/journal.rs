@@ -6,15 +6,15 @@
 //! the first, and writes the batch in **one transaction**:
 //!
 //! - per document in the batch, the room lease row is locked and its epoch compared with each
-//!   record's; a record carrying another epoch is `Refused("lease")` (a document without a lease
+//!   record's; a record carrying another epoch is `Refused(Lease)` (a document without a lease
 //!   row gets one, at epoch 0, only for records of epoch 0: a document nobody has acquired yet);
 //! - the document's records are inserted in order, each having to be the next seq
-//!   (`seq == head_seq + 1`, `parent_seq == head_seq`); one that is not is `Refused("out of
-//!   order")`, and since a refused record does not move the head, the records after it in the batch
+//!   (`seq == head_seq + 1`, `parent_seq == head_seq`); one that is not is `Refused(OutOfOrder)`,
+//!   and since a refused record does not move the head, the records after it in the batch
 //!   are refused the same way (a refused record never lets its successors in out of order, in this
 //!   batch or a later one);
 //! - a record whose `(document, client_id, change_id)` is already in the journal is
-//!   `Refused("duplicate")` without failing the batch (rooms detect duplicates before this; this is
+//!   `Refused(Duplicate)` without failing the batch (rooms detect duplicates before this; this is
 //!   the backstop). The records after it in the batch then fail the seq check above;
 //! - a record carrying [`Extra`] writes runs in its own savepoint, and a failure there refuses that
 //!   record only (and, through the seq check, the ones after it);
@@ -47,8 +47,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 pub use crate::record::{AssemblyRef, Extra, Record};
-pub use crate::snapshot::{LoadError, SERVER_CLIENT, load_head, state_at, write_snapshot};
-use crate::store::{AssemblyRefRow, ChangeRow, RoomLease, Store, Tx};
+pub use crate::snapshot::{
+    LoadError, SERVER_CLIENT, WriteSnapshotError, load_head, state_at, write_snapshot,
+};
+use crate::store::{AssemblyRefRow, NewChange, RoomLease, Store, Tx};
 
 /// The most records written in one transaction, unless [`JournalWriter::start`] is told otherwise.
 pub const MAX_BATCH: usize = 256;
@@ -56,7 +58,8 @@ pub const MAX_BATCH: usize = 256;
 pub const MAX_WAIT: Duration = Duration::from_millis(2);
 /// How many records may wait for the writer; [`JournalWriter::submit`] waits while it is full.
 pub const QUEUE: usize = 4096;
-/// A batch that has not committed by then is abandoned with every record `Unknown`.
+/// A batch that has not committed by then is abandoned with every record `Unknown` (unless
+/// [`JournalWriter::start_with_timeout`] says otherwise).
 pub const BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Column limits of `changes` a record must respect (checked before it is queued, so that one bad
@@ -73,11 +76,39 @@ pub enum JournalError {
     /// This record was not written, for the reason given; the rest of its batch was not affected
     /// (though the records after it of the same document are refused too, being out of order).
     #[error("the journal refused the change: {0}")]
-    Refused(String),
+    Refused(RefusedWhy),
     /// Whether the record was written is not known (the commit failed or timed out, or the writer
     /// stopped). Reload the document from the store.
     #[error("whether the change was written is not known")]
     Unknown,
+}
+
+/// Why the journal refused one record. Match on the variant, never on the text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RefusedWhy {
+    /// The record's epoch is not the document's lease epoch: the room has lost the document (another
+    /// acquisition took it). Stop writing; reload or unload.
+    #[error("lease")]
+    Lease,
+    /// Its seq is not the document's head plus one (or its parent is not the head): a gap, a record
+    /// after a refused one, or a seq already taken.
+    #[error("out of order")]
+    OutOfOrder,
+    /// The document already has a change with this `client_id` and `change_id`.
+    #[error("duplicate")]
+    Duplicate,
+    /// `Extra::SetRevertedBy` named a change that is missing or already reverted.
+    #[error("already reverted")]
+    AlreadyReverted,
+    /// An extra write failed in the database (the cause is logged).
+    #[error("extra writes failed")]
+    ExtraFailed,
+    /// The record breaks a column limit; it was never queued.
+    #[error("invalid record: {0}")]
+    Invalid(String),
+    /// The document does not exist.
+    #[error("no such document")]
+    NoDocument,
 }
 
 type Reply = oneshot::Sender<Result<(), JournalError>>;
@@ -98,6 +129,14 @@ pub struct JournalWriter {
     queue: mpsc::Sender<Msg>,
     alive: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+}
+
+/// How the writer task batches.
+#[derive(Debug, Clone, Copy)]
+struct Batching {
+    max_batch: usize,
+    max_wait: Duration,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for JournalWriter {
@@ -135,10 +174,26 @@ impl JournalWriter {
     /// Starts the writer task on the current tokio runtime (it must be called inside one).
     /// `max_batch` is at least 1.
     pub fn start(store: Arc<dyn Store>, max_batch: usize, max_wait: Duration) -> Self {
+        Self::start_with_timeout(store, max_batch, max_wait, BATCH_TIMEOUT)
+    }
+
+    /// [`JournalWriter::start`] with another limit than [`BATCH_TIMEOUT`] on how long one batch may
+    /// take before every record of it is `Unknown`.
+    pub fn start_with_timeout(
+        store: Arc<dyn Store>,
+        max_batch: usize,
+        max_wait: Duration,
+        timeout: Duration,
+    ) -> Self {
         let (queue, rx) = mpsc::channel(QUEUE);
         let alive = Arc::new(AtomicBool::new(true));
         let guard = Alive(alive.clone());
-        tokio::spawn(run(store, rx, max_batch.max(1), max_wait, guard));
+        let batching = Batching {
+            max_batch: max_batch.max(1),
+            max_wait,
+            timeout,
+        };
+        tokio::spawn(run(store, rx, batching, guard));
         Self {
             queue,
             alive,
@@ -157,7 +212,7 @@ impl JournalWriter {
     pub async fn submit(&self, record: Record) -> Receipt {
         let (reply, rx) = oneshot::channel();
         if let Err(why) = check(&record) {
-            let _ = reply.send(Err(JournalError::Refused(why)));
+            let _ = reply.send(Err(JournalError::Refused(RefusedWhy::Invalid(why))));
         } else if self.healthy() {
             // Fails only when the task has stopped; the reply is then dropped: `Unknown`.
             let _ = self
@@ -222,7 +277,7 @@ fn check(r: &Record) -> Result<(), String> {
         None
     };
     match bad {
-        Some(why) => Err(format!("invalid record: {why}")),
+        Some(why) => Err(why.to_owned()),
         None => Ok(()),
     }
 }
@@ -233,13 +288,7 @@ fn int(n: u64) -> i64 {
 }
 
 /// The writer task.
-async fn run(
-    store: Arc<dyn Store>,
-    mut rx: mpsc::Receiver<Msg>,
-    max_batch: usize,
-    max_wait: Duration,
-    alive: Alive,
-) {
+async fn run(store: Arc<dyn Store>, mut rx: mpsc::Receiver<Msg>, batching: Batching, alive: Alive) {
     let mut closing = None;
     loop {
         let first = match rx.recv().await {
@@ -250,10 +299,10 @@ async fn run(
             }
             None => break,
         };
-        let deadline = Instant::now() + max_wait;
+        let deadline = Instant::now() + batching.max_wait;
         let mut batch = vec![first];
         let mut stop = false;
-        while batch.len() < max_batch {
+        while batch.len() < batching.max_batch {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(Msg::Record(p))) => batch.push(*p),
                 Ok(Some(Msg::Close(done))) => {
@@ -268,7 +317,7 @@ async fn run(
                 Err(_) => break,
             }
         }
-        write(store.as_ref(), batch).await;
+        write(store.as_ref(), batch, batching.timeout).await;
         if stop {
             break;
         }
@@ -283,18 +332,18 @@ async fn run(
 }
 
 /// Writes one batch and answers every record, in order.
-async fn write(store: &dyn Store, batch: Vec<Pending>) {
+async fn write(store: &dyn Store, batch: Vec<Pending>, timeout: Duration) {
     let (records, replies): (Vec<Record>, Vec<Reply>) =
         batch.into_iter().map(|p| (p.record, p.reply)).unzip();
     let n = records.len();
-    let results = match tokio::time::timeout(BATCH_TIMEOUT, write_batch(store, &records)).await {
+    let results = match tokio::time::timeout(timeout, write_batch(store, &records)).await {
         Ok(Ok(results)) => results,
         Ok(Err(e)) => {
             tracing::error!("a journal batch of {n} records failed: {e:#}");
             vec![Err(JournalError::Unknown); n]
         }
         Err(_) => {
-            tracing::error!("a journal batch of {n} records took longer than {BATCH_TIMEOUT:?}");
+            tracing::error!("a journal batch of {n} records took longer than {timeout:?}");
             vec![Err(JournalError::Unknown); n]
         }
     };
@@ -308,7 +357,7 @@ async fn write_batch(
     store: &dyn Store,
     records: &[Record],
 ) -> anyhow::Result<Vec<Result<(), JournalError>>> {
-    let refused = |why: &str| Err(JournalError::Refused(why.to_owned()));
+    let refused = |why: RefusedWhy| Err(JournalError::Refused(why));
     let mut results: Vec<Result<(), JournalError>> =
         vec![Err(JournalError::Unknown); records.len()];
     // The records of each document, in submission order; documents in order of first appearance.
@@ -327,19 +376,23 @@ async fn write_batch(
     let mut tx = store.begin().await?;
     for doc in docs {
         let indices = &of_doc[doc];
-        // First, so that a missing document never reaches a statement that would fail on it.
-        let Some(document) = tx.document_by_id(doc).await? else {
+        let refuse_all = |results: &mut Vec<Result<(), JournalError>>, why: RefusedWhy| {
             for &i in indices {
-                results[i] = refused("no such document");
+                results[i] = refused(why.clone());
             }
-            continue;
         };
         let first_epoch = records[indices[0]].epoch;
         let lease = match tx.lock_room_lease(doc).await? {
             Some(epoch) => Some(epoch),
             None if first_epoch == 0 => {
                 // A document nobody acquired yet: its first writer, at epoch 0, creates the row;
-                // the first `lease::acquire` then moves it to epoch 1.
+                // the first `lease::acquire` then moves it to epoch 1. The document is checked
+                // first, so that a missing one never reaches the insert (whose foreign key would
+                // fail the whole batch).
+                if tx.document_by_id(doc).await?.is_none() {
+                    refuse_all(&mut results, RefusedWhy::NoDocument);
+                    continue;
+                }
                 tx.insert_room_lease(&RoomLease {
                     document_id: doc.to_owned(),
                     node_id: String::new(),
@@ -351,14 +404,20 @@ async fn write_batch(
             }
             None => None,
         };
+        // The head is read only now, with the lease row held: on PostgreSQL a batch that waited on
+        // that lock for another writer's transaction must not use a head read before it waited.
+        let Some(document) = tx.document_by_id(doc).await? else {
+            refuse_all(&mut results, RefusedWhy::NoDocument);
+            continue;
+        };
         let mut head = document.head_seq;
         let mut updated_at = None;
         for &i in indices {
             let r = &records[i];
             let result = if lease != Some(int(r.epoch)) {
-                refused("lease")
+                refused(RefusedWhy::Lease)
             } else if int(r.seq) != head + 1 || int(r.parent_seq) != head {
-                refused("out of order")
+                refused(RefusedWhy::OutOfOrder)
             } else {
                 insert(tx.as_mut(), r).await?
             };
@@ -376,22 +435,23 @@ async fn write_batch(
     Ok(results)
 }
 
-fn change_row(r: &Record) -> ChangeRow {
-    ChangeRow {
-        document_id: r.document.clone(),
+/// The row of a record, borrowing its strings and bytes.
+fn change_row(r: &Record) -> NewChange<'_> {
+    NewChange {
+        document_id: &r.document,
         seq: int(r.seq),
         parent_seq: int(r.parent_seq),
-        branch_id: "main".into(),
+        branch_id: "main",
         epoch: int(r.epoch),
-        author_id: r.author.clone(),
-        client_id: r.client_id.clone(),
-        change_id: r.change_id.clone(),
+        author_id: &r.author,
+        client_id: r.client_id.as_deref(),
+        change_id: r.change_id.as_deref(),
         created_at: r.created_at,
-        command: r.command.clone(),
-        ops: r.ops.to_vec(),
-        inverse: r.inverse.to_vec(),
-        paths: r.paths.to_vec(),
-        reads: r.reads.to_vec(),
+        command: &r.command,
+        ops: &r.ops,
+        inverse: &r.inverse,
+        paths: &r.paths,
+        reads: &r.reads,
         undo_of: r.undo_of.map(int),
         reverts: r.reverts.map(int),
         reverted_by: None,
@@ -406,7 +466,7 @@ async fn insert(tx: &mut dyn Tx, r: &Record) -> anyhow::Result<Result<(), Journa
         return Ok(if tx.insert_change(&row).await? {
             Ok(())
         } else {
-            Err(JournalError::Refused("duplicate".into()))
+            Err(JournalError::Refused(RefusedWhy::Duplicate))
         });
     }
     let mut sp = tx.savepoint().await?;
@@ -425,7 +485,7 @@ async fn insert(tx: &mut dyn Tx, r: &Record) -> anyhow::Result<Result<(), Journa
                 "a journal record of document {} with extra writes failed: {e:#}",
                 r.document
             );
-            Ok(Err(JournalError::Refused("extra writes failed".into())))
+            Ok(Err(JournalError::Refused(RefusedWhy::ExtraFailed)))
         }
     }
 }
@@ -434,21 +494,21 @@ async fn insert(tx: &mut dyn Tx, r: &Record) -> anyhow::Result<Result<(), Journa
 async fn with_extra(
     sp: &mut dyn Tx,
     r: &Record,
-    row: &ChangeRow,
+    row: &NewChange<'_>,
 ) -> anyhow::Result<Result<(), JournalError>> {
-    let refused = |why: &str| Ok(Err(JournalError::Refused(why.to_owned())));
+    let refused = |why: RefusedWhy| Ok(Err(JournalError::Refused(why)));
     if !sp.insert_change(row).await? {
-        return refused("duplicate");
+        return refused(RefusedWhy::Duplicate);
     }
     for extra in &r.extra {
         match extra {
             Extra::SetRevertedBy { seq } => {
                 if !sp.set_reverted_by(&r.document, int(*seq), row.seq).await? {
-                    return refused("already reverted");
+                    return refused(RefusedWhy::AlreadyReverted);
                 }
             }
             Extra::AssemblyRefs { rows } => {
-                // TASK 13: refuse here (`refused("missing part")`) when a referenced part no
+                // TASK 13: refuse here (a new `RefusedWhy` variant) when a referenced part no
                 // longer exists; this task only replaces the rows.
                 let rows: Vec<AssemblyRefRow> = rows
                     .iter()

@@ -373,6 +373,31 @@ pub struct ChangeRow {
     pub broke: Option<String>,
 }
 
+/// A journal row to insert: [`ChangeRow`]'s columns, borrowed from the record that carries them
+/// (the journal writer binds the MessagePack straight from the record's bytes, without copying them
+/// inside its transaction).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NewChange<'a> {
+    pub document_id: &'a str,
+    pub seq: i64,
+    pub parent_seq: i64,
+    pub branch_id: &'a str,
+    pub epoch: i64,
+    pub author_id: &'a str,
+    pub client_id: Option<&'a str>,
+    pub change_id: Option<&'a str>,
+    pub created_at: f64,
+    pub command: &'a str,
+    pub ops: &'a [u8],
+    pub inverse: &'a [u8],
+    pub paths: &'a [u8],
+    pub reads: &'a [u8],
+    pub undo_of: Option<i64>,
+    pub reverts: Option<i64>,
+    pub reverted_by: Option<i64>,
+    pub broke: Option<&'a str>,
+}
+
 /// A component of an assembly and the part it refers to (`assembly_refs`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct AssemblyRefRow {
@@ -739,7 +764,7 @@ pub trait Tx: Send {
 
     /// Adds a journal row; `false` (and nothing written, the transaction still usable) when the
     /// document already has a row with the same `client_id` and `change_id`.
-    async fn insert_change(&mut self, change: &ChangeRow) -> anyhow::Result<bool>;
+    async fn insert_change(&mut self, change: &NewChange<'_>) -> anyhow::Result<bool>;
 
     /// Sets a document's head seq and when its content last changed.
     async fn set_document_head(
