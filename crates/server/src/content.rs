@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 
 use oswx_core::{Plain, Value};
 
+use crate::error::ApiError;
+
 /// Top-level keys that belong to one person's copy of a document (where they rolled the feature tree
 /// back to, the active configuration, what is shown, their undo journal, the file's name). They are
 /// dropped from the content a document is created with, as the Python server drops them
@@ -114,6 +116,61 @@ pub fn without_local_keys(v: Value) -> Value {
         Value::Map(mut m) => {
             for key in LOCAL_ONLY {
                 m.remove(key);
+            }
+            Value::Map(m)
+        }
+        other => other,
+    }
+}
+
+/// The top-level lists whose items clients edit one by one, for a document of `kind`.
+fn item_lists(kind: &str) -> &'static [&'static str] {
+    if kind == "assembly" {
+        &["features", "components", "mates"]
+    } else {
+        &["features"]
+    }
+}
+
+/// Checks that the lists clients edit item by item can be edited that way: `features` (and, in an
+/// assembly, `components` and `mates`), when present, must be lists of objects with distinct,
+/// non-empty string ids, which [`Value::from_plain`] has made keyed lists (an empty list stays a
+/// plain one). Anything else would be stored as a plain list, whose items no operation can reach.
+/// A part may have no `components` or `mates`. Only the shape of the lists is looked at, never
+/// what the items are; repeated names are fine. The messages are the Python server's.
+pub fn check_shape(kind: &str, v: &Value) -> Result<(), ApiError> {
+    if kind != "assembly" {
+        for coll in ["components", "mates"] {
+            if v.at(&[coll]).is_some() {
+                return Err(ApiError::Unprocessable(format!("a {kind} has no {coll}")));
+            }
+        }
+    }
+    for &coll in item_lists(kind) {
+        let ok = match v.at(&[coll]) {
+            None => true,
+            Some(Value::List(items)) => items.is_empty(),
+            Some(Value::Keyed(items)) => items.iter().all(|(id, _, _)| !id.is_empty()),
+            Some(_) => false,
+        };
+        if !ok {
+            return Err(ApiError::Unprocessable(format!(
+                "content.{coll} must be a list of objects with distinct ids"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The content with the item lists of a `kind` document that are missing filled in as empty
+/// lists (as the Python server fills them in), so that a later insert has a list to go into.
+pub fn with_item_lists(kind: &str, v: Value) -> Value {
+    match v {
+        Value::Map(mut m) => {
+            for &coll in item_lists(kind) {
+                if !m.contains_key(coll) {
+                    m.insert(coll.into(), Value::List(Default::default()));
+                }
             }
             Value::Map(m)
         }

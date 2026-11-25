@@ -468,6 +468,8 @@ pub struct FlakyStore {
     inner: RwLock<Arc<dyn Store>>,
     fail_health: AtomicBool,
     fail_commit: Arc<AtomicBool>,
+    commit_then_fail: Arc<AtomicBool>,
+    fail_document_reads: AtomicBool,
 }
 
 impl FlakyStore {
@@ -476,6 +478,8 @@ impl FlakyStore {
             inner: RwLock::new(inner),
             fail_health: AtomicBool::new(false),
             fail_commit: Arc::new(AtomicBool::new(false)),
+            commit_then_fail: Arc::new(AtomicBool::new(false)),
+            fail_document_reads: AtomicBool::new(false),
         }
     }
 
@@ -502,6 +506,17 @@ impl FlakyStore {
     pub fn fail_commit(&self, fail: bool) {
         self.fail_commit.store(fail, Ordering::SeqCst);
     }
+
+    /// Makes every transaction's `commit` take effect and then report an error anyway (`true`), as
+    /// a connection lost during `COMMIT` can; or delegate again (`false`).
+    pub fn commit_then_fail(&self, fail: bool) {
+        self.commit_then_fail.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes [`Store::document_by_id`] fail (`true`) or delegate again (`false`).
+    pub fn fail_document_reads(&self, fail: bool) {
+        self.fail_document_reads.store(fail, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -521,6 +536,7 @@ impl Store for FlakyStore {
         Ok(Box::new(FlakyTx {
             inner: self.inner().begin().await?,
             fail_commit: self.fail_commit.clone(),
+            commit_then_fail: self.commit_then_fail.clone(),
         }))
     }
 
@@ -608,6 +624,9 @@ impl Store for FlakyStore {
     }
 
     async fn document_by_id(&self, id: &str) -> anyhow::Result<Option<Document>> {
+        if self.fail_document_reads.load(Ordering::SeqCst) {
+            anyhow::bail!("the flaky store was told to fail document reads");
+        }
         self.inner().document_by_id(id).await
     }
 
@@ -632,6 +651,7 @@ impl Store for FlakyStore {
 pub struct FlakyTx {
     inner: Box<dyn Tx>,
     fail_commit: Arc<AtomicBool>,
+    commit_then_fail: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -640,6 +660,10 @@ impl Tx for FlakyTx {
         if self.fail_commit.load(Ordering::SeqCst) {
             self.inner.rollback().await?;
             anyhow::bail!("the flaky store was told to fail commits");
+        }
+        if self.commit_then_fail.load(Ordering::SeqCst) {
+            self.inner.commit().await?;
+            anyhow::bail!("the flaky store committed, then was told to report an error");
         }
         self.inner.commit().await
     }

@@ -29,6 +29,11 @@ pub const FORMAT: u64 = 1;
 pub const MAX_DECOMPRESSED: u64 = 512 << 20;
 /// The zstd level snapshots are written with.
 const LEVEL: i32 = 3;
+/// How far the MessagePack reader may recurse: the core's bound on open containers
+/// (`oswx_core::wire::MAX_NESTING`, which covers a document of `MAX_DEPTH` levels and its index),
+/// counted the way rmpv counts (two levels per container and up to three for a leaf), as the core's
+/// own frame reader does.
+const PARSE_DEPTH: usize = 2 * oswx_core::wire::MAX_NESTING + 4;
 
 /// Why a snapshot could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -81,7 +86,8 @@ pub fn encode(doc: &Value, index: &Index, seq: Seq) -> Bytes {
 pub fn decode(bytes: &[u8]) -> Result<(Value, Index, Seq), SnapshotError> {
     let packed = decompress(bytes, MAX_DECOMPRESSED)?;
     let mut rest = packed.as_slice();
-    let plain = rmpv::decode::read_value(&mut rest).map_err(|_| SnapshotError::Shape)?;
+    let plain = rmpv::decode::read_value_with_max_depth(&mut rest, PARSE_DEPTH)
+        .map_err(|_| SnapshotError::Shape)?;
     if !rest.is_empty() {
         return Err(SnapshotError::TrailingBytes);
     }
@@ -239,6 +245,39 @@ mod tests {
 
     fn refused(bytes: &[u8]) -> Option<SnapshotError> {
         decode(bytes).err()
+    }
+
+    #[test]
+    fn the_deepest_document_and_index_the_core_allows_round_trip() {
+        // A root map, 31 keyed lists of maps, and a map at the bottom: 64 levels.
+        let mut item = json!({"id": "i", "leaf": {"x": 1}});
+        for _ in 1..31 {
+            item = json!({"id": "i", "c": [item]});
+        }
+        let doc = Value::from_plain(&plain_from_json(&json!({ "c": [item] }))).unwrap();
+        let deep: Vec<Arc<str>> = (0..64).map(|i| Arc::from(format!("s{i}"))).collect();
+        let writes: BTreeSet<Write> = [Write::At(deep)].into_iter().collect();
+        let index = Index::default().record(
+            1,
+            &Arc::from("u.c"),
+            &writes,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        let (doc2, index2, _) = decode(&encode(&doc, &index, 1)).unwrap();
+        assert_eq!(doc2, doc);
+        assert_eq!(index2.to_wire(), index.to_wire());
+    }
+
+    #[test]
+    fn nesting_beyond_the_cores_bound_is_refused_by_the_reader() {
+        let mut deep = Plain::Nil;
+        for _ in 0..400 {
+            deep = Plain::Array(vec![deep]);
+        }
+        let mut f = good_fields();
+        f[2].1 = deep;
+        assert_eq!(refused(&pack(f)), Some(SnapshotError::Shape));
     }
 
     fn pack(map: Vec<(&str, Plain)>) -> Vec<u8> {

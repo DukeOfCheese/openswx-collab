@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::{TestServer, Token, World, part, world};
+use oswx_server::blobs::{Blobs, ByteStream, PutOutcome};
 use oswx_server::ext::{Extensions, Quota};
 use oswx_server::snapshot::{decode, snapshot_key};
 use oswx_server::store::Id;
@@ -881,4 +882,271 @@ async fn document_and_folder_changes_are_events_with_ids_only() {
         &json!({"type": "document_moved", "org": w.org, "project": w.project,
                 "document": doc, "folder": f, "by": w.admin_id})
     );
+}
+
+#[tokio::test]
+async fn lists_of_items_must_have_distinct_ids_so_they_can_be_edited() {
+    let (server, w) = world().await;
+    let feats_msg = "content.features must be a list of objects with distinct ids";
+    let part_with = |features: Value| {
+        let mut p = part();
+        p["features"] = features;
+        json!({"name": "X", "content": p})
+    };
+    let cases = [
+        (
+            part_with(json!([{"id": "f1", "name": "A"}, {"id": "f1", "name": "B"}])),
+            feats_msg,
+        ),
+        (
+            part_with(json!([{"id": "f1"}, {"name": "no id"}])),
+            feats_msg,
+        ),
+        (part_with(json!([{"id": "f1"}, 3])), feats_msg),
+        (part_with(json!([{"id": ""}])), feats_msg),
+        (part_with(json!([{"id": 7}])), feats_msg),
+        (part_with(json!({"f1": {}})), feats_msg),
+        (part_with(json!("features")), feats_msg),
+        (
+            json!({"name": "X", "content": {"features": [], "components": []}}),
+            "a part has no components",
+        ),
+        (
+            json!({"name": "X", "content": {"mates": []}}),
+            "a part has no mates",
+        ),
+        (
+            json!({"name": "A", "kind": "assembly",
+                   "content": {"components": [{"id": "c1"}, {"id": "c1"}]}}),
+            "content.components must be a list of objects with distinct ids",
+        ),
+        (
+            json!({"name": "A", "kind": "assembly", "content": {"mates": [{"name": "m"}]}}),
+            "content.mates must be a list of objects with distinct ids",
+        ),
+    ];
+    for (body, detail) in cases {
+        assert_eq!(
+            create(&server, &w, &w.admin, body.clone()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({ "detail": detail })
+            ),
+            "{body}"
+        );
+    }
+    assert!(
+        server
+            .state
+            .store
+            .documents_in_project(&w.project)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Repeated feature names stay legal: names are settled at commit, not here.
+    let id = w
+        .document(
+            &server,
+            Some(json!({"features": [{"id": "f1", "name": "Same"}, {"id": "f2", "name": "Same"}]})),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        content(&server, &id, &w.admin).await.1["content"]["features"][1]["id"],
+        "f2"
+    );
+
+    // Missing lists are filled in as empty ones.
+    let id = w
+        .document(&server, Some(json!({"version": 3})), None, None)
+        .await;
+    assert_eq!(
+        content(&server, &id, &w.admin).await.1["content"],
+        json!({"version": 3, "features": []})
+    );
+    let (status, asm) = create(
+        &server,
+        &w,
+        &w.admin,
+        json!({"name": "A", "kind": "assembly", "content": {}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        content(&server, asm["id"].as_str().unwrap(), &w.admin)
+            .await
+            .1["content"],
+        json!({"features": [], "components": [], "mates": []})
+    );
+}
+
+#[tokio::test]
+async fn a_document_may_refer_to_at_most_4096_blobs() {
+    let (server, w) = world().await;
+    let refs: Vec<Value> = (0..4097)
+        .map(|i| json!({"$blob": sha256(i.to_string().as_bytes())}))
+        .collect();
+    assert_eq!(
+        create(
+            &server,
+            &w,
+            &w.admin,
+            json!({"name": "X", "content": {"refs": refs}})
+        )
+        .await,
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"detail": "content refers to more than 4096 blobs"})
+        )
+    );
+    // 4096 are looked up (and here all missing).
+    let (status, body) = create(
+        &server,
+        &w,
+        &w.admin,
+        json!({"name": "X", "content": {"refs": refs[..4096]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["detail"]["blobs"].as_array().unwrap().len(), 4096);
+}
+
+#[tokio::test]
+async fn a_commit_that_reports_an_error_but_took_effect_is_a_success() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let w = World::new(&server).await.unwrap();
+    flaky.commit_then_fail(true);
+    let (status, doc) = create(
+        &server,
+        &w,
+        &w.admin,
+        json!({"name": "X", "content": part()}),
+    )
+    .await;
+    flaky.commit_then_fail(false);
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let id = doc["id"].as_str().unwrap();
+    assert_eq!(doc["role"], "owner");
+    // The row and its snapshot are both there: the document opens.
+    assert_eq!(
+        content(&server, id, &w.admin).await.1["content"],
+        stored_part()
+    );
+}
+
+#[tokio::test]
+async fn when_a_failed_commit_cannot_be_settled_the_snapshot_is_kept() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let w = World::new(&server).await.unwrap();
+    flaky.commit_then_fail(true);
+    flaky.fail_document_reads(true);
+    assert_eq!(
+        create(
+            &server,
+            &w,
+            &w.admin,
+            json!({"name": "X", "content": part()})
+        )
+        .await,
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"detail": "server error"})
+        )
+    );
+    flaky.commit_then_fail(false);
+    flaky.fail_document_reads(false);
+    // The commit did take effect; its snapshot file was not removed, so the document opens.
+    let docs = server
+        .state
+        .store
+        .documents_in_project(&w.project)
+        .await
+        .unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(files_under(&storage(&server).join("docs")).len(), 1);
+    assert_eq!(
+        content(&server, &docs[0].id, &w.admin).await.1["content"],
+        stored_part()
+    );
+}
+
+/// Blob storage whose `exists` fails (an outage), and everything else works.
+struct NoLookups(Arc<dyn Blobs>);
+
+#[async_trait]
+impl Blobs for NoLookups {
+    async fn put_stream(
+        &self,
+        key: &str,
+        body: ByteStream,
+        limit: u64,
+    ) -> anyhow::Result<PutOutcome> {
+        self.0.put_stream(key, body, limit).await
+    }
+    async fn get_stream(&self, key: &str) -> anyhow::Result<Option<(u64, ByteStream)>> {
+        self.0.get_stream(key).await
+    }
+    async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+        anyhow::bail!("storage is down")
+    }
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> anyhow::Result<()> {
+        self.0.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.0.get(key).await
+    }
+    async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        self.0.delete_prefix(prefix).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.0.delete(key).await
+    }
+    async fn health(&self) -> anyhow::Result<()> {
+        self.0.health().await
+    }
+}
+
+#[tokio::test]
+async fn a_storage_outage_during_the_blob_check_is_a_server_error() {
+    let server =
+        TestServer::start_custom(|_| {}, |s| s.blobs = Arc::new(NoLookups(s.blobs.clone()))).await;
+    let w = World::new(&server).await.unwrap();
+    let mut p = part();
+    p["body"] = json!({"$blob": sha256(b"x")});
+    assert_eq!(
+        create(&server, &w, &w.admin, json!({"name": "X", "content": p})).await,
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"detail": "server error"})
+        )
+    );
+    assert!(
+        server
+            .state
+            .store
+            .documents_in_project(&w.project)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A document without blob references needs no lookup.
+    w.document(&server, None, None, None).await;
+}
+
+#[tokio::test]
+async fn a_creation_body_must_be_declared_as_json() {
+    let (server, w) = world().await;
+    let r = reqwest::Client::new()
+        .post(server.url(&docs_url(&w)))
+        .bearer_auth(&w.admin)
+        .header("content-type", "text/plain")
+        .body(json!({"name": "X", "content": part()}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(r.json::<Value>().await.unwrap()["detail"].is_string());
 }

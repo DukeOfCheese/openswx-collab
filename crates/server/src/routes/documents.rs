@@ -18,7 +18,7 @@
 //! in answers 404 `no such document`, the same in all three cases ([`require_document`]).
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -33,9 +33,10 @@ use crate::access::{
 };
 use crate::blobs::{blob_key, is_sha256};
 use crate::content::{
-    blob_refs, format_version, json_from_plain, plain_from_json, without_local_keys,
+    blob_refs, check_shape, format_version, json_from_plain, plain_from_json, with_item_lists,
+    without_local_keys,
 };
-use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery};
+use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, detail_response};
 use crate::ext::{Event, Quota, check_quota, emit};
 use crate::routes::orgs::clean_name;
 use crate::security::ProjectRole;
@@ -45,6 +46,8 @@ use crate::store::{Document, Folder, SnapshotRow, new_id};
 
 /// The largest request body document creation takes: 8 MiB.
 pub const MAX_DOCUMENT_BODY: usize = 8 << 20;
+/// The most distinct blob references one document may hold.
+pub const MAX_BLOB_REFS: usize = 4096;
 /// How many storage lookups one creation runs at once to check its blob references.
 const LOOKUPS_AT_ONCE: usize = 16;
 /// The `?folder=` value that lists the documents at the top of the project.
@@ -129,6 +132,14 @@ struct DocumentIn {
     folder_id: Option<String>,
 }
 
+/// A creation body once parsed: its fields, and the content converted (or why it could not be).
+struct Parsed {
+    name: String,
+    kind: Option<String>,
+    folder_id: Option<String>,
+    content: Result<Value, ApiError>,
+}
+
 /// What a client is told about content the core refuses: the kind of problem, never the content.
 fn content_error(err: &ValueError) -> ApiError {
     let why = match err {
@@ -151,17 +162,97 @@ pub(crate) fn folder_in(folder: Option<Folder>, project: &str) -> Result<Folder,
         .ok_or_else(|| ApiError::Unprocessable(NO_FOLDER_HERE.into()))
 }
 
+/// Whether the request declares a JSON body (`application/json` or `application/...+json`), as
+/// [`ApiJson`] requires.
+fn declares_json(request: &Request) -> bool {
+    let Some(value) = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// Reads the creation body (413 over the route's limit), then parses it and converts the content
+/// on the blocking pool, where the JSON tree is also dropped: only the converted content comes
+/// back. Not JSON is 400, the wrong shape 422, with fixed messages (a parser's message can quote
+/// the content).
+async fn parse_body(request: Request, state: &AppState) -> Result<Parsed, Box<Response>> {
+    if !declares_json(&request) {
+        return Err(Box::new(detail_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected request with `Content-Type: application/json`",
+        )));
+    }
+    let bytes = match Bytes::from_request(request, state).await {
+        Ok(bytes) => bytes,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return Err(Box::new(ApiError::TooLarge.into_response()));
+        }
+        Err(rejection) => {
+            return Err(Box::new(detail_response(
+                rejection.status(),
+                &rejection.body_text(),
+            )));
+        }
+    };
+    let parsed = tokio::task::spawn_blocking(move || {
+        let body: DocumentIn = serde_json::from_slice(&bytes).map_err(|e| {
+            if e.is_data() {
+                ApiError::Unprocessable(
+                    "the body must be {name, content, kind?, folder_id?}, name a string".into(),
+                )
+            } else {
+                ApiError::BadRequest("the body is not valid JSON".into())
+            }
+        })?;
+        drop(bytes);
+        let DocumentIn {
+            name,
+            content,
+            kind,
+            folder_id,
+        } = body;
+        let converted =
+            Value::from_plain(&plain_from_json(&content)).map_err(|e| content_error(&e));
+        drop(content);
+        Ok::<_, ApiError>(Parsed {
+            name,
+            kind,
+            folder_id,
+            content: converted,
+        })
+    })
+    .await;
+    match parsed {
+        Ok(Ok(parsed)) => Ok(parsed),
+        Ok(Err(err)) => Err(Box::new(err.into_response())),
+        Err(err) => Err(Box::new(ApiError::Internal(err.into()).into_response())),
+    }
+}
+
 /// Turns collaboration on for a file: its content becomes state 0 of a cloud document.
 ///
 /// In this order: the caller must be an editor; the extensions' quota for one more document is
-/// asked (402 if refused); the body is read (413 over [`MAX_DOCUMENT_BODY`]); the name (1 to 200
-/// characters, trimmed), `kind` (`part`, the default, or `assembly`) and the folder (in the same
-/// project) are checked (422); the content is converted (422 for one the core refuses, or whose
-/// top level is not an object); the per-person keys ([`crate::content::LOCAL_ONLY`]) are dropped;
-/// every blob reference must name a blob this organisation has (409 `{"message": "upload these
-/// blobs first", "blobs": [...]}` listing the missing and malformed hashes); then the snapshot (seq
-/// 0, epoch 0) is written to storage, and the document and its snapshot row are committed. If the
-/// commit fails the snapshot file is removed again.
+/// asked (402 if refused); the body is read (413 over [`MAX_DOCUMENT_BODY`]) and converted; the
+/// name (1 to 200 characters, trimmed), `kind` (`part`, the default, or `assembly`) and the folder
+/// (in the same project) are checked (422); the content must be one the core takes, with an object
+/// at the top, and its item lists must be editable ([`check_shape`]; 422); the per-person keys
+/// ([`crate::content::LOCAL_ONLY`]) are dropped and missing item lists filled in; at most
+/// [`MAX_BLOB_REFS`] distinct blob references (422), each naming a blob this organisation has (409
+/// `{"message": "upload these blobs first", "blobs": [...]}` listing the missing and malformed
+/// hashes); then the snapshot (seq 0, epoch 0) is written to storage, and the document and its
+/// snapshot row are committed. A failure before the commit removes the snapshot file again; see
+/// `settle_commit_error` for a commit that reports an error.
 async fn create_document(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -182,9 +273,9 @@ async fn create_document(
     if let Err(err) = check_quota(&state.ext, &project.org_id, Quota::Documents).await {
         return err.into_response();
     }
-    let body = match ApiJson::<DocumentIn>::from_request(request, &state).await {
-        Ok(ApiJson(body)) => body,
-        Err(rejection) => return rejection,
+    let body = match parse_body(request, &state).await {
+        Ok(body) => body,
+        Err(rejection) => return *rejection,
     };
     create(state, user, project.id, project.org_id, body)
         .await
@@ -196,7 +287,7 @@ async fn create(
     user: CurrentUser,
     project_id: String,
     org_id: String,
-    body: DocumentIn,
+    body: Parsed,
 ) -> Result<(StatusCode, ApiJson<serde_json::Value>), ApiError> {
     let name = clean_name(&body.name)?;
     let kind = body.kind.unwrap_or_else(|| "part".into());
@@ -208,19 +299,25 @@ async fn create(
     if let Some(folder) = &body.folder_id {
         folder_in(state.store.folder_by_id(folder).await?, &project_id)?;
     }
-    let content = body.content;
+    let doc = body.content?;
+    let shape_kind = kind.clone();
     let (doc, refs) = tokio::task::spawn_blocking(move || {
-        let doc = Value::from_plain(&plain_from_json(&content)).map_err(|e| content_error(&e))?;
         if !matches!(doc, Value::Map(_)) {
             return Err(ApiError::Unprocessable(
                 "content must be a JSON object".into(),
             ));
         }
-        let doc = without_local_keys(doc);
+        check_shape(&shape_kind, &doc)?;
+        let doc = with_item_lists(&shape_kind, without_local_keys(doc));
         let refs = blob_refs(&doc);
         Ok((doc, refs))
     })
     .await??;
+    if refs.len() > MAX_BLOB_REFS {
+        return Err(ApiError::Unprocessable(format!(
+            "content refers to more than {MAX_BLOB_REFS} blobs"
+        )));
+    }
     // TASK 13: for an assembly, check its components' references (access to every part, no
     // cycles) and record them as assembly_refs rows in the transaction below.
     let missing = missing_blobs(&state, &org_id, refs).await?;
@@ -258,11 +355,13 @@ async fn create(
     state.blobs.put(&key, bytes).await?;
     let role = match insert_document(&state, &user, &document, &snapshot).await {
         Ok(role) => role,
-        Err(err) => {
-            if let Err(e) = state.blobs.delete(&key).await {
-                tracing::warn!("could not remove the unused snapshot {key}: {e:#}");
-            }
+        Err(InsertError::BeforeCommit(err)) => {
+            forget_snapshot(&state, &key).await;
             return Err(err);
+        }
+        Err(InsertError::Commit(err, role)) => {
+            settle_commit_error(&state, &document.id, &key, err).await?;
+            role
         }
     };
     emit(
@@ -276,6 +375,43 @@ async fn create(
     )
     .await;
     Ok((StatusCode::CREATED, ApiJson(doc_out(&document, Some(role)))))
+}
+
+/// Removes a snapshot file whose row will never exist (best effort: an orphan file is harmless).
+async fn forget_snapshot(state: &AppState, key: &str) {
+    if let Err(e) = state.blobs.delete(key).await {
+        tracing::warn!("could not remove the unused snapshot {key}: {e:#}");
+    }
+}
+
+/// After `commit()` reported an error, which may have come after the commit took effect (a
+/// connection lost during `COMMIT`): reads the document back. Absent: the creation did not
+/// happen, the snapshot file is removed, 500. Present: it did, and the request succeeds. If the
+/// read fails too, the file is kept (an orphan file is harmless; a row without its file is not)
+/// and the answer is 500.
+async fn settle_commit_error(
+    state: &AppState,
+    document: &str,
+    key: &str,
+    err: anyhow::Error,
+) -> Result<(), ApiError> {
+    match state.store.document_by_id(document).await {
+        Ok(Some(_)) => {
+            tracing::warn!("a commit reported an error but took effect: {err:#}");
+            Ok(())
+        }
+        Ok(None) => {
+            forget_snapshot(state, key).await;
+            Err(ApiError::Internal(err))
+        }
+        Err(read) => {
+            tracing::error!(
+                "could not tell whether document {document} was created ({read:#}); keeping its \
+                 snapshot {key}"
+            );
+            Err(ApiError::Internal(err))
+        }
+    }
 }
 
 /// The blob references that are malformed or name no blob of the organisation, in the order
@@ -302,6 +438,21 @@ async fn missing_blobs(
     Ok(checked.into_iter().flatten().collect())
 }
 
+/// How [`insert_document`] failed.
+enum InsertError {
+    /// Before `commit()` was called: nothing was written.
+    BeforeCommit(ApiError),
+    /// `commit()` itself reported an error; it may still have taken effect. Carries the role the
+    /// transaction read.
+    Commit(anyhow::Error, ProjectRole),
+}
+
+impl<E: Into<ApiError>> From<E> for InsertError {
+    fn from(err: E) -> Self {
+        Self::BeforeCommit(err.into())
+    }
+}
+
 /// The transaction of [`create_document`]: the caller's role and the folder read again, then the
 /// document and its snapshot row. Answers the caller's role.
 async fn insert_document(
@@ -309,7 +460,7 @@ async fn insert_document(
     user: &CurrentUser,
     document: &Document,
     snapshot: &SnapshotRow,
-) -> Result<ProjectRole, ApiError> {
+) -> Result<ProjectRole, InsertError> {
     let mut tx = state.store.begin().await?;
     let (_, role) = recheck_project(
         &mut *tx,
@@ -323,7 +474,9 @@ async fn insert_document(
     }
     tx.insert_document(document).await?;
     tx.insert_snapshot(snapshot).await?;
-    tx.commit().await?;
+    if let Err(err) = tx.commit().await {
+        return Err(InsertError::Commit(err, role));
+    }
     Ok(role)
 }
 

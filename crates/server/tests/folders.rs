@@ -350,3 +350,31 @@ async fn folder_roles_and_hostile_requests() {
         )
     );
 }
+
+#[tokio::test]
+async fn two_moves_that_together_would_form_a_cycle_cannot_both_succeed() {
+    let (server, w) = world().await;
+    for round in 0..5 {
+        let a = folder(&server, &w, &format!("A{round}"), None).await;
+        let b = folder(&server, &w, &format!("B{round}"), None).await;
+        let (one, two) = tokio::join!(
+            move_to(&server, &w, &a, Some(&b)),
+            move_to(&server, &w, &b, Some(&a)),
+        );
+        let mut statuses = [one.0, two.0];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::UNPROCESSABLE_ENTITY],
+            "round {round}"
+        );
+        let store = &server.state.store;
+        let pa = store.folder_by_id(&a).await.unwrap().unwrap().parent_id;
+        let pb = store.folder_by_id(&b).await.unwrap().unwrap().parent_id;
+        assert!(
+            pa.is_none() || pb.is_none(),
+            "round {round}: a cycle {pa:?} {pb:?}"
+        );
+        assert!(pa == Some(b.clone()) || pb == Some(a.clone()));
+    }
+}
