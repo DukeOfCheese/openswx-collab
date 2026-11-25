@@ -31,6 +31,10 @@ static JOURNAL_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
 static BROADCASTS: AtomicU64 = AtomicU64::new(0);
 static BROADCAST_RECIPIENTS: AtomicU64 = AtomicU64::new(0);
 static SLOW_CONSUMERS: AtomicU64 = AtomicU64::new(0);
+static LOCKS_GRANTED: AtomicU64 = AtomicU64::new(0);
+static LOCKS_DENIED: AtomicU64 = AtomicU64::new(0);
+static PRESENCE_RELAYED: AtomicU64 = AtomicU64::new(0);
+static PRESENCE_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -71,6 +75,22 @@ pub fn slow_consumer() {
     SLOW_CONSUMERS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A `lock.acquire` newly granted `granted` paths and denied `denied`.
+pub fn locks(granted: usize, denied: usize) {
+    LOCKS_GRANTED.fetch_add(granted as u64, Ordering::Relaxed);
+    LOCKS_DENIED.fetch_add(denied as u64, Ordering::Relaxed);
+}
+
+/// A presence or draft message was relayed.
+pub fn presence_relayed() {
+    PRESENCE_RELAYED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A presence or draft message was dropped (over the rate, from a viewer, or refused by the codec).
+pub fn presence_dropped() {
+    PRESENCE_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The counters as they are now.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Counters {
@@ -84,6 +104,10 @@ pub struct Counters {
     pub broadcasts: u64,
     pub broadcast_recipients: u64,
     pub slow_consumers: u64,
+    pub locks_granted: u64,
+    pub locks_denied: u64,
+    pub presence_relayed: u64,
+    pub presence_dropped: u64,
 }
 
 /// Reads every counter.
@@ -99,5 +123,9 @@ pub fn counters() -> Counters {
         broadcasts: get(&BROADCASTS),
         broadcast_recipients: get(&BROADCAST_RECIPIENTS),
         slow_consumers: get(&SLOW_CONSUMERS),
+        locks_granted: get(&LOCKS_GRANTED),
+        locks_denied: get(&LOCKS_DENIED),
+        presence_relayed: get(&PRESENCE_RELAYED),
+        presence_dropped: get(&PRESENCE_DROPPED),
     }
 }

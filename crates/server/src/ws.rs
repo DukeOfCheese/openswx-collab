@@ -217,9 +217,11 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     let outbox = Outbox::new(4 * state.settings.max_change_bytes);
     tokio::spawn(conn::write(sink, outbox.clone()));
     let conn = conn::next_id();
+    let heard = conn::Heard::new(state.clock.clone());
     let mut request = JoinRequest {
         conn,
         outbox: outbox.clone(),
+        heard: heard.clone(),
         user: user_id.clone(),
         name,
         role,
@@ -261,7 +263,7 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         send_refusal(&outbox, "busy", "try again", close::TOO_SLOW);
         return drain(stream).await;
     };
-    conn::read(stream, conn, outbox, room, max).await;
+    conn::read(stream, conn, outbox, heard, room, max).await;
 }
 
 /// An `error` and a close, through a connection's queue (whose writer is already running).

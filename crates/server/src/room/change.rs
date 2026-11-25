@@ -14,7 +14,9 @@
 //!    Older entries are forgotten (past [`RECENT_KEEP`], those before the last snapshot; past the
 //!    room's maximum, any), and their clients stop being complete.
 //! 2. **Read-only** connections are refused (`read_only`), after the memory check, and are never
-//!    looked up in the journal.
+//!    looked up in the journal. Then **locks** (the `locks` module): a change touching what another
+//!    client holds a lock on is refused (`locked`), against the lock table of the moment it is
+//!    judged (and again whenever it is judged again).
 //! 3. **Judged** by [`oswx_core::decide`] against the tentative head, under the sender's client id,
 //!    with `Rules::openswx()`. `depends` are answered from what the room knows of the client's own
 //!    changes: accepted (tentatively or durably) if memory holds it, refused if the client's
@@ -255,6 +257,8 @@ pub(super) enum Origin {
         reply: oneshot::Sender<Result<Seq, ServerChangeError>>,
         /// Refuse it as stale if someone changed what it writes since its base.
         check_stale: bool,
+        /// Which locks refuse it.
+        locks: super::LockRule,
     },
 }
 
@@ -272,16 +276,16 @@ impl Origin {
 #[derive(Debug, Clone)]
 pub(super) struct Author {
     /// `<user>.<client>`, or [`SERVER_CLIENT`].
-    client: ClientId,
-    user: String,
+    pub(super) client: ClientId,
+    pub(super) user: String,
     name: String,
 }
 
 /// A change going through the pipeline.
 pub(super) struct Item {
-    origin: Origin,
-    author: Author,
-    change: Arc<Change>,
+    pub(super) origin: Origin,
+    pub(super) author: Author,
+    pub(super) change: Arc<Change>,
     size: usize,
     /// Set when it is first made tentative; answers wait on it, and keep waiting on it if the
     /// change is judged again.
@@ -615,6 +619,7 @@ impl Room {
             origin: Origin::Server {
                 reply: sc.reply,
                 check_stale: sc.options.check_stale,
+                locks: sc.options.locks,
             },
             author: Author {
                 client: Arc::from(SERVER_CLIENT),
@@ -679,7 +684,10 @@ impl Room {
     }
 
     /// Judges a change (off the task when it is big) and goes on with the decision.
-    pub(super) fn judge_item(&mut self, mut item: Item) {
+    pub(super) fn judge_item(&mut self, item: Item) {
+        let Some(mut item) = self.unless_locked(item) else {
+            return;
+        };
         if matches!(item.origin, Origin::Server { .. }) {
             // The server's change is made on whatever is current.
             Arc::make_mut(&mut item.change).base = self.tentative.seq;
@@ -979,7 +987,7 @@ impl Room {
     }
 
     /// Tells everyone waiting for a change that it was refused.
-    fn answer_refused(
+    pub(super) fn answer_refused(
         &mut self,
         item: Item,
         code: RejectCode,
@@ -1188,6 +1196,9 @@ impl Room {
                 }
                 item.rejudged += 1;
             }
+            let Some(mut item) = self.unless_locked(item) else {
+                continue;
+            };
             if matches!(item.origin, Origin::Server { .. }) {
                 Arc::make_mut(&mut item.change).base = self.tentative.seq;
             }

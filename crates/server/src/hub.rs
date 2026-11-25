@@ -5,8 +5,9 @@
 //! fails is reported to the caller and not remembered. A room takes itself out of the hub when it
 //! unloads.
 //!
-//! Task 10 gives the hub the online list, Task 12 the drops (`drop_account`, `drop_user` only record
-//! the call for now) and the sweeper.
+//! [`Hub::online`] reads what each open room publishes (never loading a room or waiting for one);
+//! Task 12 gives the hub the drops (`drop_account`, `drop_user` only record the call for now) and
+//! the sweeper.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,10 +177,12 @@ impl Hub {
         }
     }
 
-    /// The first people connected to a document, and how many are connected in all.
-    pub async fn online(&self, _doc: &Id) -> (Vec<Online>, usize) {
-        // TASK 10: the online list.
-        (Vec::new(), 0)
+    /// The first people connected to a document (one entry per person, in the order they joined,
+    /// at most [`room::MAX_ONLINE`]), and how many people are connected in all. Nobody when the
+    /// document's room is not open; never opens one, never waits for one.
+    pub async fn online(&self, doc: &Id) -> (Vec<Online>, usize) {
+        self.loaded(doc)
+            .map_or_else(|| (Vec::new(), 0), |room| room.online())
     }
 
     /// Closes every room: each waits briefly for the journal's answers to changes in flight, closes

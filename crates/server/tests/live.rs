@@ -732,3 +732,163 @@ async fn shutdown_closes_sockets_after_what_was_accepted_is_durable() {
         .unwrap();
     assert_eq!(row.seq, durable);
 }
+
+// ------------------------------------------------------------------ presence and drafts
+
+fn relayed(msgs: &[ServerMsg]) -> Vec<Relayed> {
+    msgs.iter()
+        .filter_map(|m| <Relayed as FromServer>::pick(m.clone()).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn presence_and_drafts_are_relayed_not_stored() {
+    let (server, world) = world().await;
+    let (bob, _) = world
+        .invite(
+            &server,
+            "bob@example.com",
+            Some("Bob"),
+            Some("editor"),
+            "member",
+        )
+        .await;
+    let (viewer, _) = world
+        .invite(
+            &server,
+            "vi@example.com",
+            Some("Vi"),
+            Some("viewer"),
+            "member",
+        )
+        .await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    let pointer = json!({"pointer": {"point": [1, 2, 3], "face": "Boss-Extrude1:cap+"},
+                         "tool": "fillet", "selection": ["Boss-Extrude1:cap+"],
+                         "camera": {"eye": [0, 0, 100]}});
+    a.presence(pointer.clone()).await;
+    let got: Relayed = b.expect().await;
+    assert_eq!(
+        (got.kind, got.client_id.as_str(), got.data),
+        (
+            "presence",
+            a.client_id.as_str(),
+            Some(plain(pointer.clone()))
+        )
+    );
+    let sketch = json!({"sketch": "f1", "entities": {"Line9": {"p1": [0, 0], "p2": [4, 4]}}});
+    a.draft(Some(sketch.clone())).await;
+    let got: Relayed = b.expect().await;
+    assert_eq!((got.kind, got.data), ("draft", Some(plain(sketch.clone()))));
+    assert!(relayed(&a.drain().await).is_empty(), "no echo");
+
+    // Someone who joins later sees where everyone is and what they are drawing.
+    let mut v = Live::connect(&server, &doc, &viewer).await;
+    let ada = v.welcome.peers.iter().find(|p| p.name == "Ada").unwrap();
+    assert_eq!(ada.presence, Some(plain(pointer)));
+    assert_eq!(ada.draft, Some(plain(sketch)));
+    assert!(!ada.read_only);
+    // Viewers have a cursor too ...
+    v.presence(json!({"tool": "measure"})).await;
+    let got: Relayed = b.expect().await;
+    assert_eq!(got.data, Some(plain(json!({"tool": "measure"}))));
+    // ... but nothing to preview.
+    v.draft(Some(json!({"x": 1}))).await;
+    v.drain().await;
+    a.draft(None).await;
+    let got: Relayed = b.expect().await;
+    assert_eq!(
+        (got.kind, got.client_id.as_str(), got.data),
+        ("draft", a.client_id.as_str(), None)
+    );
+    assert!(
+        b.seen
+            .iter()
+            .all(|m| !matches!(m, ServerMsg::Draft { data: Some(d), .. }
+        if *d == plain(json!({"x": 1}))))
+    );
+    let late = Live::connect(&server, &doc, &bob).await;
+    let ada = late.welcome.peers.iter().find(|p| p.name == "Ada").unwrap();
+    assert_eq!(ada.draft, None, "cleared");
+    let vi = late.welcome.peers.iter().find(|p| p.name == "Vi").unwrap();
+    assert!(vi.read_only);
+    assert_eq!(vi.draft, None);
+    assert_eq!(head_seq(&server, &doc).await, 0, "nothing was stored");
+}
+
+#[tokio::test]
+async fn the_61st_presence_in_a_second_is_dropped() {
+    let clock = oswx_server::clock::Clock::manual(1_800_000_000.0);
+    let c = clock.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.clock = c).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    for n in 0..61 {
+        if n % 2 == 0 {
+            a.presence(json!({"n": n})).await;
+        } else {
+            a.draft(Some(json!({"n": n}))).await;
+        }
+    }
+    a.drain().await;
+    let got = relayed(&b.drain().await);
+    assert_eq!(got.len(), 60, "presence and drafts share the allowance");
+    assert_eq!(got[59].data, Some(plain(json!({"n": 59}))));
+    a.presence(json!({"n": "late"})).await;
+    a.drain().await;
+    assert!(relayed(&b.drain().await).is_empty());
+    clock.advance(1.0);
+    a.presence(json!({"n": "next second"})).await;
+    let got: Relayed = b.expect().await;
+    assert_eq!(got.data, Some(plain(json!({"n": "next second"}))));
+}
+
+#[tokio::test]
+async fn a_presence_flood_is_dropped() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    for n in 0..1000 {
+        a.presence(json!({"n": n})).await;
+    }
+    a.drain().await;
+    let got = relayed(&b.drain().await).len();
+    assert!((60..500).contains(&got), "{got}");
+}
+
+#[tokio::test]
+async fn presence_does_not_wait_for_the_journal() {
+    let slow = |store: &std::sync::Arc<dyn oswx_server::store::Store>| {
+        oswx_server::journal::JournalWriter::start(
+            store.clone(),
+            oswx_server::journal::MAX_BATCH,
+            Duration::from_millis(1500),
+        )
+    };
+    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let change = a.make_change(0, vec![set_depth(3)]);
+    a.send_change(&change).await;
+    let sent = std::time::Instant::now();
+    a.presence(json!({"tool": "line"})).await;
+    let first = b.recv().await;
+    let took = sent.elapsed();
+    assert!(
+        matches!(first, ServerMsg::Presence { .. }),
+        "the presence comes before the change: {first:?}"
+    );
+    assert!(took < Duration::from_millis(700), "{took:?}");
+    assert_eq!(a.outcome(&change.change_id).await.seq(), 1);
+    assert!(
+        sent.elapsed() >= Duration::from_millis(1000),
+        "the journal was slow"
+    );
+}

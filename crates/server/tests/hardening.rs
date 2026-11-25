@@ -822,3 +822,101 @@ async fn connections_racing_to_open_a_document_share_one_room() {
     let epoch = server.room_status(&doc).await.epoch;
     assert_eq!(epoch, 1, "the document was leased once");
 }
+
+// ------------------------------------------------------------------ locks and presence
+
+#[tokio::test]
+async fn someone_elses_client_id_gets_none_of_their_locks() {
+    let (server, world) = world().await;
+    let (bob, _) = world
+        .invite(
+            &server,
+            "bob@example.com",
+            Some("Bob"),
+            Some("editor"),
+            "member",
+        )
+        .await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("ada-desktop")).await;
+    assert_eq!(a.lock(&[&["features", "f2"]]).await.granted.len(), 1);
+    let mut b = Live::connect_with(&server, &doc, &bob, Hello::client("ada-desktop")).await;
+    a.drain().await;
+    assert!(a.closed.is_none(), "Ada is still connected");
+    assert_eq!(b.welcome.locks.len(), 1);
+    assert_eq!(&*b.welcome.locks[0].client_id, a.client_id.as_str());
+    assert_eq!(
+        b.change_on(0, vec![set_depth(1)]).await.code(),
+        RejectCode::Locked
+    );
+    // Nor can Bob release them.
+    b.unlock(&[&["features", "f2"]]).await;
+    assert_eq!(
+        b.change_on(0, vec![set_depth(1)]).await.code(),
+        RejectCode::Locked
+    );
+}
+
+fn raw_live(t: &str, data: Plain) -> Vec<u8> {
+    pack(&map(vec![("t", s(t)), ("data", data)]))
+}
+
+#[tokio::test]
+async fn presence_and_drafts_the_codec_refuses_are_dropped_and_the_connection_kept() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let big = |n: usize| map(vec![("pad", s(&"x".repeat(n)))]);
+    let refused = [
+        raw_live("presence", big(17 * 1024)),
+        raw_live("draft", big(129 * 1024)),
+        // (A frame over the 512 KiB any message but a change may be is answered `too_large`:
+        // `frames_are_bounded`.)
+        raw_live(
+            "presence",
+            map(vec![("pointer", Plain::Array(vec![Plain::F64(f64::NAN)]))]),
+        ),
+        raw_live("draft", map(vec![("x", Plain::F64(f64::INFINITY))])),
+        raw_live("presence", map(vec![("x", Plain::Binary(vec![1, 2]))])),
+        raw_live("presence", s("not a map")),
+    ];
+    for frame in refused {
+        a.send_raw(frame).await;
+    }
+    let answers = a.drain().await;
+    assert!(
+        answers
+            .iter()
+            .all(|m| matches!(m, ServerMsg::PeerJoined(_))),
+        "nothing answered: {answers:?}"
+    );
+    assert!(a.closed.is_none());
+    a.draft(Some(json!({"x": 1}))).await;
+    a.presence(json!({"pointer": [1, 2, 3]})).await;
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        match b.recv().await {
+            ServerMsg::Presence { data, .. } => got.push(("presence", data)),
+            ServerMsg::Draft { data: Some(d), .. } => got.push(("draft", d)),
+            other => panic!("only what was valid comes: {other:?}"),
+        }
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("draft", plain(json!({"x": 1}))),
+            ("presence", plain(json!({"pointer": [1, 2, 3]})))
+        ]
+    );
+    // What a later joiner sees was never poisoned.
+    let late = Live::connect(&server, &doc, &world.admin).await;
+    let ada = late
+        .welcome
+        .peers
+        .iter()
+        .find(|p| p.client_id.as_ref() == a.client_id)
+        .unwrap();
+    assert_eq!(ada.draft, Some(plain(json!({"x": 1}))));
+    assert_eq!(ada.presence, Some(plain(json!({"pointer": [1, 2, 3]}))));
+}

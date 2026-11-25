@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use oswx_core::wire::{self, ChangeEvent, Peer, ServerMsg};
+use oswx_core::wire::{self, ChangeEvent, Lock, Peer, ServerMsg};
 use oswx_core::{Head, Seq};
 
 use crate::record::decode_ops;
@@ -25,7 +25,10 @@ pub(super) struct Welcome {
     pub role: ProjectRole,
     pub read_only: Option<String>,
     pub you: Peer,
+    /// The other connections, in the order they joined (with their last presence and draft).
     pub peers: Vec<Peer>,
+    /// Every lock.
+    pub locks: Vec<Lock>,
     pub encodes: Arc<AtomicU64>,
 }
 
@@ -60,8 +63,8 @@ impl Welcome {
             read_only_reason: self.read_only,
             you: self.you,
             peers: self.peers,
-            // TASK 10: the locks held; TASK 11: what does not rebuild.
-            locks: Vec::new(),
+            locks: self.locks,
+            // TASK 11: what does not rebuild.
             broken: Default::default(),
             content,
             changes,

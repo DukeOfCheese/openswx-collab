@@ -13,7 +13,13 @@
 //!   limit.
 //!
 //! The reader decodes frames (on the blocking pool when they are large) and hands messages to the
-//! room; malformed ones are answered here, without the room.
+//! room; malformed ones are answered in their turn through the room. Every frame read counts as
+//! hearing from the client ([`Heard`]: a connection silent for `lock_ttl` loses its locks). A
+//! `presence` or `draft` frame within the 512 KiB any non-change frame may be, whose content the
+//! codec refuses (over 16 KB or 128 KB, NaN or binary inside, not a map), is dropped silently:
+//! presence is never answered (the Python server dropped oversize and unencodable ones silently
+//! too). A longer one is answered `too_large`, like any frame too long for its kind (as Python
+//! answered a frame over its frame limit).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +34,7 @@ use oswx_core::wire::{self, ClientMsg, ServerMsg, WireError};
 use tokio::sync::{Notify, watch};
 
 use super::{RoomHandle, close};
+use crate::clock::Clock;
 
 /// The most frames a connection may have waiting, the one being written included.
 pub const MAX_QUEUED: usize = 2000;
@@ -48,6 +55,32 @@ pub type ConnId = u64;
 pub fn next_id() -> ConnId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// When a connection was last heard from (any frame), in the clock's epoch seconds. Shared by its
+/// reader, which notes every frame, and the room, which expires the locks of silent clients.
+#[derive(Debug)]
+pub struct Heard {
+    clock: Clock,
+    at: AtomicU64,
+}
+
+impl Heard {
+    /// Heard from now.
+    pub fn new(clock: Clock) -> Arc<Self> {
+        let at = AtomicU64::new(clock.now().to_bits());
+        Arc::new(Self { clock, at })
+    }
+
+    /// Notes a frame.
+    pub fn touch(&self) {
+        self.at.store(self.clock.now().to_bits(), Ordering::Relaxed);
+    }
+
+    /// When the last frame came.
+    pub fn at(&self) -> f64 {
+        f64::from_bits(self.at.load(Ordering::Relaxed))
+    }
 }
 
 /// Where a connection is in its life, as its reader and writer see it.
@@ -283,12 +316,24 @@ pub fn error_frame(code: &str, message: &str) -> Bytes {
     })
 }
 
+/// Decodes a client frame; on failure, also says whether it was a `presence` or `draft` frame.
+fn decode(frame: &[u8], max: usize) -> Result<ClientMsg, (WireError, bool)> {
+    wire::decode_client(frame, max).map_err(|e| {
+        let live = matches!(
+            wire::scan(frame, Some(wire::MAX_NODES)).map(|s| s.t),
+            Ok(Some("presence" | "draft"))
+        );
+        (e, live)
+    })
+}
+
 /// Reads a connection's frames and hands its messages to the room, until the client goes away or the
 /// server closes the connection; then tells the room it left.
 pub async fn read(
     mut stream: SplitStream<WebSocket>,
     conn: ConnId,
     outbox: Arc<Outbox>,
+    heard: Arc<Heard>,
     room: RoomHandle,
     max: usize,
 ) {
@@ -298,6 +343,9 @@ pub async fn read(
             next = stream.next() => next,
             _ = life.wait_for(|l| *l != Life::Open) => break,
         };
+        if matches!(next, Some(Ok(Message::Binary(_) | Message::Text(_)))) {
+            heard.touch();
+        }
         let frame = match next {
             Some(Ok(Message::Binary(frame))) => frame,
             Some(Ok(Message::Text(_))) => {
@@ -323,21 +371,26 @@ pub async fn read(
             break;
         }
         let decoded = if size > DECODE_OFF_TASK {
-            match tokio::task::spawn_blocking(move || wire::decode_client(&frame, max)).await {
+            match tokio::task::spawn_blocking(move || decode(&frame, max)).await {
                 Ok(decoded) => decoded,
-                Err(_) => Err(WireError::Invalid("the frame could not be read".into())),
+                Err(_) => Err((
+                    WireError::Invalid("the frame could not be read".into()),
+                    false,
+                )),
             }
         } else {
-            wire::decode_client(&frame, max)
+            decode(&frame, max)
         };
         match decoded {
-            Err(WireError::TooLarge) => {
+            // Presence is never answered: one whose content the codec refuses is dropped.
+            Err((WireError::Invalid(_), true)) => crate::metrics::presence_dropped(),
+            Err((WireError::TooLarge, _)) => {
                 let message = "send large data as blobs".to_owned();
                 if !malformed(&room, conn, &outbox, "too_large", message).await {
                     break;
                 }
             }
-            Err(WireError::Invalid(why)) => {
+            Err((WireError::Invalid(why), false)) => {
                 if !malformed(&room, conn, &outbox, "bad_message", why).await {
                     break;
                 }

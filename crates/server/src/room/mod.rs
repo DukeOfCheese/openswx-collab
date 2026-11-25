@@ -30,17 +30,26 @@
 //! welcome (the document at `H`, or the change events up to `H`) in a task of its own. Until the
 //! welcome is ready the connection's writer holds back; what is broadcast meanwhile (every change
 //! after `H`) queues behind the welcome. So a joiner misses no change, and gets none twice.
+//!
+//! # Locks, presence, who is here
+//!
+//! See the `locks` module (advisory leases on paths that also stop other clients' changes) and the
+//! `presence` module (pointers, selections and drafts relayed at once, never stored; the online
+//! list the document list reads without asking the room). The room ticks every
+//! `sweep_interval` seconds while it is loaded; a tick expires locks.
 
 mod change;
 pub mod conn;
 mod lifecycle;
+mod locks;
 mod people;
+mod presence;
 mod util;
 mod welcome;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -49,12 +58,15 @@ use oswx_core::{ClientId, Head, Seq};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+use crate::hub::Online;
 use crate::security::ProjectRole;
 use crate::state::AppState;
 use crate::store::Id;
 use util::Bounded;
 
-pub use conn::{ConnId, Outbox};
+pub use conn::{ConnId, Heard, Outbox};
+pub use locks::MAX_LOCKS;
+pub use presence::MAX_ONLINE;
 
 /// WebSocket close codes the server uses, in one place.
 pub mod close {
@@ -141,6 +153,10 @@ pub enum ServerChangeError {
     /// It was not written: the room is gone or closing, or the journal failed it.
     #[error("the change was not written")]
     NotWritten,
+    /// Locks held by others stand in its way ([`ServerChangeOptions::locks`]); the conflicts name
+    /// them (kind `locked`, `by` the holder's client id).
+    #[error("the change was refused: locked by others")]
+    Locked(Vec<oswx_core::Conflict>),
 }
 
 /// A change the server makes itself, waiting for the room.
@@ -155,11 +171,28 @@ pub struct ServerChange {
 }
 
 /// How a change the server makes is judged.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerChangeOptions {
     /// Refuse it (`stale`) if another client changed what it writes since the current head when it
     /// was asked for. Off: it lands whatever happened (a restore); ids are never prefix-checked.
     pub check_stale: bool,
+    /// Which locks refuse it (`locked`).
+    pub locks: LockRule,
+}
+
+/// Which locks stand in the way of a change the server makes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LockRule {
+    /// The rule for any change: a lock on (at, under or above) what it writes. The server is no
+    /// client, so every such lock counts.
+    #[default]
+    Writes,
+    /// As [`LockRule::Writes`], except the locks of this client (a change made for it, such as
+    /// its revert: its own locks never stop it).
+    WritesExcept(ClientId),
+    /// Any lock held by a user other than the change's author, whatever it writes (a restore
+    /// rewrites anything: it waits until nobody else is editing).
+    AnyOfOtherUsers,
 }
 
 /// What an open room is: what it and the tests can see of it.
@@ -177,6 +210,8 @@ pub struct RoomStatus {
     pub encodes: u64,
     /// Change ids remembered, and the entries of the order they are forgotten in.
     pub remembered: (usize, usize),
+    /// Locks held, and how many of them wait for their client to come back.
+    pub locks: (usize, usize),
     pub connections: Vec<ConnStatus>,
 }
 
@@ -192,6 +227,8 @@ pub struct ConnStatus {
 pub struct JoinRequest {
     pub conn: ConnId,
     pub outbox: Arc<Outbox>,
+    /// When the connection's reader last read a frame.
+    pub heard: Arc<Heard>,
     pub user: Id,
     pub name: String,
     pub role: ProjectRole,
@@ -226,7 +263,8 @@ pub enum RoomCmd {
     },
     /// A change the server makes itself.
     ServerChange(Box<ServerChange>),
-    /// A periodic nudge (TASK 10/12: lock expiry and idle checks hang off it); nothing yet.
+    /// A sweep, as the room's own timer makes every `sweep_interval` seconds: locks expire (TASK
+    /// 12: idle checks hang off it too).
     Tick,
     /// Stop: wait (briefly) for the journal's answers to changes in flight, close every connection
     /// with `code`, write a final snapshot if `snapshot` and there is anything new, then answer
@@ -251,12 +289,24 @@ pub enum RoomCmd {
 #[error("the room is gone")]
 pub struct RoomGone;
 
+/// What a room publishes for others to read without asking it (and so without waiting for it).
+#[derive(Debug, Default)]
+struct Shared {
+    /// The online list: the first people (one entry per person, in the order they joined) and
+    /// how many there are.
+    online: Mutex<(Vec<Online>, usize)>,
+    /// Locks held, and how many of those are detached.
+    locks: AtomicUsize,
+    detached: AtomicUsize,
+}
+
 /// How the rest of the server reaches a room. Cloning is cheap.
 #[derive(Clone, Debug)]
 pub struct RoomHandle {
     id: u64,
     control: mpsc::Sender<RoomCmd>,
     frames: mpsc::Sender<RoomCmd>,
+    shared: Arc<Shared>,
 }
 
 impl RoomHandle {
@@ -273,7 +323,10 @@ impl RoomHandle {
     /// Sends a command (waiting while the room's queue is full). The command comes back if the
     /// room is gone.
     pub async fn send(&self, cmd: RoomCmd) -> Result<(), Box<RoomCmd>> {
-        let channel = match cmd {
+        let channel = match &cmd {
+            // Presence and drafts take the other way in, so that a room busy with changes (not
+            // taking frames) still relays them at once.
+            RoomCmd::Frame { msg, .. } if presence::is_live(msg) => &self.control,
             RoomCmd::Frame { .. } | RoomCmd::Malformed { .. } => &self.frames,
             _ => &self.control,
         };
@@ -356,6 +409,33 @@ impl RoomHandle {
         rx.await.ok()
     }
 
+    /// Who has the document open: the first [`MAX_ONLINE`] people (one entry per person, in the
+    /// order they joined) and how many there are. Read from what the room published at its last
+    /// join or leave; never waits for the room.
+    pub fn online(&self) -> (Vec<Online>, usize) {
+        self.shared
+            .online
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the room holds any lock (attached or waiting for its client): a room that does must
+    /// stay loaded until they expire. Never waits for the room.
+    pub fn holds_locks(&self) -> bool {
+        self.shared.locks.load(Ordering::Relaxed) > 0
+    }
+
+    /// How many locks are detached (their client gone, within the grace period).
+    pub fn detached_locks(&self) -> usize {
+        self.shared.detached.load(Ordering::Relaxed)
+    }
+
+    /// Asks the room to sweep now (as its timer does).
+    pub async fn tick(&self) {
+        let _ = self.send(RoomCmd::Tick).await;
+    }
+
     /// For tests: makes the room forget every change id it remembers (as if trimmed).
     #[doc(hidden)]
     pub async fn forget_change_ids(&self) {
@@ -423,6 +503,16 @@ struct Conn {
     /// A message of this connection waits for work off the task (a blob check, a journal lookup,
     /// a big change being judged).
     busy: bool,
+    /// When its reader last read a frame.
+    heard: Arc<Heard>,
+    /// The last presence and draft it sent, for the welcomes of those who join later.
+    presence: Option<oswx_core::Plain>,
+    draft: Option<oswx_core::Plain>,
+    /// Its allowance of presence and draft messages, and of `lock.acquire`s.
+    live_rate: presence::Bucket,
+    lock_rate: presence::Bucket,
+    /// When it joined the room, in join order.
+    joined: u64,
 }
 
 impl Conn {
@@ -433,9 +523,8 @@ impl Conn {
             name: self.name.clone(),
             colour: self.colour.clone(),
             read_only: self.read_only.is_some(),
-            // TASK 10: presence and drafts.
-            presence: None,
-            draft: None,
+            presence: self.presence.clone(),
+            draft: self.draft.clone(),
         }
     }
 }
@@ -505,6 +594,11 @@ struct Room {
     slow: Vec<ConnId>,
     closing: Option<Closing>,
     encodes: Arc<AtomicU64>,
+    locks: locks::Locks,
+    /// What the room publishes for its handles.
+    shared: Arc<Shared>,
+    /// The join order of the next connection.
+    next_join: u64,
 }
 
 fn next_room_id() -> u64 {
@@ -519,6 +613,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
     let (internal_tx, internal_rx) = mpsc::unbounded_channel();
     let journal = change::pump(state.journal.clone(), internal_tx.clone());
     let id = next_room_id();
+    let shared = Arc::new(Shared::default());
     let room = Room {
         id,
         doc: init.doc,
@@ -549,6 +644,9 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         slow: Vec::new(),
         closing: None,
         encodes: Arc::new(AtomicU64::new(0)),
+        locks: locks::Locks::new(init.head.seq),
+        shared: shared.clone(),
+        next_join: 0,
         state,
     };
     tokio::spawn(room.run(control_rx, frames_rx, internal_rx));
@@ -556,6 +654,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         id,
         control: control_tx,
         frames: frames_tx,
+        shared,
     }
 }
 
@@ -567,12 +666,16 @@ impl Room {
         mut internal: mpsc::UnboundedReceiver<Internal>,
     ) {
         let mut control_open = true;
+        let every = Duration::from_secs_f64(self.state.settings.sweep_interval.max(0.001));
+        let mut sweep = tokio::time::interval_at(Instant::now() + every, every);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let deadline = self.closing.as_ref().map(|c| c.deadline);
             let far = Instant::now() + Duration::from_secs(86400);
             tokio::select! {
                 biased;
                 Some(event) = internal.recv() => self.on_internal(event),
+                _ = sweep.tick() => self.sweep(),
                 cmd = control.recv(), if control_open => match cmd {
                     Some(cmd) => self.on_command(cmd),
                     // Nobody can reach the room any more (the hub is gone).
@@ -590,6 +693,8 @@ impl Room {
                 }
             }
             self.run_parked();
+            // Locks on what is no longer in the document go once its removal is durable.
+            self.follow_head_with_locks();
             self.reap();
             if self
                 .closing
@@ -625,7 +730,7 @@ impl Room {
                 message,
             } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
             RoomCmd::ServerChange(sc) => self.on_server_change(*sc),
-            RoomCmd::Tick => {}
+            RoomCmd::Tick => self.sweep(),
             RoomCmd::Close {
                 code,
                 reason,
@@ -683,6 +788,7 @@ impl Room {
             epoch: self.epoch,
             encodes: self.encodes.load(Ordering::Relaxed),
             remembered: self.recent.sizes(),
+            locks: (self.locks.len(), self.locks.detached_count()),
             connections,
         }
     }
@@ -690,6 +796,14 @@ impl Room {
     // ------------------------------------------------------------------ frames
 
     fn on_frame(&mut self, conn: ConnId, incoming: change::Incoming) {
+        // Presence and drafts are not answered and wait for nothing: relayed now, whatever the
+        // connection's other messages wait for.
+        let incoming = match incoming {
+            change::Incoming::Msg(msg, _) if presence::is_live(&msg) => {
+                return self.on_live(conn, msg);
+            }
+            other => other,
+        };
         let max_bytes = 4 * self.state.settings.max_change_bytes;
         let Some(c) = self.conns.get_mut(&conn) else {
             return; // (a connection the room already dropped)
@@ -784,13 +898,11 @@ impl Room {
                 });
                 self.reply(conn, pong);
             }
-            // TASK 10: locks, presence and drafts.
-            ClientMsg::LockAcquire { .. }
-            | ClientMsg::LockRelease { .. }
-            | ClientMsg::Presence { .. }
-            | ClientMsg::Draft { .. } => {
-                tracing::debug!("a lock, presence or draft message is ignored until Task 10");
+            ClientMsg::LockAcquire { request_id, paths } => {
+                self.on_lock_acquire(conn, request_id, paths);
             }
+            ClientMsg::LockRelease { paths } => self.on_lock_release(conn, &paths),
+            msg @ (ClientMsg::Presence { .. } | ClientMsg::Draft { .. }) => self.on_live(conn, msg),
             // TASK 11: reverting from history and rebuild reports.
             ClientMsg::Revert { .. } | ClientMsg::RebuildReport { .. } => {
                 tracing::debug!("a revert or rebuild report is ignored until Task 11");

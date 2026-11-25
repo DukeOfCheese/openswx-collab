@@ -10,6 +10,7 @@ use oswx_core::wire::{Peer, ServerMsg};
 use std::panic::AssertUnwindSafe;
 
 use super::change::Ticket;
+use super::presence::Bucket;
 use super::welcome::Welcome;
 use super::{Conn, ConnId, Internal, JoinRequest, Reply, Room, close, conn};
 use crate::security::{ProjectRole, colour_for};
@@ -127,6 +128,9 @@ impl Room {
                 colour_for(&req.user, &taken)
             }
         };
+        // Locks this client kept through a disconnect are its again (or released, if it may
+        // now only look); a replaced connection's locks simply stay.
+        let (back, released) = self.locks_at_join(&req.client, read_only.is_some());
         let conn = Conn {
             client: req.client.clone(),
             user: req.user,
@@ -138,11 +142,21 @@ impl Room {
             parked: VecDeque::new(),
             parked_bytes: 0,
             busy: false,
+            heard: req.heard,
+            presence: None,
+            draft: None,
+            live_rate: Bucket::default(),
+            lock_rate: Bucket::default(),
+            joined: self.next_join,
         };
+        self.next_join += 1;
         let you = conn.peer();
-        let peers: Vec<Peer> = self.conns.values().map(Conn::peer).collect();
+        let mut others: Vec<&Conn> = self.conns.values().collect();
+        others.sort_by_key(|c| c.joined);
+        let peers: Vec<Peer> = others.into_iter().map(Conn::peer).collect();
         let joined = self.encode(&ServerMsg::PeerJoined(you.clone()));
         self.broadcast(&joined, &[]);
+        self.announce_join_locks(back, released);
         let welcome = Welcome {
             store: self.state.store.clone(),
             doc: self.doc.clone(),
@@ -154,6 +168,7 @@ impl Room {
             read_only: conn.read_only.clone(),
             you,
             peers,
+            locks: self.all_locks(),
             encodes: self.encodes.clone(),
         };
         // What this client already sent here is answered from memory if it comes again.
@@ -164,6 +179,7 @@ impl Room {
         self.recent.trim(self.snapshot_seq);
         self.by_client.insert(req.client, req.conn);
         self.conns.insert(req.conn, conn);
+        self.publish_online();
         let internal = self.internal.clone();
         let conn_id = req.conn;
         tokio::spawn(async move {
@@ -193,14 +209,18 @@ impl Room {
     }
 
     /// Takes a connection out of the room, closing it (with `close`, or a normal close), and tells
-    /// the others it left when `announce`.
+    /// the others it left when `announce`; its locks then wait for it (detached). Only a connection
+    /// replaced by a new one of the same client is removed without `announce`: its locks pass to the
+    /// new one.
     pub(super) fn remove_conn(&mut self, conn: ConnId, close: Option<(u16, &str)>, announce: bool) {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
-        if self.by_client.get(&c.client) == Some(&conn) {
+        let registered = self.by_client.get(&c.client) == Some(&conn);
+        if registered {
             self.by_client.remove(&c.client);
         }
+        self.publish_online();
         // For this task the refused ids are forgotten when the connection goes (TASK 12: after a
         // grace period instead).
         self.refused.remove(&c.client);
@@ -211,6 +231,9 @@ impl Room {
                 client_id: c.client.clone(),
             });
             self.broadcast(&left, &[]);
+            if registered {
+                self.locks_at_leave(&c.client);
+            }
         }
     }
 }

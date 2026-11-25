@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use oswx_core::wire::{
-    self, ChangeEvent, ClientMsg, PROTOCOL_VERSION, Peer, RejectCode, ServerMsg,
+    self, ChangeEvent, ClientMsg, Lock, LockDenied, PROTOCOL_VERSION, Peer, RejectCode, ServerMsg,
 };
-use oswx_core::{Change, Conflict, Op, Path, Pos, Seq, Value};
+use oswx_core::{Change, Conflict, Op, Path, Plain, Pos, Seq, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -110,6 +110,7 @@ pub struct Welcome {
     pub read_only_reason: Option<String>,
     pub you: Peer,
     pub peers: Vec<Peer>,
+    pub locks: Vec<Lock>,
     pub content: Option<Value>,
     pub changes: Option<Vec<ChangeEvent>>,
 }
@@ -231,6 +232,93 @@ impl FromServer for ErrorMsg {
     }
 }
 
+/// `lock.result`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockResult {
+    pub request_id: String,
+    pub granted: Vec<Path>,
+    pub denied: Vec<LockDenied>,
+}
+
+impl LockResult {
+    /// The holder named for a denied path (`None`: denied with no holder; panics if it was not
+    /// denied).
+    #[track_caller]
+    pub fn holder(&self, p: &[&str]) -> Option<&Lock> {
+        let p = path(p);
+        self.denied
+            .iter()
+            .find(|d| d.path == p)
+            .unwrap_or_else(|| panic!("{p:?} was not denied: {self:?}"))
+            .holder
+            .as_ref()
+    }
+}
+
+impl FromServer for LockResult {
+    fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::LockResult {
+                request_id,
+                granted,
+                denied,
+            } => Ok(LockResult {
+                request_id,
+                granted,
+                denied,
+            }),
+            other => Err(other),
+        }
+    }
+}
+
+/// `lock.changed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockChanged {
+    pub locks: Vec<Lock>,
+    pub released: Vec<Path>,
+}
+
+impl FromServer for LockChanged {
+    fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::LockChanged { locks, released } => Ok(LockChanged { locks, released }),
+            other => Err(other),
+        }
+    }
+}
+
+/// `presence` or `draft` from another client: (`"presence"` or `"draft"`, client id, data).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relayed {
+    pub kind: &'static str,
+    pub client_id: String,
+    pub data: Option<Plain>,
+}
+
+impl FromServer for Relayed {
+    fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::Presence { client_id, data } => Ok(Relayed {
+                kind: "presence",
+                client_id: client_id.to_string(),
+                data: Some(data),
+            }),
+            ServerMsg::Draft { client_id, data } => Ok(Relayed {
+                kind: "draft",
+                client_id: client_id.to_string(),
+                data,
+            }),
+            other => Err(other),
+        }
+    }
+}
+
+/// Opaque data (presence, a draft) from JSON.
+pub fn plain(j: serde_json::Value) -> Plain {
+    oswx_server::content::plain_from_json(&j)
+}
+
 /// `change.accepted` or `change.rejected`, for any change id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Answer {
@@ -345,7 +433,7 @@ impl Live {
                 read_only_reason,
                 you,
                 peers,
-                locks: _,
+                locks,
                 broken: _,
                 content,
                 changes,
@@ -360,6 +448,7 @@ impl Live {
                     read_only_reason,
                     you,
                     peers,
+                    locks,
                     content,
                     changes,
                 },
@@ -563,6 +652,42 @@ impl Live {
     pub fn add_feature(&mut self, name: &str) -> (Op, Arc<str>) {
         let id = self.new_id();
         (insert(&["features"], feature(&id, name), after_f2()), id)
+    }
+
+    /// Asks for locks on `paths` (each given as its segments) and waits for the `lock.result`.
+    pub async fn lock(&mut self, paths: &[&[&str]]) -> LockResult {
+        self.send_lock(paths).await;
+        self.expect().await
+    }
+
+    /// Sends a `lock.acquire` (request id `r`) without waiting.
+    pub async fn send_lock(&mut self, paths: &[&[&str]]) {
+        self.send(&ClientMsg::LockAcquire {
+            request_id: "r".into(),
+            paths: paths.iter().map(|p| path(p)).collect(),
+        })
+        .await;
+    }
+
+    /// Releases locks (no answer comes).
+    pub async fn unlock(&mut self, paths: &[&[&str]]) {
+        self.send(&ClientMsg::LockRelease {
+            paths: paths.iter().map(|p| path(p)).collect(),
+        })
+        .await;
+    }
+
+    /// Sends presence data (JSON).
+    pub async fn presence(&mut self, data: serde_json::Value) {
+        self.send(&ClientMsg::Presence { data: plain(data) }).await;
+    }
+
+    /// Sends a draft (JSON; `None` clears it).
+    pub async fn draft(&mut self, data: Option<serde_json::Value>) {
+        self.send(&ClientMsg::Draft {
+            data: data.map(plain),
+        })
+        .await;
     }
 
     /// Closes the socket from this side.
