@@ -203,6 +203,48 @@ fn bad_inserts() {
 }
 
 #[test]
+fn duplicate_ids_inside_an_inserted_item() {
+    let entry = |pos: &str, id: &str| Plain::Array(vec![s(pos), item(id)]);
+    let with_sub = |sub: Plain| m(vec![("id", s("u.c.1")), ("sub", sub)]);
+    // A keyed list inside the item that names one id twice is refused.
+    let dup = m(vec![(
+        "$list",
+        Plain::Array(vec![entry("1", "x"), entry("2", "x")]),
+    )]);
+    invalid(Op::from_wire(&insert(arr(&["l"]), with_sub(dup), s("V"))));
+    // Deeper down too.
+    let deep = m(vec![(
+        "$list",
+        Plain::Array(vec![Plain::Array(vec![
+            s("1"),
+            m(vec![
+                ("id", s("y")),
+                (
+                    "sub",
+                    m(vec![(
+                        "$list",
+                        Plain::Array(vec![entry("1", "x"), entry("2", "x")]),
+                    )]),
+                ),
+            ]),
+        ])]),
+    )]);
+    invalid(Op::from_wire(&insert(arr(&["l"]), with_sub(deep), s("V"))));
+    // Distinct ids are fine, and a plain list with a repeated id is just a plain list.
+    let fine = m(vec![(
+        "$list",
+        Plain::Array(vec![entry("1", "x"), entry("2", "y")]),
+    )]);
+    Op::from_wire(&insert(arr(&["l"]), with_sub(fine), s("V"))).unwrap();
+    let plain = Plain::Array(vec![item("x"), item("x")]);
+    let op = Op::from_wire(&insert(arr(&["l"]), with_sub(plain), s("V"))).unwrap();
+    let Op::Insert { item, .. } = op else {
+        panic!()
+    };
+    assert!(matches!(item.at(&["sub"]), Some(Value::List(_))));
+}
+
+#[test]
 fn bad_positions() {
     let bad = [
         s(""),

@@ -470,3 +470,32 @@ fn only_a_remembered_removal_lets_a_foreign_id_back_in() {
     assert!(h1.index.removed_at(&path(&["features", "f1"])));
     assert!(!h1.index.removed_at(&path(&["features"])));
 }
+
+#[test]
+fn edit_inside_an_item_removed_since_the_base_is_stale() {
+    let rm = change(
+        "rm",
+        0,
+        vec![Op::Remove {
+            list: path(&["features"]),
+            id: Arc::from("f1"),
+        }],
+    );
+    let h1 = adopt(decide_for(&head(), "u2.c1", &rm, &never).unwrap());
+    let edit = change("e", 0, vec![set(&["features", "f1", "params", "depth"], 3)]);
+    assert_eq!(
+        decide_for(&h1, "u1.c1", &edit, &never).unwrap_err(),
+        Refusal::Stale(vec![oswx_core::Conflict {
+            path: path(&["features", "f1"]),
+            seq: 1,
+            by: client("u2.c1"),
+            kind: ConflictKind::Removed,
+        }])
+    );
+    // Made after the removal, the same edit finds nothing to edit.
+    let late = change("l", 1, vec![set(&["features", "f1", "params", "depth"], 3)]);
+    assert!(matches!(
+        decide_for(&h1, "u1.c1", &late, &never),
+        Err(Refusal::Invalid(_))
+    ));
+}
