@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use common::{load, path, to_plain};
 use oswx_core::{
-    Change, ClientMsg, Conflict, ConflictKind, Op, Peer, Plain, Pos, RejectCode, ServerMsg,
-    decode_client, decode_server, encode_client, encode_server,
+    Change, ClientMsg, Conflict, ConflictKind, Lock, LockDenied, Op, Peer, Plain, Pos, RejectCode,
+    ServerMsg, decode_client, decode_server, encode_client, encode_server,
 };
 use serde_json::{Value as Json, json};
 
@@ -68,8 +68,19 @@ fn peer(client: &str) -> Peer {
         user_id: "u1".into(),
         name: "Ada".into(),
         colour: "#3366cc".into(),
+        read_only: false,
         presence: None,
         draft: None,
+    }
+}
+
+fn lock() -> Lock {
+    Lock {
+        path: path(&["features", "f1"]),
+        client_id: Arc::from("u2.client-0002"),
+        user_id: "u2".into(),
+        name: "Bob".into(),
+        detached: false,
     }
 }
 
@@ -176,6 +187,33 @@ fn vectors() -> Vec<(&'static str, &'static str, Vec<u8>)> {
             ClientMsg::LockAcquire {
                 request_id: "r-1".into(),
                 paths: vec![path(&["features", "f1"]), path(&["display"])],
+            },
+        ),
+        s2c(
+            "lock.result",
+            ServerMsg::LockResult {
+                request_id: "r-1".into(),
+                granted: vec![path(&["display"])],
+                denied: vec![
+                    LockDenied {
+                        path: path(&["features", "f1"]),
+                        holder: Some(lock()),
+                    },
+                    LockDenied {
+                        path: path(&["features", "f9"]),
+                        holder: None,
+                    },
+                ],
+            },
+        ),
+        s2c(
+            "lock.changed",
+            ServerMsg::LockChanged {
+                locks: vec![Lock {
+                    detached: true,
+                    ..lock()
+                }],
+                released: vec![path(&["display"])],
             },
         ),
         c2s(

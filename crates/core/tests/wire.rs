@@ -8,8 +8,9 @@ use oswx_core::wire::{
     MAX_DRAFT, MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
 };
 use oswx_core::{
-    Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, Lock, Op, Peer, Plain, Pos,
-    RejectCode, ServerMsg, WireError, decode_client, decode_server, encode_client, encode_server,
+    Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, Lock, LockDenied, Op, Peer,
+    Plain, Pos, RejectCode, ServerMsg, WireError, decode_client, decode_server, encode_client,
+    encode_server,
 };
 use serde_json::{Value as Json, json};
 
@@ -166,6 +167,7 @@ fn peer(n: &str) -> Peer {
         user_id: "u1".into(),
         name: "Ada".into(),
         colour: "#ff0000".into(),
+        read_only: false,
         presence: Some(to_plain(json!({"tool": "line"}))),
         draft: None,
     }
@@ -188,7 +190,17 @@ fn lock() -> Lock {
     Lock {
         path: path(&["features", "f1"]),
         client_id: Arc::from("u1.client-01"),
+        user_id: "u1".into(),
         name: "Ada".into(),
+        detached: false,
+    }
+}
+
+fn detached_lock() -> Lock {
+    Lock {
+        path: path(&["features"]),
+        detached: true,
+        ..lock()
     }
 }
 
@@ -223,8 +235,15 @@ fn welcome(content: bool, read_only: bool) -> ServerMsg {
         read_only,
         read_only_reason: read_only.then(|| "viewer role".to_string()),
         you: peer("client-01"),
-        peers: vec![peer("client-02")],
-        locks: vec![lock()],
+        peers: vec![
+            peer("client-02"),
+            Peer {
+                read_only: true,
+                draft: Some(to_plain(json!({"x": [1, 2]}))),
+                ..peer("client-03")
+            },
+        ],
+        locks: vec![lock(), detached_lock()],
         broken: broken(),
         content: content.then(|| load(json!({"features": [{"id": "f1", "name": "A"}]}))),
         changes: (!content).then(|| vec![event(4), event(5)]),
@@ -275,6 +294,17 @@ fn server_samples() -> Vec<ServerMsg> {
                 },
             ],
         },
+        ServerMsg::Rejected {
+            change_id: Arc::from("c2"),
+            code: RejectCode::Locked,
+            message: "being edited by Ada".into(),
+            conflicts: vec![Conflict {
+                path: path(&["features", "f1"]),
+                seq: 0,
+                by: Arc::from("u1.client-01"),
+                kind: ConflictKind::Locked,
+            }],
+        },
         ServerMsg::Change(event(9)),
         ServerMsg::RevertResult {
             request_id: "r1".into(),
@@ -290,10 +320,33 @@ fn server_samples() -> Vec<ServerMsg> {
             ops: vec![],
             code: Some("stale".into()),
         },
-        ServerMsg::LockChanged {
-            locks: vec![lock()],
+        ServerMsg::LockResult {
+            request_id: "r1".into(),
+            granted: vec![path(&["a"]), path(&["b", "c"])],
+            denied: vec![
+                LockDenied {
+                    path: path(&["features", "f1", "params"]),
+                    holder: Some(lock()),
+                },
+                LockDenied {
+                    path: path(&["missing"]),
+                    holder: None,
+                },
+            ],
         },
-        ServerMsg::LockChanged { locks: vec![] },
+        ServerMsg::LockResult {
+            request_id: String::new(),
+            granted: vec![],
+            denied: vec![],
+        },
+        ServerMsg::LockChanged {
+            locks: vec![lock(), detached_lock()],
+            released: vec![path(&["x", "y"])],
+        },
+        ServerMsg::LockChanged {
+            locks: vec![],
+            released: vec![],
+        },
         ServerMsg::PeerJoined(peer("client-03")),
         ServerMsg::PeerLeft {
             client_id: Arc::from("u1.client-03"),
@@ -1104,6 +1157,97 @@ fn decode_server_checks_a_welcome_part_by_part() {
             "{key}"
         );
     }
+}
+
+#[test]
+fn decode_server_is_strict_about_locks_and_peers() {
+    let lock = || json!({"path": ["a"], "client_id": "u.c", "user_id": "u", "name": "Ada", "detached": false});
+    let changed = |locks: Json, released: Json| {
+        frame(&json!({"t": "lock.changed", "locks": locks, "released": released}))
+    };
+    assert!(decode_server(&changed(json!([lock()]), json!([["b"]]))).is_ok());
+    let mut bad_locks: Vec<Json> = ["path", "client_id", "user_id", "name", "detached"]
+        .into_iter()
+        .map(|key| without(lock(), key))
+        .collect();
+    bad_locks.push(with(lock(), "detached", json!(0)));
+    bad_locks.push(with(lock(), "path", json!([])));
+    bad_locks.push(with(lock(), "user_id", json!(1)));
+    for l in bad_locks {
+        assert!(
+            matches!(
+                decode_server(&changed(json!([l]), json!([]))),
+                Err(WireError::Invalid(_))
+            ),
+            "{l}"
+        );
+    }
+    for released in [json!(null), json!(["a"]), json!([[]]), json!({})] {
+        assert!(decode_server(&changed(json!([]), released)).is_err());
+    }
+    assert!(decode_server(&frame(&json!({"t": "lock.changed", "locks": []}))).is_err());
+
+    let result = |granted: Json, denied: Json| {
+        frame(&json!({"t": "lock.result", "request_id": "r", "granted": granted, "denied": denied}))
+    };
+    assert!(decode_server(&result(json!([["a"]]), json!([{"path": ["b"]}]))).is_ok());
+    let both = json!([{"path": ["b"], "holder": lock()}, {"path": ["c"], "holder": null}]);
+    assert!(decode_server(&result(json!([]), both)).is_ok());
+    for (granted, denied) in [
+        (json!(["a"]), json!([])),
+        (json!([]), json!([{"holder": lock()}])),
+        (json!([]), json!([{"path": ["b"], "holder": "Ada"}])),
+        (
+            json!([]),
+            json!([{"path": ["b"], "holder": without(lock(), "name")}]),
+        ),
+        (json!([]), json!({})),
+        (json!(null), json!([])),
+    ] {
+        assert!(
+            matches!(
+                decode_server(&result(granted.clone(), denied.clone())),
+                Err(WireError::Invalid(_))
+            ),
+            "{granted} {denied}"
+        );
+    }
+    let no_request_id = json!({"t": "lock.result", "granted": [], "denied": []});
+    assert!(decode_server(&frame(&no_request_id)).is_err());
+
+    // A peer's read_only is optional, but a boolean when present.
+    let joined = |peer: Json| frame(&json!({"t": "peer.joined", "peer": peer}));
+    let peer = || json!({"client_id": "u.c", "user_id": "u", "name": "Ada", "colour": "#000"});
+    let read_only = |frame: &[u8]| match decode_server(frame) {
+        Ok(ServerMsg::PeerJoined(p)) => p.read_only,
+        other => panic!("a peer, not {other:?}"),
+    };
+    assert!(!read_only(&joined(peer())));
+    assert!(read_only(&joined(with(peer(), "read_only", json!(true)))));
+    assert!(!read_only(&joined(with(peer(), "read_only", json!(null)))));
+    assert!(decode_server(&joined(with(peer(), "read_only", json!(1)))).is_err());
+}
+
+#[test]
+fn a_peer_that_may_edit_travels_without_read_only() {
+    let keys = |p: Peer| {
+        let bytes = encode_server(&ServerMsg::PeerJoined(p));
+        let Plain::Map(pairs) = rmpv::decode::read_value(&mut &bytes[..]).unwrap() else {
+            panic!("a map")
+        };
+        let Plain::Map(peer) = &pairs[1].1 else {
+            panic!("a peer map")
+        };
+        peer.iter()
+            .map(|(k, _)| k.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(!keys(peer("c")).contains(&"read_only".to_owned()));
+    let viewer = Peer {
+        read_only: true,
+        ..peer("c")
+    };
+    assert!(keys(viewer).contains(&"read_only".to_owned()));
 }
 
 // ---------------------------------------------------------------- strings that are not UTF-8

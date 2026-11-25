@@ -1,0 +1,38 @@
+{
+  "direction": "s2c",
+  "hex": "84a174ab6c6f636b2e726573756c74aa726571756573745f6964a3722d31a76772616e7465649191a7646973706c6179a664656e6965649282a47061746892a86665617475726573a26631a6686f6c64657285a47061746892a86665617475726573a26631a9636c69656e745f6964ae75322e636c69656e742d30303032a7757365725f6964a27532a46e616d65a3426f62a86465746163686564c281a47061746892a86665617475726573a26639",
+  "json": {
+    "denied": [
+      {
+        "holder": {
+          "client_id": "u2.client-0002",
+          "detached": false,
+          "name": "Bob",
+          "path": [
+            "features",
+            "f1"
+          ],
+          "user_id": "u2"
+        },
+        "path": [
+          "features",
+          "f1"
+        ]
+      },
+      {
+        "path": [
+          "features",
+          "f9"
+        ]
+      }
+    ],
+    "granted": [
+      [
+        "display"
+      ]
+    ],
+    "request_id": "r-1",
+    "t": "lock.result"
+  },
+  "name": "lock.result"
+}

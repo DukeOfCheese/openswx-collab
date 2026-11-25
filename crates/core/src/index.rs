@@ -47,6 +47,8 @@ pub enum ConflictKind {
     Written,
     Removed,
     Read,
+    /// Not from the index: another client holds a lock on the path (`seq` is 0).
+    Locked,
 }
 
 type Mark = (Seq, ClientId);

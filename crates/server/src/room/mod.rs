@@ -432,6 +432,7 @@ impl Conn {
             user_id: self.user.clone(),
             name: self.name.clone(),
             colour: self.colour.clone(),
+            read_only: self.read_only.is_some(),
             // TASK 10: presence and drafts.
             presence: None,
             draft: None,

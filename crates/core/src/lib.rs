@@ -20,6 +20,6 @@ pub use path::Path;
 pub use pos::Pos;
 pub use value::{Id, KeyedList, Map, Plain, Value, ValueError};
 pub use wire::{
-    Broken, ChangeEvent, ClientMsg, Lock, PROTOCOL_VERSION, Peer, RejectCode, ServerMsg, WireError,
-    decode_client, decode_server, encode_client, encode_server,
+    Broken, ChangeEvent, ClientMsg, Lock, LockDenied, PROTOCOL_VERSION, Peer, RejectCode,
+    ServerMsg, WireError, decode_client, decode_server, encode_client, encode_server,
 };

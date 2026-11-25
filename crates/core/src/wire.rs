@@ -203,15 +203,30 @@ pub struct Peer {
     pub user_id: String,
     pub name: String,
     pub colour: String,
+    /// The peer may only look. On the wire only when true (absent means false).
+    pub read_only: bool,
     pub presence: Option<Plain>,
     pub draft: Option<Plain>,
 }
 
+/// A lock on a document path and who holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lock {
     pub path: Path,
     pub client_id: ClientId,
+    pub user_id: String,
     pub name: String,
+    /// The holder's connection is gone; the lock waits (the grace period) for it to come back.
+    pub detached: bool,
+}
+
+/// A path `lock.acquire` did not get.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LockDenied {
+    pub path: Path,
+    /// The lock in the way (its path may be above or under this one), or `None` when the path
+    /// cannot be locked at all (read-only, not in the document, the quota full, or too many requests).
+    pub holder: Option<Lock>,
 }
 
 /// A feature that does not rebuild, and the change that broke it if known.
@@ -277,8 +292,17 @@ pub enum ServerMsg {
         ops: Vec<Op>,
         code: Option<String>,
     },
+    /// The answer to a `lock.acquire`.
+    LockResult {
+        request_id: String,
+        granted: Vec<Path>,
+        denied: Vec<LockDenied>,
+    },
+    /// `locks`: locks that are new or whose holder changed (detached, attached again); `released`:
+    /// paths that are no longer locked.
     LockChanged {
         locks: Vec<Lock>,
+        released: Vec<Path>,
     },
     PeerJoined(Peer),
     PeerLeft {
@@ -917,6 +941,9 @@ fn peer_to_wire(p: &Peer) -> Plain {
         ("name", s(&p.name)),
         ("colour", s(&p.colour)),
     ];
+    if p.read_only {
+        pairs.push(("read_only", Plain::from(true)));
+    }
     if let Some(v) = &p.presence {
         pairs.push(("presence", v.clone()));
     }
@@ -933,6 +960,10 @@ fn peer_from_wire(p: &Plain) -> Result<Peer, WireError> {
         user_id: string(f.req("user_id")?, "user_id")?,
         name: string(f.req("name")?, "name")?,
         colour: string(f.req("colour")?, "colour")?,
+        read_only: match f.opt("read_only")? {
+            Some(p) => flag(p, "read_only")?,
+            None => false,
+        },
         presence: f
             .opt("presence")?
             .map(|p| opaque_map(p, "presence", None))
@@ -948,7 +979,9 @@ fn lock_to_wire(l: &Lock) -> Plain {
     map_of(vec![
         ("path", path::to_wire(&l.path)),
         ("client_id", s(&l.client_id)),
+        ("user_id", s(&l.user_id)),
         ("name", s(&l.name)),
+        ("detached", Plain::from(l.detached)),
     ])
 }
 
@@ -957,8 +990,30 @@ fn lock_from_wire(p: &Plain) -> Result<Lock, WireError> {
     Ok(Lock {
         path: one_path(f.req("path")?, "path")?,
         client_id: shared(f.req("client_id")?, "client_id", 0, usize::MAX)?,
+        user_id: string(f.req("user_id")?, "user_id")?,
         name: string(f.req("name")?, "name")?,
+        detached: flag(f.req("detached")?, "detached")?,
     })
+}
+
+fn denied_to_wire(d: &LockDenied) -> Plain {
+    let mut pairs = vec![("path", path::to_wire(&d.path))];
+    if let Some(h) = &d.holder {
+        pairs.push(("holder", lock_to_wire(h)));
+    }
+    map_of(pairs)
+}
+
+fn denied_from_wire(p: &Plain) -> Result<LockDenied, WireError> {
+    let f = Fields::new(p, "a denied lock")?;
+    Ok(LockDenied {
+        path: one_path(f.req("path")?, "path")?,
+        holder: f.opt("holder")?.map(lock_from_wire).transpose()?,
+    })
+}
+
+fn path_list(items: &[Path]) -> Plain {
+    arr(items, path::to_wire)
 }
 
 fn locks_from_wire(p: &Plain) -> Result<Vec<Lock>, WireError> {
@@ -1053,6 +1108,7 @@ fn conflict_to_wire(c: &Conflict) -> Plain {
         ConflictKind::Written => "written",
         ConflictKind::Removed => "removed",
         ConflictKind::Read => "read",
+        ConflictKind::Locked => "locked",
     };
     map_of(vec![
         ("path", path::to_wire(&c.path)),
@@ -1068,6 +1124,7 @@ fn conflict_from_wire(p: &Plain) -> Result<Conflict, WireError> {
         "written" => ConflictKind::Written,
         "removed" => ConflictKind::Removed,
         "read" => ConflictKind::Read,
+        "locked" => ConflictKind::Locked,
         _ => return invalid("unknown conflict kind"),
     };
     Ok(Conflict {
@@ -1152,8 +1209,18 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
             .put("ops", op_list(ops))
             .put_opt("code", opt_s(code))
             .bytes(),
-        ServerMsg::LockChanged { locks } => Out::new("lock.changed")
+        ServerMsg::LockResult {
+            request_id,
+            granted,
+            denied,
+        } => Out::new("lock.result")
+            .put("request_id", s(request_id))
+            .put("granted", path_list(granted))
+            .put("denied", arr(denied, denied_to_wire))
+            .bytes(),
+        ServerMsg::LockChanged { locks, released } => Out::new("lock.changed")
             .put("locks", arr(locks, lock_to_wire))
+            .put("released", path_list(released))
             .bytes(),
         ServerMsg::PeerJoined(p) => Out::new("peer.joined").put("peer", peer_to_wire(p)).bytes(),
         ServerMsg::PeerLeft { client_id } => {
@@ -1262,8 +1329,17 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
             ops: ops(f.req("ops")?, "ops", 0, usize::MAX)?,
             code: f.opt("code")?.map(|p| string(p, "code")).transpose()?,
         }),
+        "lock.result" => Ok(ServerMsg::LockResult {
+            request_id: string(f.req("request_id")?, "request_id")?,
+            granted: paths(f.req("granted")?, "granted", usize::MAX)?,
+            denied: list(f.req("denied")?, "denied", 0, usize::MAX)?
+                .iter()
+                .map(denied_from_wire)
+                .collect::<Result<_, _>>()?,
+        }),
         "lock.changed" => Ok(ServerMsg::LockChanged {
             locks: locks_from_wire(f.req("locks")?)?,
+            released: paths(f.req("released")?, "released", usize::MAX)?,
         }),
         "peer.joined" => Ok(ServerMsg::PeerJoined(peer_from_wire(f.req("peer")?)?)),
         "peer.left" => Ok(ServerMsg::PeerLeft {
