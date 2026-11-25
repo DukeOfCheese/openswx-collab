@@ -9,6 +9,8 @@
 //! relayed opaquely as [`Plain`]; they are only checked, never converted to a [`Value`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -38,10 +40,22 @@ pub const MAX_REBUILD_ENTRIES: usize = 500;
 pub const MAX_REBUILD_KEY: usize = 200;
 pub const MAX_REBUILD_MESSAGE: usize = 500;
 
-/// How deep the parser may go. The parser spends two levels on each container and up to three on
-/// a leaf, so this leaves room for the envelope, an op and a value 64 containers deep; the exact
-/// limit for values is checked where they are read.
-const PARSE_DEPTH: usize = 160;
+/// Most containers (maps and lists) a frame may have open at once. A value may be `MAX_DEPTH`
+/// levels deep, but a keyed list costs one level and three wire containers (`{"$list": [[pos, item]]}`)
+/// before its item map, so the worst case is two containers per level. The rest is the envelope: a
+/// `welcome` holds a value in a change event's op, five containers down.
+pub const MAX_NESTING: usize = 2 * MAX_DEPTH + 8;
+/// Most values (every scalar, key and container is one) a client frame may hold. Decoding builds a
+/// tree of about 24 bytes a value, so this bounds what one frame can make the server allocate.
+pub const MAX_NODES: usize = 1_000_000;
+/// A client frame longer than this is only read when it is a `change`; nothing else needs the room.
+pub const SMALL_FRAME: usize = 512 * 1024;
+/// Longest `t` the pre-scan reads, in bytes.
+pub const MAX_T: usize = 64;
+
+/// How far rmpv may recurse once the scan has bounded the nesting: it spends two levels on each
+/// container and up to three on a leaf.
+const PARSE_DEPTH: usize = 2 * MAX_NESTING + 4;
 
 #[derive(thiserror::Error, Clone, Debug, PartialEq)]
 pub enum WireError {
@@ -59,7 +73,7 @@ fn invalid<T>(why: impl Into<String>) -> Result<T, WireError> {
 
 // ---------------------------------------------------------------------------------------- types
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum ClientMsg {
     Hello {
         protocol: u32,
@@ -92,6 +106,52 @@ pub enum ClientMsg {
         errors: BTreeMap<String, String>,
     },
     Ping,
+}
+
+/// Written by hand so that printing a `Hello` never prints its token.
+impl fmt::Debug for ClientMsg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClientMsg::Hello {
+                protocol,
+                token: _,
+                client_id,
+                format_version,
+                last_seq,
+                app,
+            } => f
+                .debug_struct("Hello")
+                .field("protocol", protocol)
+                .field("token", &"<redacted>")
+                .field("client_id", client_id)
+                .field("format_version", format_version)
+                .field("last_seq", last_seq)
+                .field("app", app)
+                .finish(),
+            ClientMsg::Change(c) => f.debug_tuple("Change").field(c).finish(),
+            ClientMsg::Revert { request_id, seq } => f
+                .debug_struct("Revert")
+                .field("request_id", request_id)
+                .field("seq", seq)
+                .finish(),
+            ClientMsg::LockAcquire { request_id, paths } => f
+                .debug_struct("LockAcquire")
+                .field("request_id", request_id)
+                .field("paths", paths)
+                .finish(),
+            ClientMsg::LockRelease { paths } => {
+                f.debug_struct("LockRelease").field("paths", paths).finish()
+            }
+            ClientMsg::Presence { data } => f.debug_struct("Presence").field("data", data).finish(),
+            ClientMsg::Draft { data } => f.debug_struct("Draft").field("data", data).finish(),
+            ClientMsg::RebuildReport { seq, errors } => f
+                .debug_struct("RebuildReport")
+                .field("seq", seq)
+                .field("errors", errors)
+                .finish(),
+            ClientMsg::Ping => f.write_str("Ping"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,11 +428,13 @@ fn ops(p: &Plain, field: &str, min: usize, max: usize) -> Result<Vec<Op>, WireEr
         .collect()
 }
 
-/// Checks data that is relayed without being understood: finite numbers, string keys, no binary,
-/// no deeper than `MAX_DEPTH` containers.
+/// Checks data that is relayed without being understood: valid UTF-8 strings, finite numbers,
+/// distinct string keys, no binary, no deeper than `MAX_DEPTH` containers.
 fn check_opaque(p: &Plain, field: &str, depth: usize) -> Result<(), WireError> {
     match p {
-        Plain::Nil | Plain::Boolean(_) | Plain::Integer(_) | Plain::String(_) => Ok(()),
+        Plain::Nil | Plain::Boolean(_) | Plain::Integer(_) => Ok(()),
+        Plain::String(s) if s.is_str() => Ok(()),
+        Plain::String(_) => invalid(format!("{field} holds a string that is not UTF-8")),
         Plain::F32(f) if f.is_finite() => Ok(()),
         Plain::F64(f) if f.is_finite() => Ok(()),
         Plain::F32(_) | Plain::F64(_) => invalid(format!("{field} holds NaN or infinity")),
@@ -389,9 +451,13 @@ fn check_opaque(p: &Plain, field: &str, depth: usize) -> Result<(), WireError> {
             if depth + 1 > MAX_DEPTH {
                 return invalid(format!("{field} is nested too deeply"));
             }
+            let mut seen = BTreeSet::new();
             for (k, v) in pairs {
-                if !k.is_str() {
+                let Some(key) = k.as_str() else {
                     return invalid(format!("{field} has a key that is not a string"));
+                };
+                if !seen.insert(key) {
+                    return invalid(format!("{field} repeats the key {key}"));
                 }
                 check_opaque(v, field, depth + 1)?;
             }
@@ -400,11 +466,23 @@ fn check_opaque(p: &Plain, field: &str, depth: usize) -> Result<(), WireError> {
     }
 }
 
-fn encoded_len(p: &Plain) -> usize {
-    let mut buf = Vec::new();
-    // Writing to a Vec cannot fail.
-    let _ = rmpv::encode::write_value(&mut buf, p);
-    buf.len()
+/// A writer that fails once more than `left` bytes are written.
+struct Budget {
+    left: usize,
+}
+
+impl io::Write for Budget {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.left {
+            return Err(io::Error::other("over budget"));
+        }
+        self.left -= buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A map relayed as it is; its encoded size is at most `max` bytes when a limit is given.
@@ -413,10 +491,159 @@ fn opaque_map(p: &Plain, field: &str, max: Option<usize>) -> Result<Plain, WireE
         return invalid(format!("{field} must be a map"));
     }
     check_opaque(p, field, 0)?;
-    if max.is_some_and(|max| encoded_len(p) > max) {
+    if let Some(max) = max
+        && rmpv::encode::write_value(&mut Budget { left: max }, p).is_err()
+    {
         return invalid(format!("{field} is too large"));
     }
     Ok(p.clone())
+}
+
+/// What `scan` learned about a frame without building it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scan<'a> {
+    /// The top-level `t`, when the map has exactly one and it is a string of at most `MAX_T` bytes.
+    pub t: Option<&'a str>,
+    /// Every value, key and container counted once.
+    pub nodes: usize,
+}
+
+fn be(frame: &[u8], pos: &mut usize, width: usize) -> Result<u64, WireError> {
+    let end = pos.checked_add(width).filter(|e| *e <= frame.len());
+    let Some(end) = end else {
+        return invalid("frame ends in the middle of a value");
+    };
+    let n = frame[*pos..end]
+        .iter()
+        .fold(0u64, |n, b| (n << 8) | u64::from(*b));
+    *pos = end;
+    Ok(n)
+}
+
+fn skip(frame: &[u8], pos: &mut usize, len: u64) -> Result<(), WireError> {
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| pos.checked_add(len))
+        .filter(|e| *e <= frame.len());
+    let Some(end) = end else {
+        return invalid("frame ends in the middle of a value");
+    };
+    *pos = end;
+    Ok(())
+}
+
+/// Walks the raw bytes and checks that they are exactly one MessagePack value, a map, nested at
+/// most `MAX_NESTING` deep and (when `max_nodes` is given) holding at most that many values. It
+/// builds nothing: its memory is a fixed array, whatever the frame says. It also finds `t`.
+pub fn scan(frame: &[u8], max_nodes: Option<usize>) -> Result<Scan<'_>, WireError> {
+    // Elements still to read in each open container.
+    let mut open = [0u64; MAX_NESTING];
+    let mut depth = 0usize;
+    let mut pos = 0usize;
+    let mut nodes = 0usize;
+    let mut root_len = 0u64;
+    let (mut t, mut t_seen, mut key_is_t) = (None, 0u32, false);
+    loop {
+        let Some(&marker) = frame.get(pos) else {
+            return invalid(if nodes == 0 {
+                "empty frame"
+            } else {
+                "frame ends in the middle of a value"
+            });
+        };
+        pos += 1;
+        nodes += 1;
+        if max_nodes.is_some_and(|max| nodes > max) {
+            return invalid("too many values in the frame");
+        }
+        if nodes == 1 && !matches!(marker, 0x80..=0x8f | 0xde | 0xdf) {
+            return invalid("a frame must be a map");
+        }
+        // Which position of the top-level map this value is in, if it is directly in it.
+        let root_slot = (depth == 1).then(|| root_len - open[0]);
+        let mut text = None;
+        // How many elements the container this value opens holds.
+        let mut container = None;
+        match marker {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => {}
+            0x80..=0x8f => container = Some(2 * u64::from(marker & 0x0f)),
+            0x90..=0x9f => container = Some(u64::from(marker & 0x0f)),
+            0xa0..=0xbf | 0xd9..=0xdb => {
+                let len = match marker {
+                    0xd9 => be(frame, &mut pos, 1)?,
+                    0xda => be(frame, &mut pos, 2)?,
+                    0xdb => be(frame, &mut pos, 4)?,
+                    _ => u64::from(marker & 0x1f),
+                };
+                let start = pos;
+                skip(frame, &mut pos, len)?;
+                text = Some(&frame[start..pos]);
+            }
+            0xc4..=0xc6 => {
+                let len = be(frame, &mut pos, 1 << (marker - 0xc4))?;
+                skip(frame, &mut pos, len)?;
+            }
+            0xc7..=0xc9 => {
+                let len = be(frame, &mut pos, 1 << (marker - 0xc7))?;
+                skip(frame, &mut pos, len + 1)?;
+            }
+            0xca => skip(frame, &mut pos, 4)?,
+            0xcb => skip(frame, &mut pos, 8)?,
+            0xcc..=0xcf => skip(frame, &mut pos, 1 << (marker - 0xcc))?,
+            0xd0..=0xd3 => skip(frame, &mut pos, 1 << (marker - 0xd0))?,
+            0xd4..=0xd8 => skip(frame, &mut pos, (1 << (marker - 0xd4)) + 1)?,
+            0xdc => container = Some(be(frame, &mut pos, 2)?),
+            0xdd => container = Some(be(frame, &mut pos, 4)?),
+            0xde => container = Some(2 * be(frame, &mut pos, 2)?),
+            0xdf => container = Some(2 * be(frame, &mut pos, 4)?),
+            0xc1 => return invalid("not MessagePack"),
+        }
+        // `t`: a top-level key that is the string "t", and the value after it.
+        if let Some(slot) = root_slot {
+            if slot % 2 == 0 {
+                key_is_t = text == Some(b"t");
+            } else if key_is_t {
+                key_is_t = false;
+                t_seen += 1;
+                t = text
+                    .filter(|s| s.len() <= MAX_T)
+                    .and_then(|s| std::str::from_utf8(s).ok());
+            }
+        }
+        if let Some(n) = container.filter(|n| *n > 0) {
+            // Every element takes at least a byte.
+            if n > (frame.len() - pos) as u64 {
+                return invalid("frame ends in the middle of a value");
+            }
+            if depth == MAX_NESTING {
+                return invalid("nested too deeply");
+            }
+            if depth == 0 {
+                root_len = n;
+            }
+            open[depth] = n;
+            depth += 1;
+            continue;
+        }
+        // A value is complete; so is every container it was the last element of.
+        while depth > 0 {
+            open[depth - 1] -= 1;
+            if open[depth - 1] > 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    if pos != frame.len() {
+        return invalid("bytes after the message");
+    }
+    Ok(Scan {
+        t: if t_seen == 1 { t } else { None },
+        nodes,
+    })
 }
 
 fn parse(frame: &[u8]) -> Result<Plain, WireError> {
@@ -543,6 +770,10 @@ pub fn decode_client(frame: &[u8], max: usize) -> Result<ClientMsg, WireError> {
     if frame.len() > max {
         return Err(WireError::TooLarge);
     }
+    let scanned = scan(frame, Some(MAX_NODES))?;
+    if frame.len() > SMALL_FRAME && scanned.t != Some("change") {
+        return Err(WireError::TooLarge);
+    }
     let root = parse(frame)?;
     let f = Fields::new(&root, "a frame")?;
     let t = text(f.req("t")?, "t", 0, MAX_NAME_OF_T)?;
@@ -580,10 +811,12 @@ pub fn decode_client(frame: &[u8], max: usize) -> Result<ClientMsg, WireError> {
                 None => BTreeSet::new(),
             },
             depends: match f.opt("depends")? {
-                Some(p) => list(p, "depends", 0, MAX_DEPENDS)?
-                    .iter()
-                    .map(|d| shared(d, "depends", 1, MAX_CHANGE_ID))
-                    .collect::<Result<_, _>>()?,
+                Some(p) => distinct(
+                    list(p, "depends", 0, MAX_DEPENDS)?
+                        .iter()
+                        .map(|d| shared(d, "depends", 1, MAX_CHANGE_ID))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?,
                 None => Vec::new(),
             },
             undo_of: f
@@ -624,8 +857,16 @@ pub fn decode_client(frame: &[u8], max: usize) -> Result<ClientMsg, WireError> {
     }
 }
 
+fn distinct(ids: Vec<Arc<str>>) -> Result<Vec<Arc<str>>, WireError> {
+    let unique: BTreeSet<&Arc<str>> = ids.iter().collect();
+    if unique.len() != ids.len() {
+        return invalid("depends repeats an id");
+    }
+    Ok(ids)
+}
+
 /// Longest `t` read; nothing legitimate is longer, and this keeps a huge string out of an error.
-const MAX_NAME_OF_T: usize = 64;
+const MAX_NAME_OF_T: usize = MAX_T;
 
 fn lock_paths(f: &Fields) -> Result<Vec<Path>, WireError> {
     let items = f.req("paths")?;
@@ -934,9 +1175,10 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
     }
 }
 
-/// Reads one frame from the server, as strictly about types as `decode_client`. It has no size
-/// limit: the server is trusted not to send more than a client can take.
+/// Reads one frame from the server, as strictly about types as `decode_client`. It has no size or
+/// node limit: the server is trusted for those, not for the shape of what it sends.
 pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
+    scan(frame, None)?;
     let root = parse(frame)?;
     let f = Fields::new(&root, "a frame")?;
     let t = text(f.req("t")?, "t", 0, MAX_NAME_OF_T)?;

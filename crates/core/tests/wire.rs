@@ -1082,3 +1082,413 @@ fn decode_server_checks_a_welcome_part_by_part() {
         );
     }
 }
+
+// ---------------------------------------------------------------- strings that are not UTF-8
+
+/// Swaps every "ZZZZ" in a frame for four bytes that are not UTF-8, keeping its length.
+fn corrupt(frame: Vec<u8>) -> Vec<u8> {
+    let mut out = frame;
+    let mut n = 0;
+    let mut i = 0;
+    while i + 4 <= out.len() {
+        if &out[i..i + 4] == b"ZZZZ" {
+            out[i..i + 4].copy_from_slice(&[0xff, 0xfe, 0xfd, 0xfc]);
+            n += 1;
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    assert!(n > 0, "no placeholder in the frame");
+    out
+}
+
+#[test]
+fn strings_that_are_not_utf8_are_refused_everywhere() {
+    let z = json!("ZZZZ");
+    let cases = [
+        with(hello(), "token", z.clone()),
+        with(hello(), "client_id", json!("ZZZZZZZZ")),
+        with(hello(), "app", z.clone()),
+        with(change_json(), "change_id", z.clone()),
+        with(change_json(), "command", z.clone()),
+        with(change_json(), "depends", json!([z.clone()])),
+        with(change_json(), "undo_of", z.clone()),
+        with(change_json(), "reads", json!([[z.clone()]])),
+        with(
+            change_json(),
+            "ops",
+            json!([{"op": "unset", "path": [z.clone()]}]),
+        ),
+        with(
+            change_json(),
+            "ops",
+            json!([{"op": "set", "path": ["a"], "value": z.clone()}]),
+        ),
+        with(
+            change_json(),
+            "ops",
+            json!([{"op": "set", "path": ["a"], "value": {"k": [z.clone()]}}]),
+        ),
+        with(
+            change_json(),
+            "ops",
+            json!([{"op": "remove", "list": ["a"], "id": z.clone()}]),
+        ),
+        json!({"t": "change.revert", "request_id": z.clone(), "seq": 1}),
+        json!({"t": "lock.acquire", "request_id": "r", "paths": [[z.clone()]]}),
+        json!({"t": "lock.release", "paths": [[z.clone()]]}),
+        json!({"t": "rebuild.report", "seq": 1, "errors": {"f": z.clone()}}),
+        json!({"t": "rebuild.report", "seq": 1, "errors": {"ZZZZ": "x"}}),
+        json!({"t": "presence", "data": {"k": z.clone()}}),
+        json!({"t": "presence", "data": {"k": {"j": [1, z.clone()]}}}),
+        json!({"t": "presence", "data": {"ZZZZ": 1}}),
+        json!({"t": "draft", "data": {"k": z.clone()}}),
+        json!({"t": "draft", "data": {"ZZZZ": 1}}),
+    ];
+    for case in cases {
+        bad_raw(&corrupt(frame(&case)));
+    }
+    // The same text, valid, is fine.
+    ok(&with(hello(), "token", z));
+}
+
+#[test]
+fn invalid_utf8_inside_op_values_is_refused() {
+    let value = json!({"a": ["ZZZZ"], "b": {"c": "ZZZZ"}});
+    let f = frame(&with(
+        change_json(),
+        "ops",
+        json!([{"op": "set", "path": ["a"], "value": value}]),
+    ));
+    bad_raw(&corrupt(f));
+    let insert = json!([{"op": "insert", "list": ["l"], "item": {"id": "ZZZZ"}, "pos": "a"}]);
+    bad_raw(&corrupt(frame(&with(change_json(), "ops", insert))));
+}
+
+#[test]
+fn the_server_side_refuses_them_too() {
+    let mut msg = welcome(true, false);
+    if let ServerMsg::Welcome { content, you, .. } = &mut msg {
+        *content = Some(load(json!({"name": "ZZZZ"})));
+        you.name = "ZZZZ".into();
+    }
+    let bytes = encode_server(&msg).to_vec();
+    assert!(decode_server(&bytes).is_ok());
+    assert!(matches!(
+        decode_server(&corrupt(bytes)),
+        Err(WireError::Invalid(_))
+    ));
+    let presence = encode_server(&ServerMsg::Presence {
+        client_id: Arc::from("u.c"),
+        data: to_plain(json!({"k": "ZZZZ"})),
+    });
+    assert!(matches!(
+        decode_server(&corrupt(presence.to_vec())),
+        Err(WireError::Invalid(_))
+    ));
+}
+
+// -------------------------------------------------------------------------------- duplicates
+
+#[test]
+fn repeated_fields_and_keys_are_refused_in_every_message() {
+    let paths = || to_plain(json!([["a"]]));
+    for t in ["lock.acquire", "lock.release"] {
+        let mut pairs = vec![pair("t", Plain::from(t)), pair("paths", paths())];
+        if t == "lock.acquire" {
+            pairs.push(pair("request_id", Plain::from("r")));
+        }
+        decode_client(&raw(&Plain::Map(pairs.clone())), MAX).unwrap();
+        pairs.push(pair("paths", paths()));
+        bad_raw(&raw(&Plain::Map(pairs)));
+    }
+    for t in ["presence", "draft"] {
+        let data = || to_plain(json!({"a": 1}));
+        bad_raw(&raw(&Plain::Map(vec![
+            pair("t", Plain::from(t)),
+            pair("data", data()),
+            pair("data", data()),
+        ])));
+        // A key twice inside the data, at the top and deeper.
+        let twice = || Plain::Map(vec![pair("a", Plain::from(1)), pair("a", Plain::from(2))]);
+        bad_raw(&msg_with_data(t, twice()));
+        bad_raw(&msg_with_data(t, Plain::Map(vec![pair("b", twice())])));
+        bad_raw(&msg_with_data(
+            t,
+            Plain::Map(vec![pair("b", Plain::Array(vec![twice()]))]),
+        ));
+    }
+    bad(&with(change_json(), "depends", json!(["d1", "d2", "d1"])));
+    ok(&with(change_json(), "depends", json!(["d1", "d2"])));
+}
+
+// ------------------------------------------------------------------------------------- debug
+
+#[test]
+fn printing_a_hello_does_not_print_the_token() {
+    let msg = ClientMsg::Hello {
+        protocol: 2,
+        token: "s3cret-token-value".into(),
+        client_id: "client-01".into(),
+        format_version: None,
+        last_seq: Some(3),
+        app: None,
+    };
+    for text in [format!("{msg:?}"), format!("{msg:#?}")] {
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(text.contains("<redacted>") && text.contains("client-01"));
+    }
+    // The other messages still print.
+    assert!(format!("{:?}", ClientMsg::Ping).contains("Ping"));
+    assert!(format!("{:?}", ClientMsg::Change(change())).contains("change_id"));
+}
+
+// ----------------------------------------------------------------------------- deep documents
+
+/// A legal value 64 levels deep that alternates items and keyed lists: 32 items, the last
+/// holding an empty map at level 64.
+fn deepest() -> oswx_core::Value {
+    let mut item = json!({"id": "i31", "leaf": {}});
+    for k in (0..31).rev() {
+        item = json!({"id": format!("i{k}"), "c": [item]});
+    }
+    load(item)
+}
+
+#[test]
+fn the_deepest_legal_value_travels_in_a_change_and_a_welcome() {
+    let value = deepest();
+    assert_eq!(
+        oswx_core::Value::from_wire(&value.to_wire()).unwrap(),
+        value
+    );
+
+    let op = Op::Set {
+        path: path(&["x"]),
+        value: value.clone(),
+    };
+    let msg = ClientMsg::Change(Change {
+        ops: vec![op.clone()],
+        ..change()
+    });
+    assert_eq!(decode_client(&encode_client(&msg), MAX).unwrap(), msg);
+
+    let mut welcome = welcome(true, false);
+    if let ServerMsg::Welcome {
+        content, changes, ..
+    } = &mut welcome
+    {
+        *content = Some(value);
+        *changes = Some(vec![ChangeEvent {
+            ops: vec![op],
+            ..event(1)
+        }]);
+    }
+    let bytes = encode_server(&welcome);
+    assert_eq!(decode_server(&bytes).unwrap(), welcome);
+}
+
+// -------------------------------------------------------------------------------- pre-scan
+
+fn ping_with(extra: Plain) -> Vec<u8> {
+    raw(&Plain::Map(vec![
+        pair("t", Plain::from("ping")),
+        pair("x", extra),
+    ]))
+}
+
+#[test]
+fn a_frame_of_millions_of_nils_is_refused_without_building_it() {
+    let frame = ping_with(Plain::Array(vec![Plain::Nil; 8 * 1024 * 1024 - 32]));
+    assert!(frame.len() > 8 * 1024 * 1024 - 64);
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        decode_client(&frame, MAX),
+        Err(WireError::Invalid(_))
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn only_a_change_may_be_a_large_frame() {
+    use oswx_core::wire::SMALL_FRAME;
+    let big = || Plain::from("x".repeat(SMALL_FRAME + 100));
+    for t in ["presence", "draft"] {
+        let f = msg_with_data(t, Plain::Map(vec![pair("k", big())]));
+        assert_eq!(decode_client(&f, MAX), Err(WireError::TooLarge), "{t}");
+    }
+    assert_eq!(
+        decode_client(&ping_with(big()), MAX),
+        Err(WireError::TooLarge)
+    );
+    let op = json!([{"op": "set", "path": ["a"], "value": "x".repeat(SMALL_FRAME + 100)}]);
+    let f = frame(&with(change_json(), "ops", op));
+    assert!(f.len() > SMALL_FRAME);
+    assert!(matches!(decode_client(&f, MAX), Ok(ClientMsg::Change(_))));
+    // A small frame of any kind is read.
+    assert!(matches!(
+        decode_client(&ping_with(Plain::Nil), MAX),
+        Ok(ClientMsg::Ping)
+    ));
+    // A second `t` hides the type, so a large frame is not taken for a change.
+    let twice = raw(&Plain::Map(vec![
+        pair("t", Plain::from("change")),
+        pair("t", Plain::from("ping")),
+        pair("x", big()),
+    ]));
+    assert_eq!(decode_client(&twice, MAX), Err(WireError::TooLarge));
+}
+
+#[test]
+fn the_node_budget_is_exact() {
+    use oswx_core::wire::{MAX_NODES, scan};
+    // map + "t" + "ping" + "x" + the array + its elements
+    let frame = |k: usize| ping_with(Plain::Array(vec![Plain::Nil; k]));
+    let exact = frame(MAX_NODES - 5);
+    let at = scan(&exact, Some(MAX_NODES)).unwrap();
+    assert_eq!((at.nodes, at.t), (MAX_NODES, Some("ping")));
+    assert!(matches!(
+        scan(&frame(MAX_NODES - 4), Some(MAX_NODES)),
+        Err(WireError::Invalid(_))
+    ));
+    assert_eq!(
+        scan(&frame(MAX_NODES - 4), None).unwrap().nodes,
+        MAX_NODES + 1
+    );
+}
+
+#[test]
+fn the_scan_refuses_what_runs_past_the_end() {
+    use oswx_core::wire::scan;
+    let head = [0x81, 0xa1, 0x78];
+    let with_tail = |tail: &[u8]| [&head[..], tail].concat();
+    let cases: Vec<Vec<u8>> = vec![
+        with_tail(&[0xd9, 0xff]),
+        with_tail(&[0xd9, 0x03, 0x61, 0x62]),
+        with_tail(&[0xda, 0x01]),
+        with_tail(&[0xdb, 0xff, 0xff, 0xff, 0xff, 0x61]),
+        with_tail(&[0xc4, 0x05, 1, 2]),
+        with_tail(&[0xc6, 0xff, 0xff, 0xff, 0xff]),
+        with_tail(&[0xc7, 0x05, 0x01, 1, 2]),
+        with_tail(&[0xc9, 0xff, 0xff, 0xff, 0xff, 0x01]),
+        with_tail(&[0xd8, 0x01, 1, 2]),
+        with_tail(&[0xdd, 0xff, 0xff, 0xff, 0xff, 0xc0]),
+        with_tail(&[0xdf, 0xff, 0xff, 0xff, 0xff, 0xc0]),
+        with_tail(&[0xcb, 0, 0, 0]),
+        with_tail(&[0xcf, 0, 0]),
+        with_tail(&[0xc1]),
+        vec![0x81, 0xa1],
+        vec![0x82, 0xa1, 0x78, 0xc0],
+        vec![],
+    ];
+    for case in cases {
+        assert!(
+            matches!(scan(&case, None), Err(WireError::Invalid(_))),
+            "{case:02x?}"
+        );
+    }
+    // Two values.
+    let one = frame(&json!({"t": "ping"}));
+    assert!(scan(&one, None).is_ok());
+    assert!(scan(&[one.clone(), one.clone()].concat(), None).is_err());
+    assert!(scan(&[one, vec![0xc0]].concat(), None).is_err());
+    // Not a map at the top.
+    for top in [vec![0xc0], vec![0x90], vec![0x01], vec![0xa1, 0x74]] {
+        assert!(scan(&top, None).is_err());
+    }
+}
+
+mod scan_agrees_with_rmpv {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn count(p: &Plain) -> usize {
+        match p {
+            Plain::Array(items) => 1 + items.iter().map(count).sum::<usize>(),
+            Plain::Map(pairs) => {
+                1 + pairs
+                    .iter()
+                    .map(|(k, v)| count(k) + count(v))
+                    .sum::<usize>()
+            }
+            _ => 1,
+        }
+    }
+
+    fn leaf() -> impl Strategy<Value = Plain> {
+        prop_oneof![
+            Just(Plain::Nil),
+            any::<bool>().prop_map(Plain::Boolean),
+            any::<i64>().prop_map(Plain::from),
+            any::<u64>().prop_map(Plain::from),
+            any::<f64>().prop_map(Plain::F64),
+            any::<f32>().prop_map(Plain::F32),
+            ".{0,40}".prop_map(Plain::from),
+            "[a-z]{0,300}".prop_map(Plain::from),
+            prop::collection::vec(any::<u8>(), 0..300).prop_map(Plain::Binary),
+            (any::<i8>(), prop::collection::vec(any::<u8>(), 0..20))
+                .prop_map(|(t, d)| Plain::Ext(t, d)),
+        ]
+    }
+
+    fn value() -> impl Strategy<Value = Plain> {
+        leaf().prop_recursive(5, 80, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Plain::Array),
+                prop::collection::vec((inner.clone(), inner), 0..4).prop_map(Plain::Map),
+            ]
+        })
+    }
+
+    fn root() -> impl Strategy<Value = Plain> {
+        prop::collection::vec((value(), value()), 0..5).prop_map(Plain::Map)
+    }
+
+    /// What rmpv makes of the bytes: one value, all of them used, a map.
+    fn reference(bytes: &[u8]) -> Option<usize> {
+        let mut rest = bytes;
+        let v = rmpv::decode::read_value_with_max_depth(&mut rest, 400).ok()?;
+        (rest.is_empty() && v.is_map()).then(|| count(&v))
+    }
+
+    proptest! {
+        #[test]
+        fn counts_nodes_like_a_recursive_walk(root in root()) {
+            let bytes = raw(&root);
+            let scanned = oswx_core::wire::scan(&bytes, None).unwrap();
+            prop_assert_eq!(scanned.nodes, count(&root));
+            prop_assert_eq!(reference(&bytes), Some(count(&root)));
+        }
+
+        #[test]
+        fn accepts_what_rmpv_reads_and_nothing_else(
+            root in root(),
+            cut in any::<prop::sample::Index>(),
+            flip in any::<prop::sample::Index>(),
+            bit in 0u8..8,
+            tail in prop::option::of(any::<u8>()),
+        ) {
+            let bytes = raw(&root);
+            let mut variants = vec![bytes[..cut.index(bytes.len() + 1)].to_vec()];
+            let mut flipped = bytes.clone();
+            let at = flip.index(flipped.len());
+            flipped[at] ^= 1 << bit;
+            variants.push(flipped);
+            if let Some(b) = tail {
+                variants.push([bytes.clone(), vec![b]].concat());
+            }
+            for v in variants {
+                let scanned = oswx_core::wire::scan(&v, None);
+                match reference(&v) {
+                    Some(n) => prop_assert_eq!(scanned.map(|s| s.nodes), Ok(n), "{:02x?}", v),
+                    None => prop_assert!(scanned.is_err(), "{:02x?}", v),
+                }
+            }
+        }
+    }
+}
