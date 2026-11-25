@@ -16,6 +16,8 @@
 
 pub mod auth;
 pub mod meta;
+pub mod orgs;
+pub mod projects;
 
 use std::time::Duration;
 
@@ -43,7 +45,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// The app's routes over `state`.
 pub(crate) fn router(state: AppState) -> Router {
     // Routes whose bodies are at most DEFAULT_BODY_LIMIT. Merge new routers here.
-    let standard = Router::new().merge(meta::router()).merge(auth::router());
+    let standard = Router::new()
+        .merge(meta::router())
+        .merge(auth::router())
+        .merge(orgs::router())
+        .merge(projects::router());
 
     // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document
     // creation).
