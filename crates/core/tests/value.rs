@@ -248,3 +248,48 @@ fn keyed_list_mutators_are_persistent() {
     assert_eq!(replaced.len(), 3);
     assert_eq!(ids(&replaced), ["b", "c", "a"]);
 }
+
+#[test]
+fn wire_map_with_list_key_beside_others_is_refused() {
+    use rmpv::Value as P;
+    let bad = P::Map(vec![
+        (P::from("$list"), P::from(1)),
+        (P::from("x"), P::from(2)),
+    ]);
+    assert_eq!(Value::from_wire(&bad), Err(ValueError::Unsupported));
+    let nested = P::Map(vec![(P::from("a"), bad)]);
+    assert_eq!(Value::from_wire(&nested), Err(ValueError::Unsupported));
+}
+
+#[test]
+fn wire_position_length_is_capped_at_1024() {
+    use rmpv::Value as P;
+    let list = |pos: String| {
+        P::Map(vec![(
+            P::from("$list"),
+            P::Array(vec![P::Array(vec![
+                P::from(pos),
+                P::Map(vec![(P::from("id"), P::from("a"))]),
+            ])]),
+        )])
+    };
+    assert!(Value::from_wire(&list("1".repeat(1024))).is_ok());
+    assert_eq!(
+        Value::from_wire(&list("1".repeat(1025))),
+        Err(ValueError::BadId)
+    );
+}
+
+#[test]
+fn wire_depth_and_key_limits() {
+    let wire = |j| to_plain(j);
+    assert!(Value::from_wire(&wire(nested(64))).is_ok());
+    assert_eq!(
+        Value::from_wire(&wire(nested(65))),
+        Err(ValueError::TooDeep)
+    );
+    assert_eq!(
+        Value::from_wire(&wire(json!({ "k".repeat(201): 1 }))),
+        Err(ValueError::KeyTooLong)
+    );
+}

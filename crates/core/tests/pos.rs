@@ -131,12 +131,12 @@ fn parse_accepts_only_well_formed_positions() {
     for ok in ["1", "V", "z", "10001", "aZ9"] {
         assert_eq!(Pos::parse(ok).unwrap().as_str(), ok);
     }
-    let long = "1".repeat(200);
+    let long = "1".repeat(1024);
     assert!(Pos::parse(&long).is_some());
     for bad in ["", "0", "10", "a-", "a b", "é", "1.5"] {
         assert!(Pos::parse(bad).is_none(), "{bad:?}");
     }
-    assert!(Pos::parse(&"1".repeat(201)).is_none());
+    assert!(Pos::parse(&"1".repeat(1025)).is_none());
 }
 
 #[test]

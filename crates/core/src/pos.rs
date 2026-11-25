@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-const MAX_LEN: usize = 200;
+const MAX_LEN: usize = 1024;
 const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -14,7 +14,7 @@ impl Pos {
         &self.0
     }
 
-    /// A position from its string form: 1 to 200 base-62 digits, not ending in `0`; else `None`.
+    /// A position from its string form: 1 to 1024 base-62 digits, not ending in `0`; else `None`.
     pub fn parse(s: &str) -> Option<Pos> {
         if s.len() > MAX_LEN {
             return None;

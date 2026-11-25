@@ -303,6 +303,10 @@ fn from_wire_at(p: &Plain, depth: usize) -> Result<Value, ValueError> {
             if let [(LIST_KEY, list)] = pairs.as_slice() {
                 return keyed_from_wire(list, depth);
             }
+            // A map never holds `$list` beside other keys; it would read back as something else.
+            if pairs.iter().any(|(k, _)| *k == LIST_KEY) {
+                return Err(ValueError::Unsupported);
+            }
             Ok(Value::Map(to_map(&pairs, |v| from_wire_at(v, depth))?))
         }
         Plain::Array(items) => {
@@ -329,10 +333,7 @@ fn keyed_from_wire(list: &Plain, depth: usize) -> Result<Value, ValueError> {
         let [pos, item] = pair.as_slice() else {
             return Err(ValueError::BadId);
         };
-        let pos = pos
-            .as_str()
-            .and_then(Pos::from_string)
-            .ok_or(ValueError::BadId)?;
+        let pos = pos.as_str().and_then(Pos::parse).ok_or(ValueError::BadId)?;
         let id: Id = Arc::from(item_id(item).ok_or(ValueError::BadId)?);
         check_name(&id)?;
         if out.get(&id).is_some() {
