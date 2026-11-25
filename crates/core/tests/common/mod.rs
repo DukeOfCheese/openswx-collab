@@ -95,8 +95,8 @@ pub fn arb_value() -> impl Strategy<Value = Value> {
 }
 
 /// A part-like document: scalars, a map, a plain list, and a keyed list `features` of 0..6 items
-/// with legacy ids `f<i>`, distinct names `Feature<i>`, and a nested keyed (or empty plain) list
-/// `params/sketch/dims`.
+/// with legacy ids `f<i>`, names `Feature<i>` (in a quarter of the documents pairs share a name,
+/// as legacy content may), and a nested keyed (or empty plain) list `params/sketch/dims`.
 pub fn arb_doc() -> impl Strategy<Value = Value> {
     let feature = (
         -100i64..100,
@@ -109,8 +109,14 @@ pub fn arb_doc() -> impl Strategy<Value = Value> {
         arb_scalar(),
         arb_scalar(),
         prop::collection::vec(arb_scalar(), 0..3),
+        prop::bool::weighted(0.25),
     )
-        .prop_map(|(features, units, density, notes)| {
+        .prop_map(|(features, units, density, notes, legacy_duplicates)| {
+            // Now and then pairs of features share a name, as legacy content may.
+            let name = |i: usize| match legacy_duplicates {
+                true => format!("Feature{}", i / 2),
+                false => format!("Feature{i}"),
+            };
             let features = features
                 .into_iter()
                 .enumerate()
@@ -130,7 +136,7 @@ pub fn arb_doc() -> impl Strategy<Value = Value> {
                     };
                     let mut pairs = vec![
                         ("id", str_value(&format!("f{i}"))),
-                        ("name", str_value(&format!("Feature{i}"))),
+                        ("name", str_value(&name(i))),
                         (
                             "params",
                             map(vec![

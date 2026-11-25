@@ -284,6 +284,124 @@ fn duplicate_name_is_refused() {
     );
 }
 
+/// Legacy content in which `f1` and `f2` share a name.
+fn duplicates() -> Value {
+    load(json!({"features": [
+        {"id": "f1", "name": "A"}, {"id": "f2", "name": "A"}, {"id": "f3", "name": "B"},
+    ]}))
+}
+
+#[test]
+fn legacy_duplicates_are_left_alone() {
+    let doc = duplicates();
+    // Changes that do not give anything a new name pass.
+    run(&doc, &[remove(&["features"], "f1")]).unwrap();
+    run(&doc, &[unset(&["features", "f1", "name"])]).unwrap();
+    run(&doc, &[set(&["features", "f1", "name"], "A")]).unwrap();
+    run(&doc, &[set(&["features", "f1", "x"], 1)]).unwrap();
+    run(&doc, &[insert(&["features"], "u1.c1.1", "z")]).unwrap();
+    // Even replacing the whole list with the same names.
+    let same = json!([{"id": "f1", "name": "A"}, {"id": "f2", "name": "A"}]);
+    run(&doc, &[set(&["features"], same)]).unwrap();
+    // Giving an item a taken name is still refused.
+    assert_eq!(
+        run(&doc, &[set(&["features", "f3", "name"], "A")]).err(),
+        Some(OpError::NameTaken(Arc::from("A")))
+    );
+    let clash = Op::Insert {
+        list: path(&["features"]),
+        item: load(json!({"id": "u1.c1.1", "name": "A"})),
+        pos: pos("z"),
+    };
+    assert_eq!(
+        run(&doc, &[clash]).err(),
+        Some(OpError::NameTaken(Arc::from("A")))
+    );
+}
+
+#[test]
+fn undo_restoring_legacy_duplicates_needs_no_rules() {
+    // Undoing these re-creates the duplicate "A" from a document without one. Within one call
+    // that cannot be told apart from a change creating a duplicate, so the rules refuse it;
+    // without rules the inverse restores the original exactly.
+    let doc = duplicates();
+    for op in [
+        remove(&["features"], "f1"),
+        unset(&["features", "f1", "name"]),
+    ] {
+        let a = run(&doc, std::slice::from_ref(&op)).unwrap();
+        assert_eq!(
+            run(&a.doc, &a.inverse).err(),
+            Some(OpError::NameTaken(Arc::from("A"))),
+            "{op:?}"
+        );
+        let back = apply(&a.doc, &a.inverse, &Rules::default(), None).unwrap();
+        assert_eq!(back.doc, doc, "{op:?}");
+    }
+}
+
+/// A document of `levels` nested maps under key `a` (the root counts as one), the innermost
+/// one empty.
+fn deep(levels: usize) -> Value {
+    let mut v = json!({});
+    for _ in 1..levels {
+        v = json!({ "a": v });
+    }
+    load(v)
+}
+
+fn a_path(n: usize) -> Vec<&'static str> {
+    vec!["a"; n]
+}
+
+#[test]
+fn set_respects_the_depth_limit() {
+    let doc = deep(64);
+    let mut p = a_path(63);
+    // The innermost map is at 63 segments: a map there fits, a map inside a map does not.
+    run(&doc, &[set(&p, json!({}))]).unwrap();
+    invalid(run(&doc, &[set(&p, json!({"x": {}}))]));
+    invalid(run(&doc, &[set(&p, json!([[]]))]));
+    // 64 segments: a scalar fits, any container does not.
+    p.push("b");
+    run(&doc, &[set(&p, 1)]).unwrap();
+    invalid(run(&doc, &[set(&p, json!({}))]));
+    invalid(run(&doc, &[set(&p, json!([]))]));
+}
+
+#[test]
+fn insert_respects_the_depth_limit() {
+    let doc = deep(64);
+    let at = |n: usize| {
+        let mut l = a_path(n);
+        l.push("l");
+        l
+    };
+    let ins = |list: &[&str], item: serde_json::Value| Op::Insert {
+        list: path(list),
+        item: load(item),
+        pos: pos("V"),
+    };
+    // A list at 62 segments puts its items at 63: an item of depth 1 fits, of depth 2 does not.
+    run(&doc, &[ins(&at(61), json!({"id": "x"}))]).unwrap();
+    invalid(run(&doc, &[ins(&at(61), json!({"id": "x", "v": {}}))]));
+    // A list at 63 segments has no room for any item.
+    invalid(run(&doc, &[ins(&at(62), json!({"id": "x"}))]));
+}
+
+#[test]
+fn ids_inside_plain_lists_are_always_checked() {
+    // A keyed list inside a plain list has no path, so the check cannot tell that it was there
+    // before: re-setting the same content from a client is refused. Deliberately conservative.
+    let doc = load(json!({"grid": [[{"id": "x2"}]]}));
+    let same = json!([[{"id": "x2"}]]);
+    assert_eq!(
+        client(&doc, &[set(&["grid"], same.clone())]).err(),
+        Some(OpError::ForeignId(Arc::from("x2")))
+    );
+    run(&doc, &[set(&["grid"], same)]).unwrap();
+}
+
 #[test]
 fn all_or_nothing() {
     let doc = part();
@@ -482,14 +600,32 @@ fn generated_ops_are_mostly_applicable() {
     assert!(kinds.iter().all(|&n| n > 0), "applied kinds: {kinds:?}");
 }
 
+/// Whether no two features share a name.
+fn distinct_names(doc: &Value) -> bool {
+    let Some(Value::Keyed(k)) = doc.at(&["features"]) else {
+        return true;
+    };
+    let names: Vec<_> = k
+        .iter()
+        .filter_map(|(_, _, item)| match item.at(&["name"]) {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    names.iter().collect::<std::collections::HashSet<_>>().len() == names.len()
+}
+
 proptest! {
     #[test]
     fn inverse_restores((doc, ops) in arb_doc_and_ops()) {
         if let Ok(a) = run(&doc, &ops) {
-            let back = run(&a.doc, &a.inverse).unwrap();
+            // Undoing towards a document with duplicate names re-creates them, which the rules
+            // refuse (see `undo_restoring_legacy_duplicates_needs_no_rules`); check those without.
+            let undo_rules = if distinct_names(&doc) { rules() } else { Rules::default() };
+            let back = apply(&a.doc, &a.inverse, &undo_rules, None).unwrap();
             prop_assert_eq!(&back.doc, &doc);
             // The inverse of the inverse redoes the change.
-            let again = run(&back.doc, &back.inverse).unwrap();
+            let again = apply(&back.doc, &back.inverse, &undo_rules, None).unwrap();
             prop_assert_eq!(&again.doc, &a.doc);
         }
     }

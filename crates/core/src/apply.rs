@@ -2,10 +2,10 @@
 //!
 //! Every edit rebuilds only the path it changes; everything else is shared with the input.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::op::{Op, OpError};
+use crate::op::{MAX_DEPTH, Op, OpError};
 use crate::path::Path;
 use crate::value::{Id, KeyedList, Value};
 
@@ -43,6 +43,7 @@ pub fn apply(
     let mut out = doc.clone();
     let mut inverse = Vec::with_capacity(ops.len());
     let mut introduced = Introduced::default();
+    let mut touched: Vec<Touched> = rules.unique.iter().map(|_| Touched::default()).collect();
     for op in ops {
         let (next, undo) = apply_one(&out, op)?;
         out = next;
@@ -50,15 +51,16 @@ pub fn apply(
         if id_prefix.is_some() {
             introduced.note(op);
         }
+        for ((list, field), t) in rules.unique.iter().zip(&mut touched) {
+            t.note(op, list, field);
+        }
     }
     inverse.reverse();
     if let Some(prefix) = id_prefix {
         introduced.check(doc, &out, prefix)?;
     }
-    for (list, field) in &rules.unique {
-        if ops.iter().any(|op| may_clash(op, list, field)) {
-            check_unique(&out, list, field)?;
-        }
+    for ((list, field), t) in rules.unique.iter().zip(&touched) {
+        t.check(doc, &out, list, field)?;
     }
     Ok(Applied { doc: out, inverse })
 }
@@ -147,23 +149,26 @@ fn edit_parent<T>(
 /// One operation on `doc`: the new document and the operation that undoes it.
 fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
     match op {
-        Op::Set { path, value } => edit_parent(doc, path, |parent, last, in_item| match parent {
-            Value::Map(m) => {
-                if in_item && &**last == "id" {
-                    return Err(invalid("an item's id cannot be changed"));
+        Op::Set { path, value } => {
+            check_depth(path.len(), value)?;
+            edit_parent(doc, path, |parent, last, in_item| match parent {
+                Value::Map(m) => {
+                    if in_item && &**last == "id" {
+                        return Err(invalid("an item's id cannot be changed"));
+                    }
+                    let undo = match m.get(last) {
+                        Some(old) => Op::Set {
+                            path: path.clone(),
+                            value: old.clone(),
+                        },
+                        None => Op::Unset { path: path.clone() },
+                    };
+                    Ok((Value::Map(m.update(last.clone(), value.clone())), undo))
                 }
-                let undo = match m.get(last) {
-                    Some(old) => Op::Set {
-                        path: path.clone(),
-                        value: old.clone(),
-                    },
-                    None => Op::Unset { path: path.clone() },
-                };
-                Ok((Value::Map(m.update(last.clone(), value.clone())), undo))
-            }
-            Value::Keyed(_) => Err(invalid("set cannot replace a list item; use insert")),
-            _ => Err(OpError::Missing(path.clone())),
-        }),
+                Value::Keyed(_) => Err(invalid("set cannot replace a list item; use insert")),
+                _ => Err(OpError::Missing(path.clone())),
+            })
+        }
         Op::Unset { path } => edit_parent(doc, path, |parent, last, in_item| match parent {
             Value::Map(m) => {
                 if in_item && &**last == "id" {
@@ -184,6 +189,7 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
         }),
         Op::Insert { list, item, pos } => {
             let id = item_id(item).ok_or_else(|| invalid("item needs a string id"))?;
+            check_depth(list.len() + 1, item)?;
             let with_item =
                 |k: &KeyedList| Value::Keyed(k.inserted(id.clone(), pos.clone(), item.clone()));
             edit_parent(doc, list, |parent, last, _| match parent {
@@ -259,7 +265,9 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
 struct Introduced {
     /// (keyed list, id).
     at: BTreeSet<(Path, Id)>,
-    /// Ids in keyed lists inside plain lists, which no path reaches: always new.
+    /// Ids in keyed lists inside plain lists. No path reaches them, so there is nothing to compare
+    /// with the document before: they are deliberately always treated as new and checked, even
+    /// when the same content was there already.
     unreachable: Vec<Id>,
 }
 
@@ -322,39 +330,139 @@ impl Introduced {
     }
 }
 
-/// Whether `op` can make two items of `list` share a value of `field`: it replaces the list or
-/// something above it, inserts or replaces an item, or writes at or under an item's `field`.
-/// Removes and moves never can.
-fn may_clash(op: &Op, list: &[Id], field: &str) -> bool {
-    let target: Path = match op {
-        Op::Set { path, .. } | Op::Unset { path } => path.clone(),
-        Op::Insert { list: l, item, .. } => match item_id(item) {
-            Some(id) => child(l, id),
-            None => l.clone(),
-        },
-        Op::Remove { .. } | Op::Move { .. } => return false,
-    };
-    if target.len() <= list.len() {
-        return target[..] == list[..target.len()];
-    }
-    target.starts_with(list) && target.get(list.len() + 1).is_none_or(|seg| &**seg == field)
+/// The items of one unique rule's list whose field a change may have written.
+#[derive(Default)]
+enum Touched {
+    #[default]
+    Nothing,
+    Items(BTreeSet<Id>),
+    /// The list itself, or something above it, was replaced.
+    All,
 }
 
-/// The string values of `field` across the items of the keyed list at `list` are distinct; the
-/// first repeat in list order is `NameTaken`. Items without the field, or with a value that is
-/// not a string, are ignored. Costs O(n) in the length of the list.
-fn check_unique(doc: &Value, list: &[Id], field: &str) -> Result<(), OpError> {
-    let Some(Value::Keyed(k)) = get(doc, list) else {
-        return Ok(());
-    };
-    let mut seen = HashSet::new();
-    for (_, _, item) in k.iter() {
-        if let Value::Map(m) = item
-            && let Some(Value::Str(name)) = m.get(field)
-            && !seen.insert(name.clone())
-        {
-            return Err(OpError::NameTaken(name.clone()));
+impl Touched {
+    /// Records what `op` writes: an inserted item, a write at or under an item's `field`, or a
+    /// write at or above the list. Removes and moves write no field.
+    fn note(&mut self, op: &Op, list: &[Id], field: &str) {
+        let target: Path = match op {
+            Op::Set { path, .. } | Op::Unset { path } => path.clone(),
+            Op::Insert { list: l, item, .. } => match item_id(item) {
+                Some(id) => child(l, id),
+                None => return,
+            },
+            Op::Remove { .. } | Op::Move { .. } => return,
+        };
+        if target.len() <= list.len() {
+            if target[..] == list[..target.len()] {
+                *self = Touched::All;
+            }
+            return;
+        }
+        let writes_field = target.get(list.len() + 1).is_none_or(|seg| &**seg == field);
+        if !target.starts_with(list) || !writes_field {
+            return;
+        }
+        let id = target[list.len()].clone();
+        match self {
+            Touched::All => {}
+            Touched::Items(ids) => {
+                ids.insert(id);
+            }
+            Touched::Nothing => *self = Touched::Items(BTreeSet::from([id])),
         }
     }
-    Ok(())
+
+    /// A change may not give a touched item a value of `field` that another item of the list
+    /// has, unless the item had that same value before the change (same id, same list). So
+    /// duplicates already in the document are left alone, and an item put back exactly as it was
+    /// passes. The first offending value in list order is `NameTaken`; items without the field,
+    /// or with a value that is not a string, are ignored. Free when nothing is touched; otherwise
+    /// O(touched) to find the items to judge and, if there are any, one O(n) pass over the list.
+    fn check(
+        &self,
+        before: &Value,
+        after: &Value,
+        list: &[Id],
+        field: &str,
+    ) -> Result<(), OpError> {
+        if matches!(self, Touched::Nothing) {
+            return Ok(());
+        }
+        let Some(Value::Keyed(now)) = get(after, list) else {
+            return Ok(());
+        };
+        let was = match get(before, list) {
+            Some(Value::Keyed(k)) => Some(k),
+            _ => None,
+        };
+        let value_of = |item: &Value| match item {
+            Value::Map(m) => match m.get(field) {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        // A touched item still in the list with a string value it did not have before.
+        let judged = |id: &Id| {
+            let value = now.get(id).and_then(value_of)?;
+            let old = was.and_then(|k| k.get(id)).and_then(value_of);
+            (old.as_ref() != Some(&value)).then_some(value)
+        };
+        let judged: HashSet<Id> = match self {
+            Touched::Nothing => return Ok(()),
+            Touched::Items(ids) => ids
+                .iter()
+                .filter(|id| judged(id).is_some())
+                .cloned()
+                .collect(),
+            Touched::All => now
+                .iter()
+                .map(|(id, _, _)| id)
+                .filter(|id| judged(id).is_some())
+                .cloned()
+                .collect(),
+        };
+        if judged.is_empty() {
+            return Ok(());
+        }
+        let mut counts: HashMap<Arc<str>, usize> = HashMap::new();
+        for (_, _, item) in now.iter() {
+            if let Some(v) = value_of(item) {
+                *counts.entry(v).or_default() += 1;
+            }
+        }
+        for (id, _, item) in now.iter() {
+            if judged.contains(id)
+                && let Some(v) = value_of(item)
+                && counts[&v] > 1
+            {
+                return Err(OpError::NameTaken(v));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `v` nests at most `budget` containers deep (as `Value::from_plain` counts: a scalar is
+/// 0, a map, list or keyed list one more than its deepest child). Stops early.
+fn fits(v: &Value, budget: usize) -> bool {
+    let inside = |c: &Value| fits(c, budget - 1);
+    match v {
+        Value::Map(m) => budget > 0 && m.values().all(inside),
+        Value::List(l) => budget > 0 && l.iter().all(inside),
+        Value::Keyed(k) => budget > 0 && k.iter().all(|(_, _, c)| inside(c)),
+        _ => true,
+    }
+}
+
+/// A value placed `segments` deep (the final key or item id counted) keeps the document within
+/// `MAX_DEPTH` levels: `segments` plus the value's own depth is at most `MAX_DEPTH`.
+fn check_depth(segments: usize, value: &Value) -> Result<(), OpError> {
+    if segments <= MAX_DEPTH && fits(value, MAX_DEPTH - segments) {
+        Ok(())
+    } else {
+        Err(OpError::Invalid(format!(
+            "nesting is deeper than {MAX_DEPTH} levels"
+        )))
+    }
 }
