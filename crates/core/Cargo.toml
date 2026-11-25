@@ -9,6 +9,12 @@ publish = false
 name = "oswx_core"
 
 [dependencies]
+imbl.workspace = true
+rmpv.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
