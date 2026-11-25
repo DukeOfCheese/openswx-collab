@@ -9,8 +9,7 @@ protocol or the database; the change is listed here).
 ### Added
 - A load test, `tools/load_test.py`: N simulated people (and optionally a real openswx app) in one part, over
   the real protocol, on SQLite or PostgreSQL. The results and what limits a document are in
-  [docs/benchmarks/collaboration-load.md](docs/benchmarks/collaboration-load.md): about 40 people editing one
-  part, or 50 to 60 watching, on a laptop.
+  [docs/benchmarks/collaboration-load.md](docs/benchmarks/collaboration-load.md).
 
 ## 0.1.2 - 2026-11-24
 
