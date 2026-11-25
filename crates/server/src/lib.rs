@@ -12,6 +12,7 @@ pub mod ext;
 pub mod hub;
 pub mod mail;
 pub mod routes;
+pub mod security;
 pub mod sessions;
 pub mod state;
 pub mod store;
