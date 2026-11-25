@@ -75,13 +75,37 @@ fn diff_value(before: &Value, after: &Value, path: &mut Path, ops: &mut Vec<Op>)
         // Everything else (scalars, plain lists, a change of type, a plain list becoming keyed or
         // the reverse) is one whole-value `Set`. `==` tells `Int(1)` from `Float(1.0)`.
         _ => {
-            if before != after {
+            if !same(before, after) {
                 ops.push(Op::Set {
                     path: path.clone(),
                     value: after.clone(),
                 });
             }
         }
+    }
+}
+
+/// Exact equality: like `==`, but a float is its bits, so `0.0` and `-0.0` differ (as `1`, `1.0` and
+/// `true` do). NaN cannot occur in a document.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same(p, q))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((k, p), (l, q))| k == l && same(p, q))
+        }
+        (Value::Keyed(x), Value::Keyed(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((i, p, u), (j, q, w))| i == j && p == q && same(u, w))
+        }
+        _ => a == b,
     }
 }
 

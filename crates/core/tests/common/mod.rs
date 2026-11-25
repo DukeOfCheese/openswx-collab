@@ -312,3 +312,90 @@ pub fn arb_ops(doc: Value) -> impl Strategy<Value = Vec<Op>> {
 pub fn arb_doc_and_ops() -> impl Strategy<Value = (Value, Vec<Op>)> {
     arb_doc().prop_flat_map(|doc| (Just(doc.clone()), arb_ops(doc)))
 }
+
+/// A document `{"l": ...}` and a target for it, for exercising reordering in a keyed list.
+///
+/// `before` holds a random subset of the ids `i0..i11`, with positions drawn from only three
+/// values so that ties occur. `after` holds another subset (so some ids are fresh, some gone) in
+/// a different order, and every item's `v` changes. With `nested`, items also carry a keyed list
+/// `sub` of up to three items, reordered or shrunk between the two sides.
+pub fn arb_reorder_case(nested: bool) -> impl Strategy<Value = (Value, Plain)> {
+    let flags = || prop::collection::vec(prop::bool::weighted(0.75), 12);
+    let small = |n: usize| prop::collection::vec(0..n, 12);
+    (
+        flags(),
+        small(3),
+        flags(),
+        Just((0..12usize).collect::<Vec<_>>()).prop_shuffle(),
+        small(4),
+        small(8),
+        small(8),
+        flags(),
+    )
+        .prop_map(
+            move |(in_before, pos_idx, in_after, order, v_after, sub_b, sub_a, rev)| {
+                let positions = Pos::spread(3);
+                let subs = |mask: usize, reversed: bool| -> Vec<usize> {
+                    let mut v: Vec<usize> = (0..3).filter(|j| (mask >> j) & 1 == 1).collect();
+                    if reversed {
+                        v.reverse();
+                    }
+                    v
+                };
+                let mut list = KeyedList::new();
+                for i in (0..12).filter(|&i| in_before[i]) {
+                    let mut pairs = vec![
+                        ("id", str_value(&format!("i{i}"))),
+                        ("v", Value::Int(i as i64)),
+                    ];
+                    if nested {
+                        let items: Vec<Value> = subs(sub_b[i], false)
+                            .into_iter()
+                            .map(|j| {
+                                map(vec![
+                                    ("id", str_value(&format!("s{j}"))),
+                                    ("n", Value::Int(j as i64)),
+                                ])
+                            })
+                            .collect();
+                        pairs.push((
+                            "sub",
+                            if items.is_empty() {
+                                Value::List(Arc::new(vec![]))
+                            } else {
+                                keyed(items)
+                            },
+                        ));
+                    }
+                    list = list.inserted(
+                        Arc::from(format!("i{i}")),
+                        positions[pos_idx[i]].clone(),
+                        map(pairs),
+                    );
+                }
+                let before_list = if list.is_empty() {
+                    Value::List(Arc::new(vec![]))
+                } else {
+                    Value::Keyed(list)
+                };
+                let items: Vec<serde_json::Value> = order
+                    .iter()
+                    .filter(|&&i| in_after[i])
+                    .map(|&i| {
+                        let mut item = serde_json::json!({"id": format!("i{i}"), "v": v_after[i] as i64 + 100});
+                        if nested {
+                            item["sub"] = subs(sub_a[i], rev[i])
+                                .into_iter()
+                                .map(|j| serde_json::json!({"id": format!("s{j}"), "n": j}))
+                                .collect();
+                        }
+                        item
+                    })
+                    .collect();
+                (
+                    map(vec![("l", before_list)]),
+                    to_plain(serde_json::json!({ "l": items })),
+                )
+            },
+        )
+}

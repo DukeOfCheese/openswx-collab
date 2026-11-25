@@ -5,6 +5,7 @@ use std::sync::Arc;
 use common::{arb_doc, keyed, load, map, path, to_plain};
 use oswx_core::{KeyedList, Op, Plain, Pos, Rules, Value, ValueError, apply, diff};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use serde_json::json;
 
 fn reach(before: &Value, ops: &[Op]) -> Value {
@@ -290,4 +291,143 @@ proptest! {
         let ops = diff(&before, &after).unwrap();
         prop_assert_eq!(reach(&before, &ops).to_plain(), after);
     }
+}
+
+#[test]
+fn zero_and_negative_zero_differ() {
+    let ops = check(json!({"k": 0.0}), json!({"k": -0.0}));
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(&ops[0], Op::Set { value: Value::Float(f), .. } if f.is_sign_negative()));
+    // Inside a plain list too.
+    let ops = check(json!({"k": [0.0]}), json!({"k": [-0.0]}));
+    assert_eq!(ops.len(), 1);
+    // Equal floats emit nothing.
+    assert!(check(json!({"k": [0.0, 1.5]}), json!({"k": [0.0, 1.5]})).is_empty());
+}
+
+fn ids_of(after: &Plain) -> Vec<String> {
+    let Plain::Map(pairs) = after else {
+        panic!("map")
+    };
+    let Plain::Array(items) = &pairs[0].1 else {
+        return vec![];
+    };
+    items
+        .iter()
+        .map(|i| {
+            let Plain::Map(p) = i else { panic!("item") };
+            p.iter()
+                .find(|(k, _)| k.as_str() == Some("id"))
+                .unwrap()
+                .1
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Longest increasing subsequence length, the plain O(n^2) way.
+fn lis_len(seq: &[usize]) -> usize {
+    let mut best = vec![1usize; seq.len()];
+    for i in 0..seq.len() {
+        for j in 0..i {
+            if seq[j] < seq[i] {
+                best[i] = best[i].max(best[j] + 1);
+            }
+        }
+    }
+    best.into_iter().max().unwrap_or(0)
+}
+
+fn reorder_case_holds(before: &Value, after: &Plain) -> Result<(), TestCaseError> {
+    let ops = diff(before, after).unwrap();
+    let got = apply(before, &ops, &Rules::default(), None);
+    prop_assert!(got.is_ok(), "apply failed: {:?}", got.err());
+    prop_assert_eq!(&got.unwrap().doc.to_plain(), after);
+
+    // Bound on moves: items out of order, plus items demoted by tied positions.
+    let after_ids = ids_of(after);
+    let (survivors, tied) = match before.at(&["l"]) {
+        Some(Value::Keyed(k)) => {
+            let listed: Vec<_> = k
+                .iter()
+                .filter(|(id, _, _)| after_ids.iter().any(|a| a == &***id))
+                .collect();
+            let tied = listed
+                .iter()
+                .filter(|(_, p, _)| listed.iter().filter(|(_, q, _)| q == p).count() > 1)
+                .count();
+            (
+                listed
+                    .iter()
+                    .map(|(id, _, _)| id.to_string())
+                    .collect::<Vec<_>>(),
+                tied,
+            )
+        }
+        _ => (vec![], 0),
+    };
+    let seq: Vec<usize> = after_ids
+        .iter()
+        .filter_map(|a| survivors.iter().position(|s| s == a))
+        .collect();
+    let moves = ops
+        .iter()
+        .filter(|o| matches!(o, Op::Move { list, .. } if list == &path(&["l"])))
+        .count();
+    let bound = survivors.len() - lis_len(&seq) + tied;
+    prop_assert!(moves <= bound, "{moves} moves, bound {bound}: {ops:?}");
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn reordering_with_ties_converges((before, after) in common::arb_reorder_case(false)) {
+        reorder_case_holds(&before, &after)?;
+    }
+
+    #[test]
+    fn reordering_with_nested_lists_converges((before, after) in common::arb_reorder_case(true)) {
+        reorder_case_holds(&before, &after)?;
+    }
+}
+
+#[test]
+fn reorder_generator_reaches_moves_and_mid_list_inserts() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let strategy = common::arb_reorder_case(false);
+    let mut runner = TestRunner::deterministic();
+    let cases = 400;
+    let mut hits = 0;
+    for _ in 0..cases {
+        let (before, after) = strategy.new_tree(&mut runner).unwrap().current();
+        let ops = diff(&before, &after).unwrap();
+        let ids = ids_of(&after);
+        let has_move = ops
+            .iter()
+            .any(|o| matches!(o, Op::Move { list, .. } if list == &path(&["l"])));
+        let mid_insert = ops.iter().any(|o| match o {
+            Op::Insert { list, item, .. } if list == &path(&["l"]) => {
+                let Value::Map(m) = item else { return false };
+                let Some(Value::Str(id)) = m.get("id") else {
+                    return false;
+                };
+                ids.iter()
+                    .position(|a| a == &**id)
+                    .is_some_and(|i| i + 1 < ids.len())
+            }
+            _ => false,
+        });
+        if has_move && mid_insert {
+            hits += 1;
+        }
+    }
+    assert!(
+        hits * 2 >= cases,
+        "only {hits} of {cases} cases had a move and a mid-list insert"
+    );
 }
