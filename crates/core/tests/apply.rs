@@ -699,6 +699,134 @@ fn hand_built_values_the_wire_cannot_carry_are_refused() {
     assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc));
 }
 
+/// Whether a name breaks the rules a path segment or id must follow.
+fn bad_name(s: &str) -> bool {
+    let n = s.chars().count();
+    n == 0 || n > 200 || s == "$list"
+}
+
+/// Whether an operation's path, list path or id breaks the name rules.
+fn breaks_name_rules(op: &Op) -> bool {
+    let bad_path = |p: &oswx_core::Path| p.is_empty() || p.iter().any(|s| bad_name(s));
+    match op {
+        Op::Set { path, .. } | Op::Unset { path } => bad_path(path),
+        Op::Insert { list, item, .. } => {
+            bad_path(list) || matches!(item.at(&["id"]), Some(Value::Str(id)) if bad_name(id))
+        }
+        Op::Remove { list, id } | Op::Move { list, id, .. } => bad_path(list) || bad_name(id),
+    }
+}
+
+#[test]
+fn hand_built_paths_and_ids_out_of_bounds_are_refused() {
+    // The reviewer's probe: with no prefix and no rules, an over-long key or item id was accepted
+    // and the snapshot could not be read back.
+    let doc = load(json!({"e": [], "l": [{"id": "a"}], "m": {}}));
+    let long = "k".repeat(201);
+    let item = |id: &str| load(json!({"id": id}));
+    let p = |segs: &[&str]| path(segs);
+    let bad = [
+        Op::Set {
+            path: p(&[&long]),
+            value: Value::Int(1),
+        },
+        Op::Set {
+            path: p(&["m", &long]),
+            value: Value::Int(1),
+        },
+        Op::Set {
+            path: p(&["m", ""]),
+            value: Value::Int(1),
+        },
+        Op::Set {
+            path: vec![],
+            value: Value::Int(1),
+        },
+        Op::Unset {
+            path: p(&["m", &long]),
+        },
+        Op::Unset { path: p(&[""]) },
+        Op::Unset { path: vec![] },
+        Op::Insert {
+            list: p(&["e"]),
+            item: item(&long),
+            pos: pos("V"),
+        },
+        Op::Insert {
+            list: p(&[&long]),
+            item: item("x"),
+            pos: pos("V"),
+        },
+        Op::Insert {
+            list: p(&["m", ""]),
+            item: item("x"),
+            pos: pos("V"),
+        },
+        Op::Insert {
+            list: vec![],
+            item: item("x"),
+            pos: pos("V"),
+        },
+        Op::Remove {
+            list: p(&["l"]),
+            id: Arc::from(""),
+        },
+        Op::Remove {
+            list: p(&["l"]),
+            id: Arc::from(long.as_str()),
+        },
+        Op::Remove {
+            list: vec![],
+            id: Arc::from("a"),
+        },
+        Op::Move {
+            list: p(&["l"]),
+            id: Arc::from(long.as_str()),
+            pos: pos("V"),
+        },
+        Op::Move {
+            list: p(&[""]),
+            id: Arc::from("a"),
+            pos: pos("V"),
+        },
+        Op::Move {
+            list: vec![],
+            id: Arc::from("a"),
+            pos: pos("V"),
+        },
+    ];
+    for op in bad {
+        assert!(breaks_name_rules(&op), "{op:?}");
+        invalid(apply(
+            &doc,
+            std::slice::from_ref(&op),
+            &Rules::default(),
+            None,
+        ));
+        invalid(client(&doc, std::slice::from_ref(&op)));
+    }
+    // At the limit is fine, and reads back.
+    let at = "k".repeat(200);
+    let a = apply(
+        &doc,
+        &[
+            Op::Set {
+                path: p(&["m", &at]),
+                value: Value::Int(1),
+            },
+            Op::Insert {
+                list: p(&["e"]),
+                item: item(&at),
+                pos: pos("V"),
+            },
+        ],
+        &Rules::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc));
+}
+
 /// `{"k": {"$list": 1, "x": 2}}`, built by hand: no conversion would produce it.
 fn map_with_list_key() -> Value {
     let inner: oswx_core::Map = [
@@ -928,6 +1056,12 @@ proptest! {
         if let Ok(a) = run(&doc, &ops) {
             prop_assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc.clone()));
             prop_assert_eq!(diff(&a.doc, &a.doc.to_plain()), Ok(vec![]));
+        }
+        // Every path or id out of bounds (the generator makes some by hand) is refused on its own
+        // as invalid.
+        for op in ops.iter().filter(|op| breaks_name_rules(op)) {
+            let r = run(&doc, std::slice::from_ref(op));
+            prop_assert!(matches!(r, Err(OpError::Invalid(_))), "{:?}: {:?}", op, r);
         }
         // Every value the wire could not carry back (the generator makes some by hand) is
         // refused on its own as invalid.

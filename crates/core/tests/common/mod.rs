@@ -245,6 +245,42 @@ pub fn bad_value(kind: usize) -> Value {
     }
 }
 
+/// An operation code could build by hand whose path or id breaks the name rules (1 to 200
+/// characters, not `$list`; a path of at least one segment): apply must refuse it.
+pub fn bad_name_op(kind: usize, parent: &Path, i: usize) -> Op {
+    let long = "k".repeat(201);
+    let under = |seg: &str| child(parent, seg);
+    match kind {
+        0 => Op::Set {
+            path: under(&long),
+            value: Value::Int(1),
+        },
+        1 => Op::Set {
+            path: under(""),
+            value: Value::Int(1),
+        },
+        2 => Op::Set {
+            path: vec![],
+            value: Value::Int(1),
+        },
+        3 => Op::Insert {
+            list: under(&format!("l{i}")),
+            item: map(vec![("id", str_value(&format!("u1.c1.{long}")))]),
+            pos: Pos::between(None, None),
+        },
+        4 => Op::Unset { path: under(&long) },
+        5 => Op::Remove {
+            list: under("x"),
+            id: Arc::from(""),
+        },
+        _ => Op::Move {
+            list: vec![Arc::from("")],
+            id: Arc::from("a"),
+            pos: Pos::between(None, None),
+        },
+    }
+}
+
 type Choice = (u8, Index, Index, Index, Value);
 
 fn build_ops(doc: &Value, choices: Vec<Choice>) -> Vec<Op> {
@@ -313,6 +349,8 @@ fn build_ops(doc: &Value, choices: Vec<Choice>) -> Vec<Op> {
                     path: fresh_key(i, &a),
                     value: bad_value(b.index(5)),
                 },
+                // A path or id out of bounds, built by hand.
+                2 => bad_name_op(b.index(7), &t.maps[a.index(t.maps.len())], i),
                 _ => Op::Set {
                     path: fresh_key(i, &a),
                     value,

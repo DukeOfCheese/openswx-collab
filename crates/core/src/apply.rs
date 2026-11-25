@@ -6,8 +6,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::op::{MAX_DEPTH, Op, OpError};
-use crate::path::Path;
-use crate::value::{Id, KeyedList, LIST_KEY, Value};
+use crate::path::{self, Path};
+use crate::value::{Id, KeyedList, Value};
 
 /// Invariants every change must leave intact.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -208,10 +208,11 @@ fn edit_parent<T>(
 
 /// One operation on `doc`: the new document and the operation that undoes it.
 fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
+    check_names(op)?;
     match op {
         Op::Set { path, value } => {
             check_depth(path.len(), value)?;
-            check_wire_form(path, None, value)?;
+            check_wire_form(value)?;
             edit_parent(doc, path, |parent, last, in_item| match parent {
                 Value::Map(m) => {
                     if in_item && &**last == "id" {
@@ -251,7 +252,7 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
         Op::Insert { list, item, pos } => {
             let id = item_id(item).ok_or_else(|| invalid("item needs a string id"))?;
             check_depth(list.len() + 1, item)?;
-            check_wire_form(list, Some(id), item)?;
+            check_wire_form(item)?;
             let with_item =
                 |k: &KeyedList| Value::Keyed(k.inserted(id.clone(), pos.clone(), item.clone()));
             edit_parent(doc, list, |parent, last, _| match parent {
@@ -579,19 +580,37 @@ fn check_depth(segments: usize, value: &Value) -> Result<(), OpError> {
     }
 }
 
-/// `$list` is the key of a keyed list's wire form: a path or an item id holding it could not be
-/// read back from that form, and nor can a value that is not canonical (`Value::is_canonical`:
-/// a keyed item without its own id, a plain list that reads as keyed, `$list` as a key, ...).
-/// `Op::from_wire` never builds such an operation; hand-built ones are refused here, so a
-/// snapshot of any document `apply` produced can always be read back.
-fn check_wire_form(path: &Path, id: Option<&Id>, value: &Value) -> Result<(), OpError> {
-    if path.iter().chain(id).any(|s| &**s == LIST_KEY) {
-        Err(invalid("$list cannot be a key or an id"))
-    } else if !value.is_canonical() {
+/// Paths, list paths and ids follow the same rule as on the wire (`path::check`,
+/// `path::check_name`): `Op::from_wire` enforces it, and hand-built operations skip that, so it is
+/// checked here for all five kinds. An over-long or `$list` key or id would leave a document whose
+/// wire form cannot be read back; an empty path names nothing.
+fn check_names(op: &Op) -> Result<(), OpError> {
+    match op {
+        Op::Set { path, .. } | Op::Unset { path } => path::check(path, "path"),
+        Op::Insert { list, item, .. } => {
+            path::check(list, "list")?;
+            match item_id(item) {
+                Some(id) => path::check_name(id, "id"),
+                None => Ok(()), // `apply_one` refuses an item without an id.
+            }
+        }
+        Op::Remove { list, id } | Op::Move { list, id, .. } => {
+            path::check(list, "list")?;
+            path::check_name(id, "id")
+        }
+    }
+}
+
+/// A value whose wire form does not read back the same (`Value::is_canonical`: a keyed item
+/// without its own id, a plain list that reads as keyed, `$list` as a key, an over-long key, ...)
+/// is refused. With `check_names`, this means a snapshot of any document `apply` produced from a
+/// document that could be read back can be read back too.
+fn check_wire_form(value: &Value) -> Result<(), OpError> {
+    if value.is_canonical() {
+        Ok(())
+    } else {
         Err(invalid(
             "the value has no wire form that reads back the same",
         ))
-    } else {
-        Ok(())
     }
 }
