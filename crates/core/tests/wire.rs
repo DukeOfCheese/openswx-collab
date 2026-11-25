@@ -1426,6 +1426,26 @@ fn the_scan_refuses_what_runs_past_the_end() {
     }
 }
 
+#[test]
+fn the_reserved_byte_is_refused_as_a_value() {
+    // {"t": "ping", "x": 0xc1}: rmpv would read 0xc1 as nil; the decoder refuses it.
+    let mut frame = vec![0x82, 0xa1, b't', 0xa4, b'p', b'i', b'n', b'g', 0xa1, b'x'];
+    frame.push(0xc1);
+    assert!(matches!(
+        decode_client(&frame, 1 << 20),
+        Err(WireError::Invalid(_))
+    ));
+    // The same frame with nil in its place is a ping.
+    *frame.last_mut().unwrap() = 0xc0;
+    assert_eq!(decode_client(&frame, 1 << 20), Ok(ClientMsg::Ping));
+    // As a key too.
+    let key = [0x81, 0xc1, 0xc0];
+    assert!(matches!(
+        decode_client(&key, 1 << 20),
+        Err(WireError::Invalid(_))
+    ));
+}
+
 mod scan_agrees_with_rmpv {
     use super::*;
     use proptest::prelude::*;
@@ -1508,7 +1528,14 @@ mod scan_agrees_with_rmpv {
             for v in variants {
                 let scanned = oswx_core::wire::scan(&v, None);
                 match reference(&v) {
-                    Some(n) => prop_assert_eq!(scanned.map(|s| s.nodes), Ok(n), "{:02x?}", v),
+                    // rmpv reads the reserved byte 0xc1 as nil; the scan refuses it, as it should
+                    // (stricter than the parser, never laxer).
+                    Some(n) => prop_assert!(
+                        scanned.as_ref().map(|s| s.nodes) == Ok(n)
+                            || (scanned.is_err() && v.contains(&0xc1)),
+                        "{:02x?}",
+                        v
+                    ),
                     None => prop_assert!(scanned.is_err(), "{:02x?}", v),
                 }
             }
