@@ -471,6 +471,11 @@ impl Live {
             .expect("the frame is sent");
     }
 
+    /// Sends a frame the server may cut off halfway (an error sending it is not a failure).
+    pub async fn send_raw_lossy(&mut self, frame: Vec<u8>) {
+        let _ = self.ws.send(Message::Binary(frame.into())).await;
+    }
+
     pub async fn send_text(&mut self, text: &str) {
         self.ws
             .send(Message::Text(text.into()))

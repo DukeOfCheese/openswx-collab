@@ -4,45 +4,63 @@
 //!
 //! 1. **Resend?** A change id this client already used is answered with the seq it got
 //!    (`change.accepted`), or, while that change is still being written, answered when it is. The
-//!    room remembers, in memory, every change decided but not yet durable and every change made
-//!    durable since it loaded, back to a floor: the older ones it forgets (keeping at least those
-//!    since the last snapshot, and [`RECENT_KEEP`] in all) raise the floor. A change made on a base
-//!    below the floor may be a resend of a change memory no longer holds (an accepted change's seq
-//!    is above its base), so only then is the journal asked, by `(document, client, change id)`.
-//!    The journal's unique key is a backstop, not the mechanism.
-//! 2. **Read-only** connections are refused (`read_only`).
+//!    room remembers, in memory, every change decided but not yet durable, every change made
+//!    durable since it loaded, and, when a connection joins, that client's most recent change ids
+//!    in the document (read from the journal by the handshake). Older entries are forgotten
+//!    (keeping at least those since the last snapshot, and [`RECENT_KEEP`] in all), which raises a
+//!    floor; a change made on a base below the floor may be a resend of a change memory no longer
+//!    holds (an accepted change's seq is above its base), so only then is the journal asked, by
+//!    `(document, client, change id)`. The journal's unique key is a backstop.
+//! 2. **Read-only** connections are refused (`read_only`), after the memory check, and are never
+//!    looked up in the journal.
 //! 3. **Judged** by [`oswx_core::decide`] against the tentative head, under the sender's client id,
 //!    with `Rules::openswx()`. `depends` are answered from what the room knows of the client's own
 //!    changes: accepted (tentatively or durably) if memory holds it, refused if the client's
 //!    refused ids hold it, unknown otherwise. A big change (more than [`BIG_OPS`] operations or a
 //!    frame over [`BIG_FRAME`]) is judged on the blocking pool against a copy of the head (a
 //!    persistent value, so the copy is cheap) while the room takes no other frame but goes on with
-//!    everything else.
-//! 4. **Blobs**: the `{"$blob": sha}` references in what it sets or inserts that the room has not
-//!    seen yet are looked up in the organisation's storage (16 at a time) off the task, the sender's
-//!    later messages waiting; a missing one is `missing_blob`, a storage error `server_error`.
+//!    everything else; the sender's later messages wait for it.
+//! 4. **Blobs**: at most [`MAX_BLOB_REFS`] distinct `{"$blob": sha}` references (more is
+//!    `invalid`); those the room has not seen are looked up in the organisation's storage (16 at a
+//!    time) off the task, the sender's later messages waiting. A missing one is `missing_blob` (and
+//!    remembered as missing for [`MISSING_BLOB_SECS`]); a storage error is `server_error`.
 //! 5. **Written**: the change becomes tentative and its record goes to the journal. When the journal
 //!    reports it durable the durable head moves, the change is broadcast to every other connection
 //!    and the sender is told `change.accepted`.
+//!
+//! If the journal refuses a record for a cause of its own (a duplicate change id, a failed extra
+//! write, a broken limit, or being out of order), only that record is answered: a duplicate with
+//! the seq the journal holds for it, anything else `server_error`. The changes decided after it are
+//! kept and judged again, in their order, against the durable head; each is then written or refused
+//! on its merits, and its sender sees only the final answer. A change judged again
+//! [`MAX_REJUDGE`] times is answered `server_error`. A connection whose changes the journal refuses
+//! as duplicates more than [`MAX_DUPLICATES`] times is closed (1008, misbehaving client). A lost
+//! lease or an unknown outcome unloads the room (see the room module).
+//!
+//! The server's own changes ([`super::RoomHandle::server_change`]) go through the same pipeline
+//! under [`SERVER_CLIENT`], with no change id, and are broadcast to every connection.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use bytes::Bytes;
-use oswx_core::wire::{self, ChangeEvent, ServerMsg};
+use futures_util::FutureExt;
+use oswx_core::wire::{self, ChangeEvent, ClientMsg, ServerMsg};
 use oswx_core::{
-    Accepted, Change, ClientId, Head, Known, Op, Refusal, RejectCode, Rules, Seq, decide,
+    Accepted, Change, ClientId, Conflict, Head, Known, Op, Refusal, RejectCode, Rules, Seq, decide,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use super::{ConnId, Internal, Reply, Room};
+use super::{ConnId, Internal, Reply, Room, ServerChange, ServerChangeError, close};
 use crate::blobs::missing_blobs;
 use crate::content::blob_refs;
 use crate::journal::{JournalError, JournalWriter, Receipt, Record, RefusedWhy};
 use crate::metrics;
 use crate::record::{encode_ops, encode_paths, encode_reads};
+use crate::snapshot::SERVER_CLIENT;
 
 /// A change with more operations than this is judged off the room's task.
 pub const BIG_OPS: usize = 256;
@@ -50,21 +68,34 @@ pub const BIG_OPS: usize = 256;
 pub const BIG_FRAME: usize = 256 * 1024;
 /// Durable change ids kept in memory beyond those since the last snapshot.
 pub const RECENT_KEEP: usize = 5000;
+/// The most distinct blob references one change may hold.
+pub const MAX_BLOB_REFS: usize = 4096;
+/// How long a blob found missing is answered missing without asking storage again, in seconds.
+pub const MISSING_BLOB_SECS: f64 = 30.0;
+/// How many times a change may be judged again after a record before it was refused.
+pub const MAX_REJUDGE: u8 = 3;
+/// How many duplicate refusals from the journal a connection may cause before it is closed.
+pub const MAX_DUPLICATES: u32 = 3;
 /// Refused change ids remembered per client.
 const REFUSED_KEEP: usize = 1024;
-/// Blob hashes known to exist, remembered per room.
-const KNOWN_BLOBS_KEEP: usize = 10_000;
+/// Blob hashes remembered per room, found or missing.
+const BLOBS_KEEP: usize = 10_000;
 /// The longest `command` the journal keeps.
 const MAX_COMMAND: usize = 100;
 /// The longest `message` of a rejection.
 const MAX_MESSAGE: usize = 300;
+/// What the sender of a change that could not be written is told.
+const NOT_STORED: &str = "the server could not store the change; try again";
+
+/// Names a change in the pipeline from its first adoption on; answers wait on it.
+pub(super) type Ticket = u64;
 
 // ------------------------------------------------------------------ memory
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
     /// Decided, not yet durable.
-    Tentative(Seq),
+    Tentative(Ticket),
     Durable(Seq),
 }
 
@@ -73,7 +104,7 @@ type Key = (ClientId, Arc<str>);
 /// The change ids the room holds in memory; see the module documentation.
 pub(super) struct Recent {
     map: HashMap<Key, Seen>,
-    /// Durable entries, oldest first.
+    /// Durable entries, in the order they were remembered.
     order: VecDeque<(Seq, Key)>,
     /// Every durable change with a seq above this is in `map`.
     floor: Seq,
@@ -92,6 +123,16 @@ impl Recent {
 
     fn get(&self, client: &ClientId, change_id: &Arc<str>) -> Option<Seen> {
         self.map.get(&(client.clone(), change_id.clone())).copied()
+    }
+
+    /// Remembers that the client's change `change_id` is durable as `seq`.
+    pub(super) fn remember(&mut self, client: &ClientId, change_id: &str, seq: Seq) {
+        let key = (client.clone(), Arc::from(change_id));
+        if matches!(self.map.get(&key), Some(Seen::Tentative(_))) {
+            return;
+        }
+        self.map.insert(key.clone(), Seen::Durable(seq));
+        self.order.push_back((seq, key));
     }
 
     /// Forgets the oldest durable entries past [`RECENT_KEEP`], never one after `snapshot_seq`.
@@ -116,22 +157,104 @@ impl Recent {
 /// The change ids of one client that were refused (bounded).
 pub(super) type RefusedIds = super::Bounded<Arc<str>>;
 
-/// Blob hashes known to exist in the organisation's storage (bounded).
+/// Blob hashes the room has asked storage about: found ones (bounded), and missing ones with when
+/// that answer stops counting.
 #[derive(Debug, Default)]
-pub(super) struct KnownBlobs(super::Bounded<String>);
+pub(super) struct KnownBlobs {
+    found: super::Bounded<String>,
+    missing: HashMap<String, f64>,
+}
+
+impl KnownBlobs {
+    fn note_missing(&mut self, sha: String, now: f64) {
+        if self.missing.len() >= BLOBS_KEEP {
+            self.missing.retain(|_, until| *until > now);
+            if self.missing.len() >= BLOBS_KEEP {
+                self.missing.clear();
+            }
+        }
+        self.missing.insert(sha, now + MISSING_BLOB_SECS);
+    }
+
+    fn is_missing(&self, sha: &str, now: f64) -> bool {
+        self.missing.get(sha).is_some_and(|until| *until > now)
+    }
+}
 
 // ------------------------------------------------------------------ in flight
+
+/// A message of a connection, as the room queues it behind an earlier one.
+pub(super) enum Incoming {
+    /// A decoded message and the size of its frame.
+    Msg(ClientMsg, usize),
+    /// A change whose memory and journal checks are done: judge it.
+    Judge(Arc<Change>, usize),
+    /// A frame that could not be read: answer `error` with this code and message.
+    Malformed(&'static str, String),
+}
+
+impl Incoming {
+    pub(super) fn size(&self) -> usize {
+        match self {
+            Incoming::Msg(_, size) | Incoming::Judge(_, size) => *size,
+            Incoming::Malformed(..) => 0,
+        }
+    }
+}
+
+/// Where a change came from, and so who is answered.
+pub(super) enum Origin {
+    Conn(ConnId),
+    Server(oneshot::Sender<Result<Seq, ServerChangeError>>),
+}
+
+/// Who a change is from, for its index marks, record and broadcast.
+#[derive(Debug, Clone)]
+pub(super) struct Author {
+    /// `<user>.<client>`, or [`SERVER_CLIENT`].
+    client: ClientId,
+    user: String,
+    name: String,
+}
+
+/// A change going through the pipeline.
+pub(super) struct Item {
+    origin: Origin,
+    author: Author,
+    change: Arc<Change>,
+    size: usize,
+    /// Set when it is first made tentative; answers wait on it, and keep waiting on it if the
+    /// change is judged again.
+    ticket: Option<Ticket>,
+    /// Connections waiting for its answer (the sender, and any that resent it meanwhile).
+    waiters: Vec<ConnId>,
+    rejudged: u8,
+    /// Its blob references were checked.
+    blobs_checked: bool,
+}
+
+impl Item {
+    fn conn(&self) -> Option<ConnId> {
+        match self.origin {
+            Origin::Conn(conn) => Some(conn),
+            Origin::Server(_) => None,
+        }
+    }
+
+    /// The key of its id in [`Recent`], for a client's change.
+    fn key(&self) -> Option<Key> {
+        self.conn()
+            .map(|_| (self.author.client.clone(), self.change.change_id.clone()))
+    }
+}
 
 /// A change decided and handed to the journal, not yet durable.
 pub(super) struct Pending {
     seq: Seq,
-    client: ClientId,
-    change_id: Arc<str>,
+    item: Item,
     accepted: Accepted,
     /// The change event, encoded once for every recipient.
     event: Bytes,
-    /// Connections waiting for its answer (the sender, and any that resent it meanwhile).
-    waiters: Vec<ConnId>,
 }
 
 /// A record on its way to the journal.
@@ -151,29 +274,31 @@ pub(super) struct Outcome {
 /// A journal lookup of a change id, coming back.
 pub(super) struct Lookup {
     conn: ConnId,
-    change: Change,
+    change: Arc<Change>,
     size: usize,
+    result: anyhow::Result<Option<i64>>,
+}
+
+/// The journal's seq of a change it refused as a duplicate, coming back.
+pub(super) struct DuplicateCheck {
+    item: Item,
     result: anyhow::Result<Option<i64>>,
 }
 
 /// A blob check, coming back with what was decided before it.
 pub(super) struct BlobCheck {
-    conn: ConnId,
-    change: Change,
-    size: usize,
+    item: Item,
     version: u64,
     decision: Decision,
     asked: Vec<String>,
     result: anyhow::Result<Vec<String>>,
 }
 
-/// A big change judged off the task, coming back.
+/// A big change judged off the task, coming back (`None`: the judging panicked).
 pub(super) struct Offloaded {
-    conn: ConnId,
-    change: Change,
-    size: usize,
+    item: Item,
     version: u64,
-    result: Result<Decision, Refusal>,
+    result: Option<Result<Decision, Refusal>>,
 }
 
 /// An accepted change with everything its record and broadcast need, made where it was judged.
@@ -185,13 +310,6 @@ pub(super) struct Decision {
     paths: Bytes,
     reads: Bytes,
     event: Bytes,
-}
-
-/// Who a change is from, for its broadcast.
-struct Author {
-    client: ClientId,
-    user: String,
-    name: String,
 }
 
 /// Starts the two tasks that hand a room's records to the journal and bring the outcomes back, in
@@ -228,6 +346,16 @@ pub(super) fn pump(
     submit_tx
 }
 
+/// Runs `work` and turns a panic in it into an error, so that whoever waits for its answer gets one.
+async fn caught<T>(
+    work: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match AssertUnwindSafe(work).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("the work panicked")),
+    }
+}
+
 /// The blob references in what the operations set or insert.
 fn blob_refs_of(ops: &[Op]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -249,6 +377,12 @@ fn judge(
     change: &Change,
     known: &HashMap<Arc<str>, Known>,
 ) -> Result<Decision, Refusal> {
+    let blobs = blob_refs_of(&change.ops);
+    if blobs.len() > MAX_BLOB_REFS {
+        return Err(Refusal::Invalid(format!(
+            "a change may refer to at most {MAX_BLOB_REFS} blobs"
+        )));
+    }
     let known = |id: &str| known.get(id).copied().unwrap_or(Known::Unknown);
     let accepted = decide(
         head,
@@ -258,19 +392,25 @@ fn judge(
         None,
         &Rules::openswx(),
     )?;
+    let server = &*author.client == SERVER_CLIENT;
     let event = wire::encode_server(&ServerMsg::Change(ChangeEvent {
         seq: accepted.seq,
         client_id: author.client.clone(),
         author: author.user.clone(),
         author_name: author.name.clone(),
-        change_id: change.change_id.clone(),
+        // (As catch-up reads it from a row without one.)
+        change_id: if server {
+            Arc::from("")
+        } else {
+            change.change_id.clone()
+        },
         ops: change.ops.clone(),
         command: change.command.clone(),
         // TASK 11: undo (the room resolves `undo_of` and hands `decide` the kept inverse).
         undo_of: None,
     }));
     Ok(Decision {
-        blobs: blob_refs_of(&change.ops),
+        blobs,
         ops: encode_ops(&change.ops),
         inverse: encode_ops(&accepted.inverse),
         paths: encode_paths(&accepted.writes, &accepted.removed),
@@ -296,22 +436,32 @@ fn refusal_message(refusal: &Refusal) -> String {
 }
 
 impl Room {
+    // ------------------------------------------------------------------ arriving
+
     pub(super) fn on_change(&mut self, conn: ConnId, change: Change, size: usize) {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
         };
         match self.recent.get(&c.client, &change.change_id) {
             Some(Seen::Durable(seq)) => return self.accept_again(conn, &change.change_id, seq),
-            Some(Seen::Tentative(seq)) => {
+            Some(Seen::Tentative(ticket)) => {
                 // Still being written: answered with the change itself, when it is.
-                if let Some(p) = self.pending.iter_mut().find(|p| p.seq == seq) {
-                    p.waiters.push(conn);
-                    c.replies.push_back(Reply::Waiting(seq));
+                if let Some(p) = self
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.item.ticket == Some(ticket))
+                {
+                    p.item.waiters.push(conn);
+                    c.replies.push_back(Reply::Waiting(ticket));
                     return;
                 }
             }
             None => {}
         }
+        if let Some(reason) = c.read_only.clone() {
+            return self.reject(conn, &change.change_id, RejectCode::ReadOnly, &reason);
+        }
+        let change = Arc::new(change);
         if change.base < self.recent.floor {
             // Possibly a resend of a change memory no longer holds: ask the journal.
             c.busy = true;
@@ -319,9 +469,8 @@ impl Room {
                 (self.state.store.clone(), self.doc.clone(), c.client.clone());
             let internal = self.internal.clone();
             tokio::spawn(async move {
-                let result = store
-                    .change_seq_by_client(&doc, &client, &change.change_id)
-                    .await;
+                let result =
+                    caught(store.change_seq_by_client(&doc, &client, &change.change_id)).await;
                 let lookup = Lookup {
                     conn,
                     change,
@@ -332,7 +481,7 @@ impl Room {
             });
             return;
         }
-        self.judge_change(conn, change, size);
+        self.judge_conn_change(conn, change, size);
     }
 
     pub(super) fn on_lookup(&mut self, lookup: Lookup) {
@@ -351,13 +500,13 @@ impl Room {
                 let seq = Seq::try_from(seq).unwrap_or_default();
                 if let Some(c) = self.conns.get(&conn) {
                     // Remembered, so that a further resend needs no lookup.
-                    let key = (c.client.clone(), change.change_id.clone());
-                    self.recent.map.insert(key.clone(), Seen::Durable(seq));
-                    self.recent.order.push_back((seq, key));
+                    let client = c.client.clone();
+                    self.recent.remember(&client, &change.change_id, seq);
                 }
                 self.accept_again(conn, &change.change_id, seq);
             }
-            Ok(None) => self.judge_change(conn, change, size),
+            Ok(None) if self.paused > 0 => self.park_first(conn, Incoming::Judge(change, size)),
+            Ok(None) => self.judge_conn_change(conn, change, size),
             Err(e) => {
                 tracing::error!(
                     "could not look a change id up in document {}: {e:#}",
@@ -368,10 +517,40 @@ impl Room {
                     &change.change_id,
                     RejectCode::ServerError,
                     "the server could not check the change; try again",
-                    Vec::new(),
                 );
             }
         }
+    }
+
+    pub(super) fn on_server_change(&mut self, sc: ServerChange) {
+        if self.closing.is_some() {
+            let _ = sc.reply.send(Err(ServerChangeError::NotWritten));
+            return;
+        }
+        let change = Change {
+            // `decide` needs an id; it is neither journaled nor broadcast.
+            change_id: Arc::from(SERVER_CLIENT),
+            base: self.tentative.seq,
+            ops: sc.ops,
+            reads: Default::default(),
+            depends: Vec::new(),
+            undo_of: None,
+            command: Arc::from(sc.command.as_str()),
+        };
+        self.server_queue.push_back(Item {
+            origin: Origin::Server(sc.reply),
+            author: Author {
+                client: Arc::from(SERVER_CLIENT),
+                user: sc.author,
+                name: sc.author_name,
+            },
+            change: Arc::new(change),
+            size: 0,
+            ticket: None,
+            waiters: Vec::new(),
+            rejudged: 0,
+            blobs_checked: true,
+        });
     }
 
     fn accept_again(&mut self, conn: ConnId, change_id: &Arc<str>, seq: Seq) {
@@ -381,6 +560,8 @@ impl Room {
         });
         self.reply(conn, frame);
     }
+
+    // ------------------------------------------------------------------ judging
 
     /// What the room knows of the client's changes named in `depends`.
     fn known(&self, client: &ClientId, depends: &[Arc<str>]) -> HashMap<Arc<str>, Known> {
@@ -399,43 +580,60 @@ impl Room {
             .collect()
     }
 
-    fn judge_change(&mut self, conn: ConnId, change: Change, size: usize) {
+    pub(super) fn judge_conn_change(&mut self, conn: ConnId, change: Arc<Change>, size: usize) {
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
-        if let Some(reason) = c.read_only.clone() {
-            return self.reject(
-                conn,
-                &change.change_id,
-                RejectCode::ReadOnly,
-                &reason,
-                Vec::new(),
-            );
-        }
-        let author = Author {
-            client: c.client.clone(),
-            user: c.user.clone(),
-            name: c.name.clone(),
+        let item = Item {
+            origin: Origin::Conn(conn),
+            author: Author {
+                client: c.client.clone(),
+                user: c.user.clone(),
+                name: c.name.clone(),
+            },
+            change,
+            size,
+            ticket: None,
+            waiters: Vec::new(),
+            rejudged: 0,
+            blobs_checked: false,
         };
-        let known = self.known(&author.client, &change.depends);
+        self.judge_item(item);
+    }
+
+    /// Judges a change (off the task when it is big) and goes on with the decision.
+    pub(super) fn judge_item(&mut self, mut item: Item) {
+        if matches!(item.origin, Origin::Server(_)) {
+            // The server's change is made on whatever is current.
+            Arc::make_mut(&mut item.change).base = self.tentative.seq;
+        }
+        let known = self.known(&item.author.client, &item.change.depends);
         let version = self.tentative_version;
-        if change.ops.len() > BIG_OPS || size > BIG_FRAME {
-            // Judged off the task; no other frame is taken meanwhile, everything else goes on.
-            self.paused = true;
+        if item.change.ops.len() > BIG_OPS || item.size > BIG_FRAME {
+            // Judged off the task; no other frame is taken meanwhile, and the sender's later
+            // messages wait; everything else goes on.
+            self.paused += 1;
+            if let Some(c) = item.conn().and_then(|conn| self.conns.get_mut(&conn)) {
+                c.busy = true;
+            }
             let head = self.tentative.clone();
-            let internal = self.internal.clone();
-            let encodes = self.encodes.clone();
-            tokio::task::spawn_blocking(move || {
-                let started = Instant::now();
-                let result = judge(&head, &author, &change, &known);
-                metrics::decided(started.elapsed());
-                if result.is_ok() {
+            let (author, change) = (item.author.clone(), item.change.clone());
+            let (internal, encodes) = (self.internal.clone(), self.encodes.clone());
+            let delay = self.state.room_hooks.judge_delay;
+            tokio::spawn(async move {
+                let judging = tokio::task::spawn_blocking(move || {
+                    std::thread::sleep(delay);
+                    let started = Instant::now();
+                    let result = judge(&head, &author, &change, &known);
+                    metrics::decided(started.elapsed());
+                    result
+                });
+                let result = judging.await.ok();
+                if matches!(result, Some(Ok(_))) {
                     encodes.fetch_add(1, Ordering::Relaxed);
                 }
                 let decided = Offloaded {
-                    conn,
-                    change,
-                    size,
+                    item,
                     version,
                     result,
                 };
@@ -444,73 +642,94 @@ impl Room {
             return;
         }
         let started = Instant::now();
-        let result = judge(&self.tentative, &author, &change, &known);
+        let result = judge(&self.tentative, &item.author, &item.change, &known);
         metrics::decided(started.elapsed());
         if result.is_ok() {
             self.encodes.fetch_add(1, Ordering::Relaxed);
         }
-        self.decided(conn, change, size, version, result);
+        self.decided(item, version, result);
     }
 
     pub(super) fn on_offloaded(&mut self, decided: Offloaded) {
-        self.paused = false;
+        self.paused = self.paused.saturating_sub(1);
         let Offloaded {
-            conn,
-            change,
-            size,
+            item,
             version,
             result,
         } = decided;
-        if self.closing.is_some() || !self.conns.contains_key(&conn) {
-            return;
+        if let Some(conn) = item.conn() {
+            self.unpark(conn);
+            if !self.conns.contains_key(&conn) {
+                return;
+            }
         }
-        if version != self.tentative_version {
-            // The head it was judged against was discarded meanwhile.
-            return self.judge_change(conn, change, size);
+        if self.closing.is_some() {
+            return self.not_written(item);
         }
-        self.decided(conn, change, size, version, result);
+        match result {
+            None => {
+                tracing::error!("judging a change of document {} panicked", self.doc);
+                self.answer_refused(
+                    item,
+                    RejectCode::ServerError,
+                    "the server could not judge the change; try again",
+                    Vec::new(),
+                    None,
+                );
+            }
+            // The head it was judged against changed meanwhile.
+            Some(_) if version != self.tentative_version => self.judge_again(item),
+            Some(result) => self.decided(item, version, result),
+        }
     }
 
-    fn decided(
-        &mut self,
-        conn: ConnId,
-        change: Change,
-        size: usize,
-        version: u64,
-        result: Result<Decision, Refusal>,
-    ) {
+    /// Judges a change once more when the room takes frames, before anything its sender sent later.
+    fn judge_again(&mut self, item: Item) {
+        if self.paused == 0 {
+            return self.judge_item(item);
+        }
+        match item.origin {
+            Origin::Conn(conn) => self.park_first(conn, Incoming::Judge(item.change, item.size)),
+            Origin::Server(_) => self.server_queue.push_front(item),
+        }
+    }
+
+    fn decided(&mut self, item: Item, version: u64, result: Result<Decision, Refusal>) {
         let decision = match result {
             Ok(decision) => decision,
-            Err(refusal) => {
-                let conflicts = match &refusal {
-                    Refusal::Stale(conflicts) => conflicts.clone(),
-                    _ => Vec::new(),
-                };
-                let message = refusal_message(&refusal);
-                return self.reject(conn, &change.change_id, refusal.code(), &message, conflicts);
-            }
+            Err(refusal) => return self.refuse_item(item, refusal),
         };
+        if item.blobs_checked {
+            return self.adopt(item, decision);
+        }
+        let now = self.state.clock.now();
+        let missing: Vec<String> = decision
+            .blobs
+            .iter()
+            .filter(|h| self.known_blobs.is_missing(h, now))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return self.missing_blob(item, &missing);
+        }
         let unknown: Vec<String> = decision
             .blobs
             .iter()
-            .filter(|h| !self.known_blobs.0.contains(*h))
+            .filter(|h| !self.known_blobs.found.contains(*h))
             .cloned()
             .collect();
         if unknown.is_empty() {
-            return self.adopt(conn, change, decision);
+            return self.adopt(item, decision);
         }
-        let Some(c) = self.conns.get_mut(&conn) else {
-            return;
-        };
-        c.busy = true;
+        if let Some(c) = item.conn().and_then(|conn| self.conns.get_mut(&conn)) {
+            c.busy = true;
+        }
         let (blobs, org) = (self.state.blobs.clone(), self.org.clone());
         let internal = self.internal.clone();
         tokio::spawn(async move {
-            let result = missing_blobs(blobs.as_ref(), &org, unknown.iter().cloned()).await;
+            let result = caught(missing_blobs(blobs.as_ref(), &org, unknown.iter().cloned())).await;
             let check = BlobCheck {
-                conn,
-                change,
-                size,
+                item,
                 version,
                 decision,
                 asked: unknown,
@@ -522,77 +741,93 @@ impl Room {
 
     pub(super) fn on_blobs(&mut self, check: BlobCheck) {
         let BlobCheck {
-            conn,
-            change,
-            size,
+            mut item,
             version,
             decision,
             asked,
             result,
         } = check;
-        self.unpark(conn);
-        if self.closing.is_some() || !self.conns.contains_key(&conn) {
-            return;
+        if let Some(conn) = item.conn() {
+            self.unpark(conn);
+            if !self.conns.contains_key(&conn) {
+                return;
+            }
+        }
+        if self.closing.is_some() {
+            return self.not_written(item);
         }
         let missing = match result {
             Ok(missing) => missing,
             Err(e) => {
                 tracing::error!("could not check blobs for document {}: {e:#}", self.doc);
-                return self.reject(
-                    conn,
-                    &change.change_id,
+                return self.answer_refused(
+                    item,
                     RejectCode::ServerError,
                     "the server could not check the blobs; try again",
                     Vec::new(),
+                    None,
                 );
             }
         };
-        for sha in asked.into_iter().filter(|s| !missing.contains(s)) {
-            self.known_blobs.0.insert(sha, KNOWN_BLOBS_KEEP);
+        let now = self.state.clock.now();
+        for sha in asked {
+            if missing.contains(&sha) {
+                self.known_blobs.note_missing(sha, now);
+            } else {
+                self.known_blobs.found.insert(sha, BLOBS_KEEP);
+            }
         }
         if !missing.is_empty() {
-            let message: String = format!("upload these blobs first: {}", missing.join(", "))
-                .chars()
-                .take(MAX_MESSAGE)
-                .collect();
-            return self.reject(
-                conn,
-                &change.change_id,
-                RejectCode::MissingBlob,
-                &message,
-                Vec::new(),
-            );
+            return self.missing_blob(item, &missing);
         }
+        item.blobs_checked = true;
         if version == self.tentative_version {
-            self.adopt(conn, change, decision);
-        } else if !self.paused {
+            self.adopt(item, decision);
+        } else {
             // The head moved while storage was asked: judge again (every blob is known now).
-            self.judge_change(conn, change, size);
-        } else if let Some(c) = self.conns.get_mut(&conn) {
-            // A big change is being judged: judge this one after it, before anything later.
-            c.parked
-                .push_front((oswx_core::wire::ClientMsg::Change(change), size));
-            self.ready.push_front(conn);
+            self.judge_again(item);
         }
     }
 
+    fn missing_blob(&mut self, item: Item, missing: &[String]) {
+        let message: String = format!("upload these blobs first: {}", missing.join(", "))
+            .chars()
+            .take(MAX_MESSAGE)
+            .collect();
+        self.answer_refused(item, RejectCode::MissingBlob, &message, Vec::new(), None);
+    }
+
+    // ------------------------------------------------------------------ writing
+
     /// Makes an accepted change tentative and hands its record to the journal.
-    fn adopt(&mut self, conn: ConnId, change: Change, d: Decision) {
-        let Some(c) = self.conns.get_mut(&conn) else {
-            return;
-        };
+    fn adopt(&mut self, mut item: Item, d: Decision) {
         let seq = d.accepted.seq;
         debug_assert_eq!(seq, self.tentative.seq + 1, "decided on the tentative head");
-        c.replies.push_back(Reply::Waiting(seq));
+        let ticket = match item.ticket {
+            Some(ticket) => ticket,
+            None => {
+                let ticket = self.next_ticket;
+                self.next_ticket += 1;
+                item.ticket = Some(ticket);
+                if let Some(conn) = item.conn()
+                    && let Some(c) = self.conns.get_mut(&conn)
+                {
+                    c.replies.push_back(Reply::Waiting(ticket));
+                    item.waiters.push(conn);
+                }
+                ticket
+            }
+        };
+        let client = item.conn().map(|_| item.author.client.to_string());
         let record = Record {
             document: self.doc.clone(),
             seq,
             parent_seq: seq - 1,
             epoch: self.epoch,
-            author: c.user.clone(),
-            client_id: Some(c.client.to_string()),
-            change_id: Some(change.change_id.to_string()),
-            command: change.command.chars().take(MAX_COMMAND).collect(),
+            author: item.author.user.clone(),
+            change_id: client.as_ref().map(|_| item.change.change_id.to_string()),
+            client_id: client,
+            command: item.change.command.chars().take(MAX_COMMAND).collect(),
             ops: d.ops,
             inverse: d.inverse,
             paths: d.paths,
@@ -604,24 +839,20 @@ impl Room {
             // TASK 13: an assembly's component references.
             extra: Vec::new(),
         };
-        let client = c.client.clone();
         self.tentative = Head {
             seq,
             doc: d.accepted.doc.clone(),
             index: d.accepted.index.clone(),
         };
         self.tentative_version += 1;
-        self.recent.map.insert(
-            (client.clone(), change.change_id.clone()),
-            Seen::Tentative(seq),
-        );
+        if let Some(key) = item.key() {
+            self.recent.map.insert(key, Seen::Tentative(ticket));
+        }
         self.pending.push_back(Pending {
             seq,
-            client,
-            change_id: change.change_id,
+            item,
             accepted: d.accepted,
             event: d.event,
-            waiters: vec![conn],
         });
         let submit = Submit {
             generation: self.generation,
@@ -633,29 +864,105 @@ impl Room {
         }
     }
 
-    /// Refuses a change: tells the sender (in turn) and remembers the id as refused.
-    fn reject(
-        &mut self,
-        conn: ConnId,
-        change_id: &Arc<str>,
-        code: RejectCode,
-        message: &str,
-        conflicts: Vec<oswx_core::Conflict>,
-    ) {
+    // ------------------------------------------------------------------ answering
+
+    /// Refuses a message of a connection that never entered the pipeline.
+    fn reject(&mut self, conn: ConnId, change_id: &Arc<str>, code: RejectCode, message: &str) {
         metrics::change_rejected(code);
+        self.note_refused(conn, change_id);
+        let frame = self.encode(&ServerMsg::Rejected {
+            change_id: change_id.clone(),
+            code,
+            message: message.to_owned(),
+            conflicts: Vec::new(),
+        });
+        self.reply(conn, frame);
+    }
+
+    /// Remembers a refused id of the connection's client, only while it is connected.
+    fn note_refused(&mut self, conn: ConnId, change_id: &Arc<str>) {
         if let Some(c) = self.conns.get(&conn) {
             self.refused
                 .entry(c.client.clone())
                 .or_default()
                 .insert(change_id.clone(), REFUSED_KEEP);
         }
-        let frame = self.encode(&ServerMsg::Rejected {
-            change_id: change_id.clone(),
-            code,
-            message: message.to_owned(),
-            conflicts,
-        });
-        self.reply(conn, frame);
+    }
+
+    fn refuse_item(&mut self, item: Item, refusal: Refusal) {
+        let conflicts = match &refusal {
+            Refusal::Stale(conflicts) => conflicts.clone(),
+            _ => Vec::new(),
+        };
+        let message = refusal_message(&refusal);
+        let code = refusal.code();
+        self.answer_refused(item, code, &message, conflicts, Some(refusal));
+    }
+
+    /// Tells everyone waiting for a change that it was refused.
+    fn answer_refused(
+        &mut self,
+        item: Item,
+        code: RejectCode,
+        message: &str,
+        conflicts: Vec<Conflict>,
+        refusal: Option<Refusal>,
+    ) {
+        metrics::change_rejected(code);
+        match item.origin {
+            Origin::Server(reply) => {
+                let err = refusal.map_or(ServerChangeError::NotWritten, ServerChangeError::Refused);
+                let _ = reply.send(Err(err));
+            }
+            Origin::Conn(conn) => {
+                self.note_refused(conn, &item.change.change_id);
+                let frame = self.encode(&ServerMsg::Rejected {
+                    change_id: item.change.change_id.clone(),
+                    code,
+                    message: message.to_owned(),
+                    conflicts,
+                });
+                match item.ticket {
+                    Some(ticket) => {
+                        for w in &item.waiters {
+                            self.resolve(*w, ticket, frame.clone());
+                        }
+                    }
+                    None => self.reply(conn, frame),
+                }
+            }
+        }
+    }
+
+    /// Tells everyone waiting for a change that it is durable as `seq`.
+    fn answer_accepted(&mut self, item: Item, seq: Seq) {
+        match item.origin {
+            Origin::Server(reply) => {
+                let _ = reply.send(Ok(seq));
+            }
+            Origin::Conn(conn) => {
+                let frame = self.encode(&ServerMsg::Accepted {
+                    change_id: item.change.change_id.clone(),
+                    seq,
+                });
+                match item.ticket {
+                    Some(ticket) => {
+                        for w in &item.waiters {
+                            self.resolve(*w, ticket, frame.clone());
+                        }
+                    }
+                    None => self.reply(conn, frame),
+                }
+            }
+        }
+    }
+
+    /// A change that will not be written because the room is closing: the server is told; clients
+    /// resend after reconnecting.
+    fn not_written(&mut self, item: Item) {
+        if let Origin::Server(reply) = item.origin {
+            let _ = reply.send(Err(ServerChangeError::NotWritten));
+        }
     }
 
     // ------------------------------------------------------------------ journal outcomes
@@ -674,9 +981,9 @@ impl Room {
             return; // (unloading: nothing more is settled here)
         }
         if generation != self.generation {
-            // A record decided on a head that was discarded: the journal refuses it.
+            // A record decided on a head that was given up: the journal refuses it.
             if result.is_ok() {
-                self.lose("the journal wrote a change the room had discarded");
+                self.lose("the journal wrote a change the room had given up");
             }
             return;
         }
@@ -685,13 +992,7 @@ impl Room {
             Err(JournalError::Refused(RefusedWhy::Lease)) => {
                 self.lose("the room's lease was taken over");
             }
-            Err(JournalError::Refused(why)) => {
-                tracing::warn!(
-                    "the journal refused change {seq} of document {}: {why}",
-                    self.doc
-                );
-                self.discard_tentative();
-            }
+            Err(JournalError::Refused(why)) => self.refused_record(seq, &why),
             Err(JournalError::Unknown) => {
                 self.lose("the journal could not say whether a change was written");
             }
@@ -710,55 +1011,126 @@ impl Room {
         self.durable = Head {
             seq,
             doc: a.doc.clone(),
-            index: self
-                .durable
-                .index
-                .record(seq, &p.client, &a.writes, &a.removed, &a.reads),
+            index: self.durable.index.record(
+                seq,
+                &p.item.author.client,
+                &a.writes,
+                &a.removed,
+                &a.reads,
+            ),
         };
         if self.pending.is_empty() {
             self.tentative = self.durable.clone();
         }
         // Everyone but those waiting for this change's answer hears of it, in seq order.
-        self.broadcast(&p.event, &p.waiters);
-        let ack = self.encode(&ServerMsg::Accepted {
-            change_id: p.change_id.clone(),
-            seq,
-        });
-        for w in &p.waiters {
-            self.resolve(*w, seq, ack.clone());
+        self.broadcast(&p.event, &p.item.waiters);
+        if let Some(key) = p.item.key() {
+            self.recent.map.insert(key.clone(), Seen::Durable(seq));
+            self.recent.order.push_back((seq, key));
+            self.recent.trim(self.snapshot_seq);
         }
-        let key = (p.client, p.change_id);
-        self.recent.map.insert(key.clone(), Seen::Durable(seq));
-        self.recent.order.push_back((seq, key));
-        self.recent.trim(self.snapshot_seq);
+        self.answer_accepted(p.item, seq);
         metrics::change_accepted();
         self.maybe_snapshot();
     }
 
-    /// The journal refused a change: it and every change decided after it are refused with
-    /// `server_error` (their senders may resend), and the tentative head is the durable one again.
-    fn discard_tentative(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
+    /// The journal refused the first pending record for a cause of its own: answer it, and judge
+    /// the changes decided after it again, in their order, against the durable head.
+    fn refused_record(&mut self, seq: Seq, why: &RefusedWhy) {
+        let mut rest = std::mem::take(&mut self.pending);
+        let Some(front) = rest.pop_front() else {
+            return;
+        };
+        if front.seq != seq {
+            return self.lose("the journal answered out of order");
+        }
         self.generation += 1;
         self.tentative = self.durable.clone();
         self.tentative_version += 1;
-        for p in pending {
-            self.recent
-                .map
-                .remove(&(p.client.clone(), p.change_id.clone()));
-            metrics::change_rejected(RejectCode::ServerError);
-            self.refused
-                .entry(p.client.clone())
-                .or_default()
-                .insert(p.change_id.clone(), REFUSED_KEEP);
-            let frame = self.encode(&ServerMsg::Rejected {
-                change_id: p.change_id.clone(),
-                code: RejectCode::ServerError,
-                message: "the server could not store the change; try again".into(),
-                conflicts: Vec::new(),
-            });
-            for w in &p.waiters {
-                self.resolve(*w, p.seq, frame.clone());
+        for p in rest.iter().chain(std::iter::once(&front)) {
+            if let Some(key) = p.item.key() {
+                self.recent.map.remove(&key);
+            }
+        }
+        let mut misbehaving = None;
+        match (why, front.item.conn()) {
+            (RefusedWhy::Duplicate, Some(conn)) => {
+                // Find the seq the journal holds for it, and answer that.
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.duplicates += 1;
+                    if c.duplicates > MAX_DUPLICATES {
+                        misbehaving = Some(conn);
+                    }
+                }
+                let (store, doc) = (self.state.store.clone(), self.doc.clone());
+                let internal = self.internal.clone();
+                let item = front.item;
+                tokio::spawn(async move {
+                    let result = caught(store.change_seq_by_client(
+                        &doc,
+                        &item.author.client,
+                        &item.change.change_id,
+                    ))
+                    .await;
+                    let _ = internal.send(Internal::Duplicate(DuplicateCheck { item, result }));
+                });
+            }
+            _ => {
+                tracing::warn!(
+                    "the journal refused change {seq} of document {}: {why}",
+                    self.doc
+                );
+                self.answer_refused(
+                    front.item,
+                    RejectCode::ServerError,
+                    NOT_STORED,
+                    Vec::new(),
+                    None,
+                );
+            }
+        }
+        for p in rest {
+            let mut item = p.item;
+            if item.rejudged >= MAX_REJUDGE {
+                self.answer_refused(item, RejectCode::ServerError, NOT_STORED, Vec::new(), None);
+                continue;
+            }
+            item.rejudged += 1;
+            if matches!(item.origin, Origin::Server(_)) {
+                Arc::make_mut(&mut item.change).base = self.tentative.seq;
+            }
+            // Judged here and now, so that the order of the changes is kept (their blobs were
+            // checked already).
+            let known = self.known(&item.author.client, &item.change.depends);
+            let started = Instant::now();
+            let result = judge(&self.tentative, &item.author, &item.change, &known);
+            metrics::decided(started.elapsed());
+            match result {
+                Ok(decision) => {
+                    self.encodes.fetch_add(1, Ordering::Relaxed);
+                    self.adopt(item, decision);
+                }
+                Err(refusal) => self.refuse_item(item, refusal),
+            }
+        }
+        if let Some(conn) = misbehaving {
+            self.remove_conn(conn, Some((close::POLICY, "misbehaving client")), true);
+        }
+    }
+
+    pub(super) fn on_duplicate(&mut self, check: DuplicateCheck) {
+        let DuplicateCheck { item, result } = check;
+        match result {
+            Ok(Some(seq)) => {
+                let seq = Seq::try_from(seq).unwrap_or_default();
+                if self.by_client.contains_key(&item.author.client) {
+                    self.recent
+                        .remember(&item.author.client, &item.change.change_id, seq);
+                }
+                self.answer_accepted(item, seq);
+            }
+            Ok(None) | Err(_) => {
+                self.answer_refused(item, RejectCode::ServerError, NOT_STORED, Vec::new(), None);
             }
         }
     }

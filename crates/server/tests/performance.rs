@@ -166,9 +166,18 @@ async fn blob_checks_run_together_and_are_remembered() {
         calls,
         "the five found were remembered"
     );
-    blobs.fail_exists(true);
+    // The missing one is remembered as missing for a while: asking again costs storage nothing.
+    let again = a.change_on(1, using(&shas)).await;
+    assert_eq!(again.code(), RejectCode::MissingBlob);
     assert_eq!(
-        a.change_on(1, using(&shas)).await.code(),
+        blobs.exists_calls(),
+        calls,
+        "the missing one was remembered"
+    );
+    blobs.fail_exists(true);
+    let unseen = hex::encode(Sha256::digest(b"never seen"));
+    assert_eq!(
+        a.change_on(1, using(&[unseen])).await.code(),
         RejectCode::ServerError
     );
     assert_eq!(server.room_status(&doc).await.seq, 1);

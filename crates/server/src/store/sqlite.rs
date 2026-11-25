@@ -426,6 +426,15 @@ impl Store for SqliteStore {
         .await
     }
 
+    async fn recent_change_ids(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        q::recent_change_ids(&mut *self.reader().await?, document_id, client_id, limit).await
+    }
+
     async fn snapshot_at_or_before(
         &self,
         document_id: &str,
@@ -1612,6 +1621,20 @@ mod q {
             .bind(client_id)
             .bind(change_id)
             .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn recent_change_ids(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        client_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as(sql::RECENT_CHANGE_IDS)
+            .bind(document_id)
+            .bind(client_id)
+            .bind(limit)
+            .fetch_all(c)
             .await?)
     }
 

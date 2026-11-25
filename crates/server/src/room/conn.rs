@@ -301,24 +301,27 @@ pub async fn read(
         let frame = match next {
             Some(Ok(Message::Binary(frame))) => frame,
             Some(Ok(Message::Text(_))) => {
-                outbox.push(error_frame(
-                    "bad_message",
-                    "frames must be binary MessagePack",
-                ));
-                continue;
+                let message = "frames must be binary MessagePack".to_owned();
+                if malformed(&room, conn, &outbox, "bad_message", message).await {
+                    continue;
+                }
+                break;
             }
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            Some(Err(e)) => {
-                // The WebSocket layer refuses to read a frame over the limit; say so rather than
-                // drop the connection without a word. (Its error is only visible as text.)
-                if e.to_string().contains("Space limit exceeded") {
-                    outbox.close(close::TOO_BIG, "frame too large");
-                }
+            Some(Err(_)) => {
+                // The WebSocket layer could not read a frame: malformed, or longer than the one
+                // byte over the limit it lets through (see [ead_limit]).
+                outbox.close(close::PROTOCOL_ERROR, "unreadable frame");
                 break;
             }
             Some(Ok(Message::Close(_))) | None => break,
         };
         let size = frame.len();
+        if size > max {
+            // Read whole (so the close is not lost to a reset), then refused.
+            outbox.close(close::TOO_BIG, "frame too large");
+            break;
+        }
         let decoded = if size > DECODE_OFF_TASK {
             match tokio::task::spawn_blocking(move || wire::decode_client(&frame, max)).await {
                 Ok(decoded) => decoded,
@@ -329,10 +332,15 @@ pub async fn read(
         };
         match decoded {
             Err(WireError::TooLarge) => {
-                outbox.push(error_frame("too_large", "send large data as blobs"));
+                let message = "send large data as blobs".to_owned();
+                if !malformed(&room, conn, &outbox, "too_large", message).await {
+                    break;
+                }
             }
             Err(WireError::Invalid(why)) => {
-                outbox.push(error_frame("bad_message", &why));
+                if !malformed(&room, conn, &outbox, "bad_message", why).await {
+                    break;
+                }
             }
             // A second hello is read and ignored.
             Ok(ClientMsg::Hello { .. }) => {}
@@ -357,6 +365,30 @@ pub async fn read(
         })
         .await;
     }
+}
+
+/// The largest frame the WebSocket layer is told to read: one byte over the protocol's limit, so
+/// that a frame just over it is read whole and refused here with `TOO_BIG` (whose close frame then
+/// reaches the client), while anything longer is refused by the layer without being read.
+pub fn read_limit(max: usize) -> usize {
+    max.saturating_add(1)
+}
+
+/// Hands an unreadable frame to the room, to be answered `error` in its turn (after the answers
+/// to the connection's earlier messages); alse if the room is gone.
+async fn malformed(
+    room: &RoomHandle,
+    conn: ConnId,
+    outbox: &Outbox,
+    code: &'static str,
+    message: String,
+) -> bool {
+    let message: String = message.chars().take(MAX_ERROR_MESSAGE).collect();
+    if room.malformed(conn, code, message).await.is_err() {
+        outbox.close(close::MOVED, "reconnect");
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]

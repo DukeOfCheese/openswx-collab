@@ -4,7 +4,7 @@ use oswx_core::Seq;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::{CLOSE_WAIT, Closing, FINAL_SNAPSHOT_WAIT, INDEX_KEEP, Internal, Room, close};
+use super::{CLOSE_WAIT, Closing, FINAL_SNAPSHOT_WAIT, Internal, Room, close};
 use crate::snapshot::write_snapshot;
 
 impl Room {
@@ -108,10 +108,13 @@ impl Room {
 
     // ------------------------------------------------------------------ snapshots
 
-    /// Drops index marks older than [`INDEX_KEEP`] changes from both heads. Only ever called right
+    /// Drops index marks older than [`super::Hooks::index_keep`] changes from both heads. Only ever called right
     /// before a snapshot of the durable head is written, so that a reload judges as memory does.
     pub(super) fn prune_index(&mut self) {
-        let floor = self.durable.seq.saturating_sub(INDEX_KEEP);
+        let floor = self
+            .durable
+            .seq
+            .saturating_sub(self.state.room_hooks.index_keep);
         if floor > self.durable.index.floor() {
             self.durable.index = self.durable.index.prune(floor);
             self.tentative.index = self.tentative.index.prune(floor);

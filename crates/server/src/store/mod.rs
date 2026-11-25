@@ -556,6 +556,15 @@ pub trait Store: Send + Sync + 'static {
         change_id: &str,
     ) -> anyhow::Result<Option<i64>>;
 
+    /// A client's most recent change ids in a document with their seqs, newest first, at most
+    /// `limit`.
+    async fn recent_change_ids(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, i64)>>;
+
     /// A document's snapshot with the highest seq not above `seq` (then the highest epoch).
     async fn snapshot_at_or_before(
         &self,

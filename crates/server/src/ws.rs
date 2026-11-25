@@ -1,11 +1,14 @@
 //! `GET /api/documents/{document}/ws`: the live document WebSocket (protocol v2).
 //!
 //! Frames are binary MessagePack ([`oswx_core::wire`]); the largest frame taken is
-//! `max_change_bytes + 65536` bytes ([`frame_limit`]). A longer one ends the connection: the
-//! WebSocket layer refuses to read it, and the server closes with 1009 (which a client still sending
-//! the rest of that frame usually loses to the reset, seeing the connection drop). A frame within the
-//! limit that is not a `change` and is over 512 KiB is answered with an `error` (`too_large`) and the
-//! connection kept.
+//! `max_change_bytes + 65536` bytes ([`frame_limit`]). The WebSocket layer reads one byte more
+//! ([`conn::read_limit`]): a frame just over the limit is read whole and refused with close 1009;
+//! a longer one is refused by the layer without being read, and closed 1002 (which a client still
+//! sending the rest of that frame usually loses to the reset, seeing the connection drop). A frame
+//! within the limit that is not a `change` and is over 512 KiB is answered with an `error`
+//! (`too_large`) in its turn and the connection kept. On joining, the client's 1,000 most recent
+//! change ids in the document are read from the journal and handed to the room, so that its resends
+//! are recognised whatever base they carry.
 //!
 //! The handshake (inventory §5 "Handshake", in v2): the first frame must come within
 //! [`HELLO_TIMEOUT`] and be a `hello`; then, each refusal being an `error` frame and a close:
@@ -47,6 +50,8 @@ use crate::state::AppState;
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// How many times a join is tried when the room unloads under it.
 const JOIN_TRIES: usize = 3;
+/// How many of a client's latest change ids a join loads into the room's memory.
+const RECENT_IDS: i64 = 1000;
 /// The longest close reason sent.
 const MAX_REASON: usize = 120;
 
@@ -66,8 +71,8 @@ async fn document_ws(
 ) -> Response {
     let max = frame_limit(&state.settings);
     upgrade
-        .max_message_size(max)
-        .max_frame_size(max)
+        .max_message_size(conn::read_limit(max))
+        .max_frame_size(conn::read_limit(max))
         .on_upgrade(move |socket| serve(state, document_id, socket))
 }
 
@@ -179,6 +184,23 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         }
     };
 
+    // What this client already sent to the document, so that the room recognises its resends.
+    let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
+    let recent_ids = match state
+        .store
+        .recent_change_ids(&document_id, &client, RECENT_IDS)
+        .await
+    {
+        Ok(ids) => ids
+            .into_iter()
+            .filter_map(|(id, seq)| Some((id, u64::try_from(seq).ok()?)))
+            .collect(),
+        Err(e) => {
+            server_error(e);
+            return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
+        }
+    };
+
     let (sink, stream) = socket.split();
     let outbox = Outbox::new(4 * state.settings.max_change_bytes);
     tokio::spawn(conn::write(sink, outbox.clone()));
@@ -189,9 +211,10 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         user: user_id.clone(),
         name,
         role,
-        client: Arc::from(format!("{user_id}.{client_id}")),
+        client,
         format_version,
         last_seq,
+        recent_ids,
     };
     let mut joined = None;
     for _ in 0..JOIN_TRIES {

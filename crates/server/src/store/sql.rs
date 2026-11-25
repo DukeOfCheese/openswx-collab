@@ -349,6 +349,10 @@ pub const CHANGE_EVENTS_BETWEEN: &str = "SELECT c.seq, c.author_id, u.name AS au
 pub const CHANGE_SEQ_BY_CLIENT: &str =
     "SELECT seq FROM changes WHERE document_id = $1 AND client_id = $2 AND change_id = $3";
 
+/// [`super::Store::recent_change_ids`].
+pub const RECENT_CHANGE_IDS: &str = "SELECT change_id, seq FROM changes \
+     WHERE document_id = $1 AND client_id = $2 AND change_id IS NOT NULL ORDER BY seq DESC LIMIT $3";
+
 /// [`super::Tx::set_document_head`].
 pub const SET_DOCUMENT_HEAD: &str =
     "UPDATE documents SET head_seq = $2, updated_at = $3 WHERE id = $1";

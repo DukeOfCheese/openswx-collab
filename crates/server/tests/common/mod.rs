@@ -144,6 +144,16 @@ impl TestServer {
         settings: impl FnOnce(&mut Settings),
         journal: impl FnOnce(&Arc<dyn Store>) -> JournalWriter,
     ) -> (Self, Arc<FlakyStore>) {
+        Self::start_flaky_full(settings, journal, |_| {}).await
+    }
+
+    /// [`TestServer::start_flaky_journal`], with the state then changed by `state` (room hooks, a
+    /// blob double).
+    pub async fn start_flaky_full(
+        settings: impl FnOnce(&mut Settings),
+        journal: impl FnOnce(&Arc<dyn Store>) -> JournalWriter,
+        state: impl FnOnce(&mut AppState),
+    ) -> (Self, Arc<FlakyStore>) {
         let mut handle = None;
         let mut server = Self::start_inner(
             settings,
@@ -151,6 +161,7 @@ impl TestServer {
                 let flaky = Arc::new(FlakyStore::new(s.store.clone()));
                 handle = Some(flaky.clone());
                 s.store = flaky;
+                state(s);
             },
             journal,
         )
@@ -516,6 +527,7 @@ pub struct FlakyStore {
     begins: AtomicUsize,
     refuse_change: Arc<Mutex<Option<String>>>,
     change_lookups: AtomicUsize,
+    lookup_delay: Mutex<Duration>,
 }
 
 impl FlakyStore {
@@ -531,6 +543,7 @@ impl FlakyStore {
             begins: AtomicUsize::new(0),
             refuse_change: Arc::new(Mutex::new(None)),
             change_lookups: AtomicUsize::new(0),
+            lookup_delay: Mutex::new(Duration::ZERO),
         }
     }
 
@@ -541,6 +554,14 @@ impl FlakyStore {
             .refuse_change
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(change_id.to_owned());
+    }
+
+    /// Makes every [`Store::change_seq_by_client`] wait this long first.
+    pub fn lookup_delay(&self, d: Duration) {
+        *self
+            .lookup_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = d;
     }
 
     /// How many times [`Store::change_seq_by_client`] was asked.
@@ -766,6 +787,17 @@ impl Store for FlakyStore {
             .await
     }
 
+    async fn recent_change_ids(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, i64)>> {
+        self.inner()
+            .recent_change_ids(document_id, client_id, limit)
+            .await
+    }
+
     async fn change_seq_by_client(
         &self,
         document_id: &str,
@@ -773,6 +805,11 @@ impl Store for FlakyStore {
         change_id: &str,
     ) -> anyhow::Result<Option<i64>> {
         self.change_lookups.fetch_add(1, Ordering::SeqCst);
+        let delay = *self
+            .lookup_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tokio::time::sleep(delay).await;
         self.inner()
             .change_seq_by_client(document_id, client_id, change_id)
             .await

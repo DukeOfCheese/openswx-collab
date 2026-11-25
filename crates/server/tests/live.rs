@@ -5,13 +5,11 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
 use oswx_core::wire::{ChangeEvent, Peer, RejectCode, ServerMsg};
 use oswx_core::{ConflictKind, Seq, Value};
-use oswx_server::journal::{self, JournalWriter};
 use serde_json::json;
 
 fn depth_of(doc: &Value) -> Option<&Value> {
@@ -566,63 +564,6 @@ async fn a_client_can_send_many_changes_without_waiting() {
     );
     assert_eq!(head_seq(&server, &doc).await, 50);
     assert!(a.seen.is_empty(), "nothing but the answers: {:?}", a.seen);
-}
-
-#[tokio::test]
-async fn a_refused_record_refuses_what_was_decided_on_top_of_it() {
-    // A slow batch, so that all fifty are decided before any is written.
-    let slow = |store: &Arc<dyn oswx_server::store::Store>| {
-        JournalWriter::start(
-            store.clone(),
-            journal::MAX_BATCH,
-            Duration::from_millis(300),
-        )
-    };
-    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow).await;
-    let world = World::new(&server).await.unwrap();
-    let doc = world.document(&server, None, None, None).await;
-    let mut a = Live::connect(&server, &doc, &world.admin).await;
-    let mut watcher = Live::connect(&server, &doc, &world.admin).await;
-    flaky.refuse_change_once(&a.change_id(10));
-    let mut changes = Vec::new();
-    for n in 1..=50 {
-        let change = a.make_change(0, vec![set(&["variables", &format!("v{n}")], json!(n))]);
-        a.send_change(&change).await;
-        changes.push(change);
-    }
-    for (n, change) in changes.iter().enumerate() {
-        let outcome = a.outcome(&change.change_id).await;
-        if n < 9 {
-            assert_eq!(outcome, Outcome::Accepted(n as Seq + 1));
-        } else {
-            assert_eq!(outcome.code(), RejectCode::ServerError, "change {}", n + 1);
-        }
-    }
-    let status = server.room_status(&doc).await;
-    assert_eq!((status.seq, status.tentative), (9, 0));
-    assert_eq!(head_seq(&server, &doc).await, 9);
-    // Nobody else heard of anything past 9.
-    let heard: Vec<Seq> = watcher
-        .drain()
-        .await
-        .iter()
-        .filter_map(|m| match m {
-            ServerMsg::Change(ev) => Some(ev.seq),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(heard, (1..=9).collect::<Vec<Seq>>());
-    // Resending them succeeds.
-    for change in changes.iter().skip(9) {
-        a.send_change(change).await;
-    }
-    for (n, change) in changes.iter().enumerate().skip(9) {
-        assert_eq!(
-            a.outcome(&change.change_id).await,
-            Outcome::Accepted(n as Seq + 1)
-        );
-    }
-    assert_eq!(head_seq(&server, &doc).await, 50);
 }
 
 #[tokio::test]

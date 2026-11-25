@@ -29,6 +29,9 @@ pub struct AppState {
     pub journal: JournalWriter,
     /// This process, as room leases name it: random per process.
     pub node_id: String,
+    /// Knobs of the rooms that tests turn (defaults otherwise).
+    #[doc(hidden)]
+    pub room_hooks: Arc<crate::room::Hooks>,
 }
 
 impl AppState {
@@ -53,6 +56,7 @@ impl AppState {
             settings: Arc::new(settings),
             sessions: Sessions::default(),
             clock: Clock::system(),
+            room_hooks: Arc::default(),
         }
     }
 

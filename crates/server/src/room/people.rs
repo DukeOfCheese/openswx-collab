@@ -4,9 +4,12 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use futures_util::FutureExt;
 use oswx_core::Seq;
 use oswx_core::wire::{Peer, ServerMsg};
+use std::panic::AssertUnwindSafe;
 
+use super::change::Ticket;
 use super::welcome::Welcome;
 use super::{Conn, ConnId, Internal, JoinRequest, Reply, Room, close, conn};
 use crate::security::{ProjectRole, colour_for};
@@ -51,15 +54,15 @@ impl Room {
         }
     }
 
-    /// Settles the connection's answer that waits for `seq`, and sends what is now first in line.
-    pub(super) fn resolve(&mut self, conn: ConnId, seq: Seq, frame: Bytes) {
+    /// Settles the connection's answer that waits for `ticket`, and sends what is now first in line.
+    pub(super) fn resolve(&mut self, conn: ConnId, ticket: Ticket, frame: Bytes) {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
         };
         if let Some(slot) = c
             .replies
             .iter_mut()
-            .find(|r| matches!(r, Reply::Waiting(s) if *s == seq))
+            .find(|r| matches!(r, Reply::Waiting(t) if *t == ticket))
         {
             *slot = Reply::Ready(frame);
         }
@@ -133,7 +136,9 @@ impl Room {
             outbox: req.outbox,
             replies: VecDeque::new(),
             parked: VecDeque::new(),
+            parked_bytes: 0,
             busy: false,
+            duplicates: 0,
         };
         let you = conn.peer();
         let peers: Vec<Peer> = self.conns.values().map(Conn::peer).collect();
@@ -152,12 +157,20 @@ impl Room {
             peers,
             encodes: self.encodes.clone(),
         };
+        // What this client already sent here is answered from memory if it comes again.
+        for (change_id, seq) in req.recent_ids {
+            self.recent.remember(&req.client, &change_id, seq);
+        }
         self.by_client.insert(req.client, req.conn);
         self.conns.insert(req.conn, conn);
         let internal = self.internal.clone();
         let conn_id = req.conn;
         tokio::spawn(async move {
-            let result = welcome.build().await;
+            // A panic while building it is reported like any failure: the connection is closed.
+            let result = match AssertUnwindSafe(welcome.build()).catch_unwind().await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("building the welcome panicked")),
+            };
             let _ = internal.send(Internal::Welcome {
                 conn: conn_id,
                 result,

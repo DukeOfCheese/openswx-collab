@@ -58,6 +58,10 @@ pub use conn::{ConnId, Outbox};
 pub mod close {
     /// The server is shutting down.
     pub const GOING_AWAY: u16 = 1001;
+    /// The WebSocket layer could not read a frame (malformed, or far over the size limit).
+    pub const PROTOCOL_ERROR: u16 = 1002;
+    /// The client kept doing what it must not (repeated duplicate change ids at the journal).
+    pub const POLICY: u16 = 1008;
     /// A frame was over the size limit.
     pub const TOO_BIG: u16 = 1009;
     /// Something went wrong on the server; try again.
@@ -95,8 +99,48 @@ const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// How long a final snapshot may take when a room closes.
 const FINAL_SNAPSHOT_WAIT: Duration = Duration::from_secs(30);
 /// A snapshot's index keeps this many changes of history to judge late changes against; older
-/// marks are pruned just before the snapshot is written.
-const INDEX_KEEP: Seq = 100_000;
+/// marks are pruned just before the snapshot is written ([`Hooks::index_keep`] by default).
+pub const INDEX_KEEP: Seq = 100_000;
+
+/// Knobs of the rooms that tests turn; a running server keeps the defaults.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct Hooks {
+    /// How long judging a big change off the task waits first (to make races deterministic).
+    pub judge_delay: Duration,
+    /// History the index keeps before a snapshot prunes it ([`INDEX_KEEP`]).
+    pub index_keep: Seq,
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Self {
+            judge_delay: Duration::ZERO,
+            index_keep: INDEX_KEEP,
+        }
+    }
+}
+
+/// Why a change the server made itself ([`RoomHandle::server_change`]) did not land.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ServerChangeError {
+    /// It was judged and refused (a conflict with nothing; a name taken, an invalid operation).
+    #[error("the change was refused: {0:?}")]
+    Refused(oswx_core::Refusal),
+    /// It was not written: the room is gone or closing, or the journal failed it.
+    #[error("the change was not written")]
+    NotWritten,
+}
+
+/// A change the server makes itself, waiting for the room.
+pub struct ServerChange {
+    pub ops: Vec<oswx_core::Op>,
+    pub command: String,
+    /// The user it is made for (history shows them as its author).
+    pub author: Id,
+    pub author_name: String,
+    pub reply: oneshot::Sender<Result<Seq, ServerChangeError>>,
+}
 
 /// What an open room is: what it and the tests can see of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +177,9 @@ pub struct JoinRequest {
     pub client: ClientId,
     pub format_version: Option<i64>,
     pub last_seq: Option<Seq>,
+    /// This client's most recent change ids in the document and their seqs (from the journal), so
+    /// that its resends are recognised in memory whatever base they carry.
+    pub recent_ids: Vec<(String, Seq)>,
 }
 
 /// A command for a room.
@@ -146,6 +193,14 @@ pub enum RoomCmd {
         msg: Box<ClientMsg>,
         size: usize,
     },
+    /// A frame of a connection that could not be read: answered `error` in its turn.
+    Malformed {
+        conn: ConnId,
+        code: &'static str,
+        message: String,
+    },
+    /// A change the server makes itself.
+    ServerChange(Box<ServerChange>),
     /// A periodic nudge (TASK 10/12: lock expiry and idle checks hang off it); nothing yet.
     Tick,
     /// Stop: wait (briefly) for the journal's answers to changes in flight, close every connection
@@ -159,6 +214,9 @@ pub enum RoomCmd {
     },
     /// The durable head.
     Head(oneshot::Sender<Head>),
+    /// For tests: forget every remembered change id, as a room that has trimmed its memory has.
+    #[doc(hidden)]
+    ForgetChangeIds,
     Status(oneshot::Sender<RoomStatus>),
 }
 
@@ -190,7 +248,7 @@ impl RoomHandle {
     /// room is gone.
     pub async fn send(&self, cmd: RoomCmd) -> Result<(), Box<RoomCmd>> {
         let channel = match cmd {
-            RoomCmd::Frame { .. } => &self.frames,
+            RoomCmd::Frame { .. } | RoomCmd::Malformed { .. } => &self.frames,
             _ => &self.control,
         };
         channel.send(cmd).await.map_err(|e| Box::new(e.0))
@@ -221,6 +279,44 @@ impl RoomHandle {
         self.send(cmd).await.map_err(|_| RoomGone)
     }
 
+    pub(crate) async fn malformed(
+        &self,
+        conn: ConnId,
+        code: &'static str,
+        message: String,
+    ) -> Result<(), RoomGone> {
+        let cmd = RoomCmd::Malformed {
+            conn,
+            code,
+            message,
+        };
+        self.send(cmd).await.map_err(|_| RoomGone)
+    }
+
+    /// Makes a change on behalf of the server (a restore, a revert): judged against the current
+    /// head under [`crate::snapshot::SERVER_CLIENT`], journaled without a client id, broadcast to
+    /// every connection. Answers its seq once it is durable.
+    pub async fn server_change(
+        &self,
+        ops: Vec<oswx_core::Op>,
+        command: &str,
+        author: &str,
+        author_name: &str,
+    ) -> Result<Seq, ServerChangeError> {
+        let (reply, answer) = oneshot::channel();
+        let change = ServerChange {
+            ops,
+            command: command.to_owned(),
+            author: author.to_owned(),
+            author_name: author_name.to_owned(),
+            reply,
+        };
+        self.send(RoomCmd::ServerChange(Box::new(change)))
+            .await
+            .map_err(|_| ServerChangeError::NotWritten)?;
+        answer.await.unwrap_or(Err(ServerChangeError::NotWritten))
+    }
+
     pub(crate) async fn leave(&self, conn: ConnId) {
         let _ = self.send(RoomCmd::Leave(conn)).await;
     }
@@ -230,6 +326,12 @@ impl RoomHandle {
         let (tx, rx) = oneshot::channel();
         self.send(RoomCmd::Head(tx)).await.ok()?;
         rx.await.ok()
+    }
+
+    /// For tests: makes the room forget every change id it remembers (as if trimmed).
+    #[doc(hidden)]
+    pub async fn forget_change_ids(&self) {
+        let _ = self.send(RoomCmd::ForgetChangeIds).await;
     }
 
     /// What the room is now, or `None` if it is gone.
@@ -268,10 +370,11 @@ pub(crate) struct RoomInit {
     pub snapshot_seq: Seq,
 }
 
-/// An answer queued for a connection: ready, or waiting for the journal's outcome of a change.
+/// An answer queued for a connection: ready, or waiting for the outcome of a change in the
+/// pipeline (named by its ticket, which stays the same if the change is judged again).
 enum Reply {
     Ready(Bytes),
-    Waiting(Seq),
+    Waiting(change::Ticket),
 }
 
 /// A connection, as the room keeps it.
@@ -286,9 +389,14 @@ struct Conn {
     /// Answers not yet sent, in the order of the messages they answer.
     replies: VecDeque<Reply>,
     /// Messages waiting for an earlier one of this connection to be settled.
-    parked: VecDeque<(ClientMsg, usize)>,
-    /// A message of this connection waits for a storage answer (a blob check, a journal lookup).
+    parked: VecDeque<change::Incoming>,
+    /// The frame bytes of `parked`.
+    parked_bytes: usize,
+    /// A message of this connection waits for work off the task (a blob check, a journal lookup,
+    /// a big change being judged).
     busy: bool,
+    /// How many of its changes the journal refused as duplicates.
+    duplicates: u32,
 }
 
 impl Conn {
@@ -311,6 +419,7 @@ enum Internal {
     Lookup(change::Lookup),
     Blobs(change::BlobCheck),
     Decided(change::Offloaded),
+    Duplicate(change::DuplicateCheck),
     Welcome {
         conn: ConnId,
         result: anyhow::Result<Bytes>,
@@ -354,8 +463,11 @@ struct Room {
     known_blobs: change::KnownBlobs,
     snapshot_seq: Seq,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
-    /// A big change is being judged off the task: no frame is taken until it is back.
-    paused: bool,
+    /// Big changes being judged off the task: no frame is taken until they are back.
+    paused: u32,
+    /// Changes the server makes itself, waiting for their turn.
+    server_queue: VecDeque<change::Item>,
+    next_ticket: change::Ticket,
     /// Connections with parked messages that may go on.
     ready: VecDeque<ConnId>,
     /// Connections that broke their queue's limits, to be removed.
@@ -397,7 +509,9 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         known_blobs: change::KnownBlobs::default(),
         snapshot_seq: init.snapshot_seq,
         snapshot_task: None,
-        paused: false,
+        paused: 0,
+        server_queue: VecDeque::new(),
+        next_ticket: 0,
         ready: VecDeque::new(),
         slow: Vec::new(),
         closing: None,
@@ -457,7 +571,7 @@ impl Room {
 
     /// Whether the room takes the next frame now.
     fn takes_frames(&self) -> bool {
-        self.closing.is_none() && !self.paused && self.pending.len() < MAX_TENTATIVE
+        self.closing.is_none() && self.paused == 0 && self.pending.len() < MAX_TENTATIVE
     }
 
     fn encode(&self, msg: &ServerMsg) -> Bytes {
@@ -469,7 +583,15 @@ impl Room {
         match cmd {
             RoomCmd::Join(req) => self.join(*req),
             RoomCmd::Leave(conn) => self.remove_conn(conn, None, true),
-            RoomCmd::Frame { conn, msg, size } => self.on_frame(conn, *msg, size),
+            RoomCmd::Frame { conn, msg, size } => {
+                self.on_frame(conn, change::Incoming::Msg(*msg, size));
+            }
+            RoomCmd::Malformed {
+                conn,
+                code,
+                message,
+            } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
+            RoomCmd::ServerChange(sc) => self.on_server_change(*sc),
             RoomCmd::Tick => {}
             RoomCmd::Close {
                 code,
@@ -480,6 +602,7 @@ impl Room {
             RoomCmd::Head(reply) => {
                 let _ = reply.send(self.durable.clone());
             }
+            RoomCmd::ForgetChangeIds => self.recent = change::Recent::new(self.durable.seq),
             RoomCmd::Status(reply) => {
                 let _ = reply.send(self.status());
             }
@@ -492,12 +615,18 @@ impl Room {
             Internal::Lookup(lookup) => self.on_lookup(lookup),
             Internal::Blobs(check) => self.on_blobs(check),
             Internal::Decided(decided) => self.on_offloaded(decided),
+            Internal::Duplicate(check) => self.on_duplicate(check),
             Internal::Welcome { conn, result } => self.on_welcome(conn, result),
             Internal::Snapshot { seq, ok } => {
                 self.snapshot_task = None;
                 if ok {
                     self.snapshot_seq = self.snapshot_seq.max(seq);
                     self.recent.trim(self.snapshot_seq);
+                }
+                // Changes that became durable while it was written were not snapshotted: look
+                // again now (a failed one is tried again only once something new is durable).
+                if self.durable.seq > seq {
+                    self.maybe_snapshot();
                 }
             }
         }
@@ -526,25 +655,44 @@ impl Room {
 
     // ------------------------------------------------------------------ frames
 
-    fn on_frame(&mut self, conn: ConnId, msg: ClientMsg, size: usize) {
+    fn on_frame(&mut self, conn: ConnId, incoming: change::Incoming) {
+        let max_bytes = 4 * self.state.settings.max_change_bytes;
         let Some(c) = self.conns.get_mut(&conn) else {
             return; // (a connection the room already dropped)
         };
         if c.busy || !c.parked.is_empty() {
-            if c.parked.len() >= MAX_PARKED {
+            let size = incoming.size();
+            if c.parked.len() >= MAX_PARKED || c.parked_bytes + size > max_bytes {
                 c.outbox.close_now(close::TOO_SLOW, "too slow");
                 self.slow.push(conn);
             } else {
-                c.parked.push_back((msg, size));
+                c.parked_bytes += size;
+                c.parked.push_back(incoming);
             }
             return;
         }
-        self.dispatch(conn, msg, size);
+        self.dispatch(conn, incoming);
     }
 
-    /// Messages of connections whose earlier message has been settled, in order.
+    /// Puts a message back first in its connection's queue, to go on when the room takes frames.
+    fn park_first(&mut self, conn: ConnId, incoming: change::Incoming) {
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.parked_bytes += incoming.size();
+            c.parked.push_front(incoming);
+            if !c.busy {
+                self.ready.push_front(conn);
+            }
+        }
+    }
+
+    /// Messages of connections whose earlier message has been settled, in order; and the server's
+    /// own changes.
     fn run_parked(&mut self) {
         while self.takes_frames() {
+            if let Some(item) = self.server_queue.pop_front() {
+                self.judge_item(item);
+                continue;
+            }
             let Some(conn) = self.ready.pop_front() else {
                 return;
             };
@@ -559,10 +707,11 @@ impl Room {
                 if c.busy {
                     break;
                 }
-                let Some((msg, size)) = c.parked.pop_front() else {
+                let Some(incoming) = c.parked.pop_front() else {
                     break;
                 };
-                self.dispatch(conn, msg, size);
+                c.parked_bytes = c.parked_bytes.saturating_sub(incoming.size());
+                self.dispatch(conn, incoming);
             }
         }
     }
@@ -578,7 +727,21 @@ impl Room {
     }
 
     /// What every message a client sends leads to. Later tasks add their messages here.
-    fn dispatch(&mut self, conn: ConnId, msg: ClientMsg, size: usize) {
+    fn dispatch(&mut self, conn: ConnId, incoming: change::Incoming) {
+        let (msg, size) = match incoming {
+            change::Incoming::Msg(msg, size) => (msg, size),
+            change::Incoming::Judge(change, size) => {
+                return self.judge_conn_change(conn, change, size);
+            }
+            change::Incoming::Malformed(code, message) => {
+                let frame = self.encode(&ServerMsg::Error {
+                    code: code.to_owned(),
+                    message,
+                    request_id: None,
+                });
+                return self.reply(conn, frame);
+            }
+        };
         match msg {
             ClientMsg::Change(change) => self.on_change(conn, change, size),
             ClientMsg::Ping => {

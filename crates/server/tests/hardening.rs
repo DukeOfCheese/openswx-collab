@@ -170,8 +170,9 @@ async fn a_text_frame_after_the_hello_is_answered_and_the_connection_kept() {
 
 #[tokio::test]
 async fn frames_are_bounded() {
-    // The largest frame is max_change_bytes + 64 KiB; one byte more ends the connection (the
-    // WebSocket layer refuses to read it). Within it, what is too big for its kind is answered.
+    // The largest frame is max_change_bytes + 64 KiB; one byte more is read and refused with 1009,
+    // anything longer is refused unread by the WebSocket layer (1002, which a client still sending
+    // usually loses to the reset). Within the limit, what is too big for its kind is answered.
     let (server, world) = world().await;
     let doc = world.document(&server, None, None, None).await;
     let max = server.state.settings.max_change_bytes + 65536;
@@ -197,14 +198,20 @@ async fn frames_are_bounded() {
     let ev: ChangeEvent = watcher.expect().await;
     assert_eq!(ev.seq, 1);
 
-    // One byte over the limit: the connection ends.
+    // One byte over the limit: closed with 1009.
     let mut over = vec![0u8; max + 1];
     over[0] = 0x80;
     a.send_raw(over).await;
-    let (code, _) = a.closed().await;
-    assert!(code == 1009 || code == 1006, "closed with {code}");
+    assert_eq!(a.closed().await, (1009, "frame too large".into()));
     let left: PeerLeft = watcher.expect().await;
     assert_eq!(left.0, a.client_id);
+    // Far over: the connection ends (the WebSocket layer does not read it).
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let mut far = vec![0u8; max + 100_000];
+    far[0] = 0x80;
+    b.send_raw_lossy(far).await;
+    let (code, _) = b.closed().await;
+    assert!(code == 1002 || code == 1006, "closed with {code}");
     assert_eq!(head_seq(&server, &doc).await, 1);
 }
 
@@ -612,9 +619,8 @@ async fn a_failed_batch(
     assert_eq!(a2.welcome.seq, u64::from(landed));
     let lookups = flaky.change_lookups();
     assert_eq!(a2.resend(&change).await, Outcome::Accepted(1));
-    if landed {
-        assert!(flaky.change_lookups() > lookups, "the journal was asked");
-    }
+    // (Its id came with the client's recent ids when it joined: no lookup by change id.)
+    assert_eq!(flaky.change_lookups(), lookups);
     assert_eq!(head_seq(&server, &doc).await, 1, "written once");
     // The next change works.
     assert_eq!(
