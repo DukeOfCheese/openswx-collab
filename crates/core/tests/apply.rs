@@ -442,6 +442,50 @@ fn ids_already_under_a_set_path_are_not_new() {
 }
 
 #[test]
+fn many_sets_over_a_large_subtree_cost_one_walk_of_it() {
+    // One change of 10,000 Sets at the path of a 10,000-item keyed list: the ids the path held
+    // are learned at most once for the change, and not at all when no Set brings an id in.
+    let items: Vec<_> = (0..10_000)
+        .map(|i| json!({"id": format!("f{i}"), "v": i}))
+        .collect();
+    let doc = load(json!({ "big": items }));
+    let subtree = 1 + 10_000 * 3; // the list; each item map, its id and its v
+    let started = std::time::Instant::now();
+    let measure = |ops: &[Op]| {
+        let before = oswx_core::apply::held_values_visited();
+        client(&doc, ops).unwrap();
+        oswx_core::apply::held_values_visited() - before
+    };
+    let scalars: Vec<Op> = (0..10_000).map(|i| set(&["big"], i)).collect();
+    assert_eq!(measure(&scalars), 0);
+    let with_ids: Vec<Op> = (0..10_000)
+        .map(|i| set(&["big"], json!([{"id": "u1.c1.1", "v": i}])))
+        .collect();
+    let visited = measure(&with_ids);
+    assert!(
+        visited <= subtree,
+        "visited {visited} values, the subtree has {subtree}"
+    );
+    // Sets at many paths inside the subtree: each path's old value is walked once.
+    let inside: Vec<Op> = (0..10_000)
+        .map(|i| {
+            set(
+                &["big", &format!("f{}", i % 100), "v"],
+                json!([{"id": "u1.c1.1"}]),
+            )
+        })
+        .collect();
+    let visited = measure(&inside);
+    assert!(visited <= 100, "visited {visited}");
+    // A generous backstop on the clock (debug build).
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn remembered_removals_and_held_ids_together() {
     // f1 holds a plain list of loops whose segments carry legacy ids.
     let doc = load(json!({

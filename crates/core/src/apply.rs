@@ -112,9 +112,22 @@ fn has_item(v: &Value, list: &[Id], id: &str) -> bool {
     matches!(get(v, list), Some(Value::Keyed(k)) if k.get(id).is_some())
 }
 
+thread_local! {
+    /// Values `ids_under` has visited on this thread: lets tests bound the work a change costs.
+    static HELD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many values the prefix check has walked on this thread to learn which ids a Set's path
+/// already held. For tests: take the difference across a call.
+#[doc(hidden)]
+pub fn held_values_visited() -> usize {
+    HELD_VISITS.with(|c| c.get())
+}
+
 /// Adds to `out` the id of every item under `v`: keyed-list items, and maps with a string `id`
 /// that are elements of plain lists (an item of a list that might become keyed).
 fn ids_under(v: &Value, out: &mut HashSet<Id>) {
+    HELD_VISITS.with(|c| c.set(c.get() + 1));
     match v {
         Value::Map(m) => m.values().for_each(|c| ids_under(c, out)),
         Value::Keyed(k) => {
@@ -317,6 +330,10 @@ struct Introduced {
     /// Ids in keyed lists inside plain lists. No path reaches them, so they are treated as new
     /// unless the Set that writes them replaces a value that already held them.
     unreachable: Vec<Id>,
+    /// Per Set path, the ids under it in the document before the change. Learned only when a Set
+    /// brings in an id, and once per path for the whole change, so that many Sets at one path cost
+    /// one walk of what it held (at most `MAX_DEPTH` walks of any one value in all).
+    held: HashMap<Path, HashSet<Id>>,
 }
 
 impl Introduced {
@@ -327,11 +344,8 @@ impl Introduced {
                 // Ids anywhere under the Set's path before the change are not new for it, wherever
                 // the new value puts them: an edit inside a plain list sets the whole list, and a
                 // list may turn from plain to keyed or back.
-                let mut held = HashSet::new();
-                if let Some(old) = get(before, path) {
-                    ids_under(old, &mut held);
-                }
-                self.walk(value, &mut path.clone(), true, &held, existed);
+                let set = Held { before, path };
+                self.walk(value, &mut path.clone(), true, Some(&set), existed);
             }
             Op::Insert { list, item, .. } => {
                 if let Some(id) = item_id(item) {
@@ -340,21 +354,34 @@ impl Introduced {
                         return; // A remembered removal: the item, and all in it, may come back.
                     }
                     self.at.insert((list.clone(), id.clone()));
-                    self.walk(item, &mut at.clone(), true, &HashSet::new(), existed);
+                    self.walk(item, &mut at.clone(), true, None, existed);
                 }
             }
             Op::Unset { .. } | Op::Remove { .. } | Op::Move { .. } => {}
         }
     }
 
-    /// Notes the item ids in `v`, which sits at `path`, except those in `held` and the items (with
-    /// everything in them) whose removal `existed` remembers.
+    /// Whether `id` was under the Set's path before the change.
+    fn was_held(&mut self, set: &Held, id: &Id) -> bool {
+        if !self.held.contains_key(set.path) {
+            let mut ids = HashSet::new();
+            if let Some(old) = get(set.before, set.path) {
+                ids_under(old, &mut ids);
+            }
+            self.held.insert(set.path.clone(), ids);
+        }
+        self.held[set.path].contains(id)
+    }
+
+    /// Notes the item ids in `v`, which sits at `path`, except those the Set (if `v` is written by
+    /// one) already held and the items (with everything in them) whose removal `existed`
+    /// remembers.
     fn walk(
         &mut self,
         v: &Value,
         path: &mut Path,
         reachable: bool,
-        held: &HashSet<Id>,
+        held: Option<&Held>,
         existed: &dyn Fn(&Path) -> bool,
     ) {
         match v {
@@ -370,7 +397,7 @@ impl Introduced {
                     let list = path.clone();
                     path.push(id.clone());
                     if !(reachable && existed(path)) {
-                        if held.contains(id) {
+                        if held.is_some_and(|set| self.was_held(set, id)) {
                             // Was there before.
                         } else if reachable {
                             self.at.insert((list, id.clone()));
@@ -404,6 +431,12 @@ impl Introduced {
             None => Ok(()),
         }
     }
+}
+
+/// A Set being judged: its path, in the document before the change.
+struct Held<'a> {
+    before: &'a Value,
+    path: &'a Path,
 }
 
 /// The items of one unique rule's list whose field a change may have written.
