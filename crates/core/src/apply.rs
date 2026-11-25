@@ -211,7 +211,7 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
     match op {
         Op::Set { path, value } => {
             check_depth(path.len(), value)?;
-            check_list_key(path, None, value)?;
+            check_wire_form(path, None, value)?;
             edit_parent(doc, path, |parent, last, in_item| match parent {
                 Value::Map(m) => {
                     if in_item && &**last == "id" {
@@ -251,7 +251,7 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
         Op::Insert { list, item, pos } => {
             let id = item_id(item).ok_or_else(|| invalid("item needs a string id"))?;
             check_depth(list.len() + 1, item)?;
-            check_list_key(list, Some(id), item)?;
+            check_wire_form(list, Some(id), item)?;
             let with_item =
                 |k: &KeyedList| Value::Keyed(k.inserted(id.clone(), pos.clone(), item.clone()));
             edit_parent(doc, list, |parent, last, _| match parent {
@@ -576,23 +576,18 @@ fn check_depth(segments: usize, value: &Value) -> Result<(), OpError> {
     }
 }
 
-/// Whether a map anywhere in `v` has the key `$list`.
-fn holds_list_key(v: &Value) -> bool {
-    match v {
-        Value::Map(m) => m.contains_key(LIST_KEY) || m.values().any(holds_list_key),
-        Value::List(l) => l.iter().any(holds_list_key),
-        Value::Keyed(k) => k.iter().any(|(_, _, c)| holds_list_key(c)),
-        _ => false,
-    }
-}
-
-/// `$list` is the key of a keyed list's wire form: a document holding it as a map key, or as an
-/// item id, could not be read back from that form. `Op::from_wire` never builds such an
-/// operation; hand-built ones are refused here.
-fn check_list_key(path: &Path, id: Option<&Id>, value: &Value) -> Result<(), OpError> {
-    let in_path = path.iter().chain(id).any(|s| &**s == LIST_KEY);
-    if in_path || holds_list_key(value) {
+/// `$list` is the key of a keyed list's wire form: a path or an item id holding it could not be
+/// read back from that form, and nor can a value that is not canonical (`Value::is_canonical`:
+/// a keyed item without its own id, a plain list that reads as keyed, `$list` as a key, ...).
+/// `Op::from_wire` never builds such an operation; hand-built ones are refused here, so a
+/// snapshot of any document `apply` produced can always be read back.
+fn check_wire_form(path: &Path, id: Option<&Id>, value: &Value) -> Result<(), OpError> {
+    if path.iter().chain(id).any(|s| &**s == LIST_KEY) {
         Err(invalid("$list cannot be a key or an id"))
+    } else if !value.is_canonical() {
+        Err(invalid(
+            "the value has no wire form that reads back the same",
+        ))
     } else {
         Ok(())
     }

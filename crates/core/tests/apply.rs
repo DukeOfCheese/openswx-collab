@@ -590,6 +590,85 @@ fn the_wire_list_key_is_never_written() {
     run(&doc, &[set(&["a", "$lists"], 1), insert(&["e"], "$", "V")]).unwrap();
 }
 
+#[test]
+fn hand_built_values_the_wire_cannot_carry_are_refused() {
+    let item = |id: &str| {
+        Value::Map(
+            [(Arc::from("id"), Value::Str(Arc::from(id)))]
+                .into_iter()
+                .collect(),
+        )
+    };
+    let keyed = |id: &str, it: Value| {
+        Value::Keyed(oswx_core::KeyedList::new().inserted(Arc::from(id), pos("V"), it))
+    };
+    let bad = [
+        Value::List(Arc::new(vec![item("j1")])),
+        keyed("a", item("b")),
+        keyed("a", Value::Int(1)),
+        keyed("a", Value::Map(Default::default())),
+        Value::Float(f64::INFINITY),
+    ];
+    let doc = load(json!({"e": []}));
+    for v in bad {
+        // The reviewer's probe: the server itself (no prefix) setting a protected key.
+        invalid(apply(
+            &doc,
+            &[Op::Set {
+                path: path(&["journal"]),
+                value: v.clone(),
+            }],
+            &Rules::default(),
+            None,
+        ));
+        invalid(client(
+            &doc,
+            &[Op::Set {
+                path: path(&["b"]),
+                value: v.clone(),
+            }],
+        ));
+        let it = Value::Map(
+            [
+                (Arc::from("id"), Value::Str(Arc::from("u1.c1.1"))),
+                (Arc::from("sub"), v.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        invalid(client(
+            &doc,
+            &[Op::Insert {
+                list: path(&["e"]),
+                item: it,
+                pos: pos("V"),
+            }],
+        ));
+    }
+    // The canonical forms of the same data pass, and the result reads back.
+    let fine = Value::List(Arc::new(vec![item("j1"), item("j1")]));
+    let a = apply(
+        &doc,
+        &[Op::Set {
+            path: path(&["journal"]),
+            value: fine,
+        }],
+        &Rules::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc.clone()));
+    let a = client(
+        &doc,
+        &[Op::Set {
+            path: path(&["b"]),
+            value: keyed("u1.c1.1", item("u1.c1.1")),
+        }],
+    )
+    .unwrap();
+    assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc));
+}
+
 /// `{"k": {"$list": 1, "x": 2}}`, built by hand: no conversion would produce it.
 fn map_with_list_key() -> Value {
     let inner: oswx_core::Map = [
@@ -819,6 +898,19 @@ proptest! {
         if let Ok(a) = run(&doc, &ops) {
             prop_assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc.clone()));
             prop_assert_eq!(diff(&a.doc, &a.doc.to_plain()), Ok(vec![]));
+        }
+        // Every value the wire could not carry back (the generator makes some by hand) is
+        // refused on its own as invalid.
+        for op in &ops {
+            let value = match op {
+                Op::Set { value, .. } => value,
+                Op::Insert { item, .. } => item,
+                _ => continue,
+            };
+            if Value::from_wire(&value.to_wire()) != Ok(value.clone()) {
+                let r = run(&doc, std::slice::from_ref(op));
+                prop_assert!(matches!(r, Err(OpError::Invalid(_))), "{:?}: {:?}", op, r);
+            }
         }
     }
 }

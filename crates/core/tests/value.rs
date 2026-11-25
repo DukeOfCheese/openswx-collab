@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use oswx_core::{Pos, Value, ValueError};
+use oswx_core::{KeyedList, Map, Pos, Value, ValueError};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -432,5 +432,132 @@ proptest! {
             prop_assert!(back.is_ok(), "{:?}", back);
             prop_assert_eq!(shape(&back.unwrap()), shape(&v));
         }
+    }
+}
+
+fn round_trips(v: &Value) -> bool {
+    Value::from_wire(&v.to_wire()) == Ok(v.clone())
+}
+
+fn hmap(pairs: Vec<(&str, Value)>) -> Value {
+    Value::Map(
+        pairs
+            .into_iter()
+            .map(|(k, v)| (Arc::from(k), v))
+            .collect::<Map>(),
+    )
+}
+
+fn hkeyed(items: Vec<(&str, Value)>) -> Value {
+    let mut k = KeyedList::new();
+    for ((id, item), pos) in items.into_iter().zip(Pos::spread(3)) {
+        k = k.inserted(Arc::from(id), pos, item);
+    }
+    Value::Keyed(k)
+}
+
+fn hstr(s: &str) -> Value {
+    Value::Str(Arc::from(s))
+}
+
+fn deep_list(levels: usize) -> Value {
+    let mut v = Value::Int(1);
+    for _ in 0..levels {
+        v = Value::List(Arc::new(vec![v]));
+    }
+    v
+}
+
+#[test]
+fn canonical_values_are_those_the_wire_gives_back() {
+    let item = |id: &str| hmap(vec![("id", hstr(id))]);
+    let bad = [
+        // A plain list that plain data would read as keyed.
+        Value::List(Arc::new(vec![item("j1")])),
+        // Keyed items without their id, with another id, or not maps.
+        hkeyed(vec![("a", hmap(vec![("x", Value::Int(1))]))]),
+        hkeyed(vec![("a", item("b"))]),
+        hkeyed(vec![("a", Value::Int(1))]),
+        hkeyed(vec![("a", hmap(vec![("id", Value::Int(1))]))]),
+        // `$list` as a key or an id; over-long keys and ids.
+        hmap(vec![("$list", Value::Int(1))]),
+        hkeyed(vec![("$list", item("$list"))]),
+        hmap(vec![(&"k".repeat(201), Value::Null)]),
+        hkeyed(vec![(&"k".repeat(201), item(&"k".repeat(201)))]),
+        // Not finite; too deep.
+        Value::Float(f64::INFINITY),
+        Value::Float(f64::NAN),
+        deep_list(65),
+        // Nested inside something fine.
+        hmap(vec![("a", Value::List(Arc::new(vec![item("x")])))]),
+    ];
+    for v in bad {
+        assert!(!v.is_canonical(), "{v:?}");
+        assert!(!round_trips(&v), "{v:?}");
+    }
+    let good = [
+        Value::List(Arc::new(vec![item("a"), item("a")])),
+        Value::List(Arc::new(vec![])),
+        hkeyed(vec![]),
+        hkeyed(vec![("a", item("a")), ("", item(""))]),
+        hmap(vec![(&"k".repeat(200), Value::Float(1.5))]),
+        deep_list(64),
+    ];
+    for v in good {
+        assert!(v.is_canonical(), "{v:?}");
+        assert!(round_trips(&v), "{v:?}");
+    }
+}
+
+/// Values built by hand, as code holding the public types could: keyed items with wrong or
+/// missing ids, `$list` keys, plain lists of items with ids, numbers that are not finite.
+fn arb_hand_built() -> impl Strategy<Value = Value> {
+    let pool = || prop_oneof![Just("a"), Just("id"), Just(""), Just("$list"), Just("k")];
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        (-3i64..3).prop_map(Value::Int),
+        (-1e3f64..1e3).prop_map(Value::Float),
+        Just(Value::Float(f64::INFINITY)),
+        Just(Value::Float(f64::NAN)),
+        pool().prop_map(hstr),
+    ];
+    leaf.prop_recursive(4, 32, 4, move |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..3).prop_map(|v| Value::List(Arc::new(v))),
+            prop::collection::btree_map(pool(), inner.clone(), 0..3).prop_map(|m| {
+                Value::Map(m.into_iter().map(|(k, v)| (Arc::from(k), v)).collect())
+            }),
+            // Plain lists of items with ids, distinct or not.
+            prop::collection::vec(pool(), 1..3).prop_map(|ids| {
+                Value::List(Arc::new(
+                    ids.into_iter()
+                        .map(|id| hmap(vec![("id", hstr(id))]))
+                        .collect(),
+                ))
+            }),
+            // Keyed lists whose items are right, wrong, or not maps.
+            prop::collection::vec((pool(), inner, 0u8..3), 0..3).prop_map(|items| {
+                let mut k = KeyedList::new();
+                for ((id, v, mode), pos) in items.into_iter().zip(Pos::spread(3)) {
+                    let item = match mode {
+                        0 => hmap(vec![("id", hstr(id)), ("v", v)]),
+                        1 => hmap(vec![("id", hstr("other")), ("v", v)]),
+                        _ => v,
+                    };
+                    k = k.inserted(Arc::from(id), pos, item);
+                }
+                Value::Keyed(k)
+            }),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+
+    #[test]
+    fn is_canonical_agrees_with_the_wire_round_trip(v in arb_hand_built()) {
+        prop_assert_eq!(v.is_canonical(), round_trips(&v), "{:?}", v);
     }
 }

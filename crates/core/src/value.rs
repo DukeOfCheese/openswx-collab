@@ -143,6 +143,15 @@ impl Value {
         }
     }
 
+    /// Whether the wire form gives this value back exactly: `Value::from_wire(&v.to_wire())` is
+    /// `Ok(v)`. Values made by `from_wire` and `from_plain` always are; values built by hand may
+    /// not be. One walk, nothing allocated. It checks that numbers are finite, nesting is at most
+    /// `MAX_DEPTH`, keys and ids are at most `MAX_NAME` characters and never `$list`, every keyed
+    /// item is a map whose `id` is its key, and no plain list reads as keyed (`from_plain`'s test).
+    pub fn is_canonical(&self) -> bool {
+        canonical(self, 0)
+    }
+
     /// Reads the wire form, in which a keyed list is `{"$list": [[pos, item], ...]}`.
     pub fn from_wire(p: &Plain) -> Result<Value, ValueError> {
         from_wire_at(p, 0)
@@ -175,6 +184,55 @@ impl Value {
             }
             Value::Keyed(_) => unreachable!("keyed lists are encoded by the caller"),
         }
+    }
+}
+
+fn name_ok(s: &str) -> bool {
+    s != LIST_KEY && s.chars().count() <= MAX_NAME
+}
+
+/// `Value::is_canonical` for a value inside `depth` containers.
+fn canonical(v: &Value, depth: usize) -> bool {
+    let room = depth < MAX_DEPTH;
+    match v {
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Str(_) => true,
+        Value::Float(f) => f.is_finite(),
+        Value::Map(m) => room && m.iter().all(|(k, c)| name_ok(k) && canonical(c, depth + 1)),
+        Value::List(items) => {
+            room && !reads_as_keyed(items) && items.iter().all(|i| canonical(i, depth + 1))
+        }
+        Value::Keyed(k) => {
+            room && k.iter().all(|(id, pos, item)| {
+                let own_id = matches!(item, Value::Map(m)
+                    if matches!(m.get("id"), Some(Value::Str(s)) if s == id));
+                name_ok(id)
+                    && own_id
+                    && Pos::parse(pos.as_str()).is_some()
+                    && canonical(item, depth + 1)
+            })
+        }
+    }
+}
+
+/// Whether `from_wire` would refuse these plain-list items for looking like a keyed list: all
+/// maps with a string `id`, and those ids distinct or one of them too long.
+fn reads_as_keyed(items: &[Value]) -> bool {
+    let ids: Option<Vec<&str>> = items
+        .iter()
+        .map(|i| match i {
+            Value::Map(m) => match m.get("id") {
+                Some(Value::Str(s)) => Some(&**s),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    match ids {
+        Some(ids) if !ids.is_empty() => {
+            ids.iter().any(|id| id.chars().count() > MAX_NAME)
+                || ids.iter().collect::<BTreeSet<_>>().len() == ids.len()
+        }
+        _ => false,
     }
 }
 

@@ -230,6 +230,21 @@ fn child(p: &Path, seg: &str) -> Path {
     out
 }
 
+/// Values code could build by hand that no wire form gives back: apply must refuse them.
+pub fn bad_value(kind: usize) -> Value {
+    let item = |id: &str| map(vec![("id", str_value(id))]);
+    let keyed = |id: &str, v: Value| {
+        Value::Keyed(KeyedList::new().inserted(Arc::from(id), Pos::between(None, None), v))
+    };
+    match kind {
+        0 => Value::List(Arc::new(vec![item("u1.c1.j")])),
+        1 => keyed("u1.c1.a", item("u1.c1.b")),
+        2 => keyed("u1.c1.a", Value::Int(1)),
+        3 => Value::Float(f64::INFINITY),
+        _ => map(vec![("x", keyed("u1.c1.a", map(vec![])))]),
+    }
+}
+
 type Choice = (u8, Index, Index, Index, Value);
 
 fn build_ops(doc: &Value, choices: Vec<Choice>) -> Vec<Op> {
@@ -288,12 +303,20 @@ fn build_ops(doc: &Value, choices: Vec<Choice>) -> Vec<Op> {
             }
             // A new key (kind 3, or nothing else to aim at); now and then the wire form's list
             // key, which apply must refuse.
-            _ => Op::Set {
-                path: match c.index(10) {
-                    0 => child(&t.maps[a.index(t.maps.len())], "$list"),
-                    _ => fresh_key(i, &a),
+            _ => match c.index(10) {
+                0 => Op::Set {
+                    path: child(&t.maps[a.index(t.maps.len())], "$list"),
+                    value,
                 },
-                value,
+                // A value built by hand that the wire could not carry back.
+                1 => Op::Set {
+                    path: fresh_key(i, &a),
+                    value: bad_value(b.index(5)),
+                },
+                _ => Op::Set {
+                    path: fresh_key(i, &a),
+                    value,
+                },
             },
         })
         .collect()
