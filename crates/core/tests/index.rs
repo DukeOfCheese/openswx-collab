@@ -489,6 +489,28 @@ fn malformed_wire_is_refused() {
 }
 
 #[test]
+fn removed_at_names_exactly_the_removed_path() {
+    let ix = record(
+        &Index::default(),
+        1,
+        "uA.c1",
+        &Ch::new().remove("features/f1"),
+    );
+    assert!(ix.removed_at(&p("features/f1")));
+    for other in ["features", "features/f1/params", "features/f2", "~d/f1"] {
+        assert!(!ix.removed_at(&p(other)), "{other}");
+    }
+    assert!(!ix.removed_at(&[]));
+    // A later write at the path (the item put back) keeps the tombstone; a prune past it drops it.
+    let ix = record(&ix, 2, "uB.c1", &Ch::new().set("features/f1"));
+    assert!(ix.removed_at(&p("features/f1")));
+    assert!(!ix.prune(1).removed_at(&p("features/f1")));
+    assert!(
+        !record(&Index::default(), 1, "uA.c1", &Ch::new().remove("~d/f1")).removed_at(&p("~d/f1"))
+    );
+}
+
+#[test]
 fn prune_keeps_writes_drops_old_removals() {
     let ix = record(
         &Index::default(),

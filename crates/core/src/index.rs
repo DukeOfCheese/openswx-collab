@@ -389,6 +389,15 @@ impl Index {
         }
     }
 
+    /// Whether a removal of exactly `path` is still remembered (a tombstone not yet pruned).
+    pub fn removed_at(&self, path: &[Arc<str>]) -> bool {
+        !path.is_empty()
+            && self
+                .along(path)
+                .get(path.len() - 1)
+                .is_some_and(|node| !node.removed.is_empty())
+    }
+
     /// Bases below this are too old to judge.
     pub fn floor(&self) -> Seq {
         self.floor

@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::apply::{Rules, apply};
+use crate::apply::{Rules, apply_with};
 use crate::index::{ClientId, Conflict, Index, Seq};
 use crate::op::{Op, OpError, removed, writes};
 use crate::path::Path;
@@ -84,7 +84,8 @@ impl From<OpError> for Refusal {
 /// checking that the change is well formed, the checks run in this order: a base below the index's
 /// floor is `TooOld`; a refused change in `depends` is `Dependency`; conflicts in the index are
 /// `Stale`; then the operations are applied under `rules`, new ids having to start with
-/// `"<client>."`, and an error there is `NameTaken`, `IdTaken` or `Invalid`.
+/// `"<client>."` unless they put back an item whose removal the index still remembers (see
+/// `apply_with`), and an error there is `NameTaken`, `IdTaken` or `Invalid`.
 pub fn decide(
     head: &Head,
     client: &ClientId,
@@ -122,7 +123,10 @@ pub fn decide(
         return Err(Refusal::Stale(conflicts));
     }
     let prefix = format!("{client}.");
-    let applied = apply(&head.doc, &change.ops, rules, Some(&prefix))?;
+    // An item whose removal the index still remembers may be put back by anyone (an undo, or a
+    // restore of someone else's deleted item); once that removal is pruned, it may not.
+    let existed = |p: &Path| head.index.removed_at(p);
+    let applied = apply_with(&head.doc, &change.ops, rules, Some(&prefix), &existed)?;
     let seq = head.seq + 1;
     Ok(Accepted {
         seq,

@@ -380,3 +380,93 @@ fn two_clients_adding_the_first_items_to_an_empty_list_both_succeed() {
     };
     assert_eq!(k.len(), 2);
 }
+
+/// The head after `who` removed legacy feature `f1` as change `rm`.
+fn f1_removed_by(who: &str) -> (Head, Vec<Op>) {
+    let rm = change(
+        "rm",
+        0,
+        vec![Op::Remove {
+            list: path(&["features"]),
+            id: Arc::from("f1"),
+        }],
+    );
+    let a = decide_for(&head(), who, &rm, &never).unwrap();
+    let inverse = a.inverse.clone();
+    (adopt(a), inverse)
+}
+
+fn undo(inverse: Vec<Op>, base: Seq) -> Change {
+    let mut ch = change("undo", base, inverse);
+    ch.undo_of = Some(Arc::from("rm"));
+    ch
+}
+
+#[test]
+fn undoing_a_removal_restores_the_item() {
+    let (h1, inverse) = f1_removed_by("u1.c1");
+    // By the client that removed it.
+    let a = decide_for(&h1, "u1.c1", &undo(inverse.clone(), 1), &never).unwrap();
+    assert_eq!(a.doc, head().doc);
+    // By anyone else: restoring someone else's deleted item.
+    let a = decide_for(&h1, "u2.c1", &undo(inverse.clone(), 1), &never).unwrap();
+    assert_eq!(a.doc, head().doc);
+    // The restored item is ordinary again: it can be removed and restored once more.
+    let h2 = adopt(a);
+    let rm2 = change(
+        "rm2",
+        2,
+        vec![Op::Remove {
+            list: path(&["features"]),
+            id: Arc::from("f1"),
+        }],
+    );
+    let a = decide_for(&h2, "u3.c1", &rm2, &never).unwrap();
+    let h3 = adopt(a.clone());
+    assert!(decide_for(&h3, "u1.c1", &undo(a.inverse, 3), &never).is_ok());
+}
+
+#[test]
+fn only_a_remembered_removal_lets_a_foreign_id_back_in() {
+    let (h1, inverse) = f1_removed_by("u1.c1");
+    let item = || match &inverse[..] {
+        [Op::Insert { item, .. }] => item.clone(),
+        other => panic!("one insert, got {other:?}"),
+    };
+    let insert = |list: &[&str], item: Value| Op::Insert {
+        list: path(list),
+        item,
+        pos: Pos::between(None, None),
+    };
+    // An id never seen, or seen elsewhere, is still refused.
+    let fresh = load(json!({"id": "f9", "name": "Fillet9"}));
+    for ops in [
+        vec![insert(&["features"], fresh)],
+        vec![
+            Op::Set {
+                path: path(&["other"]),
+                value: load(json!({})),
+            },
+            insert(&["other"], item()),
+        ],
+    ] {
+        assert!(
+            matches!(
+                decide_for(&h1, "u2.c1", &change("x", 1, ops.clone()), &never),
+                Err(Refusal::Invalid(_))
+            ),
+            "{ops:?}"
+        );
+    }
+    // A removal of an item at the same path that the index no longer remembers: refused.
+    let mut pruned = h1.clone();
+    pruned.index = pruned.index.prune(1);
+    assert!(!pruned.index.removed_at(&path(&["features", "f1"])));
+    assert!(matches!(
+        decide_for(&pruned, "u1.c1", &undo(inverse.clone(), 1), &never),
+        Err(Refusal::Invalid(_))
+    ));
+    // Before pruning the removal is remembered.
+    assert!(h1.index.removed_at(&path(&["features", "f1"])));
+    assert!(!h1.index.removed_at(&path(&["features"])));
+}

@@ -10,7 +10,7 @@ pub mod pos;
 pub mod value;
 pub mod wire;
 
-pub use apply::{Applied, Rules, apply};
+pub use apply::{Applied, Rules, apply, apply_with};
 pub use diff::diff;
 pub use index::{ClientId, Conflict, ConflictKind, Index, Seq};
 pub use log::{Accepted, Change, Head, Refusal, decide};

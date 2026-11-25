@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{arb_doc_and_ops, load, path, to_plain};
-use oswx_core::{Applied, Op, OpError, Pos, Rules, Value, apply, diff};
+use oswx_core::{Applied, Op, OpError, Path, Pos, Rules, Value, apply, apply_with, diff};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
@@ -439,6 +439,70 @@ fn ids_already_under_a_set_path_are_not_new() {
         .err(),
         Some(OpError::ForeignId(Arc::from("x3")))
     );
+}
+
+#[test]
+fn remembered_removals_and_held_ids_together() {
+    // f1 holds a plain list of loops whose segments carry legacy ids.
+    let doc = load(json!({
+        "features": [
+            {"id": "f1", "name": "A", "loops": [{"segs": [{"id": "L1"}], "closed": false}]},
+            {"id": "f2", "name": "B", "loops": [{"segs": [{"id": "L2"}], "closed": false}]},
+        ],
+    }));
+    let removed = run(&doc, &[remove(&["features"], "f1")]).unwrap();
+    let back = removed.inverse.clone();
+    let f1: Path = path(&["features", "f1"]);
+    let remembered = |p: &Path| p == &f1;
+    let with = |ops: &[Op], existed: &dyn Fn(&Path) -> bool| {
+        apply_with(&removed.doc, ops, &rules(), Some("u2.c1."), existed)
+    };
+    // Without the removal remembered, putting f1 back is foreign; with it, f1 and everything in
+    // it (the unreachable L1 included) may come back.
+    assert!(matches!(
+        with(&back, &|_| false),
+        Err(OpError::ForeignId(_))
+    ));
+    assert_eq!(with(&back, &remembered).unwrap().doc, doc);
+    // In the same change, an edit inside f2's loops passes (L2 was held there) ...
+    let edit = set(
+        &["features", "f2", "loops"],
+        json!([{"segs": [{"id": "L2"}], "closed": true}]),
+    );
+    let mut ops = back.clone();
+    ops.push(edit);
+    with(&ops, &remembered).unwrap();
+    // ... but a brand-new foreign id there does not, and nor does L1 moved into f2.
+    for id in ["x9", "L1"] {
+        let mut ops = back.clone();
+        ops.push(set(
+            &["features", "f2", "loops"],
+            json!([{"segs": [{"id": "L2"}, {"id": id}], "closed": true}]),
+        ));
+        assert_eq!(
+            with(&ops, &remembered).err(),
+            Some(OpError::ForeignId(Arc::from(id))),
+            "{id}"
+        );
+    }
+    // A remembered removal is for exactly that item path: f1 put into another list is foreign.
+    let Op::Insert { item, pos, .. } = back[0].clone() else {
+        panic!("an insert")
+    };
+    let elsewhere = [
+        set(&["other"], json!({})),
+        Op::Insert {
+            list: path(&["other", "l"]),
+            item,
+            pos,
+        },
+    ];
+    assert!(matches!(
+        with(&elsewhere, &remembered),
+        Err(OpError::ForeignId(_))
+    ));
+    // The server is not bound by the prefix at all.
+    apply_with(&removed.doc, &back, &rules(), None, &|_| false).unwrap();
 }
 
 #[test]

@@ -48,6 +48,22 @@ pub fn apply(
     rules: &Rules,
     id_prefix: Option<&str>,
 ) -> Result<Applied, OpError> {
+    apply_with(doc, ops, rules, id_prefix, &|_| false)
+}
+
+/// `apply`, told which removed items may come back. `existed(path)` (a keyed list's path plus an
+/// item id) says whether a removal of exactly that item is still remembered; any client may then
+/// put an item with that id back at that path, and everything inside it, whatever its ids. This
+/// is how an undo of a removal, or a restore of someone else's deleted item, passes the prefix
+/// check. Once the removal is forgotten (the index pruned past it) the id is foreign again.
+/// `apply` is `apply_with` with nothing remembered. Only consulted when `id_prefix` is given.
+pub fn apply_with(
+    doc: &Value,
+    ops: &[Op],
+    rules: &Rules,
+    id_prefix: Option<&str>,
+    existed: &dyn Fn(&Path) -> bool,
+) -> Result<Applied, OpError> {
     let mut out = doc.clone();
     let mut inverse = Vec::with_capacity(ops.len());
     let mut introduced = Introduced::default();
@@ -57,7 +73,7 @@ pub fn apply(
         out = next;
         inverse.push(undo);
         if id_prefix.is_some() {
-            introduced.note(doc, op);
+            introduced.note(doc, op, existed);
         }
         for ((list, field), t) in rules.unique.iter().zip(&mut touched) {
             t.note(op, list, field);
@@ -304,8 +320,8 @@ struct Introduced {
 }
 
 impl Introduced {
-    /// `before` is the document before the whole change.
-    fn note(&mut self, before: &Value, op: &Op) {
+    /// `before` is the document before the whole change; `existed` as for `apply_with`.
+    fn note(&mut self, before: &Value, op: &Op, existed: &dyn Fn(&Path) -> bool) {
         match op {
             Op::Set { path, value } => {
                 // Ids anywhere under the Set's path before the change are not new for it, wherever
@@ -315,45 +331,60 @@ impl Introduced {
                 if let Some(old) = get(before, path) {
                     ids_under(old, &mut held);
                 }
-                self.walk(value, &mut path.clone(), true, &held);
+                self.walk(value, &mut path.clone(), true, &held, existed);
             }
             Op::Insert { list, item, .. } => {
                 if let Some(id) = item_id(item) {
+                    let at = child(list, id);
+                    if existed(&at) {
+                        return; // A remembered removal: the item, and all in it, may come back.
+                    }
                     self.at.insert((list.clone(), id.clone()));
-                    self.walk(item, &mut child(list, id), true, &HashSet::new());
+                    self.walk(item, &mut at.clone(), true, &HashSet::new(), existed);
                 }
             }
             Op::Unset { .. } | Op::Remove { .. } | Op::Move { .. } => {}
         }
     }
 
-    /// Notes the item ids in `v`, which sits at `path`, except those in `held`.
-    fn walk(&mut self, v: &Value, path: &mut Path, reachable: bool, held: &HashSet<Id>) {
+    /// Notes the item ids in `v`, which sits at `path`, except those in `held` and the items (with
+    /// everything in them) whose removal `existed` remembers.
+    fn walk(
+        &mut self,
+        v: &Value,
+        path: &mut Path,
+        reachable: bool,
+        held: &HashSet<Id>,
+        existed: &dyn Fn(&Path) -> bool,
+    ) {
         match v {
             Value::Map(m) => {
                 for (k, child) in m.iter() {
                     path.push(k.clone());
-                    self.walk(child, path, reachable, held);
+                    self.walk(child, path, reachable, held, existed);
                     path.pop();
                 }
             }
             Value::Keyed(k) => {
                 for (id, _, item) in k.iter() {
-                    if held.contains(id) {
-                        // Was there before.
-                    } else if reachable {
-                        self.at.insert((path.clone(), id.clone()));
-                    } else {
-                        self.unreachable.push(id.clone());
-                    }
+                    let list = path.clone();
                     path.push(id.clone());
-                    self.walk(item, path, reachable, held);
+                    if !(reachable && existed(path)) {
+                        if held.contains(id) {
+                            // Was there before.
+                        } else if reachable {
+                            self.at.insert((list, id.clone()));
+                        } else {
+                            self.unreachable.push(id.clone());
+                        }
+                        self.walk(item, path, reachable, held, existed);
+                    }
                     path.pop();
                 }
             }
             Value::List(items) => {
                 for item in items.iter() {
-                    self.walk(item, path, false, held);
+                    self.walk(item, path, false, held, existed);
                 }
             }
             _ => {}
