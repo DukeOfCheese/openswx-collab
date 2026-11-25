@@ -1,0 +1,496 @@
+mod common;
+
+use std::sync::Arc;
+
+use common::{arb_doc_and_ops, load, path};
+use oswx_core::{Applied, Op, OpError, Pos, Rules, Value, apply};
+use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
+use serde_json::json;
+
+/// The Python tests' `PART` (tests/conftest.py).
+fn part() -> Value {
+    load(json!({
+        "format": "openswx-part", "version": 3, "name": "Bracket", "units": "mm",
+        "material": {"name": null, "density": 1000.0}, "rollback": null, "active_config": "Default",
+        "next_id": 3, "counters": {"Sketch": 1, "Boss-Extrude": 1}, "variables": {},
+        "features": [
+            {"id": "f1", "name": "Sketch1", "type": "sketch", "suppressed": false,
+             "params": {"plane": "Top", "sketch": {"points": {"P1": [0, 0]}, "entities": {}, "counter": 1}}},
+            {"id": "f2", "name": "Boss-Extrude1", "type": "extrude", "suppressed": false,
+             "params": {"sketch": "Sketch1", "depth": 10}},
+        ],
+    }))
+}
+
+fn rules() -> Rules {
+    Rules::openswx()
+}
+
+fn set(p: &[&str], v: impl Into<serde_json::Value>) -> Op {
+    Op::Set {
+        path: path(p),
+        value: load(v.into()),
+    }
+}
+
+fn unset(p: &[&str]) -> Op {
+    Op::Unset { path: path(p) }
+}
+
+fn pos(s: &str) -> Pos {
+    Pos::parse(s).unwrap()
+}
+
+fn item(id: &str) -> Value {
+    load(json!({"id": id, "name": format!("N-{id}")}))
+}
+
+fn insert(list: &[&str], id: &str, at: &str) -> Op {
+    Op::Insert {
+        list: path(list),
+        item: item(id),
+        pos: pos(at),
+    }
+}
+
+fn remove(list: &[&str], id: &str) -> Op {
+    Op::Remove {
+        list: path(list),
+        id: Arc::from(id),
+    }
+}
+
+fn mv(list: &[&str], id: &str, at: &str) -> Op {
+    Op::Move {
+        list: path(list),
+        id: Arc::from(id),
+        pos: pos(at),
+    }
+}
+
+fn run(doc: &Value, ops: &[Op]) -> Result<Applied, OpError> {
+    apply(doc, ops, &rules(), None)
+}
+
+fn client(doc: &Value, ops: &[Op]) -> Result<Applied, OpError> {
+    apply(doc, ops, &rules(), Some("u1.c1."))
+}
+
+/// Applies `ops`, checks that the inverse restores `doc` exactly, and returns the result.
+fn round_trip(doc: &Value, ops: &[Op]) -> Value {
+    let a = run(doc, ops).unwrap();
+    let back = run(&a.doc, &a.inverse).unwrap();
+    assert_eq!(&back.doc, doc);
+    a.doc
+}
+
+fn missing(r: Result<Applied, OpError>, p: &[&str]) {
+    assert_eq!(r.err(), Some(OpError::Missing(path(p))));
+}
+
+fn invalid(r: Result<Applied, OpError>) {
+    assert!(matches!(r, Err(OpError::Invalid(_))), "got {r:?}");
+}
+
+fn ids(doc: &Value, list: &[&str]) -> Vec<(String, String)> {
+    let Some(Value::Keyed(k)) = doc.at(list) else {
+        panic!("not a keyed list")
+    };
+    k.iter()
+        .map(|(id, p, _)| (id.to_string(), p.as_str().to_string()))
+        .collect()
+}
+
+#[test]
+fn set_and_inverse() {
+    let a = run(&part(), &[set(&["features", "f2", "params", "depth"], 25)]).unwrap();
+    assert_eq!(
+        a.doc.at(&["features", "f2", "params", "depth"]),
+        Some(&Value::Int(25))
+    );
+    assert_eq!(run(&a.doc, &a.inverse).unwrap().doc, part());
+}
+
+#[test]
+fn set_creating_a_key_is_undone_by_unset() {
+    let a = run(&part(), &[set(&["variables", "w"], 4)]).unwrap();
+    assert_eq!(a.inverse, vec![unset(&["variables", "w"])]);
+    assert_eq!(run(&a.doc, &a.inverse).unwrap().doc, part());
+}
+
+#[test]
+fn unset_and_inverse() {
+    let doc = round_trip(&part(), &[unset(&["features", "f1", "params", "plane"])]);
+    assert_eq!(doc.at(&["features", "f1", "params", "plane"]), None);
+    missing(
+        run(&part(), &[unset(&["variables", "w"])]),
+        &["variables", "w"],
+    );
+}
+
+#[test]
+fn inverse_undoes_a_sequence_in_reverse() {
+    let ops = [
+        set(&["variables", "w"], 1),
+        set(&["variables", "w"], 2),
+        unset(&["variables", "w"]),
+        insert(&["features"], "u1.c1.1", "z"),
+        set(&["features", "u1.c1.1", "name"], "Late"),
+        mv(&["features"], "u1.c1.1", "1"),
+        remove(&["features"], "u1.c1.1"),
+    ];
+    let a = run(&part(), &ops).unwrap();
+    assert_eq!(a.doc, part());
+    assert_eq!(a.inverse.len(), ops.len());
+    assert_eq!(run(&a.doc, &a.inverse).unwrap().doc, part());
+}
+
+#[test]
+fn legacy_ids_can_be_edited_but_not_introduced() {
+    client(
+        &part(),
+        &[set(&["features", "f1", "params", "plane"], "Front")],
+    )
+    .unwrap();
+    assert_eq!(
+        client(&part(), &[insert(&["features"], "f9", "z")]).err(),
+        Some(OpError::ForeignId(Arc::from("f9")))
+    );
+    client(&part(), &[insert(&["features"], "u1.c1.1", "z")]).unwrap();
+    assert_eq!(
+        client(&part(), &[insert(&["features"], "u2.c1.1", "z")]).err(),
+        Some(OpError::ForeignId(Arc::from("u2.c1.1")))
+    );
+    // The server is not bound by the prefix.
+    run(&part(), &[insert(&["features"], "f9", "z")]).unwrap();
+}
+
+#[test]
+fn nested_new_ids_are_checked() {
+    let dims = || json!([{"id": "u2.c9.1"}]);
+    assert_eq!(
+        client(
+            &part(),
+            &[set(&["features", "f1", "params", "sketch", "dims"], dims())]
+        )
+        .err(),
+        Some(OpError::ForeignId(Arc::from("u2.c9.1")))
+    );
+    // Inside an inserted item too.
+    let it = load(json!({"id": "u1.c1.5", "sub": [{"id": "x1"}]}));
+    let r = client(
+        &part(),
+        &[Op::Insert {
+            list: path(&["features"]),
+            item: it,
+            pos: pos("z"),
+        }],
+    );
+    assert_eq!(r.err(), Some(OpError::ForeignId(Arc::from("x1"))));
+    // A list that only exists inside a plain list is checked too.
+    let nested = json!([[{"id": "x2"}]]);
+    assert_eq!(
+        client(&part(), &[set(&["variables", "grid"], nested)]).err(),
+        Some(OpError::ForeignId(Arc::from("x2")))
+    );
+}
+
+#[test]
+fn ids_that_were_there_before_are_not_new() {
+    // Re-setting a value that holds legacy ids, at the same path, introduces none.
+    let doc = load(json!({"a": {"l": [{"id": "old", "v": 1}]}}));
+    client(&doc, &[set(&["a", "l"], json!([{"id": "old", "v": 2}]))]).unwrap();
+    // The same id somewhere else is new.
+    assert_eq!(
+        client(&doc, &[set(&["b"], json!([{"id": "old"}]))]).err(),
+        Some(OpError::ForeignId(Arc::from("old")))
+    );
+    // Removed and re-inserted at the same path: not new.
+    let back = Op::Insert {
+        list: path(&["a", "l"]),
+        item: load(json!({"id": "old", "v": 3})),
+        pos: pos("V"),
+    };
+    client(&doc, &[remove(&["a", "l"], "old"), back]).unwrap();
+    // Introduced and gone again within the change: nothing is left to check.
+    client(&doc, &[set(&["b"], json!([{"id": "zzz"}])), unset(&["b"])]).unwrap();
+}
+
+#[test]
+fn swap_two_names_in_one_change() {
+    let a = run(
+        &part(),
+        &[
+            set(&["features", "f1", "name"], "Boss-Extrude1"),
+            set(&["features", "f2", "name"], "Sketch1"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        a.doc.at(&["features", "f1", "name"]),
+        Some(&Value::Str(Arc::from("Boss-Extrude1")))
+    );
+}
+
+#[test]
+fn duplicate_name_is_refused() {
+    let doc = part();
+    let r = run(&doc, &[set(&["features", "f2", "name"], "Sketch1")]);
+    assert_eq!(r.err(), Some(OpError::NameTaken(Arc::from("Sketch1"))));
+    assert_eq!(doc, part());
+    // An inserted item's name counts too.
+    let clash = Op::Insert {
+        list: path(&["features"]),
+        item: load(json!({"id": "u1.c1.1", "name": "Sketch1"})),
+        pos: pos("z"),
+    };
+    assert_eq!(
+        run(&doc, &[clash]).err(),
+        Some(OpError::NameTaken(Arc::from("Sketch1")))
+    );
+    // Non-string names and items without one are ignored.
+    run(
+        &doc,
+        &[
+            set(&["features", "f1", "name"], 1),
+            set(&["features", "f2", "name"], 1),
+        ],
+    )
+    .unwrap();
+    run(
+        &doc,
+        &[
+            unset(&["features", "f1", "name"]),
+            unset(&["features", "f2", "name"]),
+        ],
+    )
+    .unwrap();
+    // A clash in a list the rules do not name is fine.
+    run(
+        &doc,
+        &[set(
+            &["variables", "l"],
+            json!([{"id": "a", "name": "x"}, {"id": "b", "name": "x"}]),
+        )],
+    )
+    .unwrap();
+    // Replacing the whole list is checked.
+    let dup = json!([{"id": "a", "name": "x"}, {"id": "b", "name": "x"}]);
+    assert_eq!(
+        run(&doc, &[set(&["features"], dup)]).err(),
+        Some(OpError::NameTaken(Arc::from("x")))
+    );
+}
+
+#[test]
+fn all_or_nothing() {
+    let doc = part();
+    let r = run(
+        &doc,
+        &[
+            set(&["features", "f2", "params", "depth"], 25),
+            remove(&["features"], "nope"),
+        ],
+    );
+    missing(r, &["features", "nope"]);
+    assert_eq!(doc, part());
+}
+
+#[test]
+fn set_through_missing_parent() {
+    missing(
+        run(&part(), &[set(&["features", "f2", "nope", "depth"], 1)]),
+        &["features", "f2", "nope"],
+    );
+    missing(run(&part(), &[set(&["nope", "a"], 1)]), &["nope"]);
+    missing(
+        run(&part(), &[set(&["features", "f9", "name"], "x")]),
+        &["features", "f9"],
+    );
+    // Stepping into a scalar or a plain list.
+    missing(run(&part(), &[set(&["units", "x"], 1)]), &["units", "x"]);
+    missing(
+        run(
+            &part(),
+            &[set(
+                &["features", "f1", "params", "sketch", "points", "P1", "x"],
+                1,
+            )],
+        ),
+        &["features", "f1", "params", "sketch", "points", "P1", "x"],
+    );
+    missing(
+        run(&part(), &[unset(&["units", "x", "y"])]),
+        &["units", "x"],
+    );
+}
+
+#[test]
+fn set_and_unset_cannot_replace_an_item_or_its_id() {
+    invalid(run(
+        &part(),
+        &[set(&["features", "f1"], json!({"id": "f1"}))],
+    ));
+    invalid(run(&part(), &[unset(&["features", "f1"])]));
+    invalid(run(&part(), &[set(&["features", "f1", "id"], "f7")]));
+    invalid(run(&part(), &[unset(&["features", "f1", "id"])]));
+    // A map key called id outside an item is ordinary.
+    round_trip(&part(), &[set(&["variables", "id"], 1)]);
+    invalid(run(&part(), &[Op::Unset { path: vec![] }]));
+}
+
+#[test]
+fn insert_remove_move_inverse() {
+    let doc = part();
+    let before = ids(&doc, &["features"]);
+    let a = round_trip(&doc, &[insert(&["features"], "u1.c1.1", "1")]);
+    assert_eq!(ids(&a, &["features"])[0], ("u1.c1.1".into(), "1".into()));
+
+    let a = round_trip(&doc, &[remove(&["features"], "f1")]);
+    assert_eq!(ids(&a, &["features"]), before[1..].to_vec());
+
+    let a = round_trip(&doc, &[mv(&["features"], "f1", "z")]);
+    assert_eq!(ids(&a, &["features"])[1], ("f1".into(), "z".into()));
+
+    // A shared position orders by id, and the inverse restores the original one.
+    let p2 = before[1].1.clone();
+    let a = round_trip(&doc, &[mv(&["features"], "f1", &p2)]);
+    assert_eq!(ids(&a, &["features"])[0], ("f1".into(), p2));
+}
+
+#[test]
+fn insert_creates_a_keyed_list() {
+    let doc = load(json!({"a": {"empty": [], "full": [1], "n": 1}}));
+    let a = round_trip(&doc, &[insert(&["a", "new"], "u1.c1.1", "V")]);
+    assert_eq!(ids(&a, &["a", "new"]).len(), 1);
+    let a = round_trip(&doc, &[insert(&["a", "empty"], "u1.c1.1", "V")]);
+    assert_eq!(ids(&a, &["a", "empty"]).len(), 1);
+    invalid(run(&doc, &[insert(&["a", "full"], "u1.c1.1", "V")]));
+    invalid(run(&doc, &[insert(&["a", "n"], "u1.c1.1", "V")]));
+    invalid(run(&doc, &[insert(&["a"], "u1.c1.1", "V")]));
+    missing(run(&doc, &[insert(&["b", "c"], "u1.c1.1", "V")]), &["b"]);
+    missing(
+        run(&doc, &[insert(&["a", "n", "c"], "u1.c1.1", "V")]),
+        &["a", "n", "c"],
+    );
+}
+
+#[test]
+fn insert_of_a_present_id_is_refused() {
+    assert_eq!(
+        run(&part(), &[insert(&["features"], "f1", "z")]).err(),
+        Some(OpError::IdTaken(Arc::from("f1")))
+    );
+    let bad = Op::Insert {
+        list: path(&["features"]),
+        item: load(json!({"name": "no id"})),
+        pos: pos("z"),
+    };
+    invalid(run(&part(), &[bad]));
+}
+
+#[test]
+fn remove_and_move_need_the_item_and_a_keyed_list() {
+    missing(
+        run(&part(), &[remove(&["features"], "f9")]),
+        &["features", "f9"],
+    );
+    missing(
+        run(&part(), &[mv(&["features"], "f9", "V")]),
+        &["features", "f9"],
+    );
+    missing(run(&part(), &[remove(&["nope"], "f1")]), &["nope"]);
+    invalid(run(&part(), &[remove(&["variables"], "f1")]));
+    invalid(run(&part(), &[mv(&["units"], "f1", "V")]));
+}
+
+#[test]
+fn nested_keyed_lists() {
+    let doc = load(json!({"features": [
+        {"id": "f1", "name": "A", "dims": [{"id": "d1", "v": 1}, {"id": "d2", "v": 2}]},
+    ]}));
+    let a = round_trip(
+        &doc,
+        &[
+            set(&["features", "f1", "dims", "d1", "v"], 5),
+            mv(&["features", "f1", "dims"], "d1", "z"),
+            insert(&["features", "f1", "dims"], "u1.c1.1", "1"),
+            remove(&["features", "f1", "dims"], "d2"),
+        ],
+    );
+    assert_eq!(
+        ids(&a, &["features", "f1", "dims"])
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec!["u1.c1.1", "d1"]
+    );
+}
+
+#[test]
+fn sharing() {
+    let features: Vec<_> = (0..1000)
+        .map(|i| {
+            json!({"id": format!("f{i}"), "name": format!("Feature{i}"),
+                   "params": {"depth": i, "pts": [i, i]}})
+        })
+        .collect();
+    let doc = load(json!({ "features": features }));
+    let a = run(&doc, &[set(&["features", "f2", "params", "depth"], 25)]).unwrap();
+    let f1 = |d: &Value| match d.at(&["features", "f1"]) {
+        Some(Value::Map(m)) => m.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(f1(&doc).ptr_eq(&f1(&a.doc)));
+    let pts = |d: &Value| match d.at(&["features", "f1", "params", "pts"]) {
+        Some(Value::List(l)) => l.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(Arc::ptr_eq(&pts(&doc), &pts(&a.doc)));
+}
+
+#[test]
+fn generated_ops_are_mostly_applicable() {
+    let mut runner = TestRunner::deterministic();
+    let (mut ok, mut total) = (0, 0);
+    // Applied ops of each kind: set, unset, insert, remove, move; and inserts into nested lists.
+    let mut kinds = [0; 6];
+    for _ in 0..500 {
+        let (doc, ops) = arb_doc_and_ops().new_tree(&mut runner).unwrap().current();
+        if ops.is_empty() {
+            continue;
+        }
+        total += 1;
+        if run(&doc, &ops).is_ok() {
+            ok += 1;
+            for op in &ops {
+                let k = match op {
+                    Op::Set { .. } => 0,
+                    Op::Unset { .. } => 1,
+                    Op::Insert { list, .. } if list.len() > 1 => 5,
+                    Op::Insert { .. } => 2,
+                    Op::Remove { .. } => 3,
+                    Op::Move { .. } => 4,
+                };
+                kinds[k] += 1;
+            }
+        }
+    }
+    assert!(ok * 2 > total, "only {ok} of {total} op lists applied");
+    assert!(kinds.iter().all(|&n| n > 0), "applied kinds: {kinds:?}");
+}
+
+proptest! {
+    #[test]
+    fn inverse_restores((doc, ops) in arb_doc_and_ops()) {
+        if let Ok(a) = run(&doc, &ops) {
+            let back = run(&a.doc, &a.inverse).unwrap();
+            prop_assert_eq!(&back.doc, &doc);
+            // The inverse of the inverse redoes the change.
+            let again = run(&back.doc, &back.inverse).unwrap();
+            prop_assert_eq!(&again.doc, &a.doc);
+        }
+    }
+}
