@@ -8,9 +8,9 @@ use oswx_core::wire::{
     MAX_DRAFT, MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
 };
 use oswx_core::{
-    Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, Lock, LockDenied, Op, Peer,
-    Plain, Pos, RejectCode, ServerMsg, WireError, decode_client, decode_server, encode_client,
-    encode_server,
+    Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, DenyReason, Lock, LockDenied,
+    Op, Peer, Plain, Pos, RejectCode, ServerMsg, WireError, decode_client, decode_server,
+    encode_client, encode_server,
 };
 use serde_json::{Value as Json, json};
 
@@ -326,10 +326,12 @@ fn server_samples() -> Vec<ServerMsg> {
             denied: vec![
                 LockDenied {
                     path: path(&["features", "f1", "params"]),
+                    why: DenyReason::Held,
                     holder: Some(lock()),
                 },
                 LockDenied {
                     path: path(&["missing"]),
+                    why: DenyReason::NotLockable,
                     holder: None,
                 },
             ],
@@ -1190,16 +1192,40 @@ fn decode_server_is_strict_about_locks_and_peers() {
     let result = |granted: Json, denied: Json| {
         frame(&json!({"t": "lock.result", "request_id": "r", "granted": granted, "denied": denied}))
     };
-    assert!(decode_server(&result(json!([["a"]]), json!([{"path": ["b"]}]))).is_ok());
-    let both = json!([{"path": ["b"], "holder": lock()}, {"path": ["c"], "holder": null}]);
+    assert!(
+        decode_server(&result(
+            json!([["a"]]),
+            json!([{"path": ["b"], "why": "not_lockable"}])
+        ))
+        .is_ok()
+    );
+    let both = json!([{"path": ["b"], "why": "held", "holder": lock()},
+                      {"path": ["c"], "why": "rate", "holder": null}]);
     assert!(decode_server(&result(json!([]), both)).is_ok());
+    for why in ["held", "not_lockable", "quota", "rate", "read_only"] {
+        let reason = DenyReason::parse(why).unwrap();
+        assert_eq!(reason.as_str(), why);
+    }
+    assert_eq!(DenyReason::parse("nope"), None);
     for (granted, denied) in [
         (json!(["a"]), json!([])),
-        (json!([]), json!([{"holder": lock()}])),
-        (json!([]), json!([{"path": ["b"], "holder": "Ada"}])),
+        (json!([]), json!([{"why": "held", "holder": lock()}])),
         (
             json!([]),
-            json!([{"path": ["b"], "holder": without(lock(), "name")}]),
+            json!([{"path": ["b"], "why": "held", "holder": "Ada"}]),
+        ),
+        (
+            json!([]),
+            json!([{"path": ["b"], "why": "held", "holder": without(lock(), "name")}]),
+        ),
+        // A reason is required, known, and names a holder exactly when it is "held".
+        (json!([]), json!([{"path": ["b"]}])),
+        (json!([]), json!([{"path": ["b"], "why": "nope"}])),
+        (json!([]), json!([{"path": ["b"], "why": 1}])),
+        (json!([]), json!([{"path": ["b"], "why": "held"}])),
+        (
+            json!([]),
+            json!([{"path": ["b"], "why": "quota", "holder": lock()}]),
         ),
         (json!([]), json!({})),
         (json!(null), json!([])),

@@ -47,7 +47,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use oswx_core::wire::{Lock, LockDenied, ServerMsg};
+use oswx_core::wire::{DenyReason, Lock, LockDenied, ServerMsg};
 use oswx_core::{
     ClientId, Conflict, ConflictKind, MAX_DEPTH, Op, Path, RejectCode, Seq, Value, Write, writes,
 };
@@ -411,14 +411,23 @@ impl Room {
         let (client, user, name) = (c.client.clone(), c.user.clone(), c.name.clone());
         let read_only = c.read_only.is_some();
         let (mut granted, mut denied, mut acquired) = (Vec::new(), Vec::new(), Vec::new());
-        let nobody = |path: Path| LockDenied { path, holder: None };
+        let nobody = |path: Path, why: DenyReason| LockDenied {
+            path,
+            why,
+            holder: None,
+        };
         for path in paths {
             if !allowed || read_only {
-                denied.push(nobody(path));
+                let why = if allowed {
+                    DenyReason::ReadOnly
+                } else {
+                    DenyReason::Rate
+                };
+                denied.push(nobody(path, why));
                 continue;
             }
             let Some(list) = lockable(&self.durable.doc, &path) else {
-                denied.push(nobody(path));
+                denied.push(nobody(path, DenyReason::NotLockable));
                 continue;
             };
             if self
@@ -433,12 +442,13 @@ impl Room {
             if let Some(holder) = self.locks.in_the_way(&path, &client) {
                 denied.push(LockDenied {
                     path,
+                    why: DenyReason::Held,
                     holder: Some(holder),
                 });
                 continue;
             }
             if self.locks.held.get(&client).copied().unwrap_or(0) >= MAX_LOCKS {
-                denied.push(nobody(path));
+                denied.push(nobody(path, DenyReason::Quota));
                 continue;
             }
             let holder = Holder {

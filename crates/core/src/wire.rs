@@ -224,9 +224,46 @@ pub struct Lock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LockDenied {
     pub path: Path,
-    /// The lock in the way (its path may be above or under this one), or `None` when the path
-    /// cannot be locked at all (read-only, not in the document, the quota full, or too many requests).
+    pub why: DenyReason,
+    /// The lock in the way (its path may be above or under this one): present exactly when `why`
+    /// is [`DenyReason::Held`].
     pub holder: Option<Lock>,
+}
+
+/// Why `lock.acquire` did not get a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenyReason {
+    /// Another client holds a lock in the way (`holder`).
+    Held,
+    /// The path cannot be locked (not in the document, derived data, a key the server owns).
+    NotLockable,
+    /// The client, its user or the document holds as many locks as it may.
+    Quota,
+    /// Too many lock requests: try again shortly.
+    Rate,
+    /// The connection may only look.
+    ReadOnly,
+}
+
+const DENY_REASONS: [(DenyReason, &str); 5] = [
+    (DenyReason::Held, "held"),
+    (DenyReason::NotLockable, "not_lockable"),
+    (DenyReason::Quota, "quota"),
+    (DenyReason::Rate, "rate"),
+    (DenyReason::ReadOnly, "read_only"),
+];
+
+impl DenyReason {
+    pub fn as_str(self) -> &'static str {
+        DENY_REASONS
+            .iter()
+            .find(|(r, _)| *r == self)
+            .map_or("held", |(_, s)| s)
+    }
+
+    pub fn parse(s: &str) -> Option<DenyReason> {
+        DENY_REASONS.iter().find(|(_, n)| *n == s).map(|(r, _)| *r)
+    }
 }
 
 /// A feature that does not rebuild, and the change that broke it if known.
@@ -997,7 +1034,7 @@ fn lock_from_wire(p: &Plain) -> Result<Lock, WireError> {
 }
 
 fn denied_to_wire(d: &LockDenied) -> Plain {
-    let mut pairs = vec![("path", path::to_wire(&d.path))];
+    let mut pairs = vec![("path", path::to_wire(&d.path)), ("why", s(d.why.as_str()))];
     if let Some(h) = &d.holder {
         pairs.push(("holder", lock_to_wire(h)));
     }
@@ -1006,9 +1043,18 @@ fn denied_to_wire(d: &LockDenied) -> Plain {
 
 fn denied_from_wire(p: &Plain) -> Result<LockDenied, WireError> {
     let f = Fields::new(p, "a denied lock")?;
+    let why = match DenyReason::parse(text(f.req("why")?, "why", 0, usize::MAX)?) {
+        Some(why) => why,
+        None => return invalid("unknown reason a lock was denied"),
+    };
+    let holder = f.opt("holder")?.map(lock_from_wire).transpose()?;
+    if holder.is_some() != (why == DenyReason::Held) {
+        return invalid("a denied lock names its holder exactly when it is held");
+    }
     Ok(LockDenied {
         path: one_path(f.req("path")?, "path")?,
-        holder: f.opt("holder")?.map(lock_from_wire).transpose()?,
+        why,
+        holder,
     })
 }
 

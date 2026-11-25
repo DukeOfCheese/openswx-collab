@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use common::{load, path, to_plain};
 use oswx_core::{
-    Change, ClientMsg, Conflict, ConflictKind, Lock, LockDenied, Op, Peer, Plain, Pos, RejectCode,
-    ServerMsg, decode_client, decode_server, encode_client, encode_server,
+    Change, ClientMsg, Conflict, ConflictKind, DenyReason, Lock, LockDenied, Op, Peer, Plain, Pos,
+    RejectCode, ServerMsg, decode_client, decode_server, encode_client, encode_server,
 };
 use serde_json::{Value as Json, json};
 
@@ -197,10 +197,12 @@ fn vectors() -> Vec<(&'static str, &'static str, Vec<u8>)> {
                 denied: vec![
                     LockDenied {
                         path: path(&["features", "f1"]),
+                        why: DenyReason::Held,
                         holder: Some(lock()),
                     },
                     LockDenied {
                         path: path(&["features", "f9"]),
+                        why: DenyReason::NotLockable,
                         holder: None,
                     },
                 ],
