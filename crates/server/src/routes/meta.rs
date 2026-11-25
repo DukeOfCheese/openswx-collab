@@ -45,13 +45,18 @@ pub async fn registration_mode(
     store: &dyn Store,
     settings: &Settings,
 ) -> anyhow::Result<Registration> {
-    Ok(if store.user_count().await? == 0 {
+    Ok(registration_for(store.user_count().await?, settings))
+}
+
+/// The registration mode on a server with `users` accounts (see [`registration_mode`]).
+pub fn registration_for(users: u64, settings: &Settings) -> Registration {
+    if users == 0 {
         Registration::FirstUser
     } else if settings.open_registration {
         Registration::Open
     } else {
         Registration::Invite
-    })
+    }
 }
 
 async fn health() -> Json<Value> {

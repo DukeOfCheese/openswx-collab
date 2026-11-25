@@ -14,6 +14,7 @@
 //! into `large` must set one. A path may have its methods split between the groups (e.g. `GET` in
 //! `standard`, `POST` in `large`).
 
+pub mod auth;
 pub mod meta;
 
 use std::time::Duration;
@@ -42,7 +43,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// The app's routes over `state`.
 pub(crate) fn router(state: AppState) -> Router {
     // Routes whose bodies are at most DEFAULT_BODY_LIMIT. Merge new routers here.
-    let standard = Router::new().merge(meta::router());
+    let standard = Router::new().merge(meta::router()).merge(auth::router());
 
     // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document
     // creation).

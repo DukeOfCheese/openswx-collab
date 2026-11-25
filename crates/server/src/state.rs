@@ -2,14 +2,16 @@
 
 use std::sync::Arc;
 
-use crate::blobs::Blobs;
+use anyhow::bail;
+
+use crate::blobs::{Blobs, NullBlobs};
 use crate::clock::Clock;
-use crate::config::Settings;
+use crate::config::{Database, Settings};
 use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
-use crate::mail::{Mailer, MemoryMailer};
+use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::sessions::Sessions;
-use crate::store::Store;
+use crate::store::{SqliteStore, Store};
 
 /// The server's shared state. Cloning is cheap: every field is shared.
 #[derive(Clone)]
@@ -25,11 +27,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// State over a store and blob storage, with no extensions and the system clock. Replace any
-    /// public field afterwards to change it.
+    /// State over a store and blob storage, with no extensions, the system clock and a
+    /// [`MemoryMailer`] (which keeps messages rather than sending them; it reports itself as
+    /// configured exactly when the settings name a mail server and a sender). Replace any public
+    /// field afterwards to change it. A running server is built with [`AppState::from_settings`].
     pub fn new(settings: Settings, store: Arc<dyn Store>, blobs: Arc<dyn Blobs>) -> Self {
-        // Until Task 4 brings SmtpMailer, mail is kept in memory; it reports itself as configured
-        // exactly when the settings name a mail server and a sender.
         let mailer = Arc::new(MemoryMailer::new(settings.email_configured()));
         Self {
             store,
@@ -42,9 +44,31 @@ impl AppState {
             clock: Clock::system(),
         }
     }
+
+    /// The state of a running server: the database `settings.database_url` names (opened, and its
+    /// schema brought up to date as [`SqliteStore::open`] does), and mail through the operator's
+    /// SMTP server ([`SmtpMailer`]).
+    pub async fn from_settings(settings: Settings) -> anyhow::Result<Self> {
+        let store: Arc<dyn Store> = match settings.database()? {
+            Database::Sqlite(_) => {
+                Arc::new(SqliteStore::open(&settings.database_url, settings.auto_migrate).await?)
+            }
+            // TASK 16: open the PostgreSQL store here.
+            Database::Postgres(_) => bail!("this build cannot open PostgreSQL databases yet"),
+        };
+        // TASK 6: open the blob storage `settings.storage_url` names.
+        let blobs: Arc<dyn Blobs> = Arc::new(NullBlobs);
+        let mailer = Arc::new(SmtpMailer::new(&settings)?);
+        let mut state = Self::new(settings, store, blobs);
+        state.mailer = mailer;
+        Ok(state)
+    }
 }
 
 /// The whole HTTP application for this state.
+///
+/// Serve it with connection info (`into_make_service_with_connect_info::<SocketAddr>()`): sign-in
+/// and password reset limits are kept per client address, and without it every client shares one.
 pub fn app(state: AppState) -> axum::Router {
     crate::routes::router(state)
 }

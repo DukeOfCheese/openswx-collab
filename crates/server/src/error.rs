@@ -20,6 +20,8 @@ pub enum ApiError {
     NotFound(&'static str),
     /// 401 `sign in first`.
     Unauthorized,
+    /// 401 `wrong email address or password` (a refused sign-in).
+    WrongCredentials,
     /// 403 with the message.
     Forbidden(&'static str),
     /// 409 with the message.
@@ -45,7 +47,7 @@ impl ApiError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Unauthorized | Self::WrongCredentials => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -62,6 +64,7 @@ impl ApiError {
     pub fn detail(&self) -> &str {
         match self {
             Self::Unauthorized => "sign in first",
+            Self::WrongCredentials => "wrong email address or password",
             Self::NotFound(m) | Self::Forbidden(m) => m,
             Self::Conflict(m)
             | Self::BadRequest(m)

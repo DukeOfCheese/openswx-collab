@@ -3,15 +3,18 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use oswx_server::blobs::{Blobs, NullBlobs};
 use oswx_server::hub::Hub;
+use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{Id, PasswordReset, SchemaStatus, Session, SqliteStore, Store, Tx, User};
 use oswx_server::{AppState, Settings};
+use reqwest::StatusCode;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -162,7 +165,8 @@ impl TestServer {
             .expect("a free port");
         let base = format!("http://{}", listener.local_addr().expect("an address"));
         let (stop, stopped) = oneshot::channel::<()>();
-        let app = oswx_server::app(state.clone());
+        let app = oswx_server::app(state.clone())
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -207,6 +211,192 @@ impl TestServer {
     /// `base` + `path`.
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// Starts with a mail server configured, and a [`MemoryMailer`] in its place that the test reads.
+    pub async fn start_mailing(settings: impl FnOnce(&mut Settings)) -> (Self, Arc<MemoryMailer>) {
+        let mailer = Arc::new(MemoryMailer::new(true));
+        let kept = mailer.clone();
+        let server = Self::start_custom(
+            |s| {
+                s.smtp_host = "127.0.0.1".into();
+                s.smtp_from = "collab@example.org".into();
+                settings(s);
+            },
+            |s| s.mailer = kept,
+        )
+        .await;
+        (server, mailer)
+    }
+
+    /// Sends a request with an optional bearer token and JSON body; answers the status and the JSON
+    /// body (`Null` for an empty one).
+    pub async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = reqwest::Client::new().request(method, self.url(path));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("the request is answered");
+        let status = response.status();
+        let text = response.text().await.expect("a body");
+        let body = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+        };
+        (status, body)
+    }
+
+    pub async fn get(&self, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+        self.call(reqwest::Method::GET, path, token, None).await
+    }
+
+    pub async fn post(&self, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+        self.call(reqwest::Method::POST, path, token, Some(body))
+            .await
+    }
+
+    pub async fn patch(&self, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+        self.call(reqwest::Method::PATCH, path, token, Some(body))
+            .await
+    }
+
+    /// Registers an account (password [`PASSWORD`], name the address's local part) and answers its
+    /// token and id; panics unless the server answers 201.
+    pub async fn register(&self, email: &str) -> (Token, Id) {
+        self.register_with(email, PASSWORD).await
+    }
+
+    /// [`TestServer::register`] with another password.
+    pub async fn register_with(&self, email: &str, password: &str) -> (Token, Id) {
+        let name = email.split('@').next().unwrap_or_default();
+        let (status, body) = self
+            .post(
+                "/api/auth/register",
+                None,
+                json!({"email": email, "password": password, "name": name}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        (
+            body["token"].as_str().expect("a token").to_owned(),
+            body["user"]["id"].as_str().expect("an id").to_owned(),
+        )
+    }
+
+    /// Signs in and answers the token; panics unless the server answers 200.
+    pub async fn login(&self, email: &str, password: &str) -> Token {
+        let (status, body) = self
+            .post(
+                "/api/auth/login",
+                None,
+                json!({"email": email, "password": password}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["token"].as_str().expect("a token").to_owned()
+    }
+}
+
+/// The password [`TestServer::register`] gives accounts.
+pub const PASSWORD: &str = "correct horse";
+
+/// What `tracing` wrote on one thread while a [`LogCapture`] was alive there.
+type LogBuffer = Arc<Mutex<Vec<u8>>>;
+
+thread_local! {
+    /// The buffer of this thread's live [`LogCapture`], if any.
+    static CAPTURING: std::cell::RefCell<Option<LogBuffer>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The global subscriber's writer: whatever this thread's [`LogCapture`] collects, or nowhere.
+struct ThisThread(Option<LogBuffer>);
+
+impl std::io::Write for ThisThread {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(b) = &self.0 {
+            b.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ToThisThread;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ToThisThread {
+    type Writer = ThisThread;
+
+    fn make_writer(&'a self) -> ThisThread {
+        ThisThread(CAPTURING.with(|c| c.borrow().clone()))
+    }
+}
+
+/// Captures every `tracing` event, at every level, emitted on this thread while it is alive. A
+/// `#[tokio::test]` runs the test, its server and its client on one thread, so that is everything
+/// the server logs (except on the blocking pool, which logs nothing).
+///
+/// The subscriber is global (one per test binary, installed by the first capture) and writes to the
+/// capturing thread's buffer. A scoped default subscriber (`tracing::subscriber::set_default`) is
+/// not used: `tracing` caches per call site whether anyone listens, and a call site first reached by
+/// a test thread without one can stay switched off for the thread that has one.
+pub struct LogCapture {
+    buffer: LogBuffer,
+}
+
+impl LogCapture {
+    pub fn start() -> Self {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ToThisThread)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in the tests");
+        });
+        let buffer = LogBuffer::default();
+        CAPTURING.with(|c| *c.borrow_mut() = Some(buffer.clone()));
+        Self { buffer }
+    }
+
+    /// Everything captured so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buffer.lock().unwrap_or_else(PoisonError::into_inner))
+            .into_owned()
+    }
+
+    /// Panics if any captured line contains one of `secrets` (or if nothing was captured at all,
+    /// which would make the check meaningless).
+    pub fn assert_never_logged(&self, secrets: &[&str]) {
+        let text = self.text();
+        assert!(!text.is_empty(), "nothing was captured");
+        for secret in secrets {
+            assert!(!secret.is_empty());
+            if let Some(line) = text.lines().find(|l| l.contains(secret)) {
+                panic!("a secret was logged: {line}");
+            }
+        }
+    }
+}
+
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        CAPTURING.with(|c| *c.borrow_mut() = None);
     }
 }
 
@@ -439,10 +629,10 @@ pub struct World {
 }
 
 impl World {
-    /// Not yet available: accounts arrive with Task 4 and organisations and projects with Task 5,
-    /// which gives this its body.
+    /// Not yet available: organisations and projects arrive with Task 5, which gives this its body
+    /// (the admin from [`TestServer::register`]).
     pub async fn new(_server: &TestServer) -> anyhow::Result<Self> {
-        anyhow::bail!("World needs accounts (Task 4) and projects (Task 5); Task 5 provides it")
+        anyhow::bail!("World needs organisations and projects; Task 5 provides it")
     }
 }
 
