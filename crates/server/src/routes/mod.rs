@@ -2,10 +2,11 @@
 //!
 //! **Extractors.** Handlers must take their input through [`ApiJson`](crate::ApiJson),
 //! [`ApiPath`](crate::ApiPath) and [`ApiQuery`](crate::ApiQuery), never axum's own `Json`, `Path` or
-//! `Query`: those answer a bad request in plain text. As a backstop the app rewrites any 4xx or 5xx
-//! response that is not JSON into `{"detail": "<status reason>"}` (see `json_errors`), and a handler
-//! that panics answers 500 `{"detail": "server error"}` with the panic logged; neither is a reason to
-//! rely on them.
+//! `Query`: those answer a bad request in plain text. As a backstop the app rewrites a 4xx or 5xx
+//! response with no body or a `text/plain` one into `{"detail": "<status reason>"}`, keeping its other
+//! headers (see `json_errors`); a response of any other content type, such as an HTML page, passes
+//! through untouched. A handler that panics answers 500 `{"detail": "server error"}` with the panic
+//! logged; neither is a reason to rely on the backstops.
 //!
 //! **Body limits.** Request bodies are refused with 413 over [`DEFAULT_BODY_LIMIT`]. A route that takes
 //! bigger bodies goes into the `large` group in the router built by `router` and applies its own limit with
@@ -64,31 +65,47 @@ pub(crate) fn router(state: AppState) -> Router {
 }
 
 /// The backstop for [`ApiError`]'s promise that every error is `{"detail": "..."}`: a 4xx or 5xx
-/// response that is not JSON (an extractor rejection a handler did not convert, a framework error)
-/// becomes `{"detail": "<the status's reason>"}`.
+/// response with no body or a `text/plain` body (what axum's own rejections and framework errors
+/// produce) becomes `{"detail": "<the status's reason>"}`, keeping its other headers (`Allow`,
+/// `Retry-After`, `WWW-Authenticate`, ...). A response of any other content type (an HTML page, JSON,
+/// a download's 416) is left alone.
 async fn json_errors(req: Request, next: Next) -> Response {
     let response = next.run(req).await;
     let status = response.status();
-    let is_json = response
+    if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("application/json"));
-    if (status.is_client_error() || status.is_server_error()) && !is_json {
-        detail_response(status, status.canonical_reason().unwrap_or("error"))
-    } else {
-        response
+        .map(str::to_ascii_lowercase);
+    if content_type
+        .as_deref()
+        .is_some_and(|v| !v.starts_with("text/plain"))
+    {
+        return response;
     }
+    let (parts, _) = response.into_parts();
+    let mut rewritten = detail_response(status, status.canonical_reason().unwrap_or("error"));
+    for (name, value) in &parts.headers {
+        if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
+            rewritten.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    rewritten
 }
 
-/// What a handler that panicked answers: 500 `server error`; the panic goes to the log.
+/// What a handler that panicked answers: 500 `server error`. The log gets only the kind of payload:
+/// a panic message can embed request or document content. (Rust's panic hook still prints the
+/// message and location to stderr; nothing here sends them anywhere else.)
 fn panicked(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
-    let message = panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("(not a string)");
-    tracing::error!("a handler panicked: {message}");
+    let kind = if panic.is::<&str>() || panic.is::<String>() {
+        "message"
+    } else {
+        "non-string payload"
+    };
+    tracing::error!("a handler panicked ({kind}; see the panic hook's output for where)");
     detail_response(StatusCode::INTERNAL_SERVER_ERROR, "server error")
 }
 

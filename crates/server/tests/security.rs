@@ -68,7 +68,7 @@ fn password_length_is_8_to_200_characters() {
     }
     for bad in ["", "1234567", &"a".repeat(201), &"\u{fc}".repeat(7)] {
         assert!(
-            matches!(check_password_len(bad), Err(ApiError::BadRequest(_))),
+            matches!(check_password_len(bad), Err(ApiError::Unprocessable(_))),
             "{}",
             bad.len()
         );

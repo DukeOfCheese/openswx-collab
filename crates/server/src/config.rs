@@ -11,6 +11,9 @@ pub const PREFIX: &str = "OSWX_COLLAB_";
 
 const MIB: usize = 1 << 20;
 
+/// The longest interval a setting in seconds may be: a year.
+const MAX_SECONDS: f64 = 365.0 * 86400.0;
+
 /// A setting that could not be read. The message names the variable and never repeats its value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{var} must be {expected}")]
@@ -391,27 +394,30 @@ impl Env<'_> {
         name: &str,
         out: &mut T,
     ) -> Result<(), ConfigError> {
-        let mut value = T::default();
-        if self.get(name).is_none() {
+        let Some(raw) = self.get(name) else {
             return Ok(());
+        };
+        match raw.trim().parse::<T>() {
+            Ok(v) if v != T::default() => {
+                *out = v;
+                Ok(())
+            }
+            _ => Err(ConfigError::new(name, "a whole number above zero")),
         }
-        self.whole(name, &mut value)
-            .ok()
-            .filter(|()| value != T::default())
-            .ok_or_else(|| ConfigError::new(name, "a whole number above zero"))?;
-        *out = value;
-        Ok(())
     }
 
-    /// A number of seconds above zero.
+    /// A number of seconds above zero and at most [`MAX_SECONDS`] (so converting to a `Duration`
+    /// cannot panic).
     fn positive_seconds(&self, name: &str, out: &mut f64) -> Result<(), ConfigError> {
         if let Some(raw) = self.get(name) {
             *out = raw
                 .trim()
                 .parse::<f64>()
                 .ok()
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .ok_or_else(|| ConfigError::new(name, "a number of seconds above zero"))?;
+                .filter(|v| *v > 0.0 && *v <= MAX_SECONDS)
+                .ok_or_else(|| {
+                    ConfigError::new(name, "a number of seconds above zero, at most a year")
+                })?;
         }
         Ok(())
     }
@@ -558,6 +564,22 @@ mod tests {
                 );
             }
             read(&[(var, "1")]);
+        }
+        for var in [
+            "SWEEP_INTERVAL",
+            "LOCK_TTL",
+            "LOCK_GRACE",
+            "ROOM_IDLE",
+            "ACCESS_RECHECK",
+        ] {
+            for bad in ["1e300", "31536001", "inf"] {
+                assert_eq!(
+                    refused(&[(var, bad)]).var,
+                    format!("{PREFIX}{var}"),
+                    "{bad}"
+                );
+            }
+            read(&[(var, "31536000")]);
         }
     }
 

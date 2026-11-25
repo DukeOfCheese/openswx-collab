@@ -26,6 +26,8 @@ pub enum ApiError {
     Conflict(String),
     /// 400 with the message.
     BadRequest(String),
+    /// 422 with the message: well-formed input that fails validation (as FastAPI answers).
+    Unprocessable(String),
     /// 402 with the message (an extension refused, e.g. a seat limit).
     PaymentRequired(String),
     /// 413 `too large`.
@@ -47,6 +49,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -62,6 +65,7 @@ impl ApiError {
             Self::NotFound(m) | Self::Forbidden(m) => m,
             Self::Conflict(m)
             | Self::BadRequest(m)
+            | Self::Unprocessable(m)
             | Self::PaymentRequired(m)
             | Self::NotImplemented(m) => m,
             Self::TooLarge => "too large",
@@ -131,12 +135,17 @@ where
     T: DeserializeOwned + Send,
     S: Send + Sync,
 {
-    type Rejection = ApiError;
+    type Rejection = Response;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Response> {
         match Path::<T>::from_request_parts(parts, state).await {
             Ok(Path(value)) => Ok(Self(value)),
-            Err(rejection) => Err(ApiError::BadRequest(rejection.body_text())),
+            // A segment that does not parse is the client's (400); a route without the parameter
+            // the handler asks for is our bug (500, logged, not explained).
+            Err(rejection) if rejection.status().is_server_error() => {
+                Err(ApiError::Internal(anyhow::anyhow!(rejection.body_text())).into_response())
+            }
+            Err(rejection) => Err(detail_response(rejection.status(), &rejection.body_text())),
         }
     }
 }
