@@ -156,19 +156,19 @@ impl Settings {
         e.string("STORAGE_URL", &mut s.storage_url);
         e.string("S3_ENDPOINT", &mut s.s3_endpoint);
         e.string("PUBLIC_URL", &mut s.public_url);
-        e.boolean("OPEN_REGISTRATION", &mut s.open_registration);
-        e.whole("SESSION_DAYS", &mut s.session_days)?;
-        e.boolean("AUTO_MIGRATE", &mut s.auto_migrate);
-        e.whole("SNAPSHOT_EVERY", &mut s.snapshot_every)?;
-        e.seconds("LOCK_TTL", &mut s.lock_ttl)?;
-        e.seconds("LOCK_GRACE", &mut s.lock_grace)?;
-        e.seconds("SWEEP_INTERVAL", &mut s.sweep_interval)?;
-        e.seconds("ACCESS_RECHECK", &mut s.access_recheck)?;
-        e.seconds("ROOM_IDLE", &mut s.room_idle)?;
-        e.whole("CATCHUP_LIMIT", &mut s.catchup_limit)?;
-        e.whole("MAX_CHANGE_BYTES", &mut s.max_change_bytes)?;
-        e.whole("MAX_BLOB_BYTES", &mut s.max_blob_bytes)?;
-        e.whole("PRESENCE_RATE", &mut s.presence_rate)?;
+        e.boolean("OPEN_REGISTRATION", &mut s.open_registration)?;
+        e.positive_whole("SESSION_DAYS", &mut s.session_days)?;
+        e.boolean("AUTO_MIGRATE", &mut s.auto_migrate)?;
+        e.positive_whole("SNAPSHOT_EVERY", &mut s.snapshot_every)?;
+        e.positive_seconds("LOCK_TTL", &mut s.lock_ttl)?;
+        e.positive_seconds("LOCK_GRACE", &mut s.lock_grace)?;
+        e.positive_seconds("SWEEP_INTERVAL", &mut s.sweep_interval)?;
+        e.positive_seconds("ACCESS_RECHECK", &mut s.access_recheck)?;
+        e.positive_seconds("ROOM_IDLE", &mut s.room_idle)?;
+        e.positive_whole("CATCHUP_LIMIT", &mut s.catchup_limit)?;
+        e.positive_whole("MAX_CHANGE_BYTES", &mut s.max_change_bytes)?;
+        e.positive_whole("MAX_BLOB_BYTES", &mut s.max_blob_bytes)?;
+        e.positive_whole("PRESENCE_RATE", &mut s.presence_rate)?;
         e.string("SMTP_HOST", &mut s.smtp_host);
         e.whole("SMTP_PORT", &mut s.smtp_port)?;
         if let Some(raw) = e.get("SMTP_SECURITY") {
@@ -185,7 +185,7 @@ impl Settings {
         e.string("SMTP_PASSWORD", &mut s.smtp_password);
         e.string("SMTP_FROM", &mut s.smtp_from);
         e.string("SMTP_FROM_NAME", &mut s.smtp_from_name);
-        e.whole("RESET_MINUTES", &mut s.reset_minutes)?;
+        e.positive_whole("RESET_MINUTES", &mut s.reset_minutes)?;
         e.string("GOOGLE_CLIENT_ID", &mut s.google_client_id);
         e.string("GOOGLE_CLIENT_SECRET", &mut s.google_client_secret);
         e.string("GITHUB_CLIENT_ID", &mut s.github_client_id);
@@ -350,14 +350,22 @@ impl Env<'_> {
         }
     }
 
-    /// True for `1`, `true`, `yes`, `on` (any case, surrounding space ignored); anything else is false.
-    fn boolean(&self, name: &str, out: &mut bool) {
+    /// `1`, `true`, `yes`, `on` are true and `0`, `false`, `no`, `off` false (any case, surrounding
+    /// space ignored); anything else is an error.
+    fn boolean(&self, name: &str, out: &mut bool) -> Result<(), ConfigError> {
         if let Some(raw) = self.get(name) {
-            *out = matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
+            *out = match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => {
+                    return Err(ConfigError::new(
+                        name,
+                        "true or false (1, 0, yes, no, on, off)",
+                    ));
+                }
+            };
         }
+        Ok(())
     }
 
     fn whole<T: FromStr>(&self, name: &str, out: &mut T) -> Result<(), ConfigError> {
@@ -370,14 +378,33 @@ impl Env<'_> {
         Ok(())
     }
 
-    fn seconds(&self, name: &str, out: &mut f64) -> Result<(), ConfigError> {
+    /// A whole number above zero.
+    fn positive_whole<T: FromStr + Default + PartialEq>(
+        &self,
+        name: &str,
+        out: &mut T,
+    ) -> Result<(), ConfigError> {
+        let mut value = T::default();
+        if self.get(name).is_none() {
+            return Ok(());
+        }
+        self.whole(name, &mut value)
+            .ok()
+            .filter(|()| value != T::default())
+            .ok_or_else(|| ConfigError::new(name, "a whole number above zero"))?;
+        *out = value;
+        Ok(())
+    }
+
+    /// A number of seconds above zero.
+    fn positive_seconds(&self, name: &str, out: &mut f64) -> Result<(), ConfigError> {
         if let Some(raw) = self.get(name) {
             *out = raw
                 .trim()
                 .parse::<f64>()
                 .ok()
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .ok_or_else(|| ConfigError::new(name, "a number of seconds, not negative"))?;
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| ConfigError::new(name, "a number of seconds above zero"))?;
         }
         Ok(())
     }
@@ -471,7 +498,9 @@ mod tests {
             ("TRUE", true),
             ("on", true),
             ("0", false),
-            ("nah", false),
+            (" No ", false),
+            ("OFF", false),
+            ("false", false),
         ] {
             assert_eq!(
                 read(&[("OPEN_REGISTRATION", raw)]).open_registration,
@@ -483,6 +512,46 @@ mod tests {
             read(&[("SMTP_SECURITY", "none")]).smtp_security,
             SmtpSecurity::Plain
         );
+    }
+
+    #[test]
+    fn a_boolean_must_be_one_of_the_known_spellings() {
+        for var in ["OPEN_REGISTRATION", "AUTO_MIGRATE"] {
+            for bad in ["nah", "", "2", "y", "truee", "enabled"] {
+                let e = refused(&[(var, bad)]);
+                assert_eq!(e.var, format!("{PREFIX}{var}"), "{bad:?}");
+                if bad.len() > 3 {
+                    assert!(!e.to_string().contains(bad), "{e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn limits_and_intervals_must_be_above_zero() {
+        for var in [
+            "SNAPSHOT_EVERY",
+            "SWEEP_INTERVAL",
+            "PRESENCE_RATE",
+            "CATCHUP_LIMIT",
+            "LOCK_TTL",
+            "LOCK_GRACE",
+            "ROOM_IDLE",
+            "ACCESS_RECHECK",
+            "SESSION_DAYS",
+            "RESET_MINUTES",
+            "MAX_CHANGE_BYTES",
+            "MAX_BLOB_BYTES",
+        ] {
+            for bad in ["0", "0.0", "-1", "-0.5", "", "x"] {
+                assert_eq!(
+                    refused(&[(var, bad)]).var,
+                    format!("{PREFIX}{var}"),
+                    "{var}={bad:?}"
+                );
+            }
+            read(&[(var, "1")]);
+        }
     }
 
     #[test]

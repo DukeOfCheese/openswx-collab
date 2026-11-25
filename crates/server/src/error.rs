@@ -2,8 +2,9 @@
 //! which the openswx client already parses.
 
 use axum::Json;
-use axum::extract::{FromRequest, Request};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -117,5 +118,45 @@ where
 impl<T: Serialize> IntoResponse for ApiJson<T> {
     fn into_response(self) -> Response {
         Json(self.0).into_response()
+    }
+}
+
+/// Path parameters. Use this rather than `axum::extract::Path`: a segment that does not parse is 400
+/// with a `{"detail": "..."}` body rather than plain text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApiPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::BadRequest(rejection.body_text())),
+        }
+    }
+}
+
+/// Query parameters. Use this rather than `axum::extract::Query`: a query string that does not parse
+/// is 400 with a `{"detail": "..."}` body rather than plain text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApiQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::BadRequest(rejection.body_text())),
+        }
     }
 }

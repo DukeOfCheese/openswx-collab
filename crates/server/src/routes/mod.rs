@@ -1,7 +1,14 @@
 //! The routes, and how they are put together into the app.
 //!
+//! **Extractors.** Handlers must take their input through [`ApiJson`](crate::ApiJson),
+//! [`ApiPath`](crate::ApiPath) and [`ApiQuery`](crate::ApiQuery), never axum's own `Json`, `Path` or
+//! `Query`: those answer a bad request in plain text. As a backstop the app rewrites any 4xx or 5xx
+//! response that is not JSON into `{"detail": "<status reason>"}` (see `json_errors`), and a handler
+//! that panics answers 500 `{"detail": "server error"}` with the panic logged; neither is a reason to
+//! rely on them.
+//!
 //! **Body limits.** Request bodies are refused with 413 over [`DEFAULT_BODY_LIMIT`]. A route that takes
-//! bigger bodies goes into the `large` group in [`router`] and applies its own limit with
+//! bigger bodies goes into the `large` group in the router built by `router` and applies its own limit with
 //! [`with_body_limit`]; nothing outside the `standard` group gets the default, so every router merged
 //! into `large` must set one. A path may have its methods split between the groups (e.g. `GET` in
 //! `standard`, `POST` in `large`).
@@ -17,6 +24,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use http_body_util::{BodyExt, Limited};
+use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::error::{ApiError, detail_response};
 use crate::state::AppState;
@@ -50,6 +58,38 @@ pub(crate) fn router(state: AppState) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         // The limits above replace axum's own 2 MB default, which would cap the larger routes.
         .layer(DefaultBodyLimit::disable())
+        .layer(middleware::from_fn(json_errors))
+        // Outermost: also catches a panic in the layers above.
+        .layer(CatchPanicLayer::custom(panicked))
+}
+
+/// The backstop for [`ApiError`]'s promise that every error is `{"detail": "..."}`: a 4xx or 5xx
+/// response that is not JSON (an extractor rejection a handler did not convert, a framework error)
+/// becomes `{"detail": "<the status's reason>"}`.
+async fn json_errors(req: Request, next: Next) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if (status.is_client_error() || status.is_server_error()) && !is_json {
+        detail_response(status, status.canonical_reason().unwrap_or("error"))
+    } else {
+        response
+    }
+}
+
+/// What a handler that panicked answers: 500 `server error`; the panic goes to the log.
+fn panicked(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(not a string)");
+    tracing::error!("a handler panicked: {message}");
+    detail_response(StatusCode::INTERNAL_SERVER_ERROR, "server error")
 }
 
 /// Refuses request bodies over `max` bytes on every route of `router` with 413 `{"detail": "too
