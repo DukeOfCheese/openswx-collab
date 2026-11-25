@@ -1,0 +1,18 @@
+{
+  "direction": "c2s",
+  "hex": "82a174a870726573656e6365a46461746183a7706f696e74657292cb3ff8000000000000fea973656c656374696f6e91a26631a4746f6f6ca46c696e65",
+  "json": {
+    "data": {
+      "pointer": [
+        1.5,
+        -2
+      ],
+      "selection": [
+        "f1"
+      ],
+      "tool": "line"
+    },
+    "t": "presence"
+  },
+  "name": "presence"
+}

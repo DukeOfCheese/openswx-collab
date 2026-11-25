@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a4197cc223307484b28dc3028190e85838b0f418f0c5c575a333fa99b1a37a7a # shrinks to root = Map([(Array([Array([Boolean(true)])]), Nil), (Binary([]), Map([(Array([String(Utf8String { s: Ok("a𐀀𐀀A0\0  A𐀀\0𐀀𐀀0 𐀀0𐀀𐀀 ¡¡") })]), Map([(Ext(0, [0, 0, 0, 0, 0, 0, 0]), Integer(NegInt(-32769))), (Integer(PosInt(4294967296)), String(Utf8String { s: Ok("\u{7f}{'#A/\t\u{ba5e4}�Ѩ") }))])), (Array([Integer(PosInt(7570222905561227786))]), String(Utf8String { s: Ok("enzpgouydzaztbvuvgpmavprwmerwazlglocgbxavneecfelozwaqtogazslhdcpxkefozxpxujlbynudfujihtxqhfpndkjgjtsylvjtuemkkcgazmsophbhuegairxmysaluuuifwxxtfvhkjccmireriyiotikstkxirnjmjenxxmxmlirdskznkbhostpqmhzgyeusslrhhnytsfflwryscwncfbwmjahkabxvbqxwblxxavxsxmyjukjhrurbigixtwpcbss") }))]))]), cut = Index(9471016643114362219), flip = Index(144776053844924810), bit = 1, tail = Some(227)

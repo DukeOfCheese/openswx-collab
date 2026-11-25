@@ -1,0 +1,47 @@
+{
+  "scenario": "open",
+  "params": {
+    "doc_bytes": 1000000,
+    "features": 100,
+    "times": 20
+  },
+  "dialect": "v1",
+  "server": "openswx-collab 0.1.2 (protocol 1)",
+  "database": "sqlite",
+  "loadgen_commit": "aedff16",
+  "started_at": "2026-11-25T09:45:54Z",
+  "note": "scenario open-1mb - python server 0.1.2 on SQLite - server and loadgen on same machine",
+  "host": {
+    "os": "Windows 11 Education",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "cpu_threads": 16,
+    "ram_bytes": 16964685824
+  },
+  "duration_s": 0.2302003,
+  "document_bytes": 1000770,
+  "changes_sent": 0,
+  "accepted": 0,
+  "rejected": {},
+  "timeouts": 0,
+  "errors": 0,
+  "protocol_errors": 0,
+  "dropped_connections": 0,
+  "connect_failed": 0,
+  "latency_kind": "open",
+  "latency_ms": {
+    "count": 19,
+    "p50": 6.459,
+    "p90": 7.427,
+    "p99": 7.651,
+    "max": 7.651
+  },
+  "latency_from_schedule_ms": null,
+  "latency_note": "latency_ms is service time: from just before an edit is sent until its answer arrives. latency_from_schedule_ms is measured from the slot the edit was scheduled for (a fixed interval per editor), so a stalled server also shows as waiting for the edits queued behind the stall; no slot is skipped. An edit with no answer after 30 s counts as a timeout and enters both as 30000 ms. For `open`, first_open_ms is the first, cold sample and latency_ms covers the remaining ones.",
+  "first_open_ms": 24.6077,
+  "welcome_bytes": {
+    "min": 1001179,
+    "max": 1001180
+  },
+  "accepted_per_s": 0.0,
+  "server_rss_bytes": null
+}

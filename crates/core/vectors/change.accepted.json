@@ -1,0 +1,10 @@
+{
+  "direction": "s2c",
+  "hex": "83a174af6368616e67652e6163636570746564a96368616e67655f6964a6632d30303037a37365712d",
+  "json": {
+    "change_id": "c-0007",
+    "seq": 45,
+    "t": "change.accepted"
+  },
+  "name": "change.accepted"
+}

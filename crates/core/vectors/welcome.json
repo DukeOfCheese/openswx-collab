@@ -1,0 +1,49 @@
+{
+  "direction": "s2c",
+  "hex": "8aa174a777656c636f6d65a37365712caa70726f6a6563745f6964a6702d30303031a4726f6c65a6656469746f72a9726561645f6f6e6c79c2a3796f7584a9636c69656e745f6964ae75312e636c69656e742d30303031a7757365725f6964a27531a46e616d65a3416461a6636f6c6f7572a723333336366363a5706565727390a56c6f636b7390a662726f6b656e80a7636f6e74656e7481a8666561747572657381a5246c6973749292a24b6684a26964a26631a46e616d65a7536b6574636831a6706172616d7381a1770aa474797065a6736b6574636892a2664b84a26964a26632a46e616d65ad426f73732d4578747275646531a6706172616d7381a56465707468cb4016000000000000a474797065a765787472756465",
+  "json": {
+    "broken": {},
+    "content": {
+      "features": {
+        "$list": [
+          [
+            "Kf",
+            {
+              "id": "f1",
+              "name": "Sketch1",
+              "params": {
+                "w": 10
+              },
+              "type": "sketch"
+            }
+          ],
+          [
+            "fK",
+            {
+              "id": "f2",
+              "name": "Boss-Extrude1",
+              "params": {
+                "depth": 5.5
+              },
+              "type": "extrude"
+            }
+          ]
+        ]
+      }
+    },
+    "locks": [],
+    "peers": [],
+    "project_id": "p-0001",
+    "read_only": false,
+    "role": "editor",
+    "seq": 44,
+    "t": "welcome",
+    "you": {
+      "client_id": "u1.client-0001",
+      "colour": "#3366cc",
+      "name": "Ada",
+      "user_id": "u1"
+    }
+  },
+  "name": "welcome"
+}
