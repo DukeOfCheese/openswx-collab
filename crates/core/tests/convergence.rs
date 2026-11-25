@@ -10,7 +10,7 @@ use std::sync::Arc;
 use common::client::{Client, ToClient};
 use common::{load, path};
 use oswx_core::{
-    Change, ClientId, Head, Index, Op, Path, Pos, Refusal, Rules, Seq, Value, apply, decide,
+    Change, ClientId, Head, Index, Known, Op, Path, Pos, Refusal, Rules, Seq, Value, apply, decide,
 };
 use serde_json::json;
 
@@ -61,9 +61,11 @@ fn initial() -> Value {
     }))
 }
 
-/// The server's side: the head, which changes each client had refused, and what it accepted.
+/// The server's side: the head, which changes each client had accepted and refused, and what it
+/// accepted.
 struct Server {
     head: Head,
+    accepted: HashMap<ClientId, HashSet<Arc<str>>>,
     refused: HashMap<ClientId, HashSet<Arc<str>>>,
     log: Vec<(Seq, ClientId, Vec<Op>)>,
     /// Messages on their way to each client, in the order they were sent.
@@ -78,6 +80,7 @@ impl Server {
                 doc,
                 index: Index::default(),
             },
+            accepted: HashMap::new(),
             refused: HashMap::new(),
             log: Vec::new(),
             outbox: vec![VecDeque::new(); CLIENTS.len()],
@@ -86,10 +89,28 @@ impl Server {
 
     fn receive(&mut self, from: usize, change: Change) {
         let client: ClientId = Arc::from(CLIENTS[from]);
+        let accepted_ids = self.accepted.entry(client.clone()).or_default();
         let refused = self.refused.entry(client.clone()).or_default();
-        let is_refused = |id: &str| refused.contains(id);
-        match decide(&self.head, &client, &change, &is_refused, &Rules::openswx()) {
+        // An id never seen is Unknown, and refused like a refused one.
+        let known = |id: &str| {
+            if accepted_ids.contains(id) {
+                Known::Accepted
+            } else if refused.contains(id) {
+                Known::Refused
+            } else {
+                Known::Unknown
+            }
+        };
+        match decide(
+            &self.head,
+            &client,
+            &change,
+            &known,
+            None,
+            &Rules::openswx(),
+        ) {
             Ok(accepted) => {
+                accepted_ids.insert(change.change_id.clone());
                 let seq = accepted.seq;
                 self.head = Head {
                     seq,

@@ -6,10 +6,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::apply::{Rules, apply_with};
+use crate::apply::{Rules, apply_judged, carried_items};
 use crate::index::{ClientId, Conflict, Index, Seq};
 use crate::limits::MAX_CHANGE_ID;
-use crate::op::{Op, OpError, removed, writes};
+use crate::op::{Op, OpError, Write, removed, writes};
 use crate::path::Path;
 use crate::value::{Id, Value};
 use crate::wire::RejectCode;
@@ -40,6 +40,23 @@ pub struct Accepted {
     pub index: Index,
     /// The operations that take the change back out of `doc`.
     pub inverse: Vec<Op>,
+    /// What the change writes (`writes(&change.ops)`), as recorded in `index`.
+    pub writes: BTreeSet<Write>,
+    /// The items it removes (`removed(&change.ops)`), as recorded in `index`.
+    pub removed: BTreeSet<Path>,
+    /// What it reads (the change's `reads`), as recorded in `index`.
+    pub reads: BTreeSet<Path>,
+}
+
+/// What the caller knows of an earlier change of the same client, named in `depends`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Known {
+    /// It was accepted.
+    Accepted,
+    /// It was refused.
+    Refused,
+    /// The caller has never seen it (or no longer knows it).
+    Unknown,
 }
 
 /// Why a change was refused.
@@ -93,17 +110,23 @@ impl From<OpError> for Refusal {
 
 /// Decide one change against the head. Pure; the caller persists and then adopts `Accepted`.
 ///
-/// `refused(change_id)` says whether that earlier change of the same client was refused. After
-/// checking that the change is well formed, the checks run in this order: a base below the index's
-/// floor is `TooOld`; a refused change in `depends` is `Dependency`; conflicts in the index are
-/// `Stale`; then the operations are applied under `rules`, new ids having to start with
-/// `"<client>."` unless they put back an item whose removal the index still remembers (see
-/// `apply_with`), and an error there is `NameTaken`, `IdTaken` or `Invalid`.
+/// `known(change_id)` says what the caller knows of that earlier change of the same client.
+/// `undo` is the kept inverse of the change `change.undo_of` names, when the caller has it (an
+/// accepted change of the same client); `None` otherwise.
+///
+/// After checking that the change is well formed, the checks run in this order: a base below the
+/// index's floor is `TooOld`; a change in `depends` that is not known to be accepted (refused, or
+/// unknown) is `Dependency`; conflicts in the index are `Stale`; then the operations are applied
+/// under `rules`, new ids having to start with `"<client>."` unless they put back an item whose
+/// removal the index still remembers (see `apply_with`) or `undo` carries an item with that id at
+/// the same path (the undone change took it away from there), and an error there is `NameTaken`,
+/// `IdTaken` or `Invalid`.
 pub fn decide(
     head: &Head,
     client: &ClientId,
     change: &Change,
-    refused: &dyn Fn(&str) -> bool,
+    known: &dyn Fn(&str) -> Known,
+    undo: Option<&[Op]>,
     rules: &Rules,
 ) -> Result<Accepted, Refusal> {
     let id_len = change.change_id.chars().count();
@@ -124,7 +147,7 @@ pub fn decide(
     if change.base < head.index.floor() {
         return Err(Refusal::TooOld);
     }
-    if let Some(dep) = change.depends.iter().find(|d| refused(d)) {
+    if let Some(dep) = change.depends.iter().find(|d| known(d) != Known::Accepted) {
         return Err(Refusal::Dependency(dep.clone()));
     }
     let writes = writes(&change.ops);
@@ -139,7 +162,17 @@ pub fn decide(
     // An item whose removal the index still remembers may be put back by anyone (an undo, or a
     // restore of someone else's deleted item); once that removal is pruned, it may not.
     let existed = |p: &Path| head.index.removed_at(p);
-    let applied = apply_with(&head.doc, &change.ops, rules, Some(&prefix), &existed)?;
+    // Undoing a change that dropped a subtree may bring back the ids it held, at the same paths.
+    let carried = undo.map(carried_items).unwrap_or_default();
+    let kept = |p: &Path| carried.contains(p);
+    let applied = apply_judged(
+        &head.doc,
+        &change.ops,
+        rules,
+        Some(&prefix),
+        &existed,
+        &kept,
+    )?;
     let seq = head.seq + 1;
     Ok(Accepted {
         seq,
@@ -148,5 +181,8 @@ pub fn decide(
             .index
             .record(seq, client, &writes, &removed, &change.reads),
         inverse: applied.inverse,
+        writes,
+        removed,
+        reads: change.reads.clone(),
     })
 }

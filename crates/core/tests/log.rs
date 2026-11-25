@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use common::{load, path};
 use oswx_core::{
-    Accepted, Change, ClientId, ConflictKind, Head, Index, Op, Pos, Refusal, RejectCode, Rules,
-    Seq, Value, decide, diff,
+    Accepted, Change, ClientId, ConflictKind, Head, Index, Known, Op, Pos, Refusal, RejectCode,
+    Rules, Seq, Value, Write, decide, diff,
 };
 use serde_json::json;
 
@@ -46,17 +46,33 @@ fn change(id: &str, base: Seq, ops: Vec<Op>) -> Change {
     }
 }
 
-fn never(_: &str) -> bool {
-    false
+/// Every earlier change was accepted.
+fn never(_: &str) -> Known {
+    Known::Accepted
+}
+
+/// `Refused` for the ids in `refused`, `Accepted` for the others.
+fn refusing<'a>(refused: &'a [&'a str]) -> impl Fn(&str) -> Known + 'a {
+    move |id| {
+        if refused.contains(&id) {
+            Known::Refused
+        } else {
+            Known::Accepted
+        }
+    }
 }
 
 fn decide_for(
     h: &Head,
     who: &str,
     ch: &Change,
-    refused: &dyn Fn(&str) -> bool,
+    known: &dyn Fn(&str) -> Known,
 ) -> Result<Accepted, Refusal> {
-    decide(h, &client(who), ch, refused, &Rules::openswx())
+    decide(h, &client(who), ch, known, None, &Rules::openswx())
+}
+
+fn decide_undo(h: &Head, who: &str, ch: &Change, undo: Option<&[Op]>) -> Result<Accepted, Refusal> {
+    decide(h, &client(who), ch, &never, undo, &Rules::openswx())
 }
 
 /// The head after adopting `a`, as the caller does once it has persisted it.
@@ -167,8 +183,7 @@ fn change_depending_on_a_refused_change_is_refused() {
         decide_for(&h1, "u2.c1", &c1, &never),
         Err(Refusal::Stale(_))
     ));
-    let refused: BTreeSet<&str> = BTreeSet::from(["c1"]);
-    let is_refused = |id: &str| refused.contains(id);
+    let is_refused = refusing(&["c1"]);
     // c2 depends on c1 and sets draft: it would apply, but it builds on a refused change.
     let mut c2 = change(
         "c2",
@@ -206,7 +221,7 @@ fn independent_later_change_survives_a_refusal() {
         decide_for(&h1, "u2.c1", &c1, &never),
         Err(Refusal::Stale(_))
     ));
-    let is_refused = |id: &str| id == "c1";
+    let is_refused = refusing(&["c1"]);
     let c2 = change(
         "c2",
         0,
@@ -526,4 +541,195 @@ fn every_refusal_has_a_reject_code() {
         assert_eq!(refusal.code(), code, "{refusal:?}");
         assert_eq!(refusal.code().as_str(), name);
     }
+}
+
+#[test]
+fn a_dependency_the_caller_does_not_know_is_refused() {
+    let mut ch = change(
+        "c2",
+        0,
+        vec![set(&["features", "f1", "params", "draft"], 3)],
+    );
+    ch.depends = vec![Arc::from("c1")];
+    let unknown = |_: &str| Known::Unknown;
+    assert_eq!(
+        decide_for(&head(), "u1.c1", &ch, &unknown).unwrap_err(),
+        Refusal::Dependency(Arc::from("c1"))
+    );
+    assert!(decide_for(&head(), "u1.c1", &ch, &never).is_ok());
+    assert_eq!(
+        decide_for(&head(), "u1.c1", &ch, &refusing(&["c1"])).unwrap_err(),
+        Refusal::Dependency(Arc::from("c1"))
+    );
+}
+
+#[test]
+fn accepted_carries_what_it_recorded_in_the_index() {
+    let mut ch = change(
+        "a",
+        0,
+        vec![
+            set(&["features", "f1", "params", "depth"], 20),
+            Op::Remove {
+                list: path(&["features"]),
+                id: Arc::from("f2"),
+            },
+            Op::Move {
+                list: path(&["features"]),
+                id: Arc::from("f1"),
+                pos: Pos::between(None, None),
+            },
+        ],
+    );
+    ch.reads = BTreeSet::from([path(&["variables"])]);
+    let a = decide_for(&head(), "u1.c1", &ch, &never).unwrap();
+    assert_eq!(
+        a.writes,
+        BTreeSet::from([
+            Write::At(path(&["features", "f1", "params", "depth"])),
+            Write::At(path(&["features", "f2"])),
+            Write::Position(path(&["features"]), Arc::from("f1")),
+        ])
+    );
+    assert_eq!(a.removed, BTreeSet::from([path(&["features", "f2"])]));
+    assert_eq!(a.reads, ch.reads);
+    // Recording them again into the head's index gives the accepted index.
+    let again = head()
+        .index
+        .record(1, &client("u1.c1"), &a.writes, &a.removed, &a.reads);
+    assert_eq!(again.to_wire(), a.index.to_wire());
+}
+
+/// A head whose legacy feature `f1` holds a sketch with another client's entity and a legacy one,
+/// and the change by `u1.c1` that replaced the whole sketch with an empty one (accepted, adopted),
+/// with its inverse.
+fn sketch_replaced() -> (Head, Vec<Op>) {
+    let h0 = Head {
+        seq: 0,
+        doc: load(json!({
+            "features": [{"id": "f1", "name": "Sketch1", "params": {"sketch": {"entities": [
+                {"id": "u2.c1.5", "kind": "line", "sub": [{"id": "u2.c1.6"}]},
+                {"id": "e9", "kind": "arc"},
+            ]}}}],
+            "other": {},
+        })),
+        index: Index::default(),
+    };
+    let replace = change(
+        "rep",
+        0,
+        vec![Op::Set {
+            path: path(&["features", "f1", "params", "sketch"]),
+            value: load(json!({"entities": []})),
+        }],
+    );
+    let a = decide_for(&h0, "u1.c1", &replace, &never).unwrap();
+    let inverse = a.inverse.clone();
+    (adopt(a), inverse)
+}
+
+#[test]
+fn undoing_a_set_that_replaced_a_subtree_of_foreign_ids_needs_the_kept_inverse() {
+    let (h1, inverse) = sketch_replaced();
+    let mut ch = undo(inverse.clone(), 1);
+    ch.undo_of = Some(Arc::from("rep"));
+    // Without the kept inverse, the other client's and the legacy ids are foreign.
+    assert!(matches!(
+        decide_undo(&h1, "u1.c1", &ch, None),
+        Err(Refusal::Invalid(_))
+    ));
+    // With it, the subtree comes back exactly.
+    let a = decide_undo(&h1, "u1.c1", &ch, Some(&inverse)).unwrap();
+    assert_eq!(
+        a.doc.at(&["features", "f1", "params", "sketch"]),
+        sketch_replaced_original().at(&["features", "f1", "params", "sketch"])
+    );
+}
+
+fn sketch_replaced_original() -> Value {
+    load(json!({
+        "features": [{"id": "f1", "name": "Sketch1", "params": {"sketch": {"entities": [
+            {"id": "u2.c1.5", "kind": "line", "sub": [{"id": "u2.c1.6"}]},
+            {"id": "e9", "kind": "arc"},
+        ]}}}],
+        "other": {},
+    }))
+}
+
+#[test]
+fn the_kept_inverse_exempts_only_the_ids_it_carried_where_it_carried_them() {
+    let (h1, inverse) = sketch_replaced();
+    let sketch = path(&["features", "f1", "params", "sketch"]);
+    let with_undo = |ops: Vec<Op>| {
+        let mut ch = change("u", 1, ops);
+        ch.undo_of = Some(Arc::from("rep"));
+        decide_undo(&h1, "u1.c1", &ch, Some(&inverse))
+    };
+    // A foreign id the inverse did not carry, beside the ones it did: refused.
+    let extra = load(json!({"entities": [
+        {"id": "u2.c1.5", "kind": "line", "sub": [{"id": "u2.c1.6"}]},
+        {"id": "e9", "kind": "arc"},
+        {"id": "u3.c1.1", "kind": "arc"},
+    ]}));
+    assert!(matches!(
+        with_undo(vec![Op::Set {
+            path: sketch.clone(),
+            value: extra,
+        }]),
+        Err(Refusal::Invalid(_))
+    ));
+    // A foreign id slipped inside a carried item: refused (only the carried id is exempt).
+    let inside = load(json!({"entities": [
+        {"id": "u2.c1.5", "kind": "line", "sub": [{"id": "u2.c1.6"}, {"id": "u3.c1.2"}]},
+    ]}));
+    assert!(matches!(
+        with_undo(vec![Op::Set {
+            path: sketch.clone(),
+            value: inside,
+        }]),
+        Err(Refusal::Invalid(_))
+    ));
+    // A carried id put somewhere else: refused.
+    let elsewhere = load(json!({"entities": [{"id": "u2.c1.5", "kind": "line"}]}));
+    assert!(matches!(
+        with_undo(vec![Op::Set {
+            path: path(&["other", "sketch"]),
+            value: elsewhere,
+        }]),
+        Err(Refusal::Invalid(_))
+    ));
+    // A part of what it carried, at the same path: accepted.
+    let part = load(json!({"entities": [{"id": "e9", "kind": "arc"}]}));
+    assert!(
+        with_undo(vec![Op::Set {
+            path: sketch.clone(),
+            value: part,
+        }])
+        .is_ok()
+    );
+    // The client's own new ids are fine as always.
+    let own = load(json!({"entities": [{"id": "u1.c1.1", "kind": "arc"}]}));
+    assert!(
+        with_undo(vec![Op::Set {
+            path: sketch,
+            value: own,
+        }])
+        .is_ok()
+    );
+}
+
+#[test]
+fn the_kept_inverse_of_an_insert_lets_its_item_back() {
+    // u1.c1 removed another client's feature; the inverse is an Insert of it. Prune the index so
+    // the removal is no longer remembered: only the kept inverse lets it back.
+    let (h1, inverse) = f1_removed_by("u1.c1");
+    let mut pruned = h1.clone();
+    pruned.index = pruned.index.prune(1);
+    let ch = undo(inverse.clone(), 1);
+    assert!(matches!(
+        decide_undo(&pruned, "u1.c1", &ch, None),
+        Err(Refusal::Invalid(_))
+    ));
+    let a = decide_undo(&pruned, "u1.c1", &ch, Some(&inverse)).unwrap();
+    assert_eq!(a.doc, head().doc);
 }

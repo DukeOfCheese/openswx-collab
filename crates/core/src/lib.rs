@@ -14,7 +14,7 @@ pub mod wire;
 pub use apply::{Applied, Rules, apply, apply_with};
 pub use diff::diff;
 pub use index::{ClientId, Conflict, ConflictKind, Index, Seq};
-pub use log::{Accepted, Change, Head, Refusal, decide};
+pub use log::{Accepted, Change, Head, Known, Refusal, decide};
 pub use op::{MAX_DEPTH, MAX_NAME, Op, OpError, PROTECTED, Write, removed, writes};
 pub use path::Path;
 pub use pos::Pos;

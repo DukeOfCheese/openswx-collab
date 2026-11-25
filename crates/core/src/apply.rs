@@ -64,6 +64,22 @@ pub fn apply_with(
     id_prefix: Option<&str>,
     existed: &dyn Fn(&Path) -> bool,
 ) -> Result<Applied, OpError> {
+    apply_judged(doc, ops, rules, id_prefix, existed, &|_| false)
+}
+
+/// `apply_with`, told also which items a kept inverse carries. `kept(path)` (a keyed list's path
+/// plus an item id, built the way the prefix check walks values: see [`carried_items`]) says that
+/// the change being undone took an item with that id away from that path; the id may come back
+/// there whoever made it. Unlike `existed`, it exempts that one id only: the items inside it are
+/// judged one by one, so an id the inverse did not carry is still refused.
+pub(crate) fn apply_judged(
+    doc: &Value,
+    ops: &[Op],
+    rules: &Rules,
+    id_prefix: Option<&str>,
+    existed: &dyn Fn(&Path) -> bool,
+    kept: &dyn Fn(&Path) -> bool,
+) -> Result<Applied, OpError> {
     let mut out = doc.clone();
     let mut inverse = Vec::with_capacity(ops.len());
     let mut introduced = Introduced::default();
@@ -73,7 +89,7 @@ pub fn apply_with(
         out = next;
         inverse.push(undo);
         if id_prefix.is_some() {
-            introduced.note(doc, op, existed);
+            introduced.note(doc, op, existed, kept);
         }
         for ((list, field), t) in rules.unique.iter().zip(&mut touched) {
             t.note(op, list, field);
@@ -339,7 +355,13 @@ struct Introduced {
 
 impl Introduced {
     /// `before` is the document before the whole change; `existed` as for `apply_with`.
-    fn note(&mut self, before: &Value, op: &Op, existed: &dyn Fn(&Path) -> bool) {
+    fn note(
+        &mut self,
+        before: &Value,
+        op: &Op,
+        existed: &dyn Fn(&Path) -> bool,
+        kept: &dyn Fn(&Path) -> bool,
+    ) {
         match op {
             Op::Set { path, value } => {
                 // Ids anywhere under the Set's path before the change are not new for it, wherever
@@ -349,7 +371,8 @@ impl Introduced {
                 // edit would need per-list bookkeeping. An item moved by Remove and Insert into a
                 // different list is judged by the Insert and needs new ids (spec, amendment 4).
                 let set = Held { before, path };
-                self.walk(value, &mut path.clone(), true, Some(&set), existed);
+                let judge = Judge { existed, kept };
+                self.walk(value, &mut path.clone(), true, Some(&set), &judge);
             }
             Op::Insert { list, item, .. } => {
                 if let Some(id) = item_id(item) {
@@ -357,8 +380,11 @@ impl Introduced {
                     if existed(&at) {
                         return; // A remembered removal: the item, and all in it, may come back.
                     }
-                    self.at.insert((list.clone(), id.clone()));
-                    self.walk(item, &mut at.clone(), true, None, existed);
+                    if !kept(&at) {
+                        self.at.insert((list.clone(), id.clone()));
+                    }
+                    let judge = Judge { existed, kept };
+                    self.walk(item, &mut at.clone(), true, None, &judge);
                 }
             }
             Op::Unset { .. } | Op::Remove { .. } | Op::Move { .. } => {}
@@ -378,21 +404,21 @@ impl Introduced {
     }
 
     /// Notes the item ids in `v`, which sits at `path`, except those the Set (if `v` is written by
-    /// one) already held and the items (with everything in them) whose removal `existed`
-    /// remembers.
+    /// one) already held, those the kept inverse carried at the same path, and the items (with
+    /// everything in them) whose removal `existed` remembers.
     fn walk(
         &mut self,
         v: &Value,
         path: &mut Path,
         reachable: bool,
         held: Option<&Held>,
-        existed: &dyn Fn(&Path) -> bool,
+        judge: &Judge,
     ) {
         match v {
             Value::Map(m) => {
                 for (k, child) in m.iter() {
                     path.push(k.clone());
-                    self.walk(child, path, reachable, held, existed);
+                    self.walk(child, path, reachable, held, judge);
                     path.pop();
                 }
             }
@@ -400,22 +426,22 @@ impl Introduced {
                 for (id, _, item) in k.iter() {
                     let list = path.clone();
                     path.push(id.clone());
-                    if !(reachable && existed(path)) {
-                        if held.is_some_and(|set| self.was_held(set, id)) {
-                            // Was there before.
+                    if !(reachable && (judge.existed)(path)) {
+                        if (judge.kept)(path) || held.is_some_and(|set| self.was_held(set, id)) {
+                            // Was there before, or the change being undone took it from here.
                         } else if reachable {
                             self.at.insert((list, id.clone()));
                         } else {
                             self.unreachable.push(id.clone());
                         }
-                        self.walk(item, path, reachable, held, existed);
+                        self.walk(item, path, reachable, held, judge);
                     }
                     path.pop();
                 }
             }
             Value::List(items) => {
                 for item in items.iter() {
-                    self.walk(item, path, false, held, existed);
+                    self.walk(item, path, false, held, judge);
                 }
             }
             _ => {}
@@ -435,6 +461,57 @@ impl Introduced {
             None => Ok(()),
         }
     }
+}
+
+/// What lets an id in without the client's prefix: a remembered removal (`existed`, which lets in
+/// the whole item) or the kept inverse of the change being undone (`kept`, that id only).
+struct Judge<'a> {
+    existed: &'a dyn Fn(&Path) -> bool,
+    kept: &'a dyn Fn(&Path) -> bool,
+}
+
+/// The paths of the items `ops` carry in their values: for every Set value and Insert item, each
+/// keyed-list item in it at the path (list path plus id) where the prefix check finds it. Items in
+/// keyed lists inside plain lists get the path the check builds for them too (map keys and item ids
+/// from the nearest path above, the plain list itself adding nothing), so a value carried back the
+/// way it was matches item for item.
+pub(crate) fn carried_items(ops: &[Op]) -> HashSet<Path> {
+    fn walk(v: &Value, path: &mut Path, out: &mut HashSet<Path>) {
+        match v {
+            Value::Map(m) => {
+                for (k, child) in m.iter() {
+                    path.push(k.clone());
+                    walk(child, path, out);
+                    path.pop();
+                }
+            }
+            Value::Keyed(k) => {
+                for (id, _, item) in k.iter() {
+                    path.push(id.clone());
+                    out.insert(path.clone());
+                    walk(item, path, out);
+                    path.pop();
+                }
+            }
+            Value::List(items) => items.iter().for_each(|item| walk(item, path, out)),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for op in ops {
+        match op {
+            Op::Set { path, value } => walk(value, &mut path.clone(), &mut out),
+            Op::Insert { list, item, .. } => {
+                if let Some(id) = item_id(item) {
+                    let mut at = child(list, id);
+                    out.insert(at.clone());
+                    walk(item, &mut at, &mut out);
+                }
+            }
+            Op::Unset { .. } | Op::Remove { .. } | Op::Move { .. } => {}
+        }
+    }
+    out
 }
 
 /// A Set being judged: its path, in the document before the change.
