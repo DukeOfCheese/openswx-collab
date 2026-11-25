@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use oswx_core::{Pos, Value, ValueError};
+use proptest::prelude::*;
 use serde_json::json;
 
 fn to_plain(j: serde_json::Value) -> rmpv::Value {
@@ -292,4 +293,114 @@ fn wire_depth_and_key_limits() {
         Value::from_wire(&wire(json!({ "k".repeat(201): 1 }))),
         Err(ValueError::KeyTooLong)
     );
+}
+
+#[test]
+fn wire_plain_list_of_items_with_ids_is_refused() {
+    // As plain data it would be a keyed list: the two forms of one document must agree.
+    let wire = |j| to_plain(j);
+    for bad in [
+        json!([{"id": "u2.c1.1"}]),
+        json!([{"id": "a", "x": 1}, {"id": "b"}]),
+        json!({"m": [{"id": "a"}]}),
+        json!([[{"id": "a"}]]),
+        json!([{"id": ""}]),
+    ] {
+        assert_eq!(
+            Value::from_wire(&wire(bad.clone())),
+            Err(ValueError::Unsupported),
+            "{bad}"
+        );
+    }
+    // An id too long is refused as `from_plain` refuses it.
+    assert_eq!(
+        Value::from_wire(&wire(json!([{"id": "x".repeat(201)}]))),
+        Err(ValueError::KeyTooLong)
+    );
+    // Lists that are plain in both forms pass.
+    for fine in [
+        json!([]),
+        json!([1, 2]),
+        json!([{"id": "a"}, {"id": "a"}]),
+        json!([{"id": "a"}, {"x": 1}]),
+        json!([{"id": 1}]),
+        json!([{"x": 1}]),
+    ] {
+        let v = Value::from_wire(&wire(fine.clone())).unwrap();
+        assert!(matches!(v, Value::List(_)), "{fine}");
+        assert_eq!(Value::from_plain(&v.to_plain()).unwrap(), v, "{fine}");
+    }
+    // The keyed form of the same items passes.
+    let keyed_form = load(json!([{"id": "a"}])).unwrap().to_wire();
+    assert!(matches!(Value::from_wire(&keyed_form), Ok(Value::Keyed(_))));
+}
+
+/// A value's shape: which containers are keyed lists and which plain. An empty keyed list and an
+/// empty plain list have the same shape (both are written `[]` as plain data).
+#[derive(Debug, PartialEq)]
+enum Shape {
+    Leaf,
+    Plain(Vec<Shape>),
+    Keyed(Vec<(String, Shape)>),
+    Map(Vec<(String, Shape)>),
+}
+
+fn shape(v: &Value) -> Shape {
+    match v {
+        Value::List(l) if l.is_empty() => Shape::Plain(vec![]),
+        Value::Keyed(k) if k.is_empty() => Shape::Plain(vec![]),
+        Value::List(l) => Shape::Plain(l.iter().map(shape).collect()),
+        Value::Keyed(k) => Shape::Keyed(
+            k.iter()
+                .map(|(id, _, c)| (id.to_string(), shape(c)))
+                .collect(),
+        ),
+        Value::Map(m) => Shape::Map(m.iter().map(|(k, c)| (k.to_string(), shape(c))).collect()),
+        _ => Shape::Leaf,
+    }
+}
+
+/// Wire trees full of lists of maps with ids, distinct or not, plain or in keyed form.
+fn arb_wire() -> impl Strategy<Value = rmpv::Value> {
+    use rmpv::Value as P;
+    let leaf = prop_oneof![
+        Just(P::Nil),
+        (0i64..3).prop_map(P::from),
+        prop_oneof![Just("a"), Just("b"), Just("")].prop_map(P::from),
+    ];
+    leaf.prop_recursive(4, 32, 4, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..4).prop_map(P::Array),
+            prop::collection::btree_map(prop_oneof![Just("id"), Just("x")], inner.clone(), 0..3)
+                .prop_map(|m| P::Map(m.into_iter().map(|(k, v)| (P::from(k), v)).collect())),
+            prop::collection::vec(inner, 0..3).prop_map(|items| {
+                let entries = items
+                    .into_iter()
+                    .zip(Pos::spread(3))
+                    .enumerate()
+                    .map(|(i, (v, pos))| {
+                        let item = P::Map(vec![
+                            (P::from("id"), P::from(format!("k{i}"))),
+                            (P::from("v"), v),
+                        ]);
+                        P::Array(vec![P::from(pos.as_str()), item])
+                    })
+                    .collect();
+                P::Map(vec![(P::from("$list"), P::Array(entries))])
+            }),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn wire_and_plain_forms_agree_on_shape(w in arb_wire()) {
+        if let Ok(v) = Value::from_wire(&w) {
+            let back = Value::from_plain(&v.to_plain());
+            prop_assert!(back.is_ok(), "{:?}", back);
+            prop_assert_eq!(shape(&back.unwrap()), shape(&v));
+        }
+    }
 }

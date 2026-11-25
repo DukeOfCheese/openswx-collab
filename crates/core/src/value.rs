@@ -311,6 +311,17 @@ fn from_wire_at(p: &Plain, depth: usize) -> Result<Value, ValueError> {
             Ok(Value::Map(to_map(&pairs, |v| from_wire_at(v, depth))?))
         }
         Plain::Array(items) => {
+            // A list `from_plain` would make keyed is only ever sent in keyed form, so that the
+            // wire form and the plain form of a document always agree.
+            let ids: Option<Vec<&str>> = items.iter().map(item_id).collect();
+            if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+                for id in &ids {
+                    check_name(id)?;
+                }
+                if ids.iter().collect::<BTreeSet<_>>().len() == ids.len() {
+                    return Err(ValueError::Unsupported);
+                }
+            }
             let items = items
                 .iter()
                 .map(|i| from_wire_at(i, depth))

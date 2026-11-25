@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bb79e4aa0560ef3252621be8ce364ee90e001880a29a1fc1220a5f95e628cb5f # shrinks to w = Array([Map([(String(Utf8String { s: Ok("id") }), String(Utf8String { s: Ok("a") }))])])

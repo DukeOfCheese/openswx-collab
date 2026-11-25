@@ -270,6 +270,16 @@ fn hostile_values() {
     )));
     invalid(Op::from_wire(&set(a(), nested(65))));
     Op::from_wire(&set(a(), nested(64))).unwrap();
+    // A plain list that plain data would read as keyed is refused; its keyed form is not.
+    invalid(Op::from_wire(&set(
+        a(),
+        Plain::Array(vec![item("u2.c1.1")]),
+    )));
+    let keyed = m(vec![(
+        "$list",
+        Plain::Array(vec![Plain::Array(vec![s("V"), item("u2.c1.1")])]),
+    )]);
+    Op::from_wire(&set(a(), keyed)).unwrap();
     // The inserted item is checked as a value too.
     let nan = m(vec![("id", s("a")), ("x", Plain::F64(f64::NAN))]);
     invalid(Op::from_wire(&insert(arr(&["l"]), nan, s("V"))));
