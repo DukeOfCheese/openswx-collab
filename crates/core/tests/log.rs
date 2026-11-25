@@ -6,7 +6,7 @@ use std::sync::Arc;
 use common::{load, path};
 use oswx_core::{
     Accepted, Change, ClientId, ConflictKind, Head, Index, Known, Op, Pos, Refusal, RejectCode,
-    Rules, Seq, Value, Write, decide, diff,
+    Rules, SERVER_CLIENT, Seq, Value, Write, decide, decide_server, diff,
 };
 use serde_json::json;
 
@@ -747,4 +747,75 @@ fn the_kept_inverse_is_ignored_unless_the_change_is_an_undo() {
     // Marked as one: it is.
     ch.undo_of = Some(Arc::from("rep"));
     assert!(decide_undo(&h1, "u1.c1", &ch, Some(&inverse)).is_ok());
+}
+
+// ------------------------------------------------------------------ server-made changes
+
+#[test]
+fn the_server_can_put_back_a_legacy_id_whose_removal_is_forgotten() {
+    let (removed, inverse) = f1_removed_by("u1.c1");
+    // The removal's mark is pruned: no client could put f1 back now.
+    let pruned = Head {
+        index: removed.index.prune(removed.seq),
+        ..removed
+    };
+    let back = change("restore", pruned.seq, inverse);
+    assert!(matches!(
+        decide_for(&pruned, "u2.c1", &back, &never),
+        Err(Refusal::Invalid(_))
+    ));
+    let a = decide_server(&pruned, &back, &Rules::openswx(), false).expect("accepted");
+    assert!(a.doc.at(&["features", "f1"]).is_some());
+    // The index records the server client.
+    let h = adopt(a);
+    // (Made on the head before the server's change, at the floor.)
+    let later = change(
+        "later",
+        1,
+        vec![set(&["features", "f1", "params", "depth"], 3)],
+    );
+    let refused = decide_for(&h, "u1.c1", &later, &never);
+    let Err(Refusal::Stale(conflicts)) = refused else {
+        panic!("expected a conflict with the server's change: {refused:?}")
+    };
+    assert_eq!(&*conflicts[0].by, SERVER_CLIENT);
+}
+
+#[test]
+fn the_servers_changes_still_keep_names_unique_and_staleness_is_asked_for() {
+    let h = head();
+    let clash = change(
+        "rename",
+        0,
+        vec![Op::Set {
+            path: path(&["features", "f2", "name"]),
+            value: Value::Str(Arc::from("Sketch1")),
+        }],
+    );
+    assert_eq!(
+        decide_server(&h, &clash, &Rules::openswx(), false).err(),
+        Some(Refusal::NameTaken(Arc::from("Sketch1")))
+    );
+    // Someone writes f1's depth at seq 1; a server change on base 0 writing it too is stale only
+    // when the caller asks.
+    let h = adopt(
+        decide_for(
+            &h,
+            "u1.c1",
+            &change("c", 0, vec![set(&["features", "f1", "params", "depth"], 1)]),
+            &never,
+        )
+        .unwrap(),
+    );
+    let restore = change(
+        "restore",
+        0,
+        vec![set(&["features", "f1", "params", "depth"], 10)],
+    );
+    assert!(matches!(
+        decide_server(&h, &restore, &Rules::openswx(), true),
+        Err(Refusal::Stale(_))
+    ));
+    let a = decide_server(&h, &restore, &Rules::openswx(), false).unwrap();
+    assert_eq!(a.seq, 2);
 }

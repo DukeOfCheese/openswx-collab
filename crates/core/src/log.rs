@@ -132,6 +132,53 @@ pub fn decide(
     undo: Option<&[Op]>,
     rules: &Rules,
 ) -> Result<Accepted, Refusal> {
+    judge(head, client, change, known, undo, rules, true, true)
+}
+
+/// The client id under which the index records a change the server made (a restore, a revert from
+/// history). A real client is `<user id>.<client id>`, which never starts with `~`.
+pub const SERVER_CLIENT: &str = "~server";
+
+/// Decide a change the server makes itself (a restore, a revert from history), recorded in the
+/// index under [`SERVER_CLIENT`].
+///
+/// Unlike [`decide`], ids are not checked against a client prefix: a restore puts items back under
+/// their original ids, whoever made them and however long ago they were removed. The document's
+/// `rules` (unique names) still apply, and so do the shape checks. `depends` and `undo_of` are not
+/// consulted. Staleness (conflicts in the index after `change.base`, and a base below the index's
+/// floor) is checked only when `check_stale`.
+pub fn decide_server(
+    head: &Head,
+    change: &Change,
+    rules: &Rules,
+    check_stale: bool,
+) -> Result<Accepted, Refusal> {
+    let client: ClientId = Arc::from(SERVER_CLIENT);
+    judge(
+        head,
+        &client,
+        change,
+        &|_| Known::Accepted,
+        None,
+        rules,
+        check_stale,
+        false,
+    )
+}
+
+/// [`decide`] and [`decide_server`]: `check_stale` judges the index; `client_ids` holds new ids to
+/// the client's prefix (and consults `depends`).
+#[allow(clippy::too_many_arguments)]
+fn judge(
+    head: &Head,
+    client: &ClientId,
+    change: &Change,
+    known: &dyn Fn(&str) -> Known,
+    undo: Option<&[Op]>,
+    rules: &Rules,
+    check_stale: bool,
+    client_ids: bool,
+) -> Result<Accepted, Refusal> {
     let id_len = change.change_id.chars().count();
     if !(1..=MAX_CHANGE_ID).contains(&id_len) {
         return Err(Refusal::Invalid(format!(
@@ -147,21 +194,24 @@ pub fn decide(
     if change.base > head.seq {
         return Err(Refusal::Invalid("base is ahead of the document".into()));
     }
-    if change.base < head.index.floor() {
+    if check_stale && change.base < head.index.floor() {
         return Err(Refusal::TooOld);
     }
-    if let Some(dep) = change.depends.iter().find(|d| known(d) != Known::Accepted) {
+    if client_ids && let Some(dep) = change.depends.iter().find(|d| known(d) != Known::Accepted) {
         return Err(Refusal::Dependency(dep.clone()));
     }
     let writes = writes(&change.ops);
     let removed = removed(&change.ops);
-    let conflicts = head
-        .index
-        .check(change.base, client, &writes, &removed, &change.reads);
-    if !conflicts.is_empty() {
-        return Err(Refusal::Stale(conflicts));
+    if check_stale {
+        let conflicts = head
+            .index
+            .check(change.base, client, &writes, &removed, &change.reads);
+        if !conflicts.is_empty() {
+            return Err(Refusal::Stale(conflicts));
+        }
     }
     let prefix = format!("{client}.");
+    let id_prefix = client_ids.then_some(prefix.as_str());
     // An item whose removal the index still remembers may be put back by anyone (an undo, or a
     // restore of someone else's deleted item); once that removal is pruned, it may not.
     let existed = |p: &Path| head.index.removed_at(p);
@@ -171,14 +221,7 @@ pub fn decide(
         .map(carried_items)
         .unwrap_or_default();
     let kept = |p: &Path| carried.contains(p);
-    let applied = apply_judged(
-        &head.doc,
-        &change.ops,
-        rules,
-        Some(&prefix),
-        &existed,
-        &kept,
-    )?;
+    let applied = apply_judged(&head.doc, &change.ops, rules, id_prefix, &existed, &kept)?;
     let seq = head.seq + 1;
     Ok(Accepted {
         seq,
