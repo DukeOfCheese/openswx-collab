@@ -296,6 +296,36 @@ fn wire_depth_and_key_limits() {
 }
 
 #[test]
+fn the_wire_list_key_is_never_an_item_id() {
+    use rmpv::Value as P;
+    let entry = |id: &str| {
+        P::Array(vec![
+            P::from("V"),
+            P::Map(vec![(P::from("id"), P::from(id))]),
+        ])
+    };
+    let list = |entries: Vec<P>| P::Map(vec![(P::from("$list"), P::Array(entries))]);
+    assert_eq!(
+        Value::from_wire(&list(vec![entry("$list")])),
+        Err(ValueError::Unsupported)
+    );
+    let nested = P::Map(vec![(P::from("a"), list(vec![entry("$list")]))]);
+    assert_eq!(Value::from_wire(&nested), Err(ValueError::Unsupported));
+    assert_eq!(load(json!([{"id": "$list"}])), Err(ValueError::Unsupported));
+    assert_eq!(
+        load(json!({"a": [{"id": "x"}, {"id": "$list"}]})),
+        Err(ValueError::Unsupported)
+    );
+    // Similar ids are ordinary, and a plain list (repeated ids) may hold it as data.
+    assert!(Value::from_wire(&list(vec![entry("$lists")])).is_ok());
+    assert!(load(json!([{"id": "$"}])).is_ok());
+    assert!(matches!(
+        load(json!([{"id": "$list"}, {"id": "$list"}])),
+        Ok(Value::List(_))
+    ));
+}
+
+#[test]
 fn wire_plain_list_of_items_with_ids_is_refused() {
     // As plain data it would be a keyed list: the two forms of one document must agree.
     let wire = |j| to_plain(j);

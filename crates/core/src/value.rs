@@ -130,7 +130,7 @@ impl Value {
     }
 
     /// Converts ordinary data. A non-empty list of maps with distinct string `id`s becomes a keyed
-    /// list with evenly spread positions.
+    /// list with evenly spread positions; such a list with the id `$list` is refused.
     pub fn from_plain(p: &Plain) -> Result<Value, ValueError> {
         from_plain_at(p, 0)
     }
@@ -275,6 +275,9 @@ fn from_plain_at(p: &Plain, depth: usize) -> Result<Value, ValueError> {
                     check_name(id)?;
                 }
                 if ids.iter().collect::<BTreeSet<_>>().len() == ids.len() {
+                    if ids.contains(&LIST_KEY) {
+                        return Err(ValueError::Unsupported);
+                    }
                     let mut list = KeyedList::new();
                     for ((id, item), pos) in ids.iter().zip(items).zip(Pos::spread(items.len())) {
                         list = list.inserted(Arc::from(*id), pos, from_plain_at(item, depth)?);
@@ -347,6 +350,9 @@ fn keyed_from_wire(list: &Plain, depth: usize) -> Result<Value, ValueError> {
         let pos = pos.as_str().and_then(Pos::parse).ok_or(ValueError::BadId)?;
         let id: Id = Arc::from(item_id(item).ok_or(ValueError::BadId)?);
         check_name(&id)?;
+        if &*id == LIST_KEY {
+            return Err(ValueError::Unsupported);
+        }
         if out.get(&id).is_some() {
             return Err(ValueError::DuplicateId(id));
         }
