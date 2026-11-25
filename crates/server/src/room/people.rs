@@ -117,6 +117,8 @@ impl Room {
             req.outbox.close(close::MOVED, "reconnect");
             return;
         }
+        // Dead locks go before anyone's are taken up again (or handed to a replacement).
+        self.expire_locks();
         if let Some(old) = self.by_client.get(&req.client).copied() {
             // Popped first: its leaving is not announced.
             self.remove_conn(
@@ -243,7 +245,12 @@ impl Room {
             // Worked out again at its next join (client ids can be made up at will).
             self.recent.set_complete(&c.client, false);
         }
-        self.publish_online();
+        if announce {
+            // (A replaced connection's successor joins at once: no flicker in the online list.)
+            self.publish_online();
+        }
+        // Releases it made that still wait to be announced go now.
+        self.flush_lock_news(conn);
         // For this task the refused ids are forgotten when the connection goes (TASK 12: after a
         // grace period instead).
         self.refused.remove(&c.client);

@@ -29,7 +29,8 @@ pub(super) fn is_live(msg: &ClientMsg) -> bool {
     matches!(msg, ClientMsg::Presence { .. } | ClientMsg::Draft { .. })
 }
 
-/// A token bucket of `rate` tokens that refills at `rate` a second; it starts full.
+/// A token bucket that starts full: it holds at most `capacity` tokens and refills at `rate` a
+/// second.
 #[derive(Debug, Clone)]
 pub(super) struct Bucket {
     tokens: f64,
@@ -46,13 +47,13 @@ impl Default for Bucket {
 }
 
 impl Bucket {
-    /// Takes a token at `now` if there is one.
-    pub(super) fn take(&mut self, rate: f64, now: f64) -> bool {
-        let refill = self.at.map_or(rate, |at| (now - at).max(0.0) * rate);
-        self.tokens = (self.tokens + refill).min(rate);
+    /// Takes `cost` tokens at `now` if there are that many; otherwise takes none.
+    pub(super) fn take(&mut self, cost: f64, capacity: f64, rate: f64, now: f64) -> bool {
+        let refill = self.at.map_or(capacity, |at| (now - at).max(0.0) * rate);
+        self.tokens = (self.tokens + refill).min(capacity);
         self.at = Some(now);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -68,7 +69,7 @@ impl Room {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
         };
-        if !c.live_rate.take(rate, now) {
+        if !c.live_rate.take(1.0, rate, rate, now) {
             return metrics::presence_dropped();
         }
         let client_id = c.client.clone();
@@ -121,16 +122,31 @@ mod tests {
 
     #[test]
     fn a_bucket_starts_full_and_refills_by_the_second() {
+        let take = |b: &mut Bucket, now: f64| b.take(1.0, 60.0, 60.0, now);
         let mut b = Bucket::default();
-        assert!((0..60).all(|_| b.take(60.0, 100.0)));
-        assert!(!b.take(60.0, 100.0), "the 61st in the same second");
-        assert!(b.take(60.0, 101.0), "the next second");
-        assert!((0..59).all(|_| b.take(60.0, 101.0)));
-        assert!(!b.take(60.0, 101.0));
-        assert!(b.take(60.0, 101.5), "half a second is thirty");
-        // It never holds more than a second's worth.
+        assert!((0..60).all(|_| take(&mut b, 100.0)));
+        assert!(!take(&mut b, 100.0), "the 61st in the same second");
+        assert!(take(&mut b, 101.0), "the next second");
+        assert!((0..59).all(|_| take(&mut b, 101.0)));
+        assert!(!take(&mut b, 101.0));
+        assert!(take(&mut b, 101.5), "half a second is thirty");
+        // It never holds more than its capacity.
         let mut b = Bucket::default();
-        b.take(5.0, 0.0);
-        assert_eq!((0..100).filter(|_| b.take(5.0, 1000.0)).count(), 5);
+        b.take(1.0, 5.0, 5.0, 0.0);
+        assert_eq!(
+            (0..100).filter(|_| b.take(1.0, 5.0, 5.0, 1000.0)).count(),
+            5
+        );
+    }
+
+    #[test]
+    fn a_costly_request_is_paid_in_full_or_not_at_all() {
+        let mut b = Bucket::default();
+        assert!(b.take(256.0, 512.0, 64.0, 0.0));
+        assert!(b.take(256.0, 512.0, 64.0, 0.0));
+        assert!(!b.take(1.0, 512.0, 64.0, 0.0), "empty");
+        assert!(!b.take(256.0, 512.0, 64.0, 3.9), "249.6 tokens");
+        assert!(b.take(256.0, 512.0, 64.0, 4.0), "256 after 4 s");
+        assert!(b.take(3.0, 512.0, 64.0, 4.1), "a few paths again soon");
     }
 }

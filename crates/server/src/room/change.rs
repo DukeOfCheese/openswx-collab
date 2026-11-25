@@ -282,16 +282,16 @@ impl Origin {
 #[derive(Debug, Clone)]
 pub(super) struct Author {
     /// `<user>.<client>`, or [`SERVER_CLIENT`].
-    pub(super) client: ClientId,
-    pub(super) user: String,
+    client: ClientId,
+    user: String,
     name: String,
 }
 
 /// A change going through the pipeline.
 pub(super) struct Item {
-    pub(super) origin: Origin,
-    pub(super) author: Author,
-    pub(super) change: Arc<Change>,
+    origin: Origin,
+    author: Author,
+    change: Arc<Change>,
     size: usize,
     /// Set when it is first made tentative; answers wait on it, and keep waiting on it if the
     /// change is judged again.
@@ -316,6 +316,29 @@ impl Item {
         self.conn()
             .map(|_| (self.author.client.clone(), self.change.change_id.clone()))
     }
+
+    /// What the lock check needs to know of it.
+    pub(super) fn lock_view(&self) -> LockView<'_> {
+        LockView {
+            ops: &self.change.ops,
+            client: &self.author.client,
+            user: &self.author.user,
+            rule: match &self.origin {
+                Origin::Conn(_) => None,
+                Origin::Server { locks, .. } => Some(locks),
+            },
+        }
+    }
+}
+
+/// A change as the lock check sees it.
+pub(super) struct LockView<'a> {
+    pub(super) ops: &'a [Op],
+    /// Its author's client ([`SERVER_CLIENT`] for the server's own change).
+    pub(super) client: &'a ClientId,
+    pub(super) user: &'a str,
+    /// `None` for a client's change; the server's own says which locks count.
+    pub(super) rule: Option<&'a super::LockRule>,
 }
 
 /// A change decided and handed to the journal, not yet durable.
@@ -1000,8 +1023,21 @@ impl Room {
         self.answer_refused(item, code, &message, conflicts, Some(refusal));
     }
 
+    /// Refuses a change because of locks (`locked`), answering whoever waits for it.
+    pub(super) fn refuse_locked(&mut self, item: Item, conflicts: Vec<Conflict>, message: &str) {
+        match item.origin {
+            Origin::Server { reply, .. } => {
+                metrics::change_rejected(RejectCode::Locked);
+                let _ = reply.send(Err(ServerChangeError::Locked(conflicts)));
+            }
+            Origin::Conn(_) => {
+                self.answer_refused(item, RejectCode::Locked, message, conflicts, None);
+            }
+        }
+    }
+
     /// Tells everyone waiting for a change that it was refused.
-    pub(super) fn answer_refused(
+    fn answer_refused(
         &mut self,
         item: Item,
         code: RejectCode,
@@ -1125,6 +1161,8 @@ impl Room {
         }
         // Everyone but those waiting for this change's answer hears of it, in seq order.
         self.broadcast(&p.event, &p.item.waiters);
+        // Locks on what this change took out of the document go with it.
+        self.drop_locks_under(&a.writes, &a.removed);
         if let Some(key) = p.item.key() {
             self.recent.durable(key, seq);
             self.recent.trim();

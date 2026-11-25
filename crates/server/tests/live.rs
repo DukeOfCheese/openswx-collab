@@ -1,6 +1,6 @@
 //! Live editing over the WebSocket: joining, changes and their broadcast, conflicts, resends,
-//! catch-up, read-only connections, pipelining, snapshots and shutdown. (A port of
-//! `tests/test_live.py`; its lock, presence, expiry and access tests arrive with Tasks 10 and 12.)
+//! catch-up, read-only connections, pipelining, snapshots, shutdown, presence and drafts. (A port
+//! of `tests/test_live.py`; its lock tests are in `locks.rs`, its access tests arrive with Task 12.)
 
 mod common;
 
@@ -849,16 +849,95 @@ async fn the_61st_presence_in_a_second_is_dropped() {
 
 #[tokio::test]
 async fn a_presence_flood_is_dropped() {
-    let (server, world) = world().await;
+    let clock = oswx_server::clock::Clock::manual(1_800_000_000.0);
+    let c = clock.clone();
+    let server = TestServer::start_custom(|s| s.presence_rate = 5, move |s| s.clock = c).await;
+    let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect(&server, &doc, &world.admin).await;
-    for n in 0..1000 {
-        a.presence(json!({"n": n})).await;
+    // Two hundred in each of two seconds: five a second get through.
+    for second in 0..2 {
+        for n in 0..200 {
+            a.presence(json!({"n": [second, n]})).await;
+        }
+        a.drain().await;
+        clock.advance(1.0);
     }
-    a.drain().await;
-    let got = relayed(&b.drain().await).len();
-    assert!((60..500).contains(&got), "{got}");
+    let got = relayed(&b.drain().await);
+    assert_eq!(got.len(), 10);
+    assert_eq!(got[5].data, Some(plain(json!({"n": [1, 0]}))));
+}
+
+/// Waits for a presence of `who` at `live`, answering how long it took (panics after a second).
+async fn presence_within_a_second(live: &mut Live, who: &str) -> Duration {
+    let sent = std::time::Instant::now();
+    let wait = async {
+        loop {
+            let got: Relayed = live.expect().await;
+            if got.kind == "presence" && got.client_id == who {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("the presence came at once");
+    sent.elapsed()
+}
+
+#[tokio::test]
+async fn presence_goes_on_while_a_big_change_is_judged_off_the_task() {
+    let hooks = oswx_server::room::Hooks {
+        judge_delay: Duration::from_millis(2500),
+        ..oswx_server::room::Hooks::default()
+    };
+    let server =
+        TestServer::start_custom(|_| {}, |s| s.room_hooks = std::sync::Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let mut c = Live::connect(&server, &doc, &world.admin).await;
+    // More than 256 operations: judged off the room's task, which takes no frame meanwhile.
+    let ops = (0..300)
+        .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
+        .collect();
+    let big = a.make_change(0, ops);
+    a.send_change(&big).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // From the sender itself, whose later messages wait for it, and from someone else.
+    a.presence(json!({"tool": "a"})).await;
+    let a_id = a.client_id.clone();
+    presence_within_a_second(&mut b, &a_id).await;
+    b.presence(json!({"tool": "b"})).await;
+    let b_id = b.client_id.clone();
+    presence_within_a_second(&mut c, &b_id).await;
+    assert_eq!(a.outcome(&big.change_id).await.seq(), 1);
+}
+
+#[tokio::test]
+async fn presence_goes_on_while_the_senders_blobs_are_looked_up() {
+    let (server, blobs) = TestServer::start_blobs(|_| {}).await;
+    blobs.exists_delay(Duration::from_millis(2500));
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let missing = "0".repeat(64);
+    let change = a.make_change(
+        0,
+        vec![set(&["variables", "brep"], json!({"$blob": missing}))],
+    );
+    a.send_change(&change).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.presence(json!({"tool": "line"})).await;
+    let a_id = a.client_id.clone();
+    presence_within_a_second(&mut b, &a_id).await;
+    assert_eq!(
+        a.outcome(&change.change_id).await.code(),
+        RejectCode::MissingBlob
+    );
 }
 
 #[tokio::test]

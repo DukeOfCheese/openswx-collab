@@ -169,3 +169,19 @@ async fn the_list_never_opens_a_room() {
     assert_eq!(d["online_count"], 0);
     assert!(server.state.hub.loaded(&doc).is_none());
 }
+
+#[tokio::test]
+async fn a_person_whose_first_app_leaves_is_still_listed_once() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let first = Live::connect(&server, &doc, &world.admin).await;
+    let second = Live::connect(&server, &doc, &world.admin).await;
+    first.close().await;
+    wait_for_connections(&server, &doc, 1).await;
+    let d = &listing(&server, &world.project, &world.admin).await[&doc];
+    assert_eq!(
+        d["online"],
+        json!([{"name": "Ada", "colour": second.welcome.you.colour}])
+    );
+    assert_eq!(d["online_count"], 1);
+}

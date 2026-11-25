@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use oswx_core::wire::{ClientMsg, Lock, RejectCode, ServerMsg};
+use oswx_core::wire::{ClientMsg, DenyReason, Lock, RejectCode, ServerMsg};
 use oswx_core::{ConflictKind, Path};
 use oswx_server::clock::Clock;
 use oswx_server::journal::{self, JournalWriter};
@@ -73,6 +73,32 @@ fn mv(id: &str) -> oswx_core::Op {
     }
 }
 
+/// Locks the 256 top-level keys from `k<from>` on; answers the result.
+async fn lock_keys(live: &mut Live, from: usize) -> LockResult {
+    let keys: Vec<String> = (from..from + 256).map(|n| format!("k{n}")).collect();
+    let paths: Vec<[&str; 1]> = keys.iter().map(|k| [k.as_str()]).collect();
+    let refs: Vec<&[&str]> = paths.iter().map(|p| &p[..]).collect();
+    live.lock(&refs).await
+}
+
+/// The next `lock.changed`, and no second one soon after.
+async fn expect_one_lock_news(live: &mut Live) -> LockChanged {
+    let news: LockChanged = live.expect().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match live.try_recv(left).await {
+            Some(ServerMsg::LockChanged { .. }) => panic!("a second lock.changed came"),
+            Some(other) => live.seen.push(other),
+            None => break,
+        }
+    }
+    news
+}
+
 /// No `lock.changed` came to `live` up to now.
 async fn no_lock_news(live: &mut Live) {
     let seen = live.drain().await;
@@ -96,7 +122,7 @@ async fn locks_block_others_until_released() {
     assert_eq!(got.request_id, "r");
     assert_eq!(got.granted, vec![path(F2)]);
     assert_eq!(got.holder(&["features", "missing"]), None);
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(news.locks.len(), 1);
     let held = &news.locks[0];
     assert_eq!(
@@ -189,13 +215,44 @@ async fn a_list_lock_stops_inserts_removals_and_moves_only() {
     // Edits inside an item are not the list's structure.
     assert_eq!(b.change_on(0, vec![set_depth(12)]).await.seq(), 1);
     assert_eq!(b.change_on(1, vec![set_name("f1", "Base")]).await.seq(), 2);
-    // ... unless the item is locked: but nobody else may lock under a lock of Ada's.
+    // A list's lock and its items' locks go together: Bob may lock a feature (not deeper) ...
+    assert_eq!(b.lock(&[F1]).await.granted, vec![path(F1)]);
+    let deeper = b.lock(&[&["features", "f2", "params"]]).await;
+    assert_eq!(deeper.why(&["features", "f2", "params"]), DenyReason::Held);
+    // ... and then Ada, holding the list, may not remove or move it, nor Bob replace it whole.
     assert_eq!(
-        b.lock(&[F1]).await.holder(F1).unwrap().path,
-        path(&["features"])
+        a.change_on(2, vec![remove(&["features"], "f1")])
+            .await
+            .code(),
+        RejectCode::Locked
     );
-    // The holder reorders.
-    assert_eq!(a.change_on(2, vec![mv("f2")]).await.seq(), 3);
+    assert_eq!(
+        a.change_on(2, vec![mv("f1")]).await.code(),
+        RejectCode::Locked
+    );
+    let whole = set(F1, json!({"id": "f1", "name": "Sketch1", "type": "sketch"}));
+    assert_eq!(b.change_on(2, vec![whole]).await.code(), RejectCode::Locked);
+    // Edits inside it are Bob's to make.
+    assert_eq!(b.change_on(2, vec![set_name("f1", "Mine")]).await.seq(), 3);
+    // The list's holder reorders what nobody else holds.
+    assert_eq!(a.change_on(3, vec![mv("f2")]).await.seq(), 4);
+}
+
+#[tokio::test]
+async fn a_list_lock_and_a_lock_deeper_than_an_item_exclude_each_other() {
+    let (server, world) = world().await;
+    let bob = bob(&server, &world).await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    let params: &[&str] = &["features", "f1", "params"];
+    assert_eq!(a.lock(&[params]).await.granted.len(), 1);
+    let got = b.lock(&[&["features"]]).await;
+    assert_eq!(got.holder(&["features"]).unwrap().path, path(params));
+    a.unlock(&[params]).await;
+    assert_eq!(a.lock(&[&["features"]]).await.granted.len(), 1);
+    let got = b.lock(&[params]).await;
+    assert_eq!(got.holder(params).unwrap().path, path(&["features"]));
 }
 
 #[tokio::test]
@@ -241,10 +298,18 @@ async fn nested_locks_one_client_may_hold_another_may_not_take() {
     let mut b = Live::connect(&server, &doc, &bob).await;
     assert_eq!(a.lock(&[F1]).await.granted.len(), 1);
     let got = b
-        .lock(&[&["features"], &["features", "f1", "params"], F1])
+        .lock(&[
+            &["features", "f1", "params"],
+            F1,
+            &["features", "f1", "name"],
+        ])
         .await;
     assert!(got.granted.is_empty());
-    for p in [&["features"][..], &["features", "f1", "params"], F1] {
+    for p in [
+        &["features", "f1", "params"][..],
+        F1,
+        &["features", "f1", "name"],
+    ] {
         assert_eq!(got.holder(p).unwrap().path, path(F1), "{p:?}");
     }
     // Ada may nest hers; asking again for one she holds is granted.
@@ -265,6 +330,7 @@ async fn what_may_be_locked_and_by_whom() {
     let got = v.lock(&[F1, &["display"]]).await;
     assert!(got.granted.is_empty());
     assert_eq!((got.holder(F1), got.holder(&["display"])), (None, None));
+    assert_eq!(got.why(F1), DenyReason::ReadOnly);
     let got = a
         .lock(&[
             &["features", "f9"],
@@ -273,6 +339,10 @@ async fn what_may_be_locked_and_by_whom() {
             &["material", "colour"],
             &["display"],
             &["material", "density"],
+            // Keys the server owns.
+            &["rollback"],
+            &["journal"],
+            &["active_config"],
         ])
         .await;
     assert_eq!(
@@ -285,9 +355,48 @@ async fn what_may_be_locked_and_by_whom() {
         &["features", "f1", "~cache"],
         &["~derived"],
         &["material", "colour"],
+        &["rollback"],
+        &["journal"],
+        &["active_config"],
     ] {
         assert_eq!(got.holder(p), None, "{p:?}");
+        assert_eq!(got.why(p), DenyReason::NotLockable, "{p:?}");
     }
+}
+
+#[tokio::test]
+async fn a_key_locked_before_it_exists_stops_others_creating_it() {
+    let (server, world) = world().await;
+    let bob = bob(&server, &world).await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    assert_eq!(a.lock(&[&["display"]]).await.granted.len(), 1);
+    let make = set(&["display"], json!({"mode": "shaded"}));
+    assert_eq!(
+        b.change_on(0, vec![make.clone()]).await.code(),
+        RejectCode::Locked
+    );
+    assert_eq!(a.change_on(0, vec![make]).await.seq(), 1);
+}
+
+#[tokio::test]
+async fn server_changes_are_stopped_by_locks_only_when_they_say_so() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    a.lock(&[F2]).await;
+    let room = server.room(&doc);
+    let seq = room
+        .server_change(
+            vec![set_depth(4)],
+            "test",
+            &world.admin_id,
+            "Ada",
+            ServerChangeOptions::default(),
+        )
+        .await;
+    assert_eq!(seq, Ok(1));
 }
 
 #[tokio::test]
@@ -303,9 +412,41 @@ async fn locks_are_bounded_per_client() {
     let got = a.lock(&[&["one-more"]]).await;
     assert!(got.granted.is_empty());
     assert_eq!(got.holder(&["one-more"]), None);
+    assert_eq!(got.why(&["one-more"]), DenyReason::Quota);
     // Holding one again is still fine.
     assert_eq!(a.lock(&[&["key7"]]).await.granted.len(), 1);
     assert_eq!(server.room_status(&doc).await.locks, (256, 0));
+}
+
+#[tokio::test]
+async fn the_quota_holds_across_a_disconnect_and_per_user() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("ada-desktop")).await;
+    assert_eq!(lock_keys(&mut a, 0).await.granted.len(), 256);
+    a.close().await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("ada-desktop")).await;
+    assert_eq!(a.welcome.locks.len(), 256);
+    assert_eq!(
+        a.lock(&[&["one-more"]]).await.why(&["one-more"]),
+        DenyReason::Quota
+    );
+    // Three more apps of Ada's take 256 each; a fifth gets none: 1,024 per person.
+    for (n, app) in ["ada-laptop", "ada-tablet", "ada-phone", "ada-spare"]
+        .iter()
+        .enumerate()
+    {
+        let mut other = Live::connect_with(&server, &doc, &world.admin, Hello::client(app)).await;
+        let got = lock_keys(&mut other, 256 * (n + 1)).await;
+        if n < 3 {
+            assert_eq!(got.granted.len(), 256, "{app}");
+        } else {
+            assert!(got.granted.is_empty(), "{app}");
+            assert!(got.denied.iter().all(|d| d.why == DenyReason::Quota));
+        }
+    }
+    // (The other apps went at the end of each turn: their locks wait for them.)
+    assert_eq!(server.room_status(&doc).await.locks.0, 1024);
 }
 
 #[tokio::test]
@@ -316,7 +457,7 @@ async fn a_release_by_someone_else_is_ignored() {
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect(&server, &doc, &bob).await;
     a.lock(&[F2]).await;
-    let _: LockChanged = b.expect().await;
+    expect_one_lock_news(&mut b).await;
     b.unlock(&[F2, &["nothing"]]).await;
     no_lock_news(&mut b).await;
     assert_eq!(
@@ -342,7 +483,7 @@ async fn a_lock_dies_after_45_seconds_of_silence_and_a_ping_keeps_it() {
     assert_eq!(server.room_status(&doc).await.locks, (1, 0));
     clock.advance(16.0); // 46 s since the ping
     room.tick().await;
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(news.released, vec![path(F1)]);
     assert!(!room.holds_locks());
 }
@@ -381,7 +522,7 @@ async fn a_disconnected_clients_locks_wait_for_it_then_go() {
     a.close().await; // her wifi drops
     let left: PeerLeft = b.expect().await;
     assert_eq!(left.0, ada);
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(paths_of(&news.locks), vec![path(F1)]);
     assert!(news.locks[0].detached);
     let room = server.room(&doc);
@@ -400,7 +541,7 @@ async fn a_disconnected_clients_locks_wait_for_it_then_go() {
     let a2 = Live::connect_with(&server, &doc, &world.admin, Hello::client("ada-desktop")).await;
     assert_eq!(a2.welcome.locks.len(), 1);
     assert!(!a2.welcome.locks[0].detached);
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(
         (paths_of(&news.locks), news.locks[0].detached),
         (vec![path(F1)], false)
@@ -417,7 +558,7 @@ async fn a_disconnected_clients_locks_wait_for_it_then_go() {
     assert!(room.holds_locks(), "a room with a waiting lock keeps it");
     clock.advance(2.0);
     room.tick().await;
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(news.released, vec![path(F1)]);
     assert!(!room.holds_locks());
     let c = Live::connect(&server, &doc, &world.admin).await;
@@ -441,7 +582,7 @@ async fn a_client_back_with_only_view_access_loses_its_locks_at_once() {
     let a2 = Live::connect_with(&server, &doc, &world.admin, hello).await;
     assert!(a2.welcome.read_only);
     assert!(a2.welcome.locks.is_empty());
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(news.released, vec![path(F1)]);
 }
 
@@ -462,7 +603,7 @@ async fn a_lock_on_a_removed_item_goes() {
         1
     );
     let _: oswx_core::wire::ChangeEvent = b.expect().await;
-    let news: LockChanged = b.expect().await;
+    let news = expect_one_lock_news(&mut b).await;
     assert_eq!(
         news.released,
         vec![path(F2), path(&["features", "f2", "params"])]
@@ -613,12 +754,12 @@ async fn hostile_lock_requests_are_refused_by_the_codec_and_the_connection_kept(
 }
 
 #[tokio::test]
-async fn a_flood_of_lock_requests_costs_bounded_work() {
-    let (server, world) = world().await;
+async fn lock_requests_are_paid_for_per_path() {
+    let (server, world, _clock, doc) = on_a_clock().await;
     let bob = bob(&server, &world).await;
-    let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect(&server, &doc, &bob).await;
+    // A thousand one-path acquire/release pairs at one moment: the 512 path-tokens pay for 256.
     let n = 1000;
     for i in 0..n {
         let key = format!("k{i}");
@@ -630,15 +771,11 @@ async fn a_flood_of_lock_requests_costs_bounded_work() {
         let r: LockResult = a.expect().await;
         results.push(r);
     }
-    let granted = results.iter().filter(|r| !r.granted.is_empty()).count();
-    // The first second's allowance (60) and what refilled while the flood lasted.
-    assert!(granted >= 60, "{granted}");
-    assert!(granted < n / 2, "{granted}");
+    assert!(results[..256].iter().all(|r| r.granted.len() == 1));
     assert!(
-        results
+        results[256..]
             .iter()
-            .filter(|r| r.granted.is_empty())
-            .all(|r| r.denied.len() == 1 && r.denied[0].holder.is_none())
+            .all(|r| r.denied.len() == 1 && r.denied[0].why == DenyReason::Rate)
     );
     let news = b
         .drain()
@@ -646,9 +783,90 @@ async fn a_flood_of_lock_requests_costs_bounded_work() {
         .into_iter()
         .filter(|m| matches!(m, ServerMsg::LockChanged { .. }))
         .count();
-    assert!(
-        news <= 2 * granted,
-        "{news} announcements for {granted} grants"
-    );
+    assert_eq!(news, 512, "one announcement per grant and per paid release");
     assert_eq!(server.room_status(&doc).await.locks, (0, 0));
+}
+
+#[tokio::test]
+async fn releases_beyond_the_allowance_are_honoured_and_announced_together() {
+    let (server, world, _clock, doc) = on_a_clock().await;
+    let bob = bob(&server, &world).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    assert_eq!(lock_keys(&mut a, 0).await.granted.len(), 256);
+    expect_one_lock_news(&mut b).await;
+    // Asking again for one it holds, 256 times over, spends the rest of the allowance.
+    let again: Vec<&[&str]> = vec![&["k0"][..]; 256];
+    assert_eq!(a.lock(&again).await.granted.len(), 256);
+    let keys: Vec<String> = (0..256).map(|n| format!("k{n}")).collect();
+    let paths: Vec<[&str; 1]> = keys.iter().map(|k| [k.as_str()]).collect();
+    let refs: Vec<&[&str]> = paths.iter().map(|p| &p[..]).collect();
+    a.unlock(&refs).await;
+    a.drain().await;
+    assert_eq!(
+        server.room_status(&doc).await.locks,
+        (0, 0),
+        "honoured at once"
+    );
+    let news = expect_one_lock_news(&mut b).await;
+    assert_eq!(news.released.len(), 256, "announced together");
+    // Out of tokens, an acquire is refused for the rate, distinctly.
+    let got = a.lock(&[&["k1"]]).await;
+    assert_eq!(got.why(&["k1"]), DenyReason::Rate);
+}
+
+#[tokio::test]
+async fn one_editor_cycling_locks_cannot_flood_the_others() {
+    let (server, world, clock, doc) = on_a_clock().await;
+    let bob = bob(&server, &world).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    let keys: Vec<String> = (0..256).map(|n| format!("k{n}")).collect();
+    let paths: Vec<[&str; 1]> = keys.iter().map(|k| [k.as_str()]).collect();
+    let refs: Vec<&[&str]> = paths.iter().map(|p| &p[..]).collect();
+    // Sixty 256-path acquire/release cycles a second, for two seconds.
+    for _ in 0..120 {
+        a.send_lock(&refs).await;
+        a.unlock(&refs).await;
+        clock.advance(1.0 / 60.0);
+    }
+    a.drain().await;
+    tokio::time::sleep(Duration::from_millis(300)).await; // (any late announcement)
+    let msgs = b.drain().await;
+    assert!(b.closed.is_none(), "the peer is not dropped as too slow");
+    let news: Vec<&ServerMsg> = msgs
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::LockChanged { .. }))
+        .collect();
+    let bytes: usize = news
+        .iter()
+        .map(|m| oswx_core::wire::encode_server(m).len())
+        .sum();
+    assert!(news.len() <= 4, "{} announcements", news.len());
+    assert!(bytes < 100_000, "{bytes} bytes of lock news");
+    assert_eq!(server.room_status(&doc).await.locks, (0, 0));
+}
+
+#[tokio::test]
+async fn a_client_back_after_the_grace_period_gets_nothing_back() {
+    // (No sweep: only the join itself can notice the grace period is over.)
+    let clock = Clock::manual(T0);
+    let c = clock.clone();
+    let server =
+        TestServer::start_custom(|s| s.sweep_interval = 3600.0, move |s| s.clock = c).await;
+    let world = World::new(&server).await.unwrap();
+    let bob = bob(&server, &world).await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("ada-desktop")).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    a.lock(&[F1]).await;
+    let _: LockChanged = b.expect().await;
+    a.close().await;
+    let _: PeerLeft = b.expect().await;
+    let _: LockChanged = b.expect().await;
+    clock.advance(61.0);
+    let a2 = Live::connect_with(&server, &doc, &world.admin, Hello::client("ada-desktop")).await;
+    assert!(a2.welcome.locks.is_empty(), "{:?}", a2.welcome.locks);
+    let news = expect_one_lock_news(&mut b).await;
+    assert_eq!((news.locks.len(), news.released), (0, vec![path(F1)]));
 }

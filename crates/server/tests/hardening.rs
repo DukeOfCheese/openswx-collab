@@ -1,7 +1,7 @@
 //! What a hostile or broken client (or a failing database or storage) can do to live editing, and
 //! what must not happen when it does. (A port of the connection and change tests of
-//! `tests/test_hardening.py`; its lock, reservation, undo, rebuild-report and access-drop tests
-//! arrive with Tasks 10, 11 and 12.)
+//! `tests/test_hardening.py`, and of its lock and presence tests; its undo, rebuild-report and
+//! access-drop tests arrive with Tasks 11 and 12; v2 has no reservations.)
 
 mod common;
 

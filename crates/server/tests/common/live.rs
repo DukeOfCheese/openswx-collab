@@ -255,6 +255,19 @@ impl LockResult {
     }
 }
 
+impl LockResult {
+    /// Why a path was denied (panics if it was not).
+    #[track_caller]
+    pub fn why(&self, p: &[&str]) -> oswx_core::wire::DenyReason {
+        let p = path(p);
+        self.denied
+            .iter()
+            .find(|d| d.path == p)
+            .unwrap_or_else(|| panic!("{p:?} was not denied: {self:?}"))
+            .why
+    }
+}
+
 impl FromServer for LockResult {
     fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
         match msg {

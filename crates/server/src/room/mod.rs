@@ -178,16 +178,18 @@ pub struct ServerChangeOptions {
     /// Refuse it (`stale`) if another client changed what it writes since the current head when it
     /// was asked for. Off: it lands whatever happened (a restore); ids are never prefix-checked.
     pub check_stale: bool,
-    /// Which locks refuse it (`locked`).
+    /// Which locks refuse it (`locked`); by default none do.
     pub locks: LockRule,
 }
 
-/// Which locks stand in the way of a change the server makes.
+/// Which locks stand in the way of a change the server makes (it opts in to being stopped).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LockRule {
-    /// The rule for any change: a lock on (at, under or above) what it writes. The server is no
-    /// client, so every such lock counts.
+    /// No lock stops it.
     #[default]
+    None,
+    /// The rule for any client's change: a lock on (at, under or above) what it writes. The
+    /// server is no client, so every such lock counts.
     Writes,
     /// As [`LockRule::Writes`], except the locks of this client (a change made for it, such as
     /// its revert: its own locks never stop it).
@@ -551,6 +553,8 @@ enum Internal {
         seq: Seq,
         ok: bool,
     },
+    /// Time to announce the releases a connection made beyond its lock allowance.
+    LockNews(ConnId),
 }
 
 struct Closing {
@@ -651,7 +655,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         slow: Vec::new(),
         closing: None,
         encodes: Arc::new(AtomicU64::new(0)),
-        locks: locks::Locks::new(init.head.seq),
+        locks: locks::Locks::default(),
         shared: shared.clone(),
         next_join: 0,
         state,
@@ -700,8 +704,6 @@ impl Room {
                 }
             }
             self.run_parked();
-            // Locks on what is no longer in the document go once its removal is durable.
-            self.follow_head_with_locks();
             self.reap();
             if self
                 .closing
@@ -762,6 +764,7 @@ impl Room {
             Internal::Decided(decided) => self.on_offloaded(decided),
             Internal::Duplicate(check) => self.on_duplicate(check),
             Internal::Welcome { conn, result } => self.on_welcome(conn, result),
+            Internal::LockNews(conn) => self.flush_lock_news(conn),
             Internal::Snapshot { seq, ok } => {
                 self.snapshot_task = None;
                 if ok {
