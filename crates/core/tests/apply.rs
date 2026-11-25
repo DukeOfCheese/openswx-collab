@@ -321,6 +321,7 @@ fn legacy_duplicates_are_left_alone() {
 
 #[test]
 fn undo_restoring_legacy_duplicates_needs_no_rules() {
+    // As `apply`'s contract states: an inverse is exact without rules, judged like any change under them.
     // Undoing these re-creates the duplicate "A" from a document without one. Within one call
     // that cannot be told apart from a change creating a duplicate, so the rules refuse it;
     // without rules the inverse restores the original exactly.
@@ -600,32 +601,15 @@ fn generated_ops_are_mostly_applicable() {
     assert!(kinds.iter().all(|&n| n > 0), "applied kinds: {kinds:?}");
 }
 
-/// Whether no two features share a name.
-fn distinct_names(doc: &Value) -> bool {
-    let Some(Value::Keyed(k)) = doc.at(&["features"]) else {
-        return true;
-    };
-    let names: Vec<_> = k
-        .iter()
-        .filter_map(|(_, _, item)| match item.at(&["name"]) {
-            Some(Value::Str(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
-    names.iter().collect::<std::collections::HashSet<_>>().len() == names.len()
-}
-
 proptest! {
     #[test]
     fn inverse_restores((doc, ops) in arb_doc_and_ops()) {
+        // Forward under the rules; inverses without them, as `apply`'s contract states.
         if let Ok(a) = run(&doc, &ops) {
-            // Undoing towards a document with duplicate names re-creates them, which the rules
-            // refuse (see `undo_restoring_legacy_duplicates_needs_no_rules`); check those without.
-            let undo_rules = if distinct_names(&doc) { rules() } else { Rules::default() };
-            let back = apply(&a.doc, &a.inverse, &undo_rules, None).unwrap();
+            let back = apply(&a.doc, &a.inverse, &Rules::default(), None).unwrap();
             prop_assert_eq!(&back.doc, &doc);
             // The inverse of the inverse redoes the change.
-            let again = apply(&back.doc, &back.inverse, &undo_rules, None).unwrap();
+            let again = apply(&back.doc, &back.inverse, &Rules::default(), None).unwrap();
             prop_assert_eq!(&again.doc, &a.doc);
         }
     }

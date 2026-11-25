@@ -29,11 +29,19 @@ impl Rules {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Applied {
     pub doc: Value,
-    /// Undoes the change when applied in order (with no id prefix).
+    /// `inverse` applied to `doc` with `Rules::default()` and `id_prefix = None` gives back the
+    /// original document exactly. Applied under rules, an inverse is judged like any other change
+    /// and may be refused with `NameTaken` when it would bring back a name that is now taken;
+    /// callers treat that as an ordinary name clash.
     pub inverse: Vec<Op>,
 }
 
 /// Applies all ops or none. `id_prefix`: Some("<user>.<client>.") for client changes, None for the server.
+///
+/// Contract: `inverse` applied to `Applied.doc` with `Rules::default()` and `id_prefix = None`
+/// gives back `doc` exactly. Applied under rules, an inverse is judged like any other change and
+/// may be refused with `NameTaken` when it would bring back a name that is now taken; callers
+/// treat that as an ordinary name clash.
 pub fn apply(
     doc: &Value,
     ops: &[Op],
