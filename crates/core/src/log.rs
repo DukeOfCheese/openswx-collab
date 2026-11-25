@@ -111,8 +111,11 @@ impl From<OpError> for Refusal {
 /// Decide one change against the head. Pure; the caller persists and then adopts `Accepted`.
 ///
 /// `known(change_id)` says what the caller knows of that earlier change of the same client.
-/// `undo` is the kept inverse of the change `change.undo_of` names, when the caller has it (an
-/// accepted change of the same client); `None` otherwise.
+/// `undo` is the kept inverse of the change `change.undo_of` names, when the caller has it; `None`
+/// otherwise. It is ignored unless `change.undo_of` is set. The caller must take it only from the
+/// stored inverse of an accepted change by the same client (the journal's `inverse` of the row
+/// `undo_of` names), never from anything the client sent: it decides which foreign ids may come
+/// back.
 ///
 /// After checking that the change is well formed, the checks run in this order: a base below the
 /// index's floor is `TooOld`; a change in `depends` that is not known to be accepted (refused, or
@@ -163,7 +166,10 @@ pub fn decide(
     // restore of someone else's deleted item); once that removal is pruned, it may not.
     let existed = |p: &Path| head.index.removed_at(p);
     // Undoing a change that dropped a subtree may bring back the ids it held, at the same paths.
-    let carried = undo.map(carried_items).unwrap_or_default();
+    let carried = undo
+        .filter(|_| change.undo_of.is_some())
+        .map(carried_items)
+        .unwrap_or_default();
     let kept = |p: &Path| carried.contains(p);
     let applied = apply_judged(
         &head.doc,

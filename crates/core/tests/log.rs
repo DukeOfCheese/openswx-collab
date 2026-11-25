@@ -733,3 +733,18 @@ fn the_kept_inverse_of_an_insert_lets_its_item_back() {
     let a = decide_undo(&pruned, "u1.c1", &ch, Some(&inverse)).unwrap();
     assert_eq!(a.doc, head().doc);
 }
+
+#[test]
+fn the_kept_inverse_is_ignored_unless_the_change_is_an_undo() {
+    let (h1, inverse) = sketch_replaced();
+    let mut ch = undo(inverse.clone(), 1);
+    ch.undo_of = None;
+    // Not marked as an undo: the inverse passed in is not consulted, so the foreign ids are refused.
+    assert!(matches!(
+        decide_undo(&h1, "u1.c1", &ch, Some(&inverse)),
+        Err(Refusal::Invalid(_))
+    ));
+    // Marked as one: it is.
+    ch.undo_of = Some(Arc::from("rep"));
+    assert!(decide_undo(&h1, "u1.c1", &ch, Some(&inverse)).is_ok());
+}
