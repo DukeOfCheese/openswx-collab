@@ -357,7 +357,8 @@ fn sample_changes() -> Vec<Ch> {
 fn all_checks(ix: &Index) -> Vec<Vec<Conflict>> {
     let mut out = vec![];
     for ch in sample_changes() {
-        for base in 0..8 {
+        // Bases below the floor are too old to judge.
+        for base in ix.floor()..8 {
             for client in ["uA.c1", "uB.c1", "uC.c1", "uD.c1"] {
                 out.push(check(ix, base, client, &ch));
             }
@@ -501,20 +502,11 @@ fn prune_keeps_writes_drops_old_removals() {
     assert_eq!(ix.floor(), 0);
     let pruned = ix.prune(4);
     assert_eq!(pruned.floor(), 4);
-    // The write at 4 is kept, even though no base below the floor will ask for it.
-    assert_eq!(
-        check(&pruned, 2, "uC.c1", &Ch::new().set(DEPTH)),
-        vec![conflict(DEPTH, 4, "uA.c1", ConflictKind::Written)]
-    );
-    // The removal at 3 and the read at 4 are gone; the read at 5 stays.
-    assert_eq!(
-        check(&pruned, 2, "uC.c1", &Ch::new().set("features/f1/params")),
-        vec![]
-    );
-    assert_eq!(
-        check(&pruned, 2, "uC.c1", &Ch::new().remove("features/f3")),
-        vec![]
-    );
+    // The write at 4 is kept; the removal at 3 and the read at 4 are gone; the read at 5 stays.
+    // (`check` is only asked about bases at or above the floor, so this is seen in the wire form.)
+    let kept = record(&Index::default(), 4, "uA.c1", &Ch::new().set(DEPTH));
+    let kept = record(&kept, 5, "uB.c1", &Ch::new().read("features/f4")).prune(4);
+    assert_eq!(pruned.to_wire(), kept.to_wire());
     assert_eq!(
         check(&pruned, 4, "uC.c1", &Ch::new().remove("features/f4")),
         vec![conflict("features/f4", 5, "uB.c1", ConflictKind::Read)]

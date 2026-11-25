@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub mod index;
+pub mod log;
 pub mod op;
 pub mod path;
 pub mod pos;
@@ -9,6 +10,7 @@ pub mod value;
 
 pub use apply::{Applied, Rules, apply};
 pub use index::{ClientId, Conflict, ConflictKind, Index, Seq};
+pub use log::{Accepted, Change, Head, Refusal, decide};
 pub use op::{MAX_DEPTH, MAX_NAME, Op, OpError, PROTECTED, Write, removed, writes};
 pub use path::Path;
 pub use pos::Pos;

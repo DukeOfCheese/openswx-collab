@@ -1,6 +1,8 @@
 //! Shared test helpers: fixtures, and proptest generators for documents and operations.
 #![allow(dead_code)]
 
+pub mod client;
+
 use std::sync::Arc;
 
 use oswx_core::{KeyedList, Op, Path, Plain, Pos, Value};

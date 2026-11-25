@@ -282,6 +282,9 @@ impl Index {
     }
 
     /// Conflicts for a change by `client` made on `base`: empty means acceptable.
+    ///
+    /// Only sound for `base >= self.floor()`: below the floor, pruned removals and reads are no
+    /// longer there to conflict with. Callers refuse such a change as too old instead.
     pub fn check(
         &self,
         base: Seq,
@@ -290,6 +293,7 @@ impl Index {
         removed: &BTreeSet<Path>,
         reads: &BTreeSet<Path>,
     ) -> Vec<Conflict> {
+        debug_assert!(base >= self.floor, "check needs base >= floor");
         let search = || Search {
             base,
             client,
