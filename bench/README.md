@@ -55,6 +55,10 @@ Two latency figures, both p50/p90/p99/max (the same text is in the file as `late
 
 An edit with no answer after 30 s is a `timeout` and enters both figures as 30000 ms.
 
+`latency_from_schedule_ms` also includes loadgen's own timer wake-up lateness, about 0 to 15.6 ms on Windows with
+the default timer resolution. Edits the server rejects (for example `stale`) are in neither histogram; they are
+only counted under `rejected`.
+
 For `open`, `first_open_ms` is the first sample on its own (cold: the server loads the document) and
 `latency_ms` covers the remaining ones, so use `--times` of at least 2 (5 or more for percentiles worth reading).
 `welcome_bytes` (min and max) is the size of the `welcome` frame; a connection whose welcome carries no

@@ -1,0 +1,53 @@
+{
+  "scenario": "one-doc",
+  "params": {
+    "editors": 100,
+    "features": 200,
+    "rate": 2.0
+  },
+  "dialect": "v1",
+  "server": "openswx-collab 0.1.2 (protocol 1)",
+  "database": "sqlite",
+  "loadgen_commit": "aedff16",
+  "started_at": "2026-11-25T09:36:36Z",
+  "note": "scenario onedoc-100 - python server 0.1.2 on SQLite - server and loadgen on same machine",
+  "host": {
+    "os": "Windows 11 Education",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "cpu_threads": 16,
+    "ram_bytes": 16964685824
+  },
+  "duration_s": 64.3242264,
+  "document_bytes": 23370,
+  "changes_sent": 12000,
+  "accepted": 12000,
+  "rejected": {},
+  "timeouts": 0,
+  "errors": 0,
+  "protocol_errors": 0,
+  "dropped_connections": 0,
+  "connect_failed": 0,
+  "latency_kind": "edit",
+  "latency_ms": {
+    "count": 12000,
+    "p50": 531.967,
+    "p90": 558.079,
+    "p99": 590.335,
+    "max": 612.863
+  },
+  "latency_from_schedule_ms": {
+    "count": 12000,
+    "p50": 2142.207,
+    "p90": 3813.375,
+    "p99": 4370.431,
+    "max": 4407.295
+  },
+  "latency_note": "latency_ms is service time: from just before an edit is sent until its answer arrives. latency_from_schedule_ms is measured from the slot the edit was scheduled for (a fixed interval per editor), so a stalled server also shows as waiting for the edits queued behind the stall; no slot is skipped. An edit with no answer after 30 s counts as a timeout and enters both as 30000 ms. For `open`, first_open_ms is the first, cold sample and latency_ms covers the remaining ones.",
+  "first_open_ms": null,
+  "welcome_bytes": {
+    "min": 23779,
+    "max": 42678
+  },
+  "accepted_per_s": 186.5549058511491,
+  "server_rss_bytes": null
+}
