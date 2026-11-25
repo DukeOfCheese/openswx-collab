@@ -3,6 +3,7 @@
 pub mod apply;
 pub mod diff;
 pub mod index;
+pub mod limits;
 pub mod log;
 pub mod op;
 pub mod path;

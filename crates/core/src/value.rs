@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use imbl::{OrdMap, OrdSet};
 
+use crate::limits::{MAX_DEPTH, MAX_NAME};
 use crate::pos::Pos;
 
 pub type Id = Arc<str>;
@@ -15,8 +16,6 @@ pub type Id = Arc<str>;
 pub type Plain = rmpv::Value;
 pub type Map = OrdMap<Arc<str>, Value>;
 
-const MAX_DEPTH: usize = 64;
-const MAX_NAME: usize = 200;
 /// The one key of a keyed list's wire form; never a map key or a path segment in a document.
 pub(crate) const LIST_KEY: &str = "$list";
 

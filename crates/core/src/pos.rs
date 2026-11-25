@@ -31,8 +31,8 @@ impl Pos {
 
     /// A position strictly between `a` and `b`; `None` stands for the start or the end of the list.
     /// Reads a position as a base-62 fraction in (0, 1). The result is deterministic, never ends in
-    /// `0`, and is chosen so that repeated insertion at either end grows it by about one digit per
-    /// 60 inserts, and repeated insertion in one gap by about one digit per 6.
+    /// `0`, and is chosen so that repeated insertion at the front grows it by about one digit per
+    /// 60 inserts, at the back by about one digit per 31, and in one gap by about one digit per 6.
     ///
     /// Panics if `a >= b`. Items that share a position are not placed with this; callers keep them
     /// in id order. Also panics if the result would be longer than `MAX_LEN` (only possible when a

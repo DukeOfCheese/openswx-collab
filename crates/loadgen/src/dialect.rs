@@ -47,7 +47,7 @@ pub enum Outcome {
     Rejected(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Target {
     pub base_url: String,
     pub token: String,
@@ -57,4 +57,38 @@ pub struct Target {
     pub document_bytes: usize,
     /// Human-readable description of the server, for the report.
     pub server: String,
+}
+
+/// Written by hand so that printing a target never prints its token.
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .field("documents", &self.documents)
+            .field("features", &self.features)
+            .field("document_bytes", &self.document_bytes)
+            .field("server", &self.server)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printing_a_target_does_not_print_its_token() {
+        let t = Target {
+            base_url: "http://host:1".into(),
+            token: "s3cret-token".into(),
+            documents: vec!["d1".into()],
+            features: 3,
+            document_bytes: 100,
+            server: "test".into(),
+        };
+        let shown = format!("{t:?} {t:#?}");
+        assert!(!shown.contains("s3cret-token"), "{shown}");
+        assert!(shown.contains("<redacted>") && shown.contains("http://host:1"));
+    }
 }

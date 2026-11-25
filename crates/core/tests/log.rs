@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use common::{load, path};
 use oswx_core::{
-    Accepted, Change, ClientId, ConflictKind, Head, Index, Op, Pos, Refusal, Rules, Seq, Value,
-    decide, diff,
+    Accepted, Change, ClientId, ConflictKind, Head, Index, Op, Pos, Refusal, RejectCode, Rules,
+    Seq, Value, decide, diff,
 };
 use serde_json::json;
 
@@ -498,4 +498,32 @@ fn edit_inside_an_item_removed_since_the_base_is_stale() {
         decide_for(&h1, "u1.c1", &late, &never),
         Err(Refusal::Invalid(_))
     ));
+}
+
+#[test]
+fn every_refusal_has_a_reject_code() {
+    let cases = [
+        (Refusal::Stale(vec![]), RejectCode::Stale, "stale"),
+        (
+            Refusal::Dependency(Arc::from("c")),
+            RejectCode::Dependency,
+            "dependency",
+        ),
+        (
+            Refusal::NameTaken(Arc::from("n")),
+            RejectCode::NameTaken,
+            "name_taken",
+        ),
+        (
+            Refusal::IdTaken(Arc::from("i")),
+            RejectCode::IdTaken,
+            "id_taken",
+        ),
+        (Refusal::TooOld, RejectCode::TooOld, "too_old"),
+        (Refusal::Invalid("x".into()), RejectCode::Invalid, "invalid"),
+    ];
+    for (refusal, code, name) in cases {
+        assert_eq!(refusal.code(), code, "{refusal:?}");
+        assert_eq!(refusal.code().as_str(), name);
+    }
 }

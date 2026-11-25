@@ -6,6 +6,10 @@
 //! - `pending`: its own changes the server has not answered yet, in the order it sent them;
 //! - `live`: what the user sees, `confirmed` with the pending changes applied in order.
 //!
+//! A new change `depends` on every pending change whose writes or removals overlap (equal, contain
+//! or lie inside) what the new change writes, removes or reads; a pending change's reads are not
+//! counted.
+//!
 //! Every pending change keeps the inverse it got when it was last applied to `live`, so that a
 //! refused change can be taken out of `live` without starting again from `confirmed`. A pending
 //! change that no longer applies (something it built on was changed by someone else, or by one of

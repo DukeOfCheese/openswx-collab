@@ -16,8 +16,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::index::{ClientId, Conflict, ConflictKind, Seq};
+use crate::limits::MAX_DEPTH;
 use crate::log::Change;
-use crate::op::{MAX_DEPTH, Op};
+use crate::op::Op;
 use crate::path::{self, Path};
 use crate::value::{Plain, Value};
 
@@ -27,7 +28,7 @@ pub const MAX_TOKEN: usize = 512;
 pub const MIN_CLIENT_ID: usize = 8;
 pub const MAX_CLIENT_ID: usize = 64;
 pub const MAX_APP: usize = 100;
-pub const MAX_CHANGE_ID: usize = 64;
+pub use crate::limits::MAX_CHANGE_ID;
 pub const MAX_REQUEST_ID: usize = 64;
 pub const MAX_OPS: usize = 10_000;
 pub const MAX_READS: usize = 1_000;
@@ -46,7 +47,9 @@ pub const MAX_REBUILD_MESSAGE: usize = 500;
 /// `welcome` holds a value in a change event's op, five containers down.
 pub const MAX_NESTING: usize = 2 * MAX_DEPTH + 8;
 /// Most values (every scalar, key and container is one) a client frame may hold. Decoding builds a
-/// tree of about 24 bytes a value, so this bounds what one frame can make the server allocate.
+/// tree of `rmpv::Value`s, each about 40 to 48 bytes plus what strings and vectors hold, so the
+/// transient tree of a frame at this cap is roughly 50 to 100 MB: this bounds what one frame can
+/// make the server allocate.
 pub const MAX_NODES: usize = 1_000_000;
 /// A client frame longer than this is only read when it is a `change`; nothing else needs the room.
 pub const SMALL_FRAME: usize = 512 * 1024;
@@ -782,13 +785,7 @@ pub fn decode_client(frame: &[u8], max: usize) -> Result<ClientMsg, WireError> {
             protocol: u32::try_from(uint(f.req("protocol")?, "protocol")?)
                 .or_else(|_| invalid("protocol is out of range"))?,
             token: text(f.req("token")?, "token", 1, MAX_TOKEN)?.to_owned(),
-            client_id: text(
-                f.req("client_id")?,
-                "client_id",
-                MIN_CLIENT_ID,
-                MAX_CLIENT_ID,
-            )?
-            .to_owned(),
+            client_id: client_id(f.req("client_id")?)?,
             format_version: f
                 .opt("format_version")?
                 .map(|p| int(p, "format_version"))
@@ -855,6 +852,20 @@ pub fn decode_client(frame: &[u8], max: usize) -> Result<ClientMsg, WireError> {
         "ping" => Ok(ClientMsg::Ping),
         _ => invalid("unknown message type"),
     }
+}
+
+/// A hello's `client_id`: `MIN_CLIENT_ID..=MAX_CLIENT_ID` characters of `[A-Za-z0-9_-]`. A dot
+/// would make the server's `<user>.<client>` ambiguous and let one client mint ids in another's
+/// namespace.
+fn client_id(p: &Plain) -> Result<String, WireError> {
+    let s = text(p, "client_id", MIN_CLIENT_ID, MAX_CLIENT_ID)?;
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return invalid("client_id may only hold letters, digits, _ and -");
+    }
+    Ok(s.to_owned())
 }
 
 fn distinct(ids: Vec<Arc<str>>) -> Result<Vec<Arc<str>>, WireError> {

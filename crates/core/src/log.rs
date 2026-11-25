@@ -8,12 +8,11 @@ use std::sync::Arc;
 
 use crate::apply::{Rules, apply_with};
 use crate::index::{ClientId, Conflict, Index, Seq};
+use crate::limits::MAX_CHANGE_ID;
 use crate::op::{Op, OpError, removed, writes};
 use crate::path::Path;
 use crate::value::{Id, Value};
-
-/// Longest change id, in characters.
-const MAX_CHANGE_ID: usize = 64;
+use crate::wire::RejectCode;
 
 /// One change as a client sent it.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +57,20 @@ pub enum Refusal {
     Invalid(String),
     /// Its base is older than the history kept to judge it.
     TooOld,
+}
+
+impl Refusal {
+    /// The code the server sends for this refusal.
+    pub fn code(&self) -> RejectCode {
+        match self {
+            Refusal::Stale(_) => RejectCode::Stale,
+            Refusal::Dependency(_) => RejectCode::Dependency,
+            Refusal::NameTaken(_) => RejectCode::NameTaken,
+            Refusal::IdTaken(_) => RejectCode::IdTaken,
+            Refusal::Invalid(_) => RejectCode::Invalid,
+            Refusal::TooOld => RejectCode::TooOld,
+        }
+    }
 }
 
 /// The current state of a document.

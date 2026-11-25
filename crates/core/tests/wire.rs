@@ -543,6 +543,18 @@ fn hello_limits() {
     bad(&with(hello(), "client_id", json!(chars(65))));
     bad(&with(hello(), "client_id", json!(["client-01"])));
     bad(&without(hello(), "client_id"));
+    // Only [A-Za-z0-9_-]: a dot would make `<user>.<client>` ambiguous.
+    ok(&with(hello(), "client_id", json!("Az09_-Az09_-")));
+    for id in [
+        "client.01",
+        "u2.c1.xyz",
+        "client 01",
+        "client/01",
+        "clienté01",
+        "client\u{0}01",
+    ] {
+        bad(&with(hello(), "client_id", json!(id)));
+    }
     // app at most 100
     ok(&with(hello(), "app", json!(chars(100))));
     ok(&with(hello(), "app", json!(null)));

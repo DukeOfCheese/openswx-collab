@@ -7,8 +7,7 @@ use crate::path::{self, Path};
 use crate::pos::Pos;
 use crate::value::{Id, LIST_KEY, Plain, Value};
 
-pub const MAX_DEPTH: usize = 64;
-pub const MAX_NAME: usize = 200;
+pub use crate::limits::{MAX_DEPTH, MAX_NAME};
 /// Top-level keys the server owns; clients never write them.
 pub const PROTECTED: [&str; 7] = [
     "rollback",
