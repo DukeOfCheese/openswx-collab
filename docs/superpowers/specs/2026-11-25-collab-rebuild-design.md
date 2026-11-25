@@ -291,7 +291,8 @@ author's calls, not owner decisions.
    An id can be re-inserted by anyone, at the path where a removal of that id is still remembered
    (the conflict index holds its tombstone), together with everything inside the item: that is how
    undoing a removal, or restoring someone else's deleted item, gets past the id rule. Once the
-   tombstone has been pruned, the re-insert is refused like any other foreign id. An item moved to a
+   tombstone has been pruned, the re-insert is refused like any other foreign id. Ids already present
+   under a Set's path may be rearranged within that Set; an item moved by Remove and Insert to a
    different list must be given new ids at every depth by the client.
 5. **Names.** The server does not substitute names, because documents refer to features by name
    (`D1@Sketch1`). A clash at commit is refused with `name_taken`; the client engine renames (rewriting

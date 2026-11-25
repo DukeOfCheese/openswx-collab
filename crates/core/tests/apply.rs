@@ -486,6 +486,36 @@ fn many_sets_over_a_large_subtree_cost_one_walk_of_it() {
 }
 
 #[test]
+fn held_ids_may_be_rearranged_within_their_set_but_not_moved_by_insert() {
+    let doc = load(json!({"a": {"x": [{"id": "L1", "v": 1}], "y": []}}));
+    // Within one Set of `a`, L1 may move from list x to list y.
+    let a = client(
+        &doc,
+        &[set(&["a"], json!({"x": [], "y": [{"id": "L1", "v": 1}]}))],
+    )
+    .unwrap();
+    assert!(a.doc.at(&["a", "y", "L1"]).is_some());
+    // A Set of only `a/y` did not hold L1: refused.
+    assert_eq!(
+        client(&doc, &[set(&["a", "y"], json!([{"id": "L1"}]))]).err(),
+        Some(OpError::ForeignId(Arc::from("L1")))
+    );
+    // Moved by Remove and Insert into another list: refused; it needs a new id.
+    let moved = [
+        remove(&["a", "x"], "L1"),
+        Op::Insert {
+            list: path(&["a", "y"]),
+            item: load(json!({"id": "L1", "v": 1})),
+            pos: pos("V"),
+        },
+    ];
+    assert_eq!(
+        client(&doc, &moved).err(),
+        Some(OpError::ForeignId(Arc::from("L1")))
+    );
+}
+
+#[test]
 fn remembered_removals_and_held_ids_together() {
     // f1 holds a plain list of loops whose segments carry legacy ids.
     let doc = load(json!({

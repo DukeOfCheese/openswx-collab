@@ -343,7 +343,10 @@ impl Introduced {
             Op::Set { path, value } => {
                 // Ids anywhere under the Set's path before the change are not new for it, wherever
                 // the new value puts them: an edit inside a plain list sets the whole list, and a
-                // list may turn from plain to keyed or back.
+                // list may turn from plain to keyed or back. So a Set may also rearrange those ids
+                // freely within its path, even into another list under it: telling a move from an
+                // edit would need per-list bookkeeping. An item moved by Remove and Insert into a
+                // different list is judged by the Insert and needs new ids (spec, amendment 4).
                 let set = Held { before, path };
                 self.walk(value, &mut path.clone(), true, Some(&set), existed);
             }
