@@ -6,9 +6,9 @@
 /// [`super::Store::health`].
 pub const HEALTH: &str = "SELECT 1";
 
-/// The versions recorded by sqlx's migrator, which both stores share (bind `true`).
+/// The versions and checksums recorded by sqlx's migrator, which both stores share (bind `true`).
 pub const APPLIED_MIGRATIONS: &str =
-    "SELECT version FROM _sqlx_migrations WHERE success = $1 ORDER BY version";
+    "SELECT version, checksum FROM _sqlx_migrations WHERE success = $1 ORDER BY version";
 
 /// [`super::Store::user_count`]: every account, deleted and disabled ones included.
 pub const USER_COUNT: &str = "SELECT COUNT(*) FROM users";

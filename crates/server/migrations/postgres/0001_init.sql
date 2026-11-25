@@ -6,6 +6,9 @@
 -- BOOLEAN -> bool, BLOB/BYTEA (MessagePack) -> Vec<u8>, JSON as TEXT.
 --
 -- Never edit this file once released: add 0002_<what>.sql instead.
+--
+-- For the import tool: the Python server's PostgreSQL schema stored invites.projects as a `json`
+-- column; here it is TEXT holding the same JSON.
 
 CREATE TABLE users (
     id VARCHAR(32) NOT NULL PRIMARY KEY,

@@ -256,7 +256,8 @@ impl Settings {
 /// - `postgres://…`, `postgresql://…` or `postgresql+asyncpg://…`, normalised to `postgres://…`.
 ///
 /// An in-memory SQLite database (`sqlite::memory:`) is refused: every pooled connection would see a
-/// different, empty database.
+/// different, empty database. So is a SQLite path with a query string (`?mode=…`): the store sets
+/// its own connection options.
 pub fn parse_database_url(url: &str) -> Result<Database, ConfigError> {
     let bad = || ConfigError::new("DATABASE_URL", "sqlite://<path> or postgres://<url>");
     let url = url.trim();
@@ -266,6 +267,12 @@ pub fn parse_database_url(url: &str) -> Result<Database, ConfigError> {
         .or_else(|| url.strip_prefix("sqlite://"))
         .or_else(|| url.strip_prefix("sqlite:"));
     if let Some(path) = sqlite {
+        if path.contains('?') {
+            return Err(ConfigError::new(
+                "DATABASE_URL",
+                "a SQLite path without a query string (`?…` options are not supported)",
+            ));
+        }
         return if path.is_empty() || path.starts_with(':') {
             Err(bad())
         } else {
@@ -619,6 +626,8 @@ mod tests {
             "sqlite://",
             "sqlite:",
             "sqlite::memory:",
+            "sqlite://data/collab.db?mode=rwc",
+            "sqlite+aiosqlite:///./collab.db?timeout=5",
             "postgres://",
             "",
         ] {
@@ -628,6 +637,13 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_sqlite_query_string_is_refused_with_a_clear_message() {
+        let err = refused(&[("DATABASE_URL", "sqlite://data/collab.db?mode=ro")]);
+        assert_eq!(err.var, "OSWX_COLLAB_DATABASE_URL");
+        assert!(err.expected.contains("query string"), "{err}");
     }
 
     #[test]

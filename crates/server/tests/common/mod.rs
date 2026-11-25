@@ -2,8 +2,8 @@
 #![allow(dead_code)] // each test file uses part of the harness
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,17 +19,29 @@ use tokio::task::JoinHandle;
 /// A session token as the server hands it out.
 pub type Token = String;
 
-/// A running server. Dropping it stops it.
+/// A running server. Dropping it stops it and closes its database.
 pub struct TestServer {
     /// `http://127.0.0.1:<port>`, no trailing slash.
     pub base: String,
     pub state: AppState,
     /// The test database, for statements of the test's own ([`TestServer::sql`]).
     db: SqliteStore,
+    /// What `state.store` is, so that `restart` can put the reopened database in its place.
+    store_kind: StoreKind,
     /// The database and storage live here; kept across `restart`.
     dir: Arc<TempDir>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+enum StoreKind {
+    /// `state.store` is `db` itself.
+    Plain,
+    /// `state.store` is this `FlakyStore` around `db`.
+    Flaky(Arc<FlakyStore>),
+    /// A test put in a store of its own; `restart` cannot reopen it.
+    Custom,
 }
 
 /// The settings every test starts from: everything inside the test's own temporary directory.
@@ -43,18 +55,22 @@ fn test_settings(dir: &Path) -> Settings {
     }
 }
 
-/// Opens the database and storage the settings name. This is the one place that decides what a
-/// test runs against: SQLite at `settings.database_url`, or PostgreSQL with an emptied schema when
+/// Opens the database the settings name. This is the one place that decides what a test runs
+/// against: SQLite at `settings.database_url`, or PostgreSQL with an emptied schema when
 /// `OSWX_TEST_DATABASE_URL` is set.
-async fn open_backing(settings: &mut Settings) -> (SqliteStore, Arc<dyn Blobs>) {
+async fn open_store(settings: &Settings) -> SqliteStore {
     if std::env::var_os("OSWX_TEST_DATABASE_URL").is_some() {
         // TASK 16: open PgStore on an emptied schema here.
         panic!("OSWX_TEST_DATABASE_URL is set, but the PostgreSQL store arrives in Task 16");
     }
-    let store = SqliteStore::open(&settings.database_url, settings.auto_migrate)
+    SqliteStore::open(&settings.database_url, settings.auto_migrate)
         .await
-        .expect("the test database opens");
-    (store, Arc::new(NullBlobs))
+        .expect("the test database opens")
+}
+
+/// Opens the blob storage the settings name.
+fn open_blobs(_settings: &Settings) -> Arc<dyn Blobs> {
+    Arc::new(NullBlobs)
 }
 
 impl TestServer {
@@ -76,23 +92,32 @@ impl TestServer {
         let dir = Arc::new(TempDir::new().expect("a temporary directory"));
         let mut s = test_settings(dir.path());
         settings(&mut s);
-        let (db, blobs) = open_backing(&mut s).await;
-        let mut app_state = AppState::new(s, Arc::new(db.clone()), blobs);
+        let db = open_store(&s).await;
+        let blobs = open_blobs(&s);
+        let plain: Arc<dyn Store> = Arc::new(db.clone());
+        let mut app_state = AppState::new(s, plain.clone(), blobs);
         state(&mut app_state);
-        Self::serve(app_state, db, dir).await
+        let store_kind = if std::ptr::addr_eq(Arc::as_ptr(&app_state.store), Arc::as_ptr(&plain)) {
+            StoreKind::Plain
+        } else {
+            StoreKind::Custom
+        };
+        Self::serve(app_state, db, store_kind, dir).await
     }
 
     /// Starts with the test settings changed by `settings` and the store wrapped in a [`FlakyStore`],
-    /// which is returned so the test can make it fail.
+    /// which is returned so the test can make it fail. It stays in place across `restart`.
     pub async fn start_flaky(settings: impl FnOnce(&mut Settings)) -> (Self, Arc<FlakyStore>) {
         let mut handle = None;
-        let server = Self::start_custom(settings, |s| {
+        let mut server = Self::start_custom(settings, |s| {
             let flaky = Arc::new(FlakyStore::new(s.store.clone()));
             handle = Some(flaky.clone());
             s.store = flaky;
         })
         .await;
-        (server, handle.expect("the state function ran"))
+        let flaky = handle.expect("the state function ran");
+        server.store_kind = StoreKind::Flaky(flaky.clone());
+        (server, flaky)
     }
 
     /// Runs one statement of the test's own against the test database, in its own transaction
@@ -106,18 +131,32 @@ impl TestServer {
         Box::new(tx).commit().await.expect("the statement commits");
     }
 
-    /// Stops the server and starts it again on the same database and storage, as a new process
-    /// would: in-memory state (rooms, the session cache) starts empty; settings, mailer, extensions
-    /// and clock are kept. The port changes; use the new `base`.
+    /// Stops the server and starts it again on the same database file and storage, as a new process
+    /// would: the database is closed and opened again; in-memory state (rooms, the session cache)
+    /// starts empty; settings, mailer, extensions and clock are kept, and so is a [`FlakyStore`]
+    /// (around the reopened database). The port changes; use the new `base`.
     pub async fn restart(mut self) -> Self {
         self.shutdown().await;
+        self.db.close().await;
         let mut state = self.state.clone();
         state.hub = Hub::default();
         state.sessions = Sessions::default();
-        Self::serve(state, self.db.clone(), self.dir.clone()).await
+        let db = open_store(&state.settings).await;
+        let reopened: Arc<dyn Store> = Arc::new(db.clone());
+        match &self.store_kind {
+            StoreKind::Plain => state.store = reopened,
+            StoreKind::Flaky(flaky) => flaky.set_inner(reopened),
+            StoreKind::Custom => panic!("restart() cannot reopen a store the test put in itself"),
+        }
+        Self::serve(state, db, self.store_kind.clone(), self.dir.clone()).await
     }
 
-    async fn serve(state: AppState, db: SqliteStore, dir: Arc<TempDir>) -> Self {
+    async fn serve(
+        state: AppState,
+        db: SqliteStore,
+        store_kind: StoreKind,
+        dir: Arc<TempDir>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a free port");
@@ -136,6 +175,7 @@ impl TestServer {
             base,
             state,
             db,
+            store_kind,
             dir,
             stop: Some(stop),
             task: Some(task),
@@ -159,6 +199,11 @@ impl TestServer {
         self.state.hub.shutdown().await;
     }
 
+    /// The test database as this server opened it.
+    pub fn db(&self) -> &SqliteStore {
+        &self.db
+    }
+
     /// `base` + `path`.
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
@@ -173,13 +218,28 @@ impl Drop for TestServer {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        // Close the database before the temporary directory is removed (Windows will not delete
+        // open files). `Drop` cannot await, and the test's runtime is busy running this, so the
+        // closing runs on a runtime of its own on another thread.
+        let db = self.db.clone();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime to close the database");
+                rt.block_on(async {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), db.close()).await;
+                });
+            });
+        });
     }
 }
 
 /// A store that delegates to a real one and can be told to fail, for the paths a working database
 /// never takes. Every [`Store`] method delegates; add yours when you add one to the trait.
 pub struct FlakyStore {
-    inner: Arc<dyn Store>,
+    inner: RwLock<Arc<dyn Store>>,
     fail_health: AtomicBool,
     fail_commit: Arc<AtomicBool>,
 }
@@ -187,10 +247,23 @@ pub struct FlakyStore {
 impl FlakyStore {
     pub fn new(inner: Arc<dyn Store>) -> Self {
         Self {
-            inner,
+            inner: RwLock::new(inner),
             fail_health: AtomicBool::new(false),
             fail_commit: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The store this one delegates to.
+    fn inner(&self) -> Arc<dyn Store> {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Delegates to `inner` from now on (`TestServer::restart` puts the reopened database here).
+    pub fn set_inner(&self, inner: Arc<dyn Store>) {
+        *self.inner.write().unwrap_or_else(PoisonError::into_inner) = inner;
     }
 
     /// Makes `health` fail (`true`) or delegate again (`false`).
@@ -211,22 +284,22 @@ impl Store for FlakyStore {
         if self.fail_health.load(Ordering::SeqCst) {
             anyhow::bail!("the flaky store was told to fail health");
         }
-        self.inner.health().await
+        self.inner().health().await
     }
 
     async fn schema_status(&self) -> anyhow::Result<SchemaStatus> {
-        self.inner.schema_status().await
+        self.inner().schema_status().await
     }
 
     async fn begin(&self) -> anyhow::Result<Box<dyn Tx>> {
         Ok(Box::new(FlakyTx {
-            inner: self.inner.begin().await?,
+            inner: self.inner().begin().await?,
             fail_commit: self.fail_commit.clone(),
         }))
     }
 
     async fn user_count(&self) -> anyhow::Result<u64> {
-        self.inner.user_count().await
+        self.inner().user_count().await
     }
 }
 

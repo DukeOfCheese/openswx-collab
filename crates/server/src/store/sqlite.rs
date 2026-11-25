@@ -14,7 +14,29 @@
 //! locked" cannot happen. Another process writing the same file (an operator's `migrate`) is waited
 //! for by the busy timeout; because the write lock is taken at `BEGIN`, SQLite can always apply that
 //! wait (a transaction that upgrades from reading to writing could not).
+//!
+//! # The re-entrancy guard
+//!
+//! With one writer connection, a task that holds a transaction and asks for another would wait for
+//! itself, and every other writer would wait behind it. So the store remembers which tokio task
+//! holds the transaction (for a future driven by `block_on`, which has no task id: which thread),
+//! and [`SqliteStore::begin_tx`] (hence [`Store::begin`]) and
+//! [`SqliteStore::migrate`] fail at once when called from that task: "begin() called while this task
+//! holds a transaction; use savepoint()". The holder is set when the transaction starts, moves to
+//! another task when that task uses the transaction (through [`SqliteTx::conn`] or any [`Tx`]
+//! method), and is cleared when the transaction ends (commit, rollback or drop), before the
+//! connection goes back to the pool.
+//!
+//! False positives (an error where waiting would have worked):
+//! - two independent transactional futures joined within one task (`join!`, `select!`): the second
+//!   `begin` fails instead of queueing. Spawn them as tasks instead;
+//! - a task that handed its transaction to another task and calls `begin` before that task has used
+//!   it.
+//!
+//! Only `begin_tx` and `migrate` reach the writer connection; every [`Store`] method reads, on a
+//! `query_only` connection. A write belongs on [`Tx`], so it is always under the guard.
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -38,6 +60,36 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reader connections.
 const READERS: u32 = 4;
+/// What a nested `begin` answers.
+const NESTED_BEGIN: &str = "begin() called while this task holds a transaction; use savepoint()";
+
+/// Who is running: a spawned tokio task, or a future driven by `block_on` (`#[tokio::main]`,
+/// `#[tokio::test]`), which has no task id; at most one of those runs on a thread at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    Task(tokio::task::Id),
+    Thread(std::thread::ThreadId),
+}
+
+impl Caller {
+    fn current() -> Self {
+        match tokio::task::try_id() {
+            Some(id) => Self::Task(id),
+            None => Self::Thread(std::thread::current().id()),
+        }
+    }
+}
+
+/// Who holds the write transaction, if anyone (see the module documentation).
+type Holder = Arc<Mutex<Option<Caller>>>;
+
+fn holder_get(holder: &Holder) -> Option<Caller> {
+    *holder.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn holder_set(holder: &Holder, caller: Option<Caller>) {
+    *holder.lock().unwrap_or_else(PoisonError::into_inner) = caller;
+}
 
 /// A SQLite database file. Cloning is cheap: clones share the connections.
 #[derive(Clone)]
@@ -45,6 +97,7 @@ pub struct SqliteStore {
     writer: SqlitePool,
     readers: SqlitePool,
     migrator: &'static Migrator,
+    holder: Holder,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -77,6 +130,7 @@ impl SqliteStore {
     ) -> Result<Self> {
         let mut store = Self::connect(url).await?;
         store.migrator = migrator;
+        store.check_unchanged().await?;
         let status = store.schema_status().await?;
         let upgrade =
             status.current.is_some() && status.unknown.is_empty() && !status.pending.is_empty();
@@ -132,12 +186,15 @@ impl SqliteStore {
             writer,
             readers,
             migrator: &MIGRATOR,
+            holder: Holder::default(),
         })
     }
 
     /// Applies the migrations this binary carries that the database has not had, and answers the
     /// schema status afterwards. Refuses a database written by a newer server, or not by this one.
     pub async fn migrate(&self) -> Result<SchemaStatus> {
+        self.refuse_nested()?;
+        self.check_unchanged().await?;
         let status = self.schema_status().await?;
         if !status.unknown.is_empty() {
             bail!(SchemaError::Newer {
@@ -160,9 +217,37 @@ impl SqliteStore {
     /// A write transaction with direct access to its connection (for tests and tools; handlers use
     /// [`Store::begin`]). It waits while another write transaction is open.
     pub async fn begin_tx(&self) -> Result<SqliteTx<'static>> {
+        self.refuse_nested()?;
+        let tx = self.writer.begin_with("BEGIN IMMEDIATE").await?;
+        holder_set(&self.holder, Some(Caller::current()));
         Ok(SqliteTx {
-            tx: self.writer.begin_with("BEGIN IMMEDIATE").await?,
+            claim: Some(Claim(self.holder.clone())),
+            tx,
         })
+    }
+
+    /// Fails when the calling task holds the write transaction (it would wait for itself).
+    fn refuse_nested(&self) -> Result<()> {
+        if holder_get(&self.holder) == Some(Caller::current()) {
+            bail!(NESTED_BEGIN);
+        }
+        Ok(())
+    }
+
+    /// Fails when a migration the database has had differs from the one this binary carries under
+    /// the same version (sqlx checks this only when it has something to apply).
+    async fn check_unchanged(&self) -> Result<()> {
+        for (version, checksum) in q::applied_checksums(&mut *self.reader().await?).await? {
+            let changed = self.migrator.iter().any(|m| {
+                m.version == version
+                    && !m.migration_type.is_down_migration()
+                    && *m.checksum != *checksum
+            });
+            if changed {
+                bail!(SchemaError::Changed { version });
+            }
+        }
+        Ok(())
     }
 
     /// A read-only connection (`query_only`), for reads.
@@ -184,7 +269,11 @@ impl Store for SqliteStore {
     }
 
     async fn schema_status(&self) -> Result<SchemaStatus> {
-        let applied = q::applied_migrations(&mut *self.reader().await?).await?;
+        let applied: Vec<i64> = q::applied_checksums(&mut *self.reader().await?)
+            .await?
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect();
         let known: Vec<i64> = self
             .migrator
             .iter()
@@ -203,34 +292,69 @@ impl Store for SqliteStore {
     }
 }
 
+/// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
+/// and is cleared when this is dropped.
+#[derive(Debug)]
+struct Claim(Holder);
+
+impl Claim {
+    /// Records the calling task as the holder (the transaction may have moved to another task).
+    fn touch(&self) {
+        holder_set(&self.0, Some(Caller::current()));
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        holder_set(&self.0, None);
+    }
+}
+
 /// A write transaction, or a savepoint within one, on the writer connection.
 #[derive(Debug)]
 pub struct SqliteTx<'c> {
+    // Declared first so that it is dropped first: the guard is cleared before the connection goes
+    // back to the pool, where the next transaction sets it. `None` for a savepoint.
+    claim: Option<Claim>,
     tx: Transaction<'c, Sqlite>,
 }
 
 impl SqliteTx<'_> {
-    /// The transaction's connection, for statements of your own (tests and tools).
+    /// The transaction's connection. Every query of a [`Tx`] method runs through this, so the guard
+    /// follows the transaction to the task that uses it.
     pub fn conn(&mut self) -> &mut SqliteConnection {
+        self.touch();
         &mut self.tx
     }
 
     /// A savepoint within this transaction, with direct access to its connection.
     pub async fn savepoint_tx(&mut self) -> Result<SqliteTx<'_>> {
+        self.touch();
         Ok(SqliteTx {
+            claim: None,
             tx: (&mut self.tx).begin().await?,
         })
+    }
+
+    fn touch(&self) {
+        if let Some(claim) = &self.claim {
+            claim.touch();
+        }
     }
 }
 
 #[async_trait]
 impl Tx for SqliteTx<'_> {
     async fn commit(self: Box<Self>) -> Result<()> {
-        Ok(self.tx.commit().await?)
+        let SqliteTx { claim, tx } = *self;
+        drop(claim); // before the connection is released
+        Ok(tx.commit().await?)
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {
-        Ok(self.tx.rollback().await?)
+        let SqliteTx { claim, tx } = *self;
+        drop(claim);
+        Ok(tx.rollback().await?)
     }
 
     async fn savepoint(&mut self) -> Result<Box<dyn Tx + '_>> {
@@ -248,8 +372,8 @@ mod q {
         Ok(())
     }
 
-    /// Versions recorded in `_sqlx_migrations`; none when the table does not exist.
-    pub async fn applied_migrations(c: &mut SqliteConnection) -> Result<Vec<i64>> {
+    /// Versions and checksums recorded in `_sqlx_migrations`; none when the table does not exist.
+    pub async fn applied_checksums(c: &mut SqliteConnection) -> Result<Vec<(i64, Vec<u8>)>> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
         )
@@ -258,7 +382,7 @@ mod q {
         if exists == 0 {
             return Ok(Vec::new());
         }
-        Ok(sqlx::query_scalar(sql::APPLIED_MIGRATIONS)
+        Ok(sqlx::query_as(sql::APPLIED_MIGRATIONS)
             .bind(true)
             .fetch_all(c)
             .await?)

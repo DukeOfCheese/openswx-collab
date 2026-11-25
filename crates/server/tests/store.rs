@@ -526,6 +526,173 @@ async fn the_trait_transaction_and_savepoint_commit() {
 }
 
 #[tokio::test]
+async fn two_level_savepoints_through_the_trait() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&url_in(&dir, "collab.db")).await;
+    let org = |id: &str| format!("INSERT INTO orgs (id, name, created_at) VALUES ('{id}', 'O', 0)");
+
+    // With data: the writes go through each level's connection, commit and rollback through
+    // `Box<dyn Tx>`.
+    let mut tx = store.begin_tx().await.unwrap();
+    sqlx::query(&org("top")).execute(tx.conn()).await.unwrap();
+    {
+        let mut outer = tx.savepoint_tx().await.unwrap();
+        sqlx::query(&org("outer"))
+            .execute(outer.conn())
+            .await
+            .unwrap();
+        {
+            let mut inner = outer.savepoint_tx().await.unwrap();
+            sqlx::query(&org("inner"))
+                .execute(inner.conn())
+                .await
+                .unwrap();
+            let inner: Box<dyn oswx_server::store::Tx + '_> = Box::new(inner);
+            inner.rollback().await.unwrap();
+        }
+        sqlx::query(&org("outer2"))
+            .execute(outer.conn())
+            .await
+            .unwrap();
+        let outer: Box<dyn oswx_server::store::Tx + '_> = Box::new(outer);
+        outer.commit().await.unwrap();
+    }
+    let tx: Box<dyn oswx_server::store::Tx> = Box::new(tx);
+    tx.commit().await.unwrap();
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM orgs ORDER BY id")
+        .fetch_all(&mut *store.reader().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ids, ["outer", "outer2", "top"]);
+
+    // Trait objects only, all the way down.
+    let store: Arc<dyn Store> = Arc::new(store);
+    let mut tx = store.begin().await.unwrap();
+    {
+        let mut outer = tx.savepoint().await.unwrap();
+        outer.savepoint().await.unwrap().rollback().await.unwrap();
+        outer.commit().await.unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
+/// Waits at most a second: the guard answers at once, a self-wait would take 30 s.
+async fn at_once<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(1), f)
+        .await
+        .expect("answered at once")
+}
+
+#[tokio::test]
+async fn begin_while_this_task_holds_a_transaction_fails_at_once() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&url_in(&dir, "collab.db")).await;
+    let shared: Arc<dyn Store> = Arc::new(store.clone());
+
+    let tx = store.begin_tx().await.unwrap();
+    let err = at_once(store.begin_tx()).await.unwrap_err();
+    assert!(err.to_string().contains("savepoint()"), "{err}");
+    assert!(at_once(shared.begin()).await.is_err());
+    assert!(at_once(store.migrate()).await.is_err());
+    // Reads do not need the writer.
+    at_once(store.user_count()).await.unwrap();
+
+    // However the transaction ends, this task may begin again.
+    Box::new(tx).commit().await.unwrap();
+    let tx = at_once(store.begin_tx()).await.unwrap();
+    Box::new(tx).rollback().await.unwrap();
+    let tx = at_once(store.begin_tx()).await.unwrap();
+    drop(tx);
+    let tx = at_once(shared.begin()).await.unwrap();
+    assert!(at_once(shared.begin()).await.is_err());
+    tx.commit().await.unwrap();
+    at_once(shared.begin())
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn another_task_waits_for_the_transaction_instead_of_failing() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&url_in(&dir, "collab.db")).await;
+    let tx = store.begin_tx().await.unwrap();
+    let other = store.clone();
+    let waiter = tokio::spawn(async move {
+        let tx = other.begin_tx().await?;
+        Box::new(tx).commit().await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished());
+    Box::new(tx).commit().await.unwrap();
+    at_once(waiter).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_transaction_moved_to_another_task_hands_the_guard_over() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&url_in(&dir, "collab.db")).await;
+
+    // Moved and committed there: this task may begin again.
+    let tx = store.begin_tx().await.unwrap();
+    tokio::spawn(async move { Box::new(tx).commit().await })
+        .await
+        .unwrap()
+        .unwrap();
+    Box::new(at_once(store.begin_tx()).await.unwrap())
+        .commit()
+        .await
+        .unwrap();
+
+    // Moved and dropped there: the same.
+    let tx = store.begin_tx().await.unwrap();
+    tokio::spawn(async move { drop(tx) }).await.unwrap();
+    Box::new(at_once(store.begin_tx()).await.unwrap())
+        .commit()
+        .await
+        .unwrap();
+
+    // Used in the other task: that task now holds it, so its own nested begin fails at once.
+    let tx = store.begin_tx().await.unwrap();
+    let other = store.clone();
+    tokio::spawn(async move {
+        let mut tx = tx;
+        sqlx::query("SELECT 1").execute(tx.conn()).await.unwrap();
+        assert!(at_once(other.begin_tx()).await.is_err());
+        Box::new(tx).commit().await.unwrap();
+    })
+    .await
+    .unwrap();
+    Box::new(at_once(store.begin_tx()).await.unwrap())
+        .commit()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_applied_migration_that_was_edited_is_refused_at_open() {
+    let dir = TempDir::new().unwrap();
+    let url = url_in(&dir, "collab.db");
+    open(&url).await.close().await;
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite/0001_init.sql");
+    let to = dir.path().join("edited");
+    std::fs::create_dir_all(&to).unwrap();
+    let mut text = std::fs::read_to_string(src).unwrap();
+    text.push_str("\n-- edited after release\n");
+    std::fs::write(to.join("0001_init.sql"), text).unwrap();
+    let edited: &'static Migrator = Box::leak(Box::new(Migrator::new(to).await.unwrap()));
+
+    for auto_migrate in [true, false] {
+        let err = schema_error(SqliteStore::open_with_migrations(&url, auto_migrate, edited).await);
+        assert_eq!(err, SchemaError::Changed { version: 1 });
+        assert!(err.to_string().contains("changed"), "{err}");
+    }
+}
+
+#[tokio::test]
 async fn the_flaky_store_fails_health_and_commits_on_demand() {
     let dir = TempDir::new().unwrap();
     let flaky = FlakyStore::new(Arc::new(open(&url_in(&dir, "collab.db")).await));

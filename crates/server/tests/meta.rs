@@ -8,6 +8,7 @@ use axum::Router;
 use axum::routing::post;
 use common::TestServer;
 use oswx_server::ext::Extensions;
+use oswx_server::store::Store;
 use oswx_server::{ApiError, ApiJson, AppState};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -309,4 +310,40 @@ async fn restart_keeps_the_store_and_serves_again() {
     let (status, body) = get(&server, "/api/server").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["registration"], "open");
+}
+
+#[tokio::test]
+async fn restart_reopens_the_database_file_as_a_new_process_would() {
+    let server = TestServer::start().await;
+    add_users(&server, 3).await;
+    let before = server.db().clone();
+    let server = server.restart().await;
+    // The old connections are closed; the new store reads what was written before.
+    assert!(before.health().await.is_err());
+    assert_eq!(server.state.store.user_count().await.unwrap(), 3);
+    assert_eq!(
+        get(&server, "/api/server").await.1["registration"],
+        "invite"
+    );
+}
+
+#[tokio::test]
+async fn restart_keeps_a_flaky_store_wrapped_around_the_reopened_one() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    add_users(&server, 1).await;
+    let server = server.restart().await;
+    assert_eq!(server.state.store.user_count().await.unwrap(), 1);
+    flaky.fail_health(true);
+    assert_eq!(
+        get(&server, "/api/ready").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_server_closes_the_database() {
+    let server = TestServer::start().await;
+    let db = server.db().clone();
+    drop(server);
+    assert!(db.health().await.is_err());
 }

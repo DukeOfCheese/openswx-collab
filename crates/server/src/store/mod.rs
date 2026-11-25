@@ -27,10 +27,17 @@
 //! 4. **SQLite body**: one `async fn` in `sqlite.rs`'s `q` module taking `&mut SqliteConnection`,
 //!    which binds the arguments with `sqlx::query(sql::X).bind(..)` / `query_as::<_, Row>` /
 //!    `query_scalar`. The trait impls are one line each, calling it with a reader connection
-//!    (`Store`) or the transaction's connection (`Tx`). (PostgreSQL, from Task 16, mirrors this in
-//!    `postgres.rs` with `PgConnection`.)
+//!    (`Store`) or the transaction's connection, always through `self.conn()` (`Tx`), which keeps
+//!    the re-entrancy guard on the task using the transaction. (PostgreSQL, from Task 16, mirrors
+//!    this in `postgres.rs` with `PgConnection`.)
+//!
+//!    An `INSERT` lists every column and binds a value for each. The `DEFAULT`s in the schema exist
+//!    for imports and hand-written rows, not for handlers: the handler decides every value.
 //! 5. **Test double**: add the delegating line to `FlakyStore` / `FlakyTx` in
 //!    `tests/common/mod.rs` (the compiler insists).
+//!
+//! Every test of a write reads the row back through [`Store`] after the request (or after
+//! `commit`), so that a write that never reached the database fails the test.
 //!
 //! # Transactions
 //!
@@ -59,9 +66,15 @@
 //!
 //! Rules:
 //! - Only one write transaction runs at a time (SQLite has one writer; the store queues the others),
-//!   so keep transactions short, never `.await` anything slow (network, blobs, other rooms) inside
-//!   one, and never call [`Store::begin`] while holding a [`Tx`]: that waits for itself. Use a
-//!   savepoint instead.
+//!   so keep transactions short and never `.await` anything slow (network, blobs, other rooms)
+//!   inside one.
+//! - Never call [`Store::begin`] while the same task holds a [`Tx`], directly or in a helper: it
+//!   would wait for itself. The store refuses it at once with "begin() called while this task holds
+//!   a transaction; use savepoint()". Pass the `Tx` to the helper, or use a savepoint. (One false
+//!   positive: two independent transactional futures joined in one task with `join!`/`select!` get
+//!   that error instead of queueing; spawn them as tasks. See `sqlite.rs`.)
+//! - [`Store`] methods only read. A write is a [`Tx`] method, never a "single statement" `Store`
+//!   method that takes the writer behind the caller's back.
 //! - A [`Store`] read made while holding a [`Tx`] does not see the transaction's uncommitted writes.
 //!   If it must, the read belongs on [`Tx`].
 
@@ -141,6 +154,13 @@ pub enum SchemaError {
          this server knows up to {latest}); run that version or a later one"
     )]
     Newer { unknown: Vec<i64>, latest: i64 },
+    /// A migration the database has had is not the one this binary carries under that version: a
+    /// released migration was edited.
+    #[error(
+        "migration {version} has changed since it was applied to this database; released \
+         migrations must never be edited (add a new one instead)"
+    )]
+    Changed { version: i64 },
     /// The database has tables but no record of this server's migrations.
     #[error(
         "the database has tables but was not written by this server (no migration record); a \
