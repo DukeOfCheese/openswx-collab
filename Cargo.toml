@@ -8,6 +8,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-trait = "0.1"
 base64 = "0.22"
 axum = { version = "0.8", features = ["ws", "macros"] }
@@ -21,7 +22,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 sysinfo = "0.33"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-tungstenite ={ version = "0.26", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4"] }
 imbl = "7"
 rmpv = "1"
@@ -48,4 +50,11 @@ all = "warn"
 
 # scrypt at N=2^15 takes seconds unoptimised; tests hash passwords.
 [profile.dev.package.scrypt]
+opt-level = 3
+
+# Blob uploads hash and compress up to 256 MB; tests upload tens of megabytes.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.zstd-sys]
 opt-level = 3

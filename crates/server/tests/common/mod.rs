@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oswx_server::blobs::{Blobs, NullBlobs};
+use oswx_server::blobs::{Blobs, LocalBlobs};
 use oswx_server::hub::Hub;
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
@@ -74,9 +74,9 @@ async fn open_store(settings: &Settings) -> SqliteStore {
         .expect("the test database opens")
 }
 
-/// Opens the blob storage the settings name.
-fn open_blobs(_settings: &Settings) -> Arc<dyn Blobs> {
-    Arc::new(NullBlobs)
+/// Opens the blob storage the settings name: a folder in the test's temporary directory.
+fn open_blobs(settings: &Settings) -> Arc<dyn Blobs> {
+    Arc::new(LocalBlobs::new(&settings.storage_url).expect("the test storage folder"))
 }
 
 impl TestServer {

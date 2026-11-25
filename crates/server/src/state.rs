@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use anyhow::bail;
 
-use crate::blobs::{Blobs, NullBlobs};
+use crate::blobs::{Blobs, LocalBlobs};
 use crate::clock::Clock;
-use crate::config::{Database, Settings};
+use crate::config::{Database, Settings, Storage};
 use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
@@ -46,8 +46,9 @@ impl AppState {
     }
 
     /// The state of a running server: the database `settings.database_url` names (opened, and its
-    /// schema brought up to date as [`SqliteStore::open`] does), and mail through the operator's
-    /// SMTP server ([`SmtpMailer`]).
+    /// schema brought up to date as [`SqliteStore::open`] does), the blob storage
+    /// `settings.storage_url` names (a folder, [`LocalBlobs`]; S3 is refused until Task 17), and mail
+    /// through the operator's SMTP server ([`SmtpMailer`]).
     pub async fn from_settings(settings: Settings) -> anyhow::Result<Self> {
         let store: Arc<dyn Store> = match settings.database()? {
             Database::Sqlite(_) => {
@@ -56,8 +57,13 @@ impl AppState {
             // TASK 16: open the PostgreSQL store here.
             Database::Postgres(_) => bail!("this build cannot open PostgreSQL databases yet"),
         };
-        // TASK 6: open the blob storage `settings.storage_url` names.
-        let blobs: Arc<dyn Blobs> = Arc::new(NullBlobs);
+        let blobs: Arc<dyn Blobs> = match settings.storage()? {
+            Storage::Local(folder) => Arc::new(LocalBlobs::new(folder)?),
+            // TASK 17: open the S3 storage here.
+            Storage::S3 { .. } => {
+                bail!("this build cannot use S3 storage yet (S3 storage arrives in Task 17)")
+            }
+        };
         let mailer = Arc::new(SmtpMailer::new(&settings)?);
         let mut state = Self::new(settings, store, blobs);
         state.mailer = mailer;
