@@ -1438,12 +1438,34 @@ fn the_reserved_byte_is_refused_as_a_value() {
     // The same frame with nil in its place is a ping.
     *frame.last_mut().unwrap() = 0xc0;
     assert_eq!(decode_client(&frame, 1 << 20), Ok(ClientMsg::Ping));
-    // As a key too.
-    let key = [0x81, 0xc1, 0xc0];
+    // As a key, in a frame that is otherwise a ping: {"t": "ping", 0xc1: nil}.
+    let key = [0x82, 0xa1, b't', 0xa4, b'p', b'i', b'n', b'g', 0xc1, 0xc0];
     assert!(matches!(
         decode_client(&key, 1 << 20),
         Err(WireError::Invalid(_))
     ));
+    // 0xc1 inside a payload (a uint16, a string, binary data) is an ordinary byte.
+    for extra in [
+        &[0xcd, 0x00, 0xc1][..],
+        &[0xa1, 0xc1][..],
+        &[0xc4, 0x01, 0xc1][..],
+    ] {
+        let mut f = vec![0x82, 0xa1, b't', 0xa4, b'p', b'i', b'n', b'g', 0xa1, b'x'];
+        f.extend_from_slice(extra);
+        let r = decode_client(&f, 1 << 20);
+        // A lone 0xc1 is not UTF-8, so the string case is refused for that reason; the scan
+        // itself accepts all three.
+        assert!(oswx_core::wire::scan(&f, None).is_ok(), "{f:02x?}");
+        assert!(!scan_agrees_with_rmpv::reserved_marker(&f), "{f:02x?}");
+        if extra[0] != 0xa1 {
+            assert_eq!(r, Ok(ClientMsg::Ping), "{f:02x?}");
+        }
+    }
+    // As a value or a key, it is a marker.
+    assert!(scan_agrees_with_rmpv::reserved_marker(&key));
+    let mut as_value = frame.clone();
+    *as_value.last_mut().unwrap() = 0xc1;
+    assert!(scan_agrees_with_rmpv::reserved_marker(&as_value));
 }
 
 mod scan_agrees_with_rmpv {
@@ -1492,6 +1514,58 @@ mod scan_agrees_with_rmpv {
         prop::collection::vec((value(), value()), 0..5).prop_map(Plain::Map)
     }
 
+    /// Whether 0xc1 stands where a value starts, walking the markers one after another as a
+    /// reader does (containers only announce how many values follow, so every marker is met in
+    /// turn). Independent of `wire::scan`; stops at the end of the bytes.
+    pub fn reserved_marker(bytes: &[u8]) -> bool {
+        let be = |at: usize, width: usize| -> Option<usize> {
+            let b = bytes.get(at..at + width)?;
+            Some(b.iter().fold(0usize, |n, &x| (n << 8) | x as usize))
+        };
+        let mut at = 0;
+        while let Some(&m) = bytes.get(at) {
+            at += 1;
+            let skip = match m {
+                0xc1 => return true,
+                0x00..=0x7f | 0x80..=0x9f | 0xc0 | 0xc2 | 0xc3 | 0xe0..=0xff => 0,
+                0xa0..=0xbf => (m & 0x1f) as usize,
+                0xdc | 0xde => 2,
+                0xdd | 0xdf => 4,
+                0xcc | 0xd0 => 1,
+                0xcd | 0xd1 => 2,
+                0xce | 0xd2 | 0xca => 4,
+                0xcf | 0xd3 | 0xcb => 8,
+                0xd4..=0xd8 => 1 + (1 << (m - 0xd4)),
+                0xd9 | 0xc4 => match be(at, 1) {
+                    Some(n) => 1 + n,
+                    None => return false,
+                },
+                0xda | 0xc5 => match be(at, 2) {
+                    Some(n) => 2 + n,
+                    None => return false,
+                },
+                0xdb | 0xc6 => match be(at, 4) {
+                    Some(n) => 4 + n,
+                    None => return false,
+                },
+                0xc7 => match be(at, 1) {
+                    Some(n) => 2 + n,
+                    None => return false,
+                },
+                0xc8 => match be(at, 2) {
+                    Some(n) => 3 + n,
+                    None => return false,
+                },
+                0xc9 => match be(at, 4) {
+                    Some(n) => 5 + n,
+                    None => return false,
+                },
+            };
+            at = at.saturating_add(skip);
+        }
+        false
+    }
+
     /// What rmpv makes of the bytes: one value, all of them used, a map.
     fn reference(bytes: &[u8]) -> Option<usize> {
         let mut rest = bytes;
@@ -1528,11 +1602,12 @@ mod scan_agrees_with_rmpv {
             for v in variants {
                 let scanned = oswx_core::wire::scan(&v, None);
                 match reference(&v) {
-                    // rmpv reads the reserved byte 0xc1 as nil; the scan refuses it, as it should
-                    // (stricter than the parser, never laxer).
+                    // rmpv reads the reserved marker 0xc1 as nil; the scan refuses it, as it
+                    // should (stricter than the parser, never laxer). Only a 0xc1 that stands
+                    // where a value starts excuses a refusal; one inside a payload does not.
                     Some(n) => prop_assert!(
                         scanned.as_ref().map(|s| s.nodes) == Ok(n)
-                            || (scanned.is_err() && v.contains(&0xc1)),
+                            || (scanned.is_err() && reserved_marker(&v)),
                         "{:02x?}",
                         v
                     ),
