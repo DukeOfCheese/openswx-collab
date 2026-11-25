@@ -286,9 +286,13 @@ fn build_ops(doc: &Value, choices: Vec<Choice>) -> Vec<Op> {
                     pos: pick_pos(poss, &c, &b),
                 }
             }
-            // A new key (kind 3, or nothing else to aim at).
+            // A new key (kind 3, or nothing else to aim at); now and then the wire form's list
+            // key, which apply must refuse.
             _ => Op::Set {
-                path: fresh_key(i, &a),
+                path: match c.index(10) {
+                    0 => child(&t.maps[a.index(t.maps.len())], "$list"),
+                    _ => fresh_key(i, &a),
+                },
                 value,
             },
         })

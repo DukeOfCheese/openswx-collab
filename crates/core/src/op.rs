@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::path::{self, Path};
 use crate::pos::Pos;
-use crate::value::{Id, Plain, Value};
+use crate::value::{Id, LIST_KEY, Plain, Value};
 
 pub const MAX_DEPTH: usize = 64;
 pub const MAX_NAME: usize = 200;
@@ -141,8 +141,12 @@ impl Op {
                 if !matches!(item, Value::Map(_)) {
                     return Err(invalid("item must be a map"));
                 }
-                if item_id(&item).is_none() {
-                    return Err(invalid("item needs a string id"));
+                match item_id(&item) {
+                    None => return Err(invalid("item needs a string id")),
+                    Some(id) if &**id == LIST_KEY => {
+                        return Err(invalid("an item id cannot be $list"));
+                    }
+                    Some(_) => {}
                 }
                 let pos = parse_pos(field(pairs, "pos")?)?;
                 Ok(Op::Insert { list, item, pos })

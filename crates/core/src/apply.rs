@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::op::{MAX_DEPTH, Op, OpError};
 use crate::path::Path;
-use crate::value::{Id, KeyedList, Value};
+use crate::value::{Id, KeyedList, LIST_KEY, Value};
 
 /// Invariants every change must leave intact.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -159,6 +159,7 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
     match op {
         Op::Set { path, value } => {
             check_depth(path.len(), value)?;
+            check_list_key(path, None, value)?;
             edit_parent(doc, path, |parent, last, in_item| match parent {
                 Value::Map(m) => {
                     if in_item && &**last == "id" {
@@ -198,6 +199,7 @@ fn apply_one(doc: &Value, op: &Op) -> Result<(Value, Op), OpError> {
         Op::Insert { list, item, pos } => {
             let id = item_id(item).ok_or_else(|| invalid("item needs a string id"))?;
             check_depth(list.len() + 1, item)?;
+            check_list_key(list, Some(id), item)?;
             let with_item =
                 |k: &KeyedList| Value::Keyed(k.inserted(id.clone(), pos.clone(), item.clone()));
             edit_parent(doc, list, |parent, last, _| match parent {
@@ -472,5 +474,27 @@ fn check_depth(segments: usize, value: &Value) -> Result<(), OpError> {
         Err(OpError::Invalid(format!(
             "nesting is deeper than {MAX_DEPTH} levels"
         )))
+    }
+}
+
+/// Whether a map anywhere in `v` has the key `$list`.
+fn holds_list_key(v: &Value) -> bool {
+    match v {
+        Value::Map(m) => m.contains_key(LIST_KEY) || m.values().any(holds_list_key),
+        Value::List(l) => l.iter().any(holds_list_key),
+        Value::Keyed(k) => k.iter().any(|(_, _, c)| holds_list_key(c)),
+        _ => false,
+    }
+}
+
+/// `$list` is the key of a keyed list's wire form: a document holding it as a map key, or as an
+/// item id, could not be read back from that form. `Op::from_wire` never builds such an
+/// operation; hand-built ones are refused here.
+fn check_list_key(path: &Path, id: Option<&Id>, value: &Value) -> Result<(), OpError> {
+    let in_path = path.iter().chain(id).any(|s| &**s == LIST_KEY);
+    if in_path || holds_list_key(value) {
+        Err(invalid("$list cannot be a key or an id"))
+    } else {
+        Ok(())
     }
 }

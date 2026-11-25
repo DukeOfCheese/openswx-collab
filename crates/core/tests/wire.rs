@@ -728,6 +728,17 @@ fn change_ops_and_reads_are_checked() {
     bad(&with(c(), "reads", json!([deep])));
     let fine: Vec<String> = (0..64).map(|i| format!("s{i}")).collect();
     ok(&with(c(), "reads", json!([fine])));
+    // `$list` is never a segment: not in an op, a read or a lock path.
+    bad(&with(
+        c(),
+        "ops",
+        json!([{"op": "set", "path": ["$list"], "value": 1}]),
+    ));
+    bad(&with(c(), "reads", json!([["features", "$list"]])));
+    ok(&with(c(), "reads", json!([["features", "$lists"]])));
+    let acquire = |p: Json| json!({"t": "lock.acquire", "request_id": "r", "paths": p});
+    bad(&acquire(json!([["$list"]])));
+    ok(&acquire(json!([["list"]])));
 }
 
 #[test]

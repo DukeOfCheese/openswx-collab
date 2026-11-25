@@ -142,6 +142,27 @@ fn bad_paths() {
 }
 
 #[test]
+fn the_wire_list_key_is_never_a_segment() {
+    // `$list` as a map key would make the document unreadable in its own wire form.
+    let l = |segs: &[&str]| arr(segs);
+    for path in [&["$list"][..], &["a", "$list"], &["$list", "b"]] {
+        invalid(Op::from_wire(&set(l(path), Plain::from(1))));
+        invalid(Op::from_wire(&unset(l(path))));
+        invalid(Op::from_wire(&insert(l(path), item("u.c.1"), s("V"))));
+        invalid(Op::from_wire(&remove(l(path), s("u.c.1"))));
+        invalid(Op::from_wire(&mv(l(path), s("u.c.1"), s("V"))));
+    }
+    invalid(Op::from_wire(&remove(l(&["l"]), s("$list"))));
+    invalid(Op::from_wire(&mv(l(&["l"]), s("$list"), s("V"))));
+    invalid(Op::from_wire(&insert(l(&["l"]), item("$list"), s("V"))));
+    // Similar names are ordinary.
+    for seg in ["$lists", "list", "$", "x$list"] {
+        Op::from_wire(&set(l(&["a", seg]), Plain::from(1))).unwrap();
+        Op::from_wire(&insert(l(&[seg]), item(seg), s("V"))).unwrap();
+    }
+}
+
+#[test]
 fn protected_first_segment() {
     for k in PROTECTED {
         invalid(Op::from_wire(&set(arr(&[k, "x"]), Plain::from(1))));

@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{arb_doc_and_ops, load, path};
-use oswx_core::{Applied, Op, OpError, Pos, Rules, Value, apply};
+use oswx_core::{Applied, Op, OpError, Pos, Rules, Value, apply, diff};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
@@ -404,6 +404,58 @@ fn ids_inside_plain_lists_are_always_checked() {
 }
 
 #[test]
+fn the_wire_list_key_is_never_written() {
+    // Hand-built operations skip `Op::from_wire`; apply refuses `$list` itself.
+    let doc = load(json!({"a": {"l": [{"id": "x"}]}, "e": []}));
+    for p in [&["$list"][..], &["a", "$list"]] {
+        invalid(run(&doc, &[set(p, 1)]));
+        invalid(run(&doc, &[insert(p, "u1.c1.1", "V")]));
+    }
+    invalid(run(&doc, &[insert(&["e"], "$list", "V")]));
+    invalid(run(&doc, &[insert(&["a", "l"], "$list", "V")]));
+    // A value holding a `$list` key, at any depth, is refused too.
+    let bad = map_with_list_key();
+    invalid(run(
+        &doc,
+        &[Op::Set {
+            path: path(&["b"]),
+            value: bad.clone(),
+        }],
+    ));
+    let item = Value::Map(
+        [
+            (Arc::from("id"), Value::Str(Arc::from("u1.c1.1"))),
+            (Arc::from("sub"), bad),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    invalid(run(
+        &doc,
+        &[Op::Insert {
+            list: path(&["e"]),
+            item,
+            pos: pos("V"),
+        }],
+    ));
+    // The document is still readable in its wire form.
+    assert_eq!(Value::from_wire(&doc.to_wire()).unwrap(), doc);
+    // Similar names are ordinary.
+    run(&doc, &[set(&["a", "$lists"], 1), insert(&["e"], "$", "V")]).unwrap();
+}
+
+/// `{"k": {"$list": 1, "x": 2}}`, built by hand: no conversion would produce it.
+fn map_with_list_key() -> Value {
+    let inner: oswx_core::Map = [
+        (Arc::from("$list"), Value::Int(1)),
+        (Arc::from("x"), Value::Int(2)),
+    ]
+    .into_iter()
+    .collect();
+    Value::Map([(Arc::from("k"), Value::Map(inner))].into_iter().collect())
+}
+
+#[test]
 fn all_or_nothing() {
     let doc = part();
     let r = run(
@@ -611,6 +663,16 @@ proptest! {
             // The inverse of the inverse redoes the change.
             let again = apply(&back.doc, &back.inverse, &Rules::default(), None).unwrap();
             prop_assert_eq!(&again.doc, &a.doc);
+        }
+    }
+
+    #[test]
+    fn accepted_results_reload((doc, ops) in arb_doc_and_ops()) {
+        // Whatever apply accepts can be sent as a snapshot and read back, and a client holding
+        // it as plain data sees nothing to send.
+        if let Ok(a) = run(&doc, &ops) {
+            prop_assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc.clone()));
+            prop_assert!(diff(&a.doc, &a.doc.to_plain()).is_ok());
         }
     }
 }

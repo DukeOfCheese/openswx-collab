@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use crate::op::{MAX_DEPTH, MAX_NAME, OpError};
-use crate::value::Plain;
+use crate::value::{LIST_KEY, Plain};
 
 pub type Path = Vec<Arc<str>>;
 
-/// A string of 1..=`MAX_NAME` characters.
+/// A string of 1..=`MAX_NAME` characters, other than `$list` (the wire form's keyed-list key: as
+/// a map key it would make the document unreadable).
 pub(crate) fn name(p: &Plain, what: &str) -> Result<Arc<str>, OpError> {
     let s = p
         .as_str()
@@ -17,6 +18,9 @@ pub(crate) fn name(p: &Plain, what: &str) -> Result<Arc<str>, OpError> {
         return Err(OpError::Invalid(format!(
             "{what} must be 1 to {MAX_NAME} characters"
         )));
+    }
+    if s == LIST_KEY {
+        return Err(OpError::Invalid(format!("{what} cannot be {LIST_KEY}")));
     }
     Ok(Arc::from(s))
 }
