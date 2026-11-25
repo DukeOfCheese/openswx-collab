@@ -145,7 +145,8 @@ impl Value {
 
     /// Whether the wire form gives this value back exactly: `Value::from_wire(&v.to_wire())` is
     /// `Ok(v)`. Values made by `from_wire` and `from_plain` always are; values built by hand may
-    /// not be. One walk, nothing allocated. It checks that numbers are finite, nesting is at most
+    /// not be. One walk; the only allocation is a set of ids for each plain list whose items all
+    /// carry ids. It checks that numbers are finite, nesting is at most
     /// `MAX_DEPTH`, keys and ids are at most `MAX_NAME` characters and never `$list`, every keyed
     /// item is a map whose `id` is its key, and no plain list reads as keyed (`from_plain`'s test).
     pub fn is_canonical(&self) -> bool {
@@ -215,25 +216,25 @@ fn canonical(v: &Value, depth: usize) -> bool {
 }
 
 /// Whether `from_wire` would refuse these plain-list items for looking like a keyed list: all
-/// maps with a string `id`, and those ids distinct or one of them too long.
+/// maps with a string `id`, and those ids distinct or one of them too long. Allocates only for a
+/// list whose items all carry ids (a set, to tell whether they are distinct).
 fn reads_as_keyed(items: &[Value]) -> bool {
-    let ids: Option<Vec<&str>> = items
-        .iter()
-        .map(|i| match i {
-            Value::Map(m) => match m.get("id") {
-                Some(Value::Str(s)) => Some(&**s),
-                _ => None,
-            },
+    let id_of = |i: &Value| match i {
+        Value::Map(m) => match m.get("id") {
+            Some(Value::Str(s)) => Some(s.clone()),
             _ => None,
-        })
-        .collect();
-    match ids {
-        Some(ids) if !ids.is_empty() => {
-            ids.iter().any(|id| id.chars().count() > MAX_NAME)
-                || ids.iter().collect::<BTreeSet<_>>().len() == ids.len()
-        }
-        _ => false,
+        },
+        _ => None,
+    };
+    if items.is_empty() || !items.iter().all(|i| id_of(i).is_some()) {
+        return false;
     }
+    let ids = items.iter().filter_map(id_of);
+    if ids.clone().any(|id| id.chars().count() > MAX_NAME) {
+        return true;
+    }
+    let mut seen = BTreeSet::new();
+    ids.into_iter().all(|id| seen.insert(id))
 }
 
 fn enter(depth: usize) -> Result<usize, ValueError> {
