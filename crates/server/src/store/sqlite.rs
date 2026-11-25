@@ -48,7 +48,7 @@ use sqlx::sqlite::{
 };
 use sqlx::{Acquire, Sqlite, Transaction};
 
-use super::{SchemaError, SchemaStatus, Store, Tx, sql};
+use super::{PasswordReset, SchemaError, SchemaStatus, Session, Store, Tx, User, sql};
 use crate::config::{Database, parse_database_url};
 
 /// The migrations in `migrations/sqlite/`, embedded in the binary.
@@ -290,6 +290,22 @@ impl Store for SqliteStore {
     async fn user_count(&self) -> Result<u64> {
         q::user_count(&mut *self.reader().await?).await
     }
+
+    async fn user_by_id(&self, id: &str) -> Result<Option<User>> {
+        q::user_by_id(&mut *self.reader().await?, id).await
+    }
+
+    async fn user_by_email(&self, email: &str) -> Result<Option<User>> {
+        q::user_by_email(&mut *self.reader().await?, email).await
+    }
+
+    async fn session_by_hash(&self, token_hash: &str) -> Result<Option<Session>> {
+        q::session_by_hash(&mut *self.reader().await?, token_hash).await
+    }
+
+    async fn password_reset_by_hash(&self, token_hash: &str) -> Result<Option<PasswordReset>> {
+        q::password_reset_by_hash(&mut *self.reader().await?, token_hash).await
+    }
 }
 
 /// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
@@ -360,6 +376,74 @@ impl Tx for SqliteTx<'_> {
     async fn savepoint(&mut self) -> Result<Box<dyn Tx + '_>> {
         Ok(Box::new(self.savepoint_tx().await?))
     }
+
+    async fn user_count(&mut self) -> Result<u64> {
+        q::user_count(self.conn()).await
+    }
+
+    async fn user_by_id(&mut self, id: &str) -> Result<Option<User>> {
+        q::user_by_id(self.conn(), id).await
+    }
+
+    async fn user_by_email(&mut self, email: &str) -> Result<Option<User>> {
+        q::user_by_email(self.conn(), email).await
+    }
+
+    async fn insert_user(&mut self, user: &User) -> Result<()> {
+        q::insert_user(self.conn(), user).await
+    }
+
+    async fn set_user_name(&mut self, id: &str, name: &str) -> Result<()> {
+        q::set_user_name(self.conn(), id, name).await
+    }
+
+    async fn set_user_password(&mut self, id: &str, password_hash: Option<&str>) -> Result<()> {
+        q::set_user_password(self.conn(), id, password_hash).await
+    }
+
+    async fn set_user_email_verified(&mut self, id: &str, verified: bool) -> Result<()> {
+        q::set_user_email_verified(self.conn(), id, verified).await
+    }
+
+    async fn set_user_disabled(&mut self, id: &str, disabled: bool) -> Result<()> {
+        q::set_user_disabled(self.conn(), id, disabled).await
+    }
+
+    async fn insert_session(&mut self, session: &Session) -> Result<()> {
+        q::insert_session(self.conn(), session).await
+    }
+
+    async fn delete_session(&mut self, token_hash: &str) -> Result<()> {
+        q::delete_session(self.conn(), token_hash).await
+    }
+
+    async fn delete_user_sessions(&mut self, user_id: &str) -> Result<()> {
+        q::delete_user_sessions(self.conn(), user_id).await
+    }
+
+    async fn delete_other_user_sessions(&mut self, user_id: &str, keep: &str) -> Result<()> {
+        q::delete_other_user_sessions(self.conn(), user_id, keep).await
+    }
+
+    async fn delete_expired_user_sessions(&mut self, user_id: &str, now: f64) -> Result<()> {
+        q::delete_expired_user_sessions(self.conn(), user_id, now).await
+    }
+
+    async fn insert_password_reset(&mut self, reset: &PasswordReset) -> Result<()> {
+        q::insert_password_reset(self.conn(), reset).await
+    }
+
+    async fn take_password_reset(&mut self, token_hash: &str) -> Result<Option<PasswordReset>> {
+        q::take_password_reset(self.conn(), token_hash).await
+    }
+
+    async fn delete_user_password_resets(&mut self, user_id: &str) -> Result<()> {
+        q::delete_user_password_resets(self.conn(), user_id).await
+    }
+
+    async fn delete_expired_password_resets(&mut self, now: f64) -> Result<()> {
+        q::delete_expired_password_resets(self.conn(), now).await
+    }
 }
 
 /// One function per query; the trait methods call these with a reader or the transaction's
@@ -402,5 +486,196 @@ mod q {
     pub async fn user_count(c: &mut SqliteConnection) -> Result<u64> {
         let n: i64 = sqlx::query_scalar(sql::USER_COUNT).fetch_one(c).await?;
         Ok(u64::try_from(n)?)
+    }
+
+    pub async fn user_by_id(c: &mut SqliteConnection, id: &str) -> Result<Option<User>> {
+        Ok(sqlx::query_as(sql::USER_BY_ID)
+            .bind(id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn user_by_email(c: &mut SqliteConnection, email: &str) -> Result<Option<User>> {
+        Ok(sqlx::query_as(sql::USER_BY_EMAIL)
+            .bind(email)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn insert_user(c: &mut SqliteConnection, u: &User) -> Result<()> {
+        sqlx::query(sql::INSERT_USER)
+            .bind(&u.id)
+            .bind(&u.email)
+            .bind(&u.name)
+            .bind(&u.password_hash)
+            .bind(u.is_server_admin)
+            .bind(u.disabled)
+            .bind(u.email_verified)
+            .bind(u.created_at)
+            .bind(u.deleted_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_name(c: &mut SqliteConnection, id: &str, name: &str) -> Result<()> {
+        sqlx::query(sql::SET_USER_NAME)
+            .bind(id)
+            .bind(name)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_password(
+        c: &mut SqliteConnection,
+        id: &str,
+        password_hash: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_USER_PASSWORD)
+            .bind(id)
+            .bind(password_hash)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_email_verified(
+        c: &mut SqliteConnection,
+        id: &str,
+        verified: bool,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_USER_EMAIL_VERIFIED)
+            .bind(id)
+            .bind(verified)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_user_disabled(
+        c: &mut SqliteConnection,
+        id: &str,
+        disabled: bool,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_USER_DISABLED)
+            .bind(id)
+            .bind(disabled)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_session(c: &mut SqliteConnection, s: &Session) -> Result<()> {
+        sqlx::query(sql::INSERT_SESSION)
+            .bind(&s.token_hash)
+            .bind(&s.user_id)
+            .bind(s.created_at)
+            .bind(s.expires_at)
+            .bind(&s.label)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn session_by_hash(
+        c: &mut SqliteConnection,
+        token_hash: &str,
+    ) -> Result<Option<Session>> {
+        Ok(sqlx::query_as(sql::SESSION_BY_HASH)
+            .bind(token_hash)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn delete_session(c: &mut SqliteConnection, token_hash: &str) -> Result<()> {
+        sqlx::query(sql::DELETE_SESSION)
+            .bind(token_hash)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_user_sessions(c: &mut SqliteConnection, user_id: &str) -> Result<()> {
+        sqlx::query(sql::DELETE_USER_SESSIONS)
+            .bind(user_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_other_user_sessions(
+        c: &mut SqliteConnection,
+        user_id: &str,
+        keep: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_OTHER_USER_SESSIONS)
+            .bind(user_id)
+            .bind(keep)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_expired_user_sessions(
+        c: &mut SqliteConnection,
+        user_id: &str,
+        now: f64,
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_EXPIRED_USER_SESSIONS)
+            .bind(user_id)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_password_reset(c: &mut SqliteConnection, r: &PasswordReset) -> Result<()> {
+        sqlx::query(sql::INSERT_PASSWORD_RESET)
+            .bind(&r.token_hash)
+            .bind(&r.user_id)
+            .bind(r.expires_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn password_reset_by_hash(
+        c: &mut SqliteConnection,
+        token_hash: &str,
+    ) -> Result<Option<PasswordReset>> {
+        Ok(sqlx::query_as(sql::PASSWORD_RESET_BY_HASH)
+            .bind(token_hash)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn take_password_reset(
+        c: &mut SqliteConnection,
+        token_hash: &str,
+    ) -> Result<Option<PasswordReset>> {
+        Ok(sqlx::query_as(sql::TAKE_PASSWORD_RESET)
+            .bind(token_hash)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn delete_user_password_resets(
+        c: &mut SqliteConnection,
+        user_id: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_USER_PASSWORD_RESETS)
+            .bind(user_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_expired_password_resets(c: &mut SqliteConnection, now: f64) -> Result<()> {
+        sqlx::query(sql::DELETE_EXPIRED_PASSWORD_RESETS)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(())
     }
 }

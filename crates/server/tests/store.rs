@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::FlakyStore;
-use oswx_server::store::{SchemaError, SchemaStatus, SqliteStore, Store, Tx as _, new_id};
+use oswx_server::store::{
+    PasswordReset, SchemaError, SchemaStatus, Session, SqliteStore, Store, Tx as _, User, new_id,
+};
 use sqlx::migrate::Migrator;
 use tempfile::TempDir;
 
@@ -523,6 +525,191 @@ async fn the_trait_transaction_and_savepoint_commit() {
     tx.commit().await.unwrap();
     // The writer is free again.
     store.begin().await.unwrap().rollback().await.unwrap();
+}
+
+fn user(id: &str, email: &str) -> User {
+    User {
+        id: id.into(),
+        email: email.into(),
+        name: "N".into(),
+        password_hash: Some("scrypt$x".into()),
+        is_server_admin: false,
+        disabled: false,
+        email_verified: false,
+        created_at: 1.5,
+        deleted_at: None,
+    }
+}
+
+fn session(hash: &str, user_id: &str, expires_at: f64) -> Session {
+    Session {
+        token_hash: hash.into(),
+        user_id: user_id.into(),
+        created_at: 1.0,
+        expires_at,
+        label: "laptop".into(),
+    }
+}
+
+#[tokio::test]
+async fn accounts_are_written_and_read_back() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn Store> = Arc::new(open(&url_in(&dir, "collab.db")).await);
+    let ada = user(&new_id(), "ada@example.com");
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_user(&ada).await.unwrap();
+    assert_eq!(
+        tx.user_count().await.unwrap(),
+        1,
+        "the transaction sees its own write"
+    );
+    assert_eq!(
+        tx.user_by_email("ada@example.com").await.unwrap(),
+        Some(ada.clone())
+    );
+    assert!(
+        store.user_by_id(&ada.id).await.unwrap().is_none(),
+        "not committed yet"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(store.user_by_id(&ada.id).await.unwrap(), Some(ada.clone()));
+    assert_eq!(
+        store.user_by_email("ada@example.com").await.unwrap(),
+        Some(ada.clone())
+    );
+    assert!(
+        store
+            .user_by_email("ADA@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The address is unique.
+    let mut tx = store.begin().await.unwrap();
+    assert!(
+        tx.insert_user(&user(&new_id(), "ada@example.com"))
+            .await
+            .is_err()
+    );
+    drop(tx);
+
+    let mut tx = store.begin().await.unwrap();
+    tx.set_user_name(&ada.id, "Ada L").await.unwrap();
+    tx.set_user_password(&ada.id, None).await.unwrap();
+    tx.set_user_email_verified(&ada.id, true).await.unwrap();
+    tx.set_user_disabled(&ada.id, true).await.unwrap();
+    tx.commit().await.unwrap();
+    let got = store.user_by_id(&ada.id).await.unwrap().unwrap();
+    assert_eq!(
+        got,
+        User {
+            name: "Ada L".into(),
+            password_hash: None,
+            email_verified: true,
+            disabled: true,
+            ..ada.clone()
+        }
+    );
+    assert!(!got.active());
+}
+
+#[tokio::test]
+async fn sessions_and_password_resets_are_written_read_back_and_deleted() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn Store> = Arc::new(open(&url_in(&dir, "collab.db")).await);
+    let (a, b) = (new_id(), new_id());
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_user(&user(&a, "a@example.com")).await.unwrap();
+    tx.insert_user(&user(&b, "b@example.com")).await.unwrap();
+    for (hash, owner, expires) in [
+        ("s1", &a, 10.0),
+        ("s2", &a, 100.0),
+        ("s3", &a, 100.0),
+        ("s4", &b, 5.0),
+    ] {
+        tx.insert_session(&session(hash, owner, expires))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(
+        store.session_by_hash("s2").await.unwrap(),
+        Some(session("s2", &a, 100.0))
+    );
+
+    let mut tx = store.begin().await.unwrap();
+    tx.delete_expired_user_sessions(&a, 50.0).await.unwrap(); // s1
+    tx.delete_session("s3").await.unwrap();
+    tx.commit().await.unwrap();
+    for (hash, kept) in [("s1", false), ("s2", true), ("s3", false), ("s4", true)] {
+        assert_eq!(
+            store.session_by_hash(hash).await.unwrap().is_some(),
+            kept,
+            "{hash}"
+        );
+    }
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_session(&session("s5", &a, 100.0)).await.unwrap();
+    tx.delete_other_user_sessions(&a, "s5").await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(store.session_by_hash("s2").await.unwrap().is_none());
+    assert!(store.session_by_hash("s5").await.unwrap().is_some());
+    let mut tx = store.begin().await.unwrap();
+    tx.delete_user_sessions(&a).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(store.session_by_hash("s5").await.unwrap().is_none());
+    assert!(
+        store.session_by_hash("s4").await.unwrap().is_some(),
+        "only a's"
+    );
+
+    let reset = |hash: &str, owner: &str, expires_at: f64| PasswordReset {
+        token_hash: hash.into(),
+        user_id: owner.into(),
+        expires_at,
+    };
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_password_reset(&reset("r1", &a, 10.0))
+        .await
+        .unwrap();
+    tx.insert_password_reset(&reset("r2", &a, 100.0))
+        .await
+        .unwrap();
+    tx.insert_password_reset(&reset("r3", &b, 10.0))
+        .await
+        .unwrap();
+    tx.insert_password_reset(&reset("r4", &b, 100.0))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        store.password_reset_by_hash("r2").await.unwrap(),
+        Some(reset("r2", &a, 100.0))
+    );
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(
+        tx.take_password_reset("r2").await.unwrap(),
+        Some(reset("r2", &a, 100.0))
+    );
+    assert_eq!(
+        tx.take_password_reset("r2").await.unwrap(),
+        None,
+        "a reset is taken once"
+    );
+    tx.delete_expired_password_resets(50.0).await.unwrap(); // r1, r3
+    tx.commit().await.unwrap();
+    for (hash, kept) in [("r1", false), ("r2", false), ("r3", false), ("r4", true)] {
+        assert_eq!(
+            store.password_reset_by_hash(hash).await.unwrap().is_some(),
+            kept,
+            "{hash}"
+        );
+    }
+    let mut tx = store.begin().await.unwrap();
+    tx.delete_user_password_resets(&b).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(store.password_reset_by_hash("r4").await.unwrap().is_none());
 }
 
 #[tokio::test]

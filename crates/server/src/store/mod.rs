@@ -169,6 +169,47 @@ pub enum SchemaError {
     Foreign,
 }
 
+/// An account (`users`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct User {
+    pub id: Id,
+    /// Normalised by [`crate::security::clean_email`]; unique.
+    pub email: String,
+    pub name: String,
+    /// `None` for an account that signs in only through a provider.
+    pub password_hash: Option<String>,
+    pub is_server_admin: bool,
+    pub disabled: bool,
+    pub email_verified: bool,
+    pub created_at: f64,
+    pub deleted_at: Option<f64>,
+}
+
+impl User {
+    /// Whether this account may sign in at all: it is neither disabled nor deleted.
+    pub fn active(&self) -> bool {
+        !self.disabled && self.deleted_at.is_none()
+    }
+}
+
+/// A signed-in device (`sessions`). Only the token's hash is stored.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Session {
+    pub token_hash: String,
+    pub user_id: Id,
+    pub created_at: f64,
+    pub expires_at: f64,
+    pub label: String,
+}
+
+/// A password reset link (`password_resets`). Only the token's hash is stored.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct PasswordReset {
+    pub token_hash: String,
+    pub user_id: Id,
+    pub expires_at: f64,
+}
+
 /// The database. One method per query; see the module documentation for how to add one.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
@@ -183,6 +224,21 @@ pub trait Store: Send + Sync + 'static {
 
     /// How many accounts exist, deleted and disabled ones included (the registration mode).
     async fn user_count(&self) -> anyhow::Result<u64>;
+
+    /// The account with this id.
+    async fn user_by_id(&self, id: &str) -> anyhow::Result<Option<User>>;
+
+    /// The account with this (normalised) email address.
+    async fn user_by_email(&self, email: &str) -> anyhow::Result<Option<User>>;
+
+    /// The session whose token has this hash, expired or not.
+    async fn session_by_hash(&self, token_hash: &str) -> anyhow::Result<Option<Session>>;
+
+    /// The password reset whose token has this hash, expired or not.
+    async fn password_reset_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<PasswordReset>>;
 }
 
 /// A write transaction (or a savepoint within one). Dropping it without [`Tx::commit`] rolls it
@@ -197,4 +253,59 @@ pub trait Tx: Send {
 
     /// Opens a savepoint: a transaction within this one, which can be rolled back on its own.
     async fn savepoint(&mut self) -> anyhow::Result<Box<dyn Tx + '_>>;
+
+    /// [`Store::user_count`], serialised with this transaction's writes (registration decides who
+    /// becomes the server admin from it).
+    async fn user_count(&mut self) -> anyhow::Result<u64>;
+
+    /// [`Store::user_by_id`], seeing this transaction's writes.
+    async fn user_by_id(&mut self, id: &str) -> anyhow::Result<Option<User>>;
+
+    /// [`Store::user_by_email`], seeing this transaction's writes.
+    async fn user_by_email(&mut self, email: &str) -> anyhow::Result<Option<User>>;
+
+    /// Adds an account. Fails if the id or the email address is taken.
+    async fn insert_user(&mut self, user: &User) -> anyhow::Result<()>;
+
+    async fn set_user_name(&mut self, id: &str, name: &str) -> anyhow::Result<()>;
+
+    async fn set_user_password(
+        &mut self,
+        id: &str,
+        password_hash: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    async fn set_user_email_verified(&mut self, id: &str, verified: bool) -> anyhow::Result<()>;
+
+    async fn set_user_disabled(&mut self, id: &str, disabled: bool) -> anyhow::Result<()>;
+
+    async fn insert_session(&mut self, session: &Session) -> anyhow::Result<()>;
+
+    /// Ends one session.
+    async fn delete_session(&mut self, token_hash: &str) -> anyhow::Result<()>;
+
+    /// Ends every session of an account.
+    async fn delete_user_sessions(&mut self, user_id: &str) -> anyhow::Result<()>;
+
+    /// Ends every session of an account but the one whose token has the hash `keep`.
+    async fn delete_other_user_sessions(&mut self, user_id: &str, keep: &str)
+    -> anyhow::Result<()>;
+
+    /// Removes an account's sessions that expired before `now`.
+    async fn delete_expired_user_sessions(&mut self, user_id: &str, now: f64)
+    -> anyhow::Result<()>;
+
+    async fn insert_password_reset(&mut self, reset: &PasswordReset) -> anyhow::Result<()>;
+
+    /// Removes the password reset whose token has this hash and answers it (`None` if there was
+    /// none): a link works once, even when two requests race.
+    async fn take_password_reset(
+        &mut self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<PasswordReset>>;
+
+    async fn delete_user_password_resets(&mut self, user_id: &str) -> anyhow::Result<()>;
+
+    /// Removes every account's password resets that expired before `now`.
+    async fn delete_expired_password_resets(&mut self, now: f64) -> anyhow::Result<()>;
 }

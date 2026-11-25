@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use oswx_server::blobs::{Blobs, NullBlobs};
 use oswx_server::hub::Hub;
 use oswx_server::sessions::Sessions;
-use oswx_server::store::{Id, SchemaStatus, SqliteStore, Store, Tx};
+use oswx_server::store::{Id, PasswordReset, SchemaStatus, Session, SqliteStore, Store, Tx, User};
 use oswx_server::{AppState, Settings};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -301,6 +301,25 @@ impl Store for FlakyStore {
     async fn user_count(&self) -> anyhow::Result<u64> {
         self.inner().user_count().await
     }
+
+    async fn user_by_id(&self, id: &str) -> anyhow::Result<Option<User>> {
+        self.inner().user_by_id(id).await
+    }
+
+    async fn user_by_email(&self, email: &str) -> anyhow::Result<Option<User>> {
+        self.inner().user_by_email(email).await
+    }
+
+    async fn session_by_hash(&self, token_hash: &str) -> anyhow::Result<Option<Session>> {
+        self.inner().session_by_hash(token_hash).await
+    }
+
+    async fn password_reset_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<PasswordReset>> {
+        self.inner().password_reset_by_hash(token_hash).await
+    }
 }
 
 /// [`FlakyStore`]'s transaction. Every [`Tx`] method delegates; add yours when you add one.
@@ -325,6 +344,89 @@ impl Tx for FlakyTx {
 
     async fn savepoint(&mut self) -> anyhow::Result<Box<dyn Tx + '_>> {
         self.inner.savepoint().await
+    }
+
+    async fn user_count(&mut self) -> anyhow::Result<u64> {
+        self.inner.user_count().await
+    }
+
+    async fn user_by_id(&mut self, id: &str) -> anyhow::Result<Option<User>> {
+        self.inner.user_by_id(id).await
+    }
+
+    async fn user_by_email(&mut self, email: &str) -> anyhow::Result<Option<User>> {
+        self.inner.user_by_email(email).await
+    }
+
+    async fn insert_user(&mut self, user: &User) -> anyhow::Result<()> {
+        self.inner.insert_user(user).await
+    }
+
+    async fn set_user_name(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.inner.set_user_name(id, name).await
+    }
+
+    async fn set_user_password(
+        &mut self,
+        id: &str,
+        password_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.inner.set_user_password(id, password_hash).await
+    }
+
+    async fn set_user_email_verified(&mut self, id: &str, verified: bool) -> anyhow::Result<()> {
+        self.inner.set_user_email_verified(id, verified).await
+    }
+
+    async fn set_user_disabled(&mut self, id: &str, disabled: bool) -> anyhow::Result<()> {
+        self.inner.set_user_disabled(id, disabled).await
+    }
+
+    async fn insert_session(&mut self, session: &Session) -> anyhow::Result<()> {
+        self.inner.insert_session(session).await
+    }
+
+    async fn delete_session(&mut self, token_hash: &str) -> anyhow::Result<()> {
+        self.inner.delete_session(token_hash).await
+    }
+
+    async fn delete_user_sessions(&mut self, user_id: &str) -> anyhow::Result<()> {
+        self.inner.delete_user_sessions(user_id).await
+    }
+
+    async fn delete_other_user_sessions(
+        &mut self,
+        user_id: &str,
+        keep: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_other_user_sessions(user_id, keep).await
+    }
+
+    async fn delete_expired_user_sessions(
+        &mut self,
+        user_id: &str,
+        now: f64,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_expired_user_sessions(user_id, now).await
+    }
+
+    async fn insert_password_reset(&mut self, reset: &PasswordReset) -> anyhow::Result<()> {
+        self.inner.insert_password_reset(reset).await
+    }
+
+    async fn take_password_reset(
+        &mut self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<PasswordReset>> {
+        self.inner.take_password_reset(token_hash).await
+    }
+
+    async fn delete_user_password_resets(&mut self, user_id: &str) -> anyhow::Result<()> {
+        self.inner.delete_user_password_resets(user_id).await
+    }
+
+    async fn delete_expired_password_resets(&mut self, now: f64) -> anyhow::Result<()> {
+        self.inner.delete_expired_password_resets(now).await
     }
 }
 

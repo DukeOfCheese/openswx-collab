@@ -4,6 +4,7 @@
 //! `Result<_, ApiError>` and take JSON bodies through [`ApiJson`], paths through [`ApiPath`] and queries through [`ApiQuery`], so every error a client sees has the
 //! shape `{"detail": "..."}`.
 
+pub mod access;
 pub mod blobs;
 pub mod clock;
 pub mod config;
