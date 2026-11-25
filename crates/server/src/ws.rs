@@ -43,7 +43,7 @@ use crate::error::ApiPath;
 use crate::hub::OpenError;
 use crate::room::conn::{self, Outbox, error_frame};
 use crate::room::{JoinRequest, close};
-use crate::security::token_hash;
+use crate::security::{ProjectRole, token_hash};
 use crate::state::AppState;
 
 /// How long a client has to send its hello.
@@ -184,17 +184,29 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         }
     };
 
-    // What this client already sent to the document, so that the room recognises its resends.
+    // What this client already sent to the document, so that the room recognises its resends (a
+    // viewer cannot send changes: nothing to load, and the room never looks its ids up).
     let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
-    let recent_ids = match state
-        .store
-        .recent_change_ids(&document_id, &client, RECENT_IDS)
-        .await
-    {
-        Ok(ids) => ids
-            .into_iter()
-            .filter_map(|(id, seq)| Some((id, u64::try_from(seq).ok()?)))
-            .collect(),
+    let preload = if role == ProjectRole::Viewer {
+        Ok(None)
+    } else {
+        state
+            .store
+            .recent_change_ids(&document_id, &client, RECENT_IDS)
+            .await
+            .map(Some)
+    };
+    let (recent_ids, ids_complete): (Vec<(String, u64)>, bool) = match preload {
+        Ok(None) => (Vec::new(), false),
+        Ok(Some(ids)) => {
+            // Fewer than asked for: these are all of them.
+            let complete = (ids.len() as i64) < RECENT_IDS;
+            let ids = ids
+                .into_iter()
+                .filter_map(|(id, seq)| Some((id, u64::try_from(seq).ok()?)))
+                .collect();
+            (ids, complete)
+        }
         Err(e) => {
             server_error(e);
             return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
@@ -215,6 +227,7 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         format_version,
         last_seq,
         recent_ids,
+        ids_complete,
     };
     let mut joined = None;
     for _ in 0..JOIN_TRIES {

@@ -13,7 +13,7 @@ use common::*;
 use oswx_core::wire::{ChangeEvent, RejectCode, ServerMsg};
 use oswx_core::{Op, Refusal, Seq};
 use oswx_server::journal::{self, JournalWriter};
-use oswx_server::room::{Hooks, ServerChangeError};
+use oswx_server::room::{Hooks, ServerChangeError, ServerChangeOptions};
 use oswx_server::store::Store;
 use serde_json::json;
 
@@ -221,35 +221,31 @@ async fn a_resend_while_the_change_is_being_written_gets_its_seq_once() {
 async fn a_clients_answers_stay_in_order_when_big_changes_are_judged_off_the_task() {
     let hooks = Hooks {
         judge_delay: Duration::from_millis(800),
+        // (So that B's ids are not all in memory, and its changes are looked up first.)
+        max_remembered: 1,
         ..Hooks::default()
     };
     let (server, flaky) =
         TestServer::start_flaky_full(|_| {}, new_journal, |s| s.room_hooks = Arc::new(hooks)).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
-    let mut first = Live::connect(&server, &doc, &world.admin).await;
-    assert_eq!(
-        first
-            .change(vec![var("first", 1)], vec![], vec![])
-            .await
-            .seq(),
-        1
-    );
+    let mut first =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("order-b1")).await;
+    many_changes(&mut first, 2, "first").await;
     first.close().await;
-    // After a restart the room's memory starts at 1: a change made on 0 is looked up first.
-    let server = server.restart().await;
     flaky.lookup_delay(Duration::from_millis(300));
     let mut a = Live::connect(&server, &doc, &world.admin).await;
-    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, Hello::client("order-b1")).await;
+    let lookups = flaky.change_lookups();
     let big = |who: &str| -> Vec<Op> { (0..300).map(|n| var(&format!("{who}{n}"), n)).collect() };
     // B's big change waits for the journal lookup ...
     let b1 = b.make_change(0, big("b"));
     b.send_change(&b1).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     // ... while A's big change is being judged off the task, and B sends one that builds on B1.
-    let a1 = a.make_change(1, big("a"));
+    let a1 = a.make_change(2, big("a"));
     a.send_change(&a1).await;
-    let mut b2 = b.make_change(1, vec![var("b-after", 1)]);
+    let mut b2 = b.make_change(2, vec![var("b-after", 1)]);
     b2.depends = vec![b1.change_id.clone()];
     b.send_change(&b2).await;
     let first_answer: Answer = b.expect().await;
@@ -264,26 +260,37 @@ async fn a_clients_answers_stay_in_order_when_big_changes_are_judged_off_the_tas
         a.outcome(&a1.change_id).await,
         Outcome::Accepted(_)
     ));
+    assert!(
+        flaky.change_lookups() > lookups,
+        "B1 went through the journal lookup"
+    );
 }
 
 #[tokio::test]
 async fn what_a_connection_may_queue_is_bounded() {
-    let (server, flaky) = TestServer::start_flaky(|s| s.max_change_bytes = 20000).await;
+    // A room that remembers one id, so that these clients' ids are not all in memory and each new
+    // change is looked up in the (slow) journal first.
+    let hooks = Hooks {
+        max_remembered: 1,
+        ..Hooks::default()
+    };
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.max_change_bytes = 20000,
+        new_journal,
+        |s| s.room_hooks = Arc::new(hooks),
+    )
+    .await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
-    let mut first = Live::connect(&server, &doc, &world.admin).await;
-    assert_eq!(
-        first
-            .change(vec![var("first", 1)], vec![], vec![])
-            .await
-            .seq(),
-        1
-    );
-    first.close().await;
-    let server = server.restart().await;
+    for client in ["queue-a1", "queue-b1"] {
+        let mut first =
+            Live::connect_with(&server, &doc, &world.admin, Hello::client(client)).await;
+        many_changes(&mut first, 2, client).await;
+        first.close().await;
+    }
     flaky.lookup_delay(Duration::from_secs(3));
     // Bytes: behind a change that waits for the journal, 96 kB of changes (the limit is 80 kB).
-    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("queue-a1")).await;
     let wait = a.make_change(0, vec![var("wait", 1)]);
     a.send_change(&wait).await;
     let pad = "p".repeat(16_000);
@@ -293,7 +300,7 @@ async fn what_a_connection_may_queue_is_bounded() {
     }
     assert_eq!(a.closed().await.0, 4408);
     // Count: 1,100 small messages behind one that waits.
-    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, Hello::client("queue-b1")).await;
     let wait = b.make_change(0, vec![var("wait", 2)]);
     b.send_change(&wait).await;
     for _ in 0..1100 {
@@ -369,6 +376,7 @@ async fn the_server_can_make_a_change_that_everyone_hears_and_a_reload_judges_al
             "restore to 0",
             &world.admin_id,
             "Ada",
+            ServerChangeOptions::default(),
         )
         .await
         .unwrap();
@@ -394,6 +402,7 @@ async fn the_server_can_make_a_change_that_everyone_hears_and_a_reload_judges_al
             "restore",
             &world.admin_id,
             "Ada",
+            ServerChangeOptions::default(),
         )
         .await;
     assert!(
@@ -515,4 +524,215 @@ async fn the_index_is_pruned_before_a_snapshot_and_a_reload_judges_the_same() {
     .unwrap();
     assert_eq!(loaded.seq, 25);
     assert_eq!(loaded.index.to_wire(), memory.index.to_wire());
+}
+
+// ------------------------------------------------------------------ fix round 2
+
+/// `n` changes from `live`, pipelined, each on its own variable; answers their change ids in order.
+async fn many_changes(live: &mut Live, n: usize, tag: &str) -> Vec<oswx_core::Change> {
+    let mut changes = Vec::new();
+    for i in 0..n {
+        let change = live.make_change(live.seq, vec![var(&format!("{tag}{i}"), i as i64)]);
+        live.send_change(&change).await;
+        changes.push(change);
+    }
+    for change in &changes {
+        live.outcome(&change.change_id).await.seq();
+    }
+    changes
+}
+
+#[tokio::test]
+async fn old_ids_resent_ahead_of_others_never_reach_the_journal_or_hurt_anyone() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    // The hostile client has more changes here than a join loads.
+    let mut h = Live::connect_with(&server, &doc, &world.admin, Hello::client("hostile-1")).await;
+    let old = many_changes(&mut h, 1005, "h").await;
+    h.close().await;
+    let server = server.restart().await;
+    let mut h = Live::connect_with(&server, &doc, &world.admin, Hello::client("hostile-1")).await;
+    let mut v = Live::connect(&server, &doc, &world.admin).await;
+    let head = v.welcome.seq;
+    let duplicates = flaky.duplicate_inserts();
+    for change in &old[..4] {
+        let mut again = change.clone();
+        again.base = head;
+        h.send_change(&again).await;
+    }
+    let mine = v.make_change(head, vec![var("victim", 1)]);
+    v.send_change(&mine).await;
+    for (n, change) in old[..4].iter().enumerate() {
+        assert_eq!(
+            h.outcome(&change.change_id).await,
+            Outcome::Accepted(n as Seq + 1),
+            "the original seq"
+        );
+    }
+    assert_eq!(v.outcome(&mine.change_id).await.seq(), head + 1);
+    assert!(rejections(&v.seen).is_empty(), "{:?}", v.seen);
+    assert_eq!(
+        flaky.duplicate_inserts(),
+        duplicates,
+        "no duplicate reached the journal"
+    );
+    assert!(h.closed.is_none());
+}
+
+#[tokio::test]
+async fn an_ordinary_client_sends_new_changes_without_store_lookups() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("ordinary-1")).await;
+    many_changes(&mut a, 20, "a").await;
+    a.close().await;
+    let server = server.restart().await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("ordinary-1")).await;
+    let lookups = flaky.change_lookups();
+    // New changes, one of them made offline on an old base.
+    assert!(matches!(
+        a.change_on(3, vec![var("offline", 1)]).await,
+        Outcome::Accepted(_)
+    ));
+    many_changes(&mut a, 20, "b").await;
+    assert_eq!(
+        flaky.change_lookups(),
+        lookups,
+        "the hot path asks the store nothing"
+    );
+}
+
+#[tokio::test]
+async fn reconnecting_again_and_again_does_not_grow_the_rooms_memory() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, Hello::client("looping-1")).await;
+    many_changes(&mut a, 1001, "a").await;
+    a.close().await;
+    let _watcher = Live::connect(&server, &doc, &world.admin).await;
+    let again = Live::connect_with(&server, &doc, &world.admin, Hello::client("looping-1")).await;
+    again.close().await;
+    let before = server.room_status(&doc).await.remembered;
+    for _ in 0..1000 {
+        let again =
+            Live::connect_with(&server, &doc, &world.admin, Hello::client("looping-1")).await;
+        again.close().await;
+    }
+    assert_eq!(server.room_status(&doc).await.remembered, before);
+}
+
+#[tokio::test]
+async fn a_change_that_builds_on_a_resent_one_is_judged_with_it() {
+    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow(300)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let x = a.make_change(0, vec![var("x", 1)]);
+    assert_eq!(a.resend(&x).await.seq(), 1);
+    // The room lost X from memory (a race), then A sends X again and Y on top of it.
+    server.room(&doc).forget_change_ids().await;
+    let mut again = x.clone();
+    again.base = 1;
+    a.send_change(&again).await;
+    let mut y = a.make_change(1, vec![var("y", 1)]);
+    y.depends = vec![x.change_id.clone()];
+    a.send_change(&y).await;
+    assert_eq!(a.outcome(&x.change_id).await, Outcome::Accepted(1));
+    assert_eq!(a.outcome(&y.change_id).await, Outcome::Accepted(2));
+}
+
+#[tokio::test]
+async fn the_server_puts_an_item_back_with_its_original_id_after_its_tombstone_is_pruned() {
+    let hooks = Hooks {
+        index_keep: 1,
+        ..Hooks::default()
+    };
+    let server =
+        TestServer::start_custom(|s| s.snapshot_every = 2, |s| s.room_hooks = Arc::new(hooks))
+            .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(
+        a.change(vec![remove(&["features"], "f2")], vec![], vec![])
+            .await
+            .seq(),
+        1
+    );
+    for n in 0..5 {
+        a.change(vec![var("v", n)], vec![], vec![]).await.seq();
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while server.room_status(&doc).await.snapshot_seq < 4 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let head = server.room(&doc).durable_head().await.unwrap();
+    assert!(head.index.floor() > 1, "the removal's mark is pruned");
+    let mut f2 = feature("f2", "Boss-Extrude1");
+    f2["type"] = json!("extrude");
+    let put_back = insert(&["features"], f2, after_f2());
+    let seq = server
+        .room(&doc)
+        .server_change(
+            vec![put_back],
+            "restore to 0",
+            &world.admin_id,
+            "Ada",
+            ServerChangeOptions::default(),
+        )
+        .await;
+    assert_eq!(seq, Ok(7));
+}
+
+#[tokio::test]
+async fn a_viewer_joining_loads_no_change_ids() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let (viewer, _) = world
+        .invite(&server, "vi@example.com", None, Some("viewer"), "member")
+        .await;
+    let doc = world.document(&server, None, None, None).await;
+    let preloads = flaky.preloads();
+    let _v = Live::connect(&server, &doc, &viewer).await;
+    assert_eq!(flaky.preloads(), preloads);
+    let _e = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(flaky.preloads(), preloads + 1);
+}
+
+#[tokio::test]
+async fn once_memory_forgets_a_clients_id_its_next_unknown_id_is_looked_up() {
+    let hooks = Hooks {
+        max_remembered: 50,
+        ..Hooks::default()
+    };
+    let (server, flaky) =
+        TestServer::start_flaky_full(|_| {}, new_journal, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    many_changes(&mut a, 40, "a").await;
+    let lookups = flaky.change_lookups();
+    assert!(matches!(
+        a.change(vec![var("n", 1)], vec![], vec![]).await,
+        Outcome::Accepted(_)
+    ));
+    assert_eq!(
+        flaky.change_lookups(),
+        lookups,
+        "nothing forgotten yet: no lookup"
+    );
+    // Past the room's maximum, its oldest ids are forgotten ...
+    many_changes(&mut a, 20, "b").await;
+    let status = server.room_status(&doc).await;
+    assert!(status.remembered.1 <= 50, "{:?}", status.remembered);
+    // ... and from then on an id memory does not hold is asked of the journal.
+    let lookups = flaky.change_lookups();
+    assert!(matches!(
+        a.change(vec![var("n", 2)], vec![], vec![]).await,
+        Outcome::Accepted(_)
+    ));
+    assert_eq!(flaky.change_lookups(), lookups + 1);
 }

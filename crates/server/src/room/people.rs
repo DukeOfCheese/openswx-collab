@@ -138,7 +138,6 @@ impl Room {
             parked: VecDeque::new(),
             parked_bytes: 0,
             busy: false,
-            duplicates: 0,
         };
         let you = conn.peer();
         let peers: Vec<Peer> = self.conns.values().map(Conn::peer).collect();
@@ -161,6 +160,8 @@ impl Room {
         for (change_id, seq) in req.recent_ids {
             self.recent.remember(&req.client, &change_id, seq);
         }
+        self.recent.set_complete(&req.client, req.ids_complete);
+        self.recent.trim(self.snapshot_seq);
         self.by_client.insert(req.client, req.conn);
         self.conns.insert(req.conn, conn);
         let internal = self.internal.clone();

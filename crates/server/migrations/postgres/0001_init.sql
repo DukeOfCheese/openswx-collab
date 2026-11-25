@@ -163,6 +163,8 @@ CREATE TABLE changes (
     PRIMARY KEY (document_id, seq),
     CONSTRAINT uq_change_id UNIQUE (document_id, client_id, change_id)
 );
+-- A joining client's latest change ids, newest first, without sorting the document's history.
+CREATE INDEX ix_changes_client_seq ON changes (document_id, client_id, seq);
 
 CREATE TABLE snapshots (
     document_id VARCHAR(32) NOT NULL REFERENCES documents (id) ON DELETE CASCADE,

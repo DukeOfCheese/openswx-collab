@@ -251,7 +251,8 @@ async fn a_big_change_is_judged_off_the_room_task_and_lands_like_any_other() {
 async fn scale_check_one_hundred_editors() {
     const CLIENTS: usize = 100;
     const SECONDS: u64 = 10;
-    let (server, world) = world().await;
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut tasks = Vec::new();
     let server = std::sync::Arc::new(server);
@@ -290,13 +291,19 @@ async fn scale_check_one_hundred_editors() {
     latencies.sort();
     let at = |q: f64| latencies[((latencies.len() as f64 - 1.0) * q) as usize];
     println!(
-        "scale: {} changes accepted, {} rejected {:?}; median {:?}, p99 {:?}, max {:?}",
+        "scale: {} changes accepted, {} rejected {:?}; median {:?}, p99 {:?}, max {:?}; {} store lookups",
         latencies.len(),
         rejected.len(),
         rejected,
         at(0.5),
         at(0.99),
-        latencies.last().unwrap()
+        latencies.last().unwrap(),
+        flaky.change_lookups()
+    );
+    assert_eq!(
+        flaky.change_lookups(),
+        0,
+        "the hot path asks the store nothing"
     );
     assert!(rejected.is_empty());
     let head: Seq = server.room_status(&doc).await.seq;

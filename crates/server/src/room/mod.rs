@@ -13,8 +13,10 @@
 //! See the `change` module: a change is judged against the tentative head, handed to the journal, and only
 //! when the journal reports it durable is the durable head moved, the change broadcast and its sender
 //! told `change.accepted`. Nothing that can fail runs after that report. The room decides change
-//! `n + 1` while `n` is still being written (pipelining); if the journal refuses `n`, every change
-//! decided after it is refused with `server_error` and the tentative head returns to the durable one.
+//! `n + 1` while `n` is still being written (pipelining); if the journal refuses `n` for a cause of
+//! its own, only `n` is answered, and every change decided after it is judged again, in order,
+//! against the durable head (each then written or refused on its merits; its sender sees only the
+//! final answer).
 //! If the journal cannot say whether `n` was written, or the lease was lost, the room unloads at once
 //! and closes every connection with [`close::MOVED`]: clients reconnect (a fresh room loads what the
 //! store has) and resend; a resend whose row did land is answered with its original seq.
@@ -94,6 +96,8 @@ const MAX_TENTATIVE: usize = 4096;
 /// The most messages of one connection that may wait for its earlier one (a blob check, a journal
 /// lookup); past it the connection is closed as too slow.
 const MAX_PARKED: usize = 1024;
+/// How many users' journal duplicates a room counts (the oldest forgotten first).
+const DUPLICATE_USERS: usize = 1024;
 /// How long closing waits for the journal's answers to changes in flight.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// How long a final snapshot may take when a room closes.
@@ -110,13 +114,20 @@ pub struct Hooks {
     pub judge_delay: Duration,
     /// History the index keeps before a snapshot prunes it ([`INDEX_KEEP`]).
     pub index_keep: Seq,
+    /// The most change ids a room remembers ([`MAX_REMEMBERED`]).
+    pub max_remembered: usize,
 }
+
+/// The most change ids a room remembers, whatever its snapshots; past it the oldest are forgotten
+/// (and their clients' later unknown ids are looked up in the journal).
+pub const MAX_REMEMBERED: usize = 100_000;
 
 impl Default for Hooks {
     fn default() -> Self {
         Self {
             judge_delay: Duration::ZERO,
             index_keep: INDEX_KEEP,
+            max_remembered: MAX_REMEMBERED,
         }
     }
 }
@@ -139,7 +150,16 @@ pub struct ServerChange {
     /// The user it is made for (history shows them as its author).
     pub author: Id,
     pub author_name: String,
+    pub options: ServerChangeOptions,
     pub reply: oneshot::Sender<Result<Seq, ServerChangeError>>,
+}
+
+/// How a change the server makes is judged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerChangeOptions {
+    /// Refuse it (`stale`) if another client changed what it writes since the current head when it
+    /// was asked for. Off: it lands whatever happened (a restore); ids are never prefix-checked.
+    pub check_stale: bool,
 }
 
 /// What an open room is: what it and the tests can see of it.
@@ -155,6 +175,8 @@ pub struct RoomStatus {
     pub epoch: u64,
     /// How many frames the room has encoded (each broadcast is encoded once, whoever receives it).
     pub encodes: u64,
+    /// Change ids remembered, and the entries of the order they are forgotten in.
+    pub remembered: (usize, usize),
     pub connections: Vec<ConnStatus>,
 }
 
@@ -180,6 +202,9 @@ pub struct JoinRequest {
     /// This client's most recent change ids in the document and their seqs (from the journal), so
     /// that its resends are recognised in memory whatever base they carry.
     pub recent_ids: Vec<(String, Seq)>,
+    /// `recent_ids` are all the ids this client ever journaled here (the journal had fewer than a
+    /// join loads).
+    pub ids_complete: bool,
 }
 
 /// A command for a room.
@@ -214,7 +239,8 @@ pub enum RoomCmd {
     },
     /// The durable head.
     Head(oneshot::Sender<Head>),
-    /// For tests: forget every remembered change id, as a room that has trimmed its memory has.
+    /// For tests: forget every remembered change id but keep believing memory complete, as a room
+    /// that lost entries in a race would.
     #[doc(hidden)]
     ForgetChangeIds,
     Status(oneshot::Sender<RoomStatus>),
@@ -302,6 +328,7 @@ impl RoomHandle {
         command: &str,
         author: &str,
         author_name: &str,
+        options: ServerChangeOptions,
     ) -> Result<Seq, ServerChangeError> {
         let (reply, answer) = oneshot::channel();
         let change = ServerChange {
@@ -309,6 +336,7 @@ impl RoomHandle {
             command: command.to_owned(),
             author: author.to_owned(),
             author_name: author_name.to_owned(),
+            options,
             reply,
         };
         self.send(RoomCmd::ServerChange(Box::new(change)))
@@ -395,8 +423,6 @@ struct Conn {
     /// A message of this connection waits for work off the task (a blob check, a journal lookup,
     /// a big change being judged).
     busy: bool,
-    /// How many of its changes the journal refused as duplicates.
-    duplicates: u32,
 }
 
 impl Conn {
@@ -468,6 +494,10 @@ struct Room {
     /// Changes the server makes itself, waiting for their turn.
     server_queue: VecDeque<change::Item>,
     next_ticket: change::Ticket,
+    /// Connections that sent a change again while the journal's seq for it is looked up.
+    checking: HashMap<change::Ticket, Vec<ConnId>>,
+    /// Journal duplicates per user (surviving reconnects), bounded.
+    duplicates: util::Tally,
     /// Connections with parked messages that may go on.
     ready: VecDeque<ConnId>,
     /// Connections that broke their queue's limits, to be removed.
@@ -504,7 +534,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         internal: internal_tx,
         conns: HashMap::new(),
         by_client: HashMap::new(),
-        recent: change::Recent::new(init.head.seq),
+        recent: change::Recent::new(state.room_hooks.max_remembered),
         refused: HashMap::new(),
         known_blobs: change::KnownBlobs::default(),
         snapshot_seq: init.snapshot_seq,
@@ -512,6 +542,8 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         paused: 0,
         server_queue: VecDeque::new(),
         next_ticket: 0,
+        checking: HashMap::new(),
+        duplicates: util::Tally::new(DUPLICATE_USERS),
         ready: VecDeque::new(),
         slow: Vec::new(),
         closing: None,
@@ -602,7 +634,7 @@ impl Room {
             RoomCmd::Head(reply) => {
                 let _ = reply.send(self.durable.clone());
             }
-            RoomCmd::ForgetChangeIds => self.recent = change::Recent::new(self.durable.seq),
+            RoomCmd::ForgetChangeIds => self.recent.forget_entries(),
             RoomCmd::Status(reply) => {
                 let _ = reply.send(self.status());
             }
@@ -649,6 +681,7 @@ impl Room {
             snapshot_seq: self.snapshot_seq,
             epoch: self.epoch,
             encodes: self.encodes.load(Ordering::Relaxed),
+            remembered: self.recent.sizes(),
             connections,
         }
     }

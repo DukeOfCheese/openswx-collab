@@ -6,11 +6,13 @@
 //!    (`change.accepted`), or, while that change is still being written, answered when it is. The
 //!    room remembers, in memory, every change decided but not yet durable, every change made
 //!    durable since it loaded, and, when a connection joins, that client's most recent change ids
-//!    in the document (read from the journal by the handshake). Older entries are forgotten
-//!    (keeping at least those since the last snapshot, and [`RECENT_KEEP`] in all), which raises a
-//!    floor; a change made on a base below the floor may be a resend of a change memory no longer
-//!    holds (an accepted change's seq is above its base), so only then is the journal asked, by
-//!    `(document, client, change id)`. The journal's unique key is a backstop.
+//!    in the document (read from the journal by the handshake). A client whose join found fewer ids
+//!    than a join loads, and none of whose entries has been forgotten since, is **complete**: an id
+//!    memory does not hold is new, and is judged at once (the hot path asks the store nothing). For
+//!    any other client a miss is looked up by `(document, client, change id)` first, off the task.
+//!    So a duplicate reaches the journal (whose unique key is the backstop) only through a race.
+//!    Older entries are forgotten (past [`RECENT_KEEP`], those before the last snapshot; past the
+//!    room's maximum, any), and their clients stop being complete.
 //! 2. **Read-only** connections are refused (`read_only`), after the memory check, and are never
 //!    looked up in the journal.
 //! 3. **Judged** by [`oswx_core::decide`] against the tentative head, under the sender's client id,
@@ -30,17 +32,19 @@
 //!
 //! If the journal refuses a record for a cause of its own (a duplicate change id, a failed extra
 //! write, a broken limit, or being out of order), only that record is answered: a duplicate with
-//! the seq the journal holds for it, anything else `server_error`. The changes decided after it are
-//! kept and judged again, in their order, against the durable head; each is then written or refused
-//! on its merits, and its sender sees only the final answer. A change judged again
-//! [`MAX_REJUDGE`] times is answered `server_error`. A connection whose changes the journal refuses
-//! as duplicates more than [`MAX_DUPLICATES`] times is closed (1008, misbehaving client). A lost
+//! the seq the journal holds for it (counting as accepted for the changes that build on it until
+//! then), anything else `server_error`. The changes decided after it are kept and judged again, in
+//! their order, against the durable head; each is then written or refused on its merits, and its
+//! sender sees only the final answer. A change judged again [`MAX_REJUDGE`] times for a systematic
+//! cause is answered `server_error` (a duplicate refusal does not count). A user whose changes the
+//! journal refuses as duplicates more than [`MAX_DUPLICATES`] times in a room is closed there
+//! (1008, misbehaving client). A lost
 //! lease or an unknown outcome unloads the room (see the room module).
 //!
 //! The server's own changes ([`super::RoomHandle::server_change`]) go through the same pipeline
 //! under [`SERVER_CLIENT`], with no change id, and are broadcast to every connection.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -51,6 +55,7 @@ use futures_util::FutureExt;
 use oswx_core::wire::{self, ChangeEvent, ClientMsg, ServerMsg};
 use oswx_core::{
     Accepted, Change, ClientId, Conflict, Head, Known, Op, Refusal, RejectCode, Rules, Seq, decide,
+    decide_server,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -74,7 +79,8 @@ pub const MAX_BLOB_REFS: usize = 4096;
 pub const MISSING_BLOB_SECS: f64 = 30.0;
 /// How many times a change may be judged again after a record before it was refused.
 pub const MAX_REJUDGE: u8 = 3;
-/// How many duplicate refusals from the journal a connection may cause before it is closed.
+/// How many duplicate refusals from the journal one user may cause in a room before their
+/// connections to it are closed.
 pub const MAX_DUPLICATES: u32 = 3;
 /// Refused change ids remembered per client.
 const REFUSED_KEEP: usize = 1024;
@@ -96,6 +102,9 @@ pub(super) type Ticket = u64;
 enum Seen {
     /// Decided, not yet durable.
     Tentative(Ticket),
+    /// The journal refused it as a duplicate; the seq it holds is being looked up. Counts as
+    /// accepted for the changes that build on it.
+    Checking(Ticket),
     Durable(Seq),
 }
 
@@ -104,20 +113,25 @@ type Key = (ClientId, Arc<str>);
 /// The change ids the room holds in memory; see the module documentation.
 pub(super) struct Recent {
     map: HashMap<Key, Seen>,
-    /// Durable entries, in the order they were remembered.
+    /// Durable entries, oldest first, each remembered key once (a key forgotten and remembered
+    /// again may leave an older entry behind, which only forgets early).
     order: VecDeque<(Seq, Key)>,
-    /// Every durable change with a seq above this is in `map`.
-    floor: Seq,
+    /// Clients for which memory holds every id they ever journaled in this document: a miss is a
+    /// new id. Set at join when the journal had fewer ids than a join loads; cleared whenever one of
+    /// the client's entries is forgotten.
+    complete: HashSet<ClientId>,
+    /// The most durable entries kept, whatever the snapshots.
+    max: usize,
 }
 
 impl Recent {
-    /// Memory as a room loaded at `head` has it: nothing, every change at or below `head` being
-    /// asked of the journal.
-    pub(super) fn new(head: Seq) -> Self {
+    /// Empty memory keeping at most `max` durable entries.
+    pub(super) fn new(max: usize) -> Self {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
-            floor: head,
+            complete: HashSet::new(),
+            max: max.max(1),
         }
     }
 
@@ -125,31 +139,63 @@ impl Recent {
         self.map.get(&(client.clone(), change_id.clone())).copied()
     }
 
-    /// Remembers that the client's change `change_id` is durable as `seq`.
-    pub(super) fn remember(&mut self, client: &ClientId, change_id: &str, seq: Seq) {
-        let key = (client.clone(), Arc::from(change_id));
-        if matches!(self.map.get(&key), Some(Seen::Tentative(_))) {
-            return;
-        }
-        self.map.insert(key.clone(), Seen::Durable(seq));
-        self.order.push_back((seq, key));
+    /// Whether a change id of `client` that memory does not hold is new.
+    fn is_complete(&self, client: &ClientId) -> bool {
+        self.complete.contains(client)
     }
 
-    /// Forgets the oldest durable entries past [`RECENT_KEEP`], never one after `snapshot_seq`.
+    /// Says whether memory now holds every id `client` journaled here.
+    pub(super) fn set_complete(&mut self, client: &ClientId, complete: bool) {
+        if complete {
+            self.complete.insert(client.clone());
+        } else {
+            self.complete.remove(client);
+        }
+    }
+
+    /// Remembers that the client's change `change_id` is durable as `seq`.
+    pub(super) fn remember(&mut self, client: &ClientId, change_id: &str, seq: Seq) {
+        self.durable((client.clone(), Arc::from(change_id)), seq);
+    }
+
+    fn durable(&mut self, key: Key, seq: Seq) {
+        let before = self.map.insert(key.clone(), Seen::Durable(seq));
+        if !matches!(before, Some(Seen::Durable(_))) {
+            self.order.push_back((seq, key));
+        }
+    }
+
+    /// For tests: forgets every entry, but not which clients are complete.
+    pub(super) fn forget_entries(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    /// How many ids are remembered, and how long the order of forgetting is.
+    pub(super) fn sizes(&self) -> (usize, usize) {
+        (self.map.len(), self.order.len())
+    }
+
+    /// Forgets the oldest durable entries: past [`RECENT_KEEP`] those at or before
+    /// `snapshot_seq`, and past the hard maximum any. A client whose entry is forgotten is no
+    /// longer complete.
     pub(super) fn trim(&mut self, snapshot_seq: Seq) {
-        while self.order.len() > RECENT_KEEP {
-            let Some((seq, _)) = self.order.front() else {
+        loop {
+            let over_soft = self.order.len() > RECENT_KEEP
+                && self
+                    .order
+                    .front()
+                    .is_some_and(|(seq, _)| *seq <= snapshot_seq);
+            if !over_soft && self.order.len() <= self.max {
+                break;
+            }
+            let Some((seq, key)) = self.order.pop_front() else {
                 break;
             };
-            if *seq > snapshot_seq {
-                break;
+            if self.map.get(&key) == Some(&Seen::Durable(seq)) {
+                self.map.remove(&key);
             }
-            if let Some((seq, key)) = self.order.pop_front() {
-                if self.map.get(&key) == Some(&Seen::Durable(seq)) {
-                    self.map.remove(&key);
-                }
-                self.floor = self.floor.max(seq);
-            }
+            self.complete.remove(&key.0);
         }
     }
 }
@@ -205,7 +251,21 @@ impl Incoming {
 /// Where a change came from, and so who is answered.
 pub(super) enum Origin {
     Conn(ConnId),
-    Server(oneshot::Sender<Result<Seq, ServerChangeError>>),
+    Server {
+        reply: oneshot::Sender<Result<Seq, ServerChangeError>>,
+        /// Refuse it as stale if someone changed what it writes since its base.
+        check_stale: bool,
+    },
+}
+
+impl Origin {
+    /// `Some(check_stale)` for the server's own change.
+    fn server_stale(&self) -> Option<bool> {
+        match self {
+            Origin::Server { check_stale, .. } => Some(*check_stale),
+            Origin::Conn(_) => None,
+        }
+    }
 }
 
 /// Who a change is from, for its index marks, record and broadcast.
@@ -237,7 +297,7 @@ impl Item {
     fn conn(&self) -> Option<ConnId> {
         match self.origin {
             Origin::Conn(conn) => Some(conn),
-            Origin::Server(_) => None,
+            Origin::Server { .. } => None,
         }
     }
 
@@ -370,12 +430,14 @@ fn blob_refs_of(ops: &[Op]) -> BTreeSet<String> {
 }
 
 /// Judges a change against `head` and, if it is accepted, makes everything its record and broadcast
-/// need. Pure and `Send`, so it can run on the blocking pool.
+/// need. `server_stale` is `Some(check_stale)` for a change the server makes itself
+/// ([`decide_server`]). Pure and `Send`, so it can run on the blocking pool.
 fn judge(
     head: &Head,
     author: &Author,
     change: &Change,
     known: &HashMap<Arc<str>, Known>,
+    server_stale: Option<bool>,
 ) -> Result<Decision, Refusal> {
     let blobs = blob_refs_of(&change.ops);
     if blobs.len() > MAX_BLOB_REFS {
@@ -383,15 +445,21 @@ fn judge(
             "a change may refer to at most {MAX_BLOB_REFS} blobs"
         )));
     }
-    let known = |id: &str| known.get(id).copied().unwrap_or(Known::Unknown);
-    let accepted = decide(
-        head,
-        &author.client,
-        change,
-        &known,
-        None,
-        &Rules::openswx(),
-    )?;
+    let accepted = match server_stale {
+        // The server's own change: no id prefix, staleness only when asked.
+        Some(check_stale) => decide_server(head, change, &Rules::openswx(), check_stale)?,
+        None => {
+            let known = |id: &str| known.get(id).copied().unwrap_or(Known::Unknown);
+            decide(
+                head,
+                &author.client,
+                change,
+                &known,
+                None,
+                &Rules::openswx(),
+            )?
+        }
+    };
     let server = &*author.client == SERVER_CLIENT;
     let event = wire::encode_server(&ServerMsg::Change(ChangeEvent {
         seq: accepted.seq,
@@ -456,14 +524,20 @@ impl Room {
                     return;
                 }
             }
+            Some(Seen::Checking(ticket)) => {
+                // Its seq is being looked up: answered with it.
+                c.replies.push_back(Reply::Waiting(ticket));
+                self.checking.entry(ticket).or_default().push(conn);
+                return;
+            }
             None => {}
         }
         if let Some(reason) = c.read_only.clone() {
             return self.reject(conn, &change.change_id, RejectCode::ReadOnly, &reason);
         }
         let change = Arc::new(change);
-        if change.base < self.recent.floor {
-            // Possibly a resend of a change memory no longer holds: ask the journal.
+        if !self.recent.is_complete(&c.client) {
+            // Memory may not hold every id this client journaled: ask the journal first.
             c.busy = true;
             let (store, doc, client) =
                 (self.state.store.clone(), self.doc.clone(), c.client.clone());
@@ -538,7 +612,10 @@ impl Room {
             command: Arc::from(sc.command.as_str()),
         };
         self.server_queue.push_back(Item {
-            origin: Origin::Server(sc.reply),
+            origin: Origin::Server {
+                reply: sc.reply,
+                check_stale: sc.options.check_stale,
+            },
             author: Author {
                 client: Arc::from(SERVER_CLIENT),
                 user: sc.author,
@@ -603,7 +680,7 @@ impl Room {
 
     /// Judges a change (off the task when it is big) and goes on with the decision.
     pub(super) fn judge_item(&mut self, mut item: Item) {
-        if matches!(item.origin, Origin::Server(_)) {
+        if matches!(item.origin, Origin::Server { .. }) {
             // The server's change is made on whatever is current.
             Arc::make_mut(&mut item.change).base = self.tentative.seq;
         }
@@ -617,6 +694,7 @@ impl Room {
                 c.busy = true;
             }
             let head = self.tentative.clone();
+            let stale = item.origin.server_stale();
             let (author, change) = (item.author.clone(), item.change.clone());
             let (internal, encodes) = (self.internal.clone(), self.encodes.clone());
             let delay = self.state.room_hooks.judge_delay;
@@ -624,7 +702,7 @@ impl Room {
                 let judging = tokio::task::spawn_blocking(move || {
                     std::thread::sleep(delay);
                     let started = Instant::now();
-                    let result = judge(&head, &author, &change, &known);
+                    let result = judge(&head, &author, &change, &known, stale);
                     metrics::decided(started.elapsed());
                     result
                 });
@@ -642,7 +720,8 @@ impl Room {
             return;
         }
         let started = Instant::now();
-        let result = judge(&self.tentative, &item.author, &item.change, &known);
+        let stale = item.origin.server_stale();
+        let result = judge(&self.tentative, &item.author, &item.change, &known, stale);
         metrics::decided(started.elapsed());
         if result.is_ok() {
             self.encodes.fetch_add(1, Ordering::Relaxed);
@@ -690,7 +769,7 @@ impl Room {
         }
         match item.origin {
             Origin::Conn(conn) => self.park_first(conn, Incoming::Judge(item.change, item.size)),
-            Origin::Server(_) => self.server_queue.push_front(item),
+            Origin::Server { .. } => self.server_queue.push_front(item),
         }
     }
 
@@ -910,7 +989,7 @@ impl Room {
     ) {
         metrics::change_rejected(code);
         match item.origin {
-            Origin::Server(reply) => {
+            Origin::Server { reply, .. } => {
                 let err = refusal.map_or(ServerChangeError::NotWritten, ServerChangeError::Refused);
                 let _ = reply.send(Err(err));
             }
@@ -937,7 +1016,7 @@ impl Room {
     /// Tells everyone waiting for a change that it is durable as `seq`.
     fn answer_accepted(&mut self, item: Item, seq: Seq) {
         match item.origin {
-            Origin::Server(reply) => {
+            Origin::Server { reply, .. } => {
                 let _ = reply.send(Ok(seq));
             }
             Origin::Conn(conn) => {
@@ -960,7 +1039,7 @@ impl Room {
     /// A change that will not be written because the room is closing: the server is told; clients
     /// resend after reconnecting.
     fn not_written(&mut self, item: Item) {
-        if let Origin::Server(reply) = item.origin {
+        if let Origin::Server { reply, .. } = item.origin {
             let _ = reply.send(Err(ServerChangeError::NotWritten));
         }
     }
@@ -1025,8 +1104,7 @@ impl Room {
         // Everyone but those waiting for this change's answer hears of it, in seq order.
         self.broadcast(&p.event, &p.item.waiters);
         if let Some(key) = p.item.key() {
-            self.recent.map.insert(key.clone(), Seen::Durable(seq));
-            self.recent.order.push_back((seq, key));
+            self.recent.durable(key, seq);
             self.recent.trim(self.snapshot_seq);
         }
         self.answer_accepted(p.item, seq);
@@ -1047,20 +1125,21 @@ impl Room {
         self.generation += 1;
         self.tentative = self.durable.clone();
         self.tentative_version += 1;
-        for p in rest.iter().chain(std::iter::once(&front)) {
+        for p in &rest {
             if let Some(key) = p.item.key() {
                 self.recent.map.remove(&key);
             }
         }
+        let duplicate = matches!(why, RefusedWhy::Duplicate);
         let mut misbehaving = None;
-        match (why, front.item.conn()) {
-            (RefusedWhy::Duplicate, Some(conn)) => {
-                // Find the seq the journal holds for it, and answer that.
-                if let Some(c) = self.conns.get_mut(&conn) {
-                    c.duplicates += 1;
-                    if c.duplicates > MAX_DUPLICATES {
-                        misbehaving = Some(conn);
-                    }
+        match (duplicate, front.item.key(), front.item.ticket) {
+            (true, Some(key), Some(ticket)) => {
+                // Find the seq the journal holds for it, and answer that. Meanwhile it counts as
+                // accepted for the changes that build on it.
+                self.recent.map.insert(key, Seen::Checking(ticket));
+                let user = front.item.author.user.clone();
+                if self.duplicates.add(&user) > MAX_DUPLICATES {
+                    misbehaving = Some(user);
                 }
                 let (store, doc) = (self.state.store.clone(), self.doc.clone());
                 let internal = self.internal.clone();
@@ -1076,6 +1155,9 @@ impl Room {
                 });
             }
             _ => {
+                if let Some(key) = front.item.key() {
+                    self.recent.map.remove(&key);
+                }
                 tracing::warn!(
                     "the journal refused change {seq} of document {}: {why}",
                     self.doc
@@ -1091,19 +1173,30 @@ impl Room {
         }
         for p in rest {
             let mut item = p.item;
-            if item.rejudged >= MAX_REJUDGE {
-                self.answer_refused(item, RejectCode::ServerError, NOT_STORED, Vec::new(), None);
-                continue;
+            // A duplicate refusal is the other record's fault (and should not happen at all: see
+            // the module documentation); only systematic causes count toward the cap.
+            if !duplicate {
+                if item.rejudged >= MAX_REJUDGE {
+                    self.answer_refused(
+                        item,
+                        RejectCode::ServerError,
+                        NOT_STORED,
+                        Vec::new(),
+                        None,
+                    );
+                    continue;
+                }
+                item.rejudged += 1;
             }
-            item.rejudged += 1;
-            if matches!(item.origin, Origin::Server(_)) {
+            if matches!(item.origin, Origin::Server { .. }) {
                 Arc::make_mut(&mut item.change).base = self.tentative.seq;
             }
             // Judged here and now, so that the order of the changes is kept (their blobs were
             // checked already).
             let known = self.known(&item.author.client, &item.change.depends);
             let started = Instant::now();
-            let result = judge(&self.tentative, &item.author, &item.change, &known);
+            let stale = item.origin.server_stale();
+            let result = judge(&self.tentative, &item.author, &item.change, &known, stale);
             metrics::decided(started.elapsed());
             match result {
                 Ok(decision) => {
@@ -1113,23 +1206,41 @@ impl Room {
                 Err(refusal) => self.refuse_item(item, refusal),
             }
         }
-        if let Some(conn) = misbehaving {
-            self.remove_conn(conn, Some((close::POLICY, "misbehaving client")), true);
+        if let Some(user) = misbehaving {
+            let theirs: Vec<ConnId> = self
+                .conns
+                .iter()
+                .filter(|(_, c)| c.user == user)
+                .map(|(id, _)| *id)
+                .collect();
+            for conn in theirs {
+                self.remove_conn(conn, Some((close::POLICY, "misbehaving client")), true);
+            }
         }
     }
 
     pub(super) fn on_duplicate(&mut self, check: DuplicateCheck) {
-        let DuplicateCheck { item, result } = check;
+        let DuplicateCheck { mut item, result } = check;
+        if let Some(ticket) = item.ticket {
+            // (Connections that sent it again while it was looked up.)
+            item.waiters
+                .extend(self.checking.remove(&ticket).unwrap_or_default());
+        }
         match result {
             Ok(Some(seq)) => {
                 let seq = Seq::try_from(seq).unwrap_or_default();
-                if self.by_client.contains_key(&item.author.client) {
-                    self.recent
-                        .remember(&item.author.client, &item.change.change_id, seq);
+                if let Some((client, id)) = item.key() {
+                    self.recent.remember(&client, &id, seq);
+                    self.recent.trim(self.snapshot_seq);
                 }
                 self.answer_accepted(item, seq);
             }
             Ok(None) | Err(_) => {
+                if let Some(key) = item.key()
+                    && matches!(self.recent.map.get(&key), Some(Seen::Checking(_)))
+                {
+                    self.recent.map.remove(&key);
+                }
                 self.answer_refused(item, RejectCode::ServerError, NOT_STORED, Vec::new(), None);
             }
         }

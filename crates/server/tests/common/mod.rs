@@ -528,6 +528,8 @@ pub struct FlakyStore {
     refuse_change: Arc<Mutex<Option<String>>>,
     change_lookups: AtomicUsize,
     lookup_delay: Mutex<Duration>,
+    duplicate_inserts: Arc<AtomicUsize>,
+    preloads: AtomicUsize,
 }
 
 impl FlakyStore {
@@ -544,6 +546,8 @@ impl FlakyStore {
             refuse_change: Arc::new(Mutex::new(None)),
             change_lookups: AtomicUsize::new(0),
             lookup_delay: Mutex::new(Duration::ZERO),
+            duplicate_inserts: Arc::new(AtomicUsize::new(0)),
+            preloads: AtomicUsize::new(0),
         }
     }
 
@@ -562,6 +566,16 @@ impl FlakyStore {
             .lookup_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = d;
+    }
+
+    /// How many journal inserts found the change id already there (a duplicate reaching the journal).
+    pub fn duplicate_inserts(&self) -> usize {
+        self.duplicate_inserts.load(Ordering::SeqCst)
+    }
+
+    /// How many times [`Store::recent_change_ids`] was asked.
+    pub fn preloads(&self) -> usize {
+        self.preloads.load(Ordering::SeqCst)
     }
 
     /// How many times [`Store::change_seq_by_client`] was asked.
@@ -646,6 +660,7 @@ impl Store for FlakyStore {
             commit_then_fail: self.commit_then_fail.clone(),
             hang_commit: self.hang_commit.clone(),
             refuse_change: self.refuse_change.clone(),
+            duplicate_inserts: self.duplicate_inserts.clone(),
         }))
     }
 
@@ -793,6 +808,7 @@ impl Store for FlakyStore {
         client_id: &str,
         limit: i64,
     ) -> anyhow::Result<Vec<(String, i64)>> {
+        self.preloads.fetch_add(1, Ordering::SeqCst);
         self.inner()
             .recent_change_ids(document_id, client_id, limit)
             .await
@@ -848,6 +864,7 @@ pub struct FlakyTx {
     commit_then_fail: Arc<AtomicBool>,
     hang_commit: Arc<AtomicBool>,
     refuse_change: Arc<Mutex<Option<String>>>,
+    duplicate_inserts: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -1169,7 +1186,11 @@ impl Tx for FlakyTx {
                 return Ok(false);
             }
         }
-        self.inner.insert_change(change).await
+        let inserted = self.inner.insert_change(change).await?;
+        if !inserted {
+            self.duplicate_inserts.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(inserted)
     }
 
     async fn set_document_head(

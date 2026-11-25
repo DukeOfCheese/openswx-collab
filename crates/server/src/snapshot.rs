@@ -165,9 +165,9 @@ pub async fn load_head_doc(
 /// with no `client_id`, such as a restore). A real client is `<user id>.<client id>`, which never
 /// starts with `~`.
 ///
-/// The room must decide a change it makes itself (`oswx_core::decide`) under this client id, and
+/// The room must decide a change it makes itself (`oswx_core::decide_server`) under this client id, and
 /// journal it with `client_id: None`, so that a reload rebuilds the same index the room had.
-pub const SERVER_CLIENT: &str = "~server";
+pub use oswx_core::SERVER_CLIENT;
 
 /// How many journal rows loading reads at a time.
 const REPLAY_PAGE: i64 = 500;

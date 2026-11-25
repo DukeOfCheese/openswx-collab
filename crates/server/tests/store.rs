@@ -1177,6 +1177,7 @@ versions.created_at DOUBLE PRECISION NN";
     let mut expected_indexes = vec![
         "assembly_refs (part_id) ix_assembly_refs_part_id",
         "assembly_refs unique (assembly_id, component_id) pk",
+        "changes (document_id, client_id, seq) ix_changes_client_seq",
         "changes unique (document_id, client_id, change_id) u",
         "changes unique (document_id, seq) pk",
         "documents (folder_id) ix_documents_folder_id",
