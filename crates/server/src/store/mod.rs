@@ -373,6 +373,19 @@ pub struct ChangeRow {
     pub broke: Option<String>,
 }
 
+/// What a change event (a live broadcast or a catch-up in a welcome) needs of a journal row.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ChangeEventRow {
+    pub seq: i64,
+    pub author_id: Id,
+    /// The author's display name; `None` if the account row is gone.
+    pub author_name: Option<String>,
+    pub client_id: Option<String>,
+    pub change_id: Option<String>,
+    pub command: String,
+    pub ops: Vec<u8>,
+}
+
 /// A journal row to insert: [`ChangeRow`]'s columns, borrowed from the record that carries them
 /// (the journal writer binds the MessagePack straight from the record's bytes, without copying them
 /// inside its transaction).
@@ -524,6 +537,24 @@ pub trait Store: Send + Sync + 'static {
     /// One journal row.
     async fn change_by_seq(&self, document_id: &str, seq: i64)
     -> anyhow::Result<Option<ChangeRow>>;
+
+    /// A document's journal rows with `after < seq <= upto` as change events, in seq order, at most
+    /// `limit` of them.
+    async fn change_events_between(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeEventRow>>;
+
+    /// The seq of the change a client sent under `change_id`, if the journal has it (a resend).
+    async fn change_seq_by_client(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> anyhow::Result<Option<i64>>;
 
     /// A document's snapshot with the highest seq not above `seq` (then the highest epoch).
     async fn snapshot_at_or_before(

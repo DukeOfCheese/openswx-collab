@@ -340,6 +340,15 @@ pub const CHANGE_BY_SEQ: &str = concat!(
     " FROM changes WHERE document_id = $1 AND seq = $2"
 );
 
+/// [`super::Store::change_events_between`]: what a change event carries, with the author's name.
+pub const CHANGE_EVENTS_BETWEEN: &str = "SELECT c.seq, c.author_id, u.name AS author_name, \
+     c.client_id, c.change_id, c.command, c.ops FROM changes c LEFT JOIN users u ON u.id = c.author_id \
+     WHERE c.document_id = $1 AND c.seq > $2 AND c.seq <= $3 ORDER BY c.seq LIMIT $4";
+
+/// [`super::Store::change_seq_by_client`].
+pub const CHANGE_SEQ_BY_CLIENT: &str =
+    "SELECT seq FROM changes WHERE document_id = $1 AND client_id = $2 AND change_id = $3";
+
 /// [`super::Tx::set_document_head`].
 pub const SET_DOCUMENT_HEAD: &str =
     "UPDATE documents SET head_seq = $2, updated_at = $3 WHERE id = $1";

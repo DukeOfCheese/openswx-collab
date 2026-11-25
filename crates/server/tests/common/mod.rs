@@ -1,6 +1,11 @@
 //! The test harness: a real server per test on a free port, mirroring the Python `conftest.py`.
 #![allow(dead_code)] // each test file uses part of the harness
 
+mod live;
+
+#[allow(unused_imports)] // (not every test file uses the live client)
+pub use live::*;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -13,9 +18,9 @@ use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange, Org, OrgMember,
-    OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus,
-    Session, SnapshotRow, SqliteStore, Store, Tx, User,
+    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange,
+    Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease,
+    SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx, User,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -97,6 +102,16 @@ impl TestServer {
         settings: impl FnOnce(&mut Settings),
         state: impl FnOnce(&mut AppState),
     ) -> Self {
+        Self::start_inner(settings, state, new_journal).await
+    }
+
+    /// [`TestServer::start_custom`], with the journal (when the test put in a store of its own) made
+    /// by `journal` on that store.
+    async fn start_inner(
+        settings: impl FnOnce(&mut Settings),
+        state: impl FnOnce(&mut AppState),
+        journal: impl FnOnce(&Arc<dyn Store>) -> JournalWriter,
+    ) -> Self {
         let dir = Arc::new(TempDir::new().expect("a temporary directory"));
         let mut s = test_settings(dir.path());
         settings(&mut s);
@@ -107,7 +122,7 @@ impl TestServer {
         state(&mut app_state);
         if !std::ptr::addr_eq(Arc::as_ptr(&app_state.store), Arc::as_ptr(&plain)) {
             // The test put in a store of its own: the journal writes through it too.
-            app_state.journal = new_journal(&app_state.store);
+            app_state.journal = journal(&app_state.store);
         }
         let store_kind = if std::ptr::addr_eq(Arc::as_ptr(&app_state.store), Arc::as_ptr(&plain)) {
             StoreKind::Plain
@@ -120,12 +135,25 @@ impl TestServer {
     /// Starts with the test settings changed by `settings` and the store wrapped in a [`FlakyStore`],
     /// which is returned so the test can make it fail. It stays in place across `restart`.
     pub async fn start_flaky(settings: impl FnOnce(&mut Settings)) -> (Self, Arc<FlakyStore>) {
+        Self::start_flaky_journal(settings, new_journal).await
+    }
+
+    /// [`TestServer::start_flaky`] with the journal writer `journal` makes on the flaky store (other
+    /// batching or a shorter batch timeout). After `restart` the journal is the default one.
+    pub async fn start_flaky_journal(
+        settings: impl FnOnce(&mut Settings),
+        journal: impl FnOnce(&Arc<dyn Store>) -> JournalWriter,
+    ) -> (Self, Arc<FlakyStore>) {
         let mut handle = None;
-        let mut server = Self::start_custom(settings, |s| {
-            let flaky = Arc::new(FlakyStore::new(s.store.clone()));
-            handle = Some(flaky.clone());
-            s.store = flaky;
-        })
+        let mut server = Self::start_inner(
+            settings,
+            |s| {
+                let flaky = Arc::new(FlakyStore::new(s.store.clone()));
+                handle = Some(flaky.clone());
+                s.store = flaky;
+            },
+            journal,
+        )
         .await;
         let flaky = handle.expect("the state function ran");
         server.store_kind = StoreKind::Flaky(flaky.clone());
@@ -486,6 +514,8 @@ pub struct FlakyStore {
     panic_on_begin: AtomicBool,
     hang_commit: Arc<AtomicBool>,
     begins: AtomicUsize,
+    refuse_change: Arc<Mutex<Option<String>>>,
+    change_lookups: AtomicUsize,
 }
 
 impl FlakyStore {
@@ -499,7 +529,23 @@ impl FlakyStore {
             panic_on_begin: AtomicBool::new(false),
             hang_commit: Arc::new(AtomicBool::new(false)),
             begins: AtomicUsize::new(0),
+            refuse_change: Arc::new(Mutex::new(None)),
+            change_lookups: AtomicUsize::new(0),
         }
+    }
+
+    /// Makes the next journal insert of a change with this `change_id` insert nothing, as if the
+    /// journal already had it (the journal then refuses that record as a duplicate).
+    pub fn refuse_change_once(&self, change_id: &str) {
+        *self
+            .refuse_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(change_id.to_owned());
+    }
+
+    /// How many times [`Store::change_seq_by_client`] was asked.
+    pub fn change_lookups(&self) -> usize {
+        self.change_lookups.load(Ordering::SeqCst)
     }
 
     /// Makes [`Store::begin`] panic (`true`), as a bug in the caller's task would, or delegate
@@ -578,6 +624,7 @@ impl Store for FlakyStore {
             fail_commit: self.fail_commit.clone(),
             commit_then_fail: self.commit_then_fail.clone(),
             hang_commit: self.hang_commit.clone(),
+            refuse_change: self.refuse_change.clone(),
         }))
     }
 
@@ -707,6 +754,30 @@ impl Store for FlakyStore {
         self.inner().change_by_seq(document_id, seq).await
     }
 
+    async fn change_events_between(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeEventRow>> {
+        self.inner()
+            .change_events_between(document_id, after, upto, limit)
+            .await
+    }
+
+    async fn change_seq_by_client(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        self.change_lookups.fetch_add(1, Ordering::SeqCst);
+        self.inner()
+            .change_seq_by_client(document_id, client_id, change_id)
+            .await
+    }
+
     async fn snapshot_at_or_before(
         &self,
         document_id: &str,
@@ -739,6 +810,7 @@ pub struct FlakyTx {
     fail_commit: Arc<AtomicBool>,
     commit_then_fail: Arc<AtomicBool>,
     hang_commit: Arc<AtomicBool>,
+    refuse_change: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -1050,6 +1122,16 @@ impl Tx for FlakyTx {
     }
 
     async fn insert_change(&mut self, change: &NewChange<'_>) -> anyhow::Result<bool> {
+        {
+            let mut refuse = self
+                .refuse_change
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if refuse.is_some() && refuse.as_deref() == change.change_id {
+                *refuse = None;
+                return Ok(false);
+            }
+        }
         self.inner.insert_change(change).await
     }
 
@@ -1237,12 +1319,172 @@ pub async fn world() -> (TestServer, World) {
     (server, world)
 }
 
-/// A v2 WebSocket client built on `oswx_core::wire`.
-pub struct Live {}
+/// Blob storage that delegates to a real one and can be made slow or broken, and counts what it is
+/// asked.
+pub struct TestBlobs {
+    inner: Arc<dyn Blobs>,
+    exists_delay: Mutex<Duration>,
+    put_delay: Mutex<Duration>,
+    fail_exists: AtomicBool,
+    fail_put: AtomicBool,
+    exists_calls: AtomicUsize,
+    exists_now: AtomicUsize,
+    exists_most: AtomicUsize,
+    puts: AtomicUsize,
+}
 
-impl Live {
-    /// Not yet available: the WebSocket arrives with Task 9, which gives `Live` its body.
-    pub async fn connect(_server: &TestServer, _token: &str, _doc: &Id) -> anyhow::Result<Self> {
-        anyhow::bail!("Live needs the document WebSocket; Task 9 provides it")
+impl TestBlobs {
+    pub fn new(inner: Arc<dyn Blobs>) -> Self {
+        Self {
+            inner,
+            exists_delay: Mutex::new(Duration::ZERO),
+            put_delay: Mutex::new(Duration::ZERO),
+            fail_exists: AtomicBool::new(false),
+            fail_put: AtomicBool::new(false),
+            exists_calls: AtomicUsize::new(0),
+            exists_now: AtomicUsize::new(0),
+            exists_most: AtomicUsize::new(0),
+            puts: AtomicUsize::new(0),
+        }
+    }
+
+    /// Every `exists` waits this long first.
+    pub fn exists_delay(&self, d: Duration) {
+        *self
+            .exists_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = d;
+    }
+
+    /// Every `put` (snapshots) waits this long first.
+    pub fn put_delay(&self, d: Duration) {
+        *self
+            .put_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = d;
+    }
+
+    /// Makes `exists` fail (an outage) or delegate again.
+    pub fn fail_exists(&self, fail: bool) {
+        self.fail_exists.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes `put` fail or delegate again.
+    pub fn fail_put(&self, fail: bool) {
+        self.fail_put.store(fail, Ordering::SeqCst);
+    }
+
+    /// How many `exists` calls were made.
+    pub fn exists_calls(&self) -> usize {
+        self.exists_calls.load(Ordering::SeqCst)
+    }
+
+    /// The most `exists` calls that were running at once.
+    pub fn exists_most(&self) -> usize {
+        self.exists_most.load(Ordering::SeqCst)
+    }
+
+    /// How many `put` calls were made (failed ones included).
+    pub fn puts(&self) -> usize {
+        self.puts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Blobs for TestBlobs {
+    async fn put_stream(
+        &self,
+        key: &str,
+        body: oswx_server::blobs::ByteStream,
+        limit: u64,
+    ) -> anyhow::Result<oswx_server::blobs::PutOutcome> {
+        self.inner.put_stream(key, body, limit).await
+    }
+
+    async fn get_stream(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<(u64, oswx_server::blobs::ByteStream)>> {
+        self.inner.get_stream(key).await
+    }
+
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.exists_calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.exists_now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.exists_most.fetch_max(now, Ordering::SeqCst);
+        let delay = *self
+            .exists_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tokio::time::sleep(delay).await;
+        self.exists_now.fetch_sub(1, Ordering::SeqCst);
+        if self.fail_exists.load(Ordering::SeqCst) {
+            anyhow::bail!("the test storage was told to fail exists");
+        }
+        self.inner.exists(key).await
+    }
+
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> anyhow::Result<()> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        let delay = *self
+            .put_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tokio::time::sleep(delay).await;
+        if self.fail_put.load(Ordering::SeqCst) {
+            anyhow::bail!("the test storage was told to fail put");
+        }
+        self.inner.put(key, bytes).await
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        self.inner.delete_prefix(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn health(&self) -> anyhow::Result<()> {
+        self.inner.health().await
+    }
+}
+
+impl TestServer {
+    /// Starts with the test settings changed by `settings` and the blob storage wrapped in a
+    /// [`TestBlobs`], which is returned so the test can slow it down or break it. It stays in place
+    /// across `restart`.
+    pub async fn start_blobs(settings: impl FnOnce(&mut Settings)) -> (Self, Arc<TestBlobs>) {
+        let mut handle = None;
+        let server = Self::start_custom(settings, |s| {
+            let blobs = Arc::new(TestBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+        })
+        .await;
+        (server, handle.expect("the state function ran"))
+    }
+
+    /// The open room of a document (panics if there is none).
+    pub fn room(&self, doc: &str) -> oswx_server::room::RoomHandle {
+        self.state
+            .hub
+            .loaded(doc)
+            .expect("the document's room is open")
+    }
+
+    /// What the open room of a document is now.
+    pub async fn room_status(&self, doc: &str) -> oswx_server::room::RoomStatus {
+        self.room(doc).status().await.expect("the room answers")
+    }
+
+    /// Stops the server as a shutdown does (rooms close, the journal writes what it holds), without
+    /// starting it again.
+    pub async fn stop(&mut self) {
+        self.shutdown().await;
     }
 }

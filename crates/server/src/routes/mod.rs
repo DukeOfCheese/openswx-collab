@@ -55,7 +55,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(projects::router())
         .merge(blobs::router())
         .merge(documents::router())
-        .merge(folders::router());
+        .merge(folders::router())
+        .merge(crate::ws::router());
 
     // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document
     // creation).

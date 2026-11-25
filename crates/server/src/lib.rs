@@ -15,13 +15,16 @@ pub mod hub;
 pub mod journal;
 pub mod lease;
 pub mod mail;
+pub mod metrics;
 pub mod record;
+pub mod room;
 pub mod routes;
 pub mod security;
 pub mod sessions;
 pub mod snapshot;
 pub mod state;
 pub mod store;
+pub mod ws;
 
 pub use clock::Clock;
 pub use config::Settings;

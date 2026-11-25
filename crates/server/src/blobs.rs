@@ -25,7 +25,7 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::write::ZstdEncoder;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::{self, BoxStream, Stream, StreamExt};
+use futures_util::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -151,6 +151,33 @@ fn windows_device(c: &str) -> bool {
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// How many storage lookups [`missing_blobs`] runs at once.
+pub const LOOKUPS_AT_ONCE: usize = 16;
+
+/// The blob references (hashes) that are malformed or name no blob of the organisation, in the order
+/// given, asking storage [`LOOKUPS_AT_ONCE`] at a time. A storage that cannot answer is an error,
+/// never "missing".
+pub async fn missing_blobs(
+    blobs: &dyn Blobs,
+    org_id: &str,
+    refs: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Vec<String>> {
+    let checked: Vec<Option<String>> = stream::iter(refs.into_iter().map(|sha| {
+        let key = is_sha256(&sha).then(|| blob_key(org_id, &sha));
+        async move {
+            let here = match key {
+                Some(key) => blobs.exists(&key).await?,
+                None => false,
+            };
+            anyhow::Ok((!here).then_some(sha))
+        }
+    }))
+    .buffered(LOOKUPS_AT_ONCE)
+    .try_collect()
+    .await?;
+    Ok(checked.into_iter().flatten().collect())
 }
 
 // ------------------------------------------------------------------ local folder

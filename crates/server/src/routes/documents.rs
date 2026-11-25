@@ -23,7 +23,6 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use futures_util::stream::{self, StreamExt, TryStreamExt};
 use oswx_core::{Index, Value, ValueError};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
@@ -31,7 +30,6 @@ use serde_json::json;
 use crate::access::{
     CurrentUser, recheck_document, recheck_project, require_document, require_project,
 };
-use crate::blobs::{blob_key, is_sha256};
 use crate::content::{
     blob_refs, check_shape, format_version, json_from_plain, plain_from_json, with_item_lists,
     without_local_keys,
@@ -48,8 +46,6 @@ use crate::store::{Document, Folder, SnapshotRow, new_id};
 pub const MAX_DOCUMENT_BODY: usize = 8 << 20;
 /// The most distinct blob references one document may hold.
 pub const MAX_BLOB_REFS: usize = 4096;
-/// How many storage lookups one creation runs at once to check its blob references.
-const LOOKUPS_AT_ONCE: usize = 16;
 /// The `?folder=` value that lists the documents at the top of the project.
 pub const ROOT_FOLDER: &str = "root";
 /// What naming a folder that is not in the project answers (422; it never says whether the folder
@@ -421,21 +417,7 @@ async fn missing_blobs(
     org_id: &str,
     refs: impl IntoIterator<Item = String>,
 ) -> Result<Vec<String>, ApiError> {
-    let checked: Vec<Option<String>> = stream::iter(refs.into_iter().map(|sha| {
-        let blobs = state.blobs.clone();
-        let key = is_sha256(&sha).then(|| blob_key(org_id, &sha));
-        async move {
-            let here = match key {
-                Some(key) => blobs.exists(&key).await?,
-                None => false,
-            };
-            anyhow::Ok((!here).then_some(sha))
-        }
-    }))
-    .buffered(LOOKUPS_AT_ONCE)
-    .try_collect()
-    .await?;
-    Ok(checked.into_iter().flatten().collect())
+    Ok(crate::blobs::missing_blobs(state.blobs.as_ref(), org_id, refs).await?)
 }
 
 /// How [`insert_document`] failed.
@@ -646,8 +628,20 @@ async fn get_content(
             "reading an earlier state of a document arrives with history".into(),
         ));
     }
-    let (content, _, seq) =
-        load_head_doc(state.store.as_ref(), state.blobs.as_ref(), &doc.id).await?;
+    // An open room has the durable head in memory; otherwise it is read from the store (without
+    // opening a room for one request).
+    let open = match state.hub.loaded(&doc.id) {
+        Some(room) => room.durable_head().await,
+        None => None,
+    };
+    let (content, seq) = match open {
+        Some(head) => (head.doc, head.seq),
+        None => {
+            let (content, _, seq) =
+                load_head_doc(state.store.as_ref(), state.blobs.as_ref(), &doc.id).await?;
+            (content, seq)
+        }
+    };
     let body = tokio::task::spawn_blocking(move || {
         serde_json::to_vec(&json!({
             "document": doc_out(&doc, None),

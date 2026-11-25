@@ -49,9 +49,9 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    AssemblyRefRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange, Org, OrgMember,
-    OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError,
-    SchemaStatus, Session, SnapshotRow, Store, Tx, User, sql,
+    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange,
+    Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease,
+    SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx, User, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -399,6 +399,31 @@ impl Store for SqliteStore {
 
     async fn change_by_seq(&self, document_id: &str, seq: i64) -> Result<Option<ChangeRow>> {
         q::change_by_seq(&mut *self.reader().await?, document_id, seq).await
+    }
+
+    async fn change_events_between(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeEventRow>> {
+        q::change_events_between(&mut *self.reader().await?, document_id, after, upto, limit).await
+    }
+
+    async fn change_seq_by_client(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> Result<Option<i64>> {
+        q::change_seq_by_client(
+            &mut *self.reader().await?,
+            document_id,
+            client_id,
+            change_id,
+        )
+        .await
     }
 
     async fn snapshot_at_or_before(
@@ -1556,6 +1581,36 @@ mod q {
         Ok(sqlx::query_as(sql::CHANGE_BY_SEQ)
             .bind(document_id)
             .bind(seq)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn change_events_between(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeEventRow>> {
+        Ok(sqlx::query_as(sql::CHANGE_EVENTS_BETWEEN)
+            .bind(document_id)
+            .bind(after)
+            .bind(upto)
+            .bind(limit)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn change_seq_by_client(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(sql::CHANGE_SEQ_BY_CLIENT)
+            .bind(document_id)
+            .bind(client_id)
+            .bind(change_id)
             .fetch_optional(c)
             .await?)
     }
