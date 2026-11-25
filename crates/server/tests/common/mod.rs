@@ -3,12 +3,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use oswx_server::blobs::{Blobs, NullBlobs};
 use oswx_server::hub::Hub;
 use oswx_server::sessions::Sessions;
-use oswx_server::store::{Id, MemoryStore, Store};
+use oswx_server::store::{Id, SchemaStatus, SqliteStore, Store, Tx};
 use oswx_server::{AppState, Settings};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -22,6 +24,8 @@ pub struct TestServer {
     /// `http://127.0.0.1:<port>`, no trailing slash.
     pub base: String,
     pub state: AppState,
+    /// The test database, for statements of the test's own ([`TestServer::sql`]).
+    db: SqliteStore,
     /// The database and storage live here; kept across `restart`.
     dir: Arc<TempDir>,
     stop: Option<oneshot::Sender<()>>,
@@ -40,10 +44,17 @@ fn test_settings(dir: &Path) -> Settings {
 }
 
 /// Opens the database and storage the settings name. This is the one place that decides what a
-/// test runs against (Task 2: SQLite at `settings.database_url`, or PostgreSQL with an emptied
-/// schema when `OSWX_TEST_DATABASE_URL` is set).
-async fn open_backing(_settings: &mut Settings) -> (Arc<dyn Store>, Arc<dyn Blobs>) {
-    (Arc::new(MemoryStore::new()), Arc::new(NullBlobs))
+/// test runs against: SQLite at `settings.database_url`, or PostgreSQL with an emptied schema when
+/// `OSWX_TEST_DATABASE_URL` is set.
+async fn open_backing(settings: &mut Settings) -> (SqliteStore, Arc<dyn Blobs>) {
+    if std::env::var_os("OSWX_TEST_DATABASE_URL").is_some() {
+        // TASK 16: open PgStore on an emptied schema here.
+        panic!("OSWX_TEST_DATABASE_URL is set, but the PostgreSQL store arrives in Task 16");
+    }
+    let store = SqliteStore::open(&settings.database_url, settings.auto_migrate)
+        .await
+        .expect("the test database opens");
+    (store, Arc::new(NullBlobs))
 }
 
 impl TestServer {
@@ -65,10 +76,34 @@ impl TestServer {
         let dir = Arc::new(TempDir::new().expect("a temporary directory"));
         let mut s = test_settings(dir.path());
         settings(&mut s);
-        let (store, blobs) = open_backing(&mut s).await;
-        let mut app_state = AppState::new(s, store, blobs);
+        let (db, blobs) = open_backing(&mut s).await;
+        let mut app_state = AppState::new(s, Arc::new(db.clone()), blobs);
         state(&mut app_state);
-        Self::serve(app_state, dir).await
+        Self::serve(app_state, db, dir).await
+    }
+
+    /// Starts with the test settings changed by `settings` and the store wrapped in a [`FlakyStore`],
+    /// which is returned so the test can make it fail.
+    pub async fn start_flaky(settings: impl FnOnce(&mut Settings)) -> (Self, Arc<FlakyStore>) {
+        let mut handle = None;
+        let server = Self::start_custom(settings, |s| {
+            let flaky = Arc::new(FlakyStore::new(s.store.clone()));
+            handle = Some(flaky.clone());
+            s.store = flaky;
+        })
+        .await;
+        (server, handle.expect("the state function ran"))
+    }
+
+    /// Runs one statement of the test's own against the test database, in its own transaction
+    /// (to set up rows no route can make yet).
+    pub async fn sql(&self, statement: &str) {
+        let mut tx = self.db.begin_tx().await.expect("a transaction");
+        sqlx::query(statement)
+            .execute(tx.conn())
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        Box::new(tx).commit().await.expect("the statement commits");
     }
 
     /// Stops the server and starts it again on the same database and storage, as a new process
@@ -79,10 +114,10 @@ impl TestServer {
         let mut state = self.state.clone();
         state.hub = Hub::default();
         state.sessions = Sessions::default();
-        Self::serve(state, self.dir.clone()).await
+        Self::serve(state, self.db.clone(), self.dir.clone()).await
     }
 
-    async fn serve(state: AppState, dir: Arc<TempDir>) -> Self {
+    async fn serve(state: AppState, db: SqliteStore, dir: Arc<TempDir>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a free port");
@@ -100,6 +135,7 @@ impl TestServer {
         Self {
             base,
             state,
+            db,
             dir,
             stop: Some(stop),
             task: Some(task),
@@ -137,6 +173,85 @@ impl Drop for TestServer {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+/// A store that delegates to a real one and can be told to fail, for the paths a working database
+/// never takes. Every [`Store`] method delegates; add yours when you add one to the trait.
+pub struct FlakyStore {
+    inner: Arc<dyn Store>,
+    fail_health: AtomicBool,
+    fail_commit: Arc<AtomicBool>,
+}
+
+impl FlakyStore {
+    pub fn new(inner: Arc<dyn Store>) -> Self {
+        Self {
+            inner,
+            fail_health: AtomicBool::new(false),
+            fail_commit: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Makes `health` fail (`true`) or delegate again (`false`).
+    pub fn fail_health(&self, fail: bool) {
+        self.fail_health.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes every transaction's `commit` roll back and fail (`true`), or delegate again (`false`).
+    /// Savepoints are not affected: the enclosing transaction's commit is what fails.
+    pub fn fail_commit(&self, fail: bool) {
+        self.fail_commit.store(fail, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Store for FlakyStore {
+    async fn health(&self) -> anyhow::Result<()> {
+        if self.fail_health.load(Ordering::SeqCst) {
+            anyhow::bail!("the flaky store was told to fail health");
+        }
+        self.inner.health().await
+    }
+
+    async fn schema_status(&self) -> anyhow::Result<SchemaStatus> {
+        self.inner.schema_status().await
+    }
+
+    async fn begin(&self) -> anyhow::Result<Box<dyn Tx>> {
+        Ok(Box::new(FlakyTx {
+            inner: self.inner.begin().await?,
+            fail_commit: self.fail_commit.clone(),
+        }))
+    }
+
+    async fn user_count(&self) -> anyhow::Result<u64> {
+        self.inner.user_count().await
+    }
+}
+
+/// [`FlakyStore`]'s transaction. Every [`Tx`] method delegates; add yours when you add one.
+pub struct FlakyTx {
+    inner: Box<dyn Tx>,
+    fail_commit: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Tx for FlakyTx {
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        if self.fail_commit.load(Ordering::SeqCst) {
+            self.inner.rollback().await?;
+            anyhow::bail!("the flaky store was told to fail commits");
+        }
+        self.inner.commit().await
+    }
+
+    async fn rollback(self: Box<Self>) -> anyhow::Result<()> {
+        self.inner.rollback().await
+    }
+
+    async fn savepoint(&mut self) -> anyhow::Result<Box<dyn Tx + '_>> {
+        self.inner.savepoint().await
     }
 }
 

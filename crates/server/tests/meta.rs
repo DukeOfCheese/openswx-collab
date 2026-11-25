@@ -8,7 +8,6 @@ use axum::Router;
 use axum::routing::post;
 use common::TestServer;
 use oswx_server::ext::Extensions;
-use oswx_server::store::MemoryStore;
 use oswx_server::{ApiError, ApiJson, AppState};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -20,14 +19,16 @@ async fn get(server: &TestServer, path: &str) -> (StatusCode, Value) {
     (status, r.json().await.unwrap())
 }
 
-/// A server whose store is the returned test double.
-async fn with_store(
-    settings: impl FnOnce(&mut oswx_server::Settings),
-) -> (TestServer, Arc<MemoryStore>) {
-    let store = Arc::new(MemoryStore::new());
-    let handle = store.clone();
-    let server = TestServer::start_custom(settings, move |s| s.store = store).await;
-    (server, handle)
+/// Adds `n` accounts straight into the database (accounts get routes in Task 4).
+async fn add_users(server: &TestServer, n: usize) {
+    for _ in 0..n {
+        let id = oswx_server::store::new_id();
+        server
+            .sql(&format!(
+                "INSERT INTO users (id, email, name, created_at) VALUES ('{id}', '{id}@example.com', 'U', 0)"
+            ))
+            .await;
+    }
 }
 
 #[tokio::test]
@@ -41,18 +42,18 @@ async fn health_says_ok() {
 
 #[tokio::test]
 async fn ready_is_ok_while_the_store_answers_and_503_when_it_does_not() {
-    let (server, store) = with_store(|_| {}).await;
+    let (server, store) = TestServer::start_flaky(|_| {}).await;
     assert_eq!(
         get(&server, "/api/ready").await,
         (StatusCode::OK, json!({"ok": true}))
     );
 
-    store.set_healthy(false);
+    store.fail_health(true);
     let (status, body) = get(&server, "/api/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body, json!({"ok": false}));
 
-    store.set_healthy(true);
+    store.fail_health(false);
     assert_eq!(get(&server, "/api/ready").await.0, StatusCode::OK);
 }
 
@@ -77,23 +78,23 @@ async fn server_info_has_the_python_shape_with_protocol_2() {
 
 #[tokio::test]
 async fn registration_is_first_user_then_invite_or_open() {
-    let (server, store) = with_store(|_| {}).await;
+    let server = TestServer::start().await;
     assert_eq!(
         get(&server, "/api/server").await.1["registration"],
         "first_user"
     );
-    store.set_user_count(1);
+    add_users(&server, 1).await;
     assert_eq!(
         get(&server, "/api/server").await.1["registration"],
         "invite"
     );
 
-    let (server, store) = with_store(|s| s.open_registration = true).await;
+    let server = TestServer::start_with(|s| s.open_registration = true).await;
     assert_eq!(
         get(&server, "/api/server").await.1["registration"],
         "first_user"
     );
-    store.set_user_count(3);
+    add_users(&server, 3).await;
     assert_eq!(get(&server, "/api/server").await.1["registration"], "open");
 }
 
@@ -130,6 +131,10 @@ async fn fail() -> Result<(), ApiError> {
     Err(anyhow::anyhow!("the secret reason").into())
 }
 
+async fn missing() -> Result<(), ApiError> {
+    Err(ApiError::NotFound("no such project"))
+}
+
 impl Extensions for TestExtension {
     fn server_info(&self) -> Value {
         json!({"edition": "test", "seats": 5})
@@ -139,6 +144,7 @@ impl Extensions for TestExtension {
         Router::new()
             .route("/api/test/echo", post(echo_count))
             .route("/api/test/fail", post(fail))
+            .route("/api/test/missing", axum::routing::get(missing))
             .with_state(state)
     }
 }
@@ -162,6 +168,15 @@ async fn an_unknown_route_is_404_with_a_detail() {
     assert_eq!(
         get(&server, "/api/no/such/route").await,
         (StatusCode::NOT_FOUND, json!({"detail": "Not Found"}))
+    );
+}
+
+#[tokio::test]
+async fn a_handler_404_carries_its_own_message() {
+    let server = with_extension().await;
+    assert_eq!(
+        get(&server, "/api/test/missing").await,
+        (StatusCode::NOT_FOUND, json!({"detail": "no such project"}))
     );
 }
 
@@ -288,8 +303,8 @@ async fn an_internal_error_says_only_server_error() {
 
 #[tokio::test]
 async fn restart_keeps_the_store_and_serves_again() {
-    let (server, store) = with_store(|s| s.open_registration = true).await;
-    store.set_user_count(2);
+    let server = TestServer::start_with(|s| s.open_registration = true).await;
+    add_users(&server, 2).await;
     let server = server.restart().await;
     let (status, body) = get(&server, "/api/server").await;
     assert_eq!(status, StatusCode::OK);

@@ -1,6 +1,6 @@
 [package]
 name = "oswx-server"
-version = "0.0.0"
+version = "0.2.0-dev"
 edition.workspace = true
 license.workspace = true
 publish = false
@@ -15,9 +15,11 @@ axum.workspace = true
 http-body-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true

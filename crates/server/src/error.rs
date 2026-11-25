@@ -15,8 +15,8 @@ use serde::de::DeserializeOwned;
 /// client is told only "server error", and the error is logged.
 #[derive(Debug)]
 pub enum ApiError {
-    /// 404 `Not Found`.
-    NotFound,
+    /// 404 with the message (e.g. `no such project`; `Not Found` for an unknown route).
+    NotFound(&'static str),
     /// 401 `sign in first`.
     Unauthorized,
     /// 403 with the message.
@@ -41,7 +41,7 @@ impl ApiError {
     /// The status code this error answers with.
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -57,9 +57,8 @@ impl ApiError {
     /// The `detail` the client sees.
     pub fn detail(&self) -> &str {
         match self {
-            Self::NotFound => "Not Found",
             Self::Unauthorized => "sign in first",
-            Self::Forbidden(m) => m,
+            Self::NotFound(m) | Self::Forbidden(m) => m,
             Self::Conflict(m)
             | Self::BadRequest(m)
             | Self::PaymentRequired(m)

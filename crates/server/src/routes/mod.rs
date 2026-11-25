@@ -92,7 +92,7 @@ async fn too_large(req: Request) -> Response {
 }
 
 async fn not_found() -> ApiError {
-    ApiError::NotFound
+    ApiError::NotFound("Not Found")
 }
 
 /// 405, or 413 for a body over the default limit (this runs outside the routes' own limits).

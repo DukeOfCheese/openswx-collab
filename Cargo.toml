@@ -29,6 +29,7 @@ proptest = "1"
 bytes = "1"
 tempfile = "3"
 tracing = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "migrate", "macros", "derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

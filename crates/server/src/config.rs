@@ -44,8 +44,8 @@ pub enum SmtpSecurity {
 /// Where the database is, from `OSWX_COLLAB_DATABASE_URL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Database {
-    /// A SQLite file. Written `sqlite://<path>` (so `sqlite:///abs/path` is absolute), or in the
-    /// Python form `sqlite+aiosqlite:///<path>`.
+    /// A SQLite file. Written `sqlite://<path>` (so `sqlite:///abs/path` is absolute), `sqlite:<path>`,
+    /// or in the Python form `sqlite+aiosqlite:///<path>`.
     Sqlite(PathBuf),
     /// A PostgreSQL URL, normalised to start with `postgres://`. Written `postgres://…`,
     /// `postgresql://…` or in the Python form `postgresql+asyncpg://…`.
@@ -220,26 +220,7 @@ impl Settings {
 
     /// The database, parsed from `database_url`.
     pub fn database(&self) -> Result<Database, ConfigError> {
-        let bad = || ConfigError::new("DATABASE_URL", "sqlite://<path> or postgres://<url>");
-        let url = self.database_url.trim();
-        // The Python form first: after `sqlite+aiosqlite:///` comes the path (`////abs` is absolute).
-        let sqlite = url
-            .strip_prefix("sqlite+aiosqlite:///")
-            .or_else(|| url.strip_prefix("sqlite://"));
-        if let Some(path) = sqlite {
-            return if path.is_empty() {
-                Err(bad())
-            } else {
-                Ok(Database::Sqlite(PathBuf::from(path)))
-            };
-        }
-        let postgres = ["postgresql+asyncpg://", "postgresql://", "postgres://"]
-            .iter()
-            .find_map(|p| url.strip_prefix(p));
-        match postgres {
-            Some(rest) if !rest.is_empty() => Ok(Database::Postgres(format!("postgres://{rest}"))),
-            _ => Err(bad()),
-        }
+        parse_database_url(&self.database_url)
     }
 
     /// The blob storage, parsed from `storage_url`.
@@ -265,6 +246,38 @@ impl Settings {
             ));
         }
         Ok(Storage::Local(PathBuf::from(url)))
+    }
+}
+
+/// Parses a database URL as `OSWX_COLLAB_DATABASE_URL` takes it:
+///
+/// - `sqlite://<path>` or `sqlite:<path>` (sqlx forms, so `sqlite:///abs/path` is absolute);
+/// - `sqlite+aiosqlite:///<path>` (the Python form, so `sqlite+aiosqlite:////abs/path` is absolute);
+/// - `postgres://…`, `postgresql://…` or `postgresql+asyncpg://…`, normalised to `postgres://…`.
+///
+/// An in-memory SQLite database (`sqlite::memory:`) is refused: every pooled connection would see a
+/// different, empty database.
+pub fn parse_database_url(url: &str) -> Result<Database, ConfigError> {
+    let bad = || ConfigError::new("DATABASE_URL", "sqlite://<path> or postgres://<url>");
+    let url = url.trim();
+    // The Python form first: after `sqlite+aiosqlite:///` comes the path (`////abs` is absolute).
+    let sqlite = url
+        .strip_prefix("sqlite+aiosqlite:///")
+        .or_else(|| url.strip_prefix("sqlite://"))
+        .or_else(|| url.strip_prefix("sqlite:"));
+    if let Some(path) = sqlite {
+        return if path.is_empty() || path.starts_with(':') {
+            Err(bad())
+        } else {
+            Ok(Database::Sqlite(PathBuf::from(path)))
+        };
+    }
+    let postgres = ["postgresql+asyncpg://", "postgresql://", "postgres://"]
+        .iter()
+        .find_map(|p| url.strip_prefix(p));
+    match postgres {
+        Some(rest) if !rest.is_empty() => Ok(Database::Postgres(format!("postgres://{rest}"))),
+        _ => Err(bad()),
     }
 }
 
@@ -514,6 +527,8 @@ mod tests {
         let pg = Some(Database::Postgres("postgres://u:pw@db:5432/collab".into()));
         assert_eq!(db("sqlite://data/collab.db"), sqlite("data/collab.db"));
         assert_eq!(db("sqlite:///srv/collab.db"), sqlite("/srv/collab.db"));
+        assert_eq!(db("sqlite:data/collab.db"), sqlite("data/collab.db"));
+        assert_eq!(db("sqlite:/srv/collab.db"), sqlite("/srv/collab.db"));
         assert_eq!(
             db("sqlite+aiosqlite:///./data/collab.db"),
             sqlite("./data/collab.db")
@@ -533,6 +548,8 @@ mod tests {
             "mysql://db/collab",
             "./collab.db",
             "sqlite://",
+            "sqlite:",
+            "sqlite::memory:",
             "postgres://",
             "",
         ] {
