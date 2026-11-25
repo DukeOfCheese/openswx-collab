@@ -5,6 +5,9 @@
 //! classified exactly as `Value::from_plain` does, so a list of maps with distinct string `id`s is
 //! a keyed list and is diffed by id.
 //!
+//! An empty plain list and an empty keyed list are the same thing (`[]`): items appearing in one
+//! are inserted, and a keyed list emptied is diffed by removing its items.
+//!
 //! Order of the result: at every level, `Unset`s for keys that went away come first; then, key by
 //! key in key order, whole-value `Set`s for new or replaced keys and the diffs of children present
 //! on both sides. In a keyed list, `Remove`s come first, then one `Insert` or `Move` for every item
@@ -72,8 +75,16 @@ fn diff_value(before: &Value, after: &Value, path: &mut Path, ops: &mut Vec<Op>)
     match (before, after) {
         (Value::Map(b), Value::Map(a)) => diff_maps(b, a, path, false, ops),
         (Value::Keyed(b), Value::Keyed(a)) => diff_keyed(b, a, path, ops),
-        // Everything else (scalars, plain lists, a change of type, a plain list becoming keyed or
-        // the reverse) is one whole-value `Set`. `==` tells `Int(1)` from `Float(1.0)`.
+        // An empty plain list is an empty keyed list: the first items are inserted and the last
+        // ones removed, never set (`apply` inserts into an empty plain list).
+        (Value::List(b), Value::Keyed(a)) if b.is_empty() => {
+            diff_keyed(&KeyedList::new(), a, path, ops)
+        }
+        (Value::Keyed(b), Value::List(a)) if a.is_empty() => {
+            diff_keyed(b, &KeyedList::new(), path, ops)
+        }
+        // Everything else (scalars, plain lists, a change of type, a non-empty plain list becoming
+        // keyed or the reverse) is one whole-value `Set`. `==` tells `Int(1)` from `Float(1.0)`.
         _ => {
             if !same(before, after) {
                 ops.push(Op::Set {
@@ -86,9 +97,13 @@ fn diff_value(before: &Value, after: &Value, path: &mut Path, ops: &mut Vec<Op>)
 }
 
 /// Exact equality: like `==`, but a float is its bits, so `0.0` and `-0.0` differ (as `1`, `1.0` and
-/// `true` do). NaN cannot occur in a document.
+/// `true` do), and an empty keyed list equals an empty plain list (both are `[]` as plain data).
+/// NaN cannot occur in a document.
 fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        (Value::Keyed(k), Value::List(l)) | (Value::List(l), Value::Keyed(k)) => {
+            k.is_empty() && l.is_empty()
+        }
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same(p, q))

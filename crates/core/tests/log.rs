@@ -6,7 +6,7 @@ use std::sync::Arc;
 use common::{load, path};
 use oswx_core::{
     Accepted, Change, ClientId, ConflictKind, Head, Index, Op, Pos, Refusal, Rules, Seq, Value,
-    decide,
+    decide, diff,
 };
 use serde_json::json;
 
@@ -359,4 +359,24 @@ fn malformed_changes_are_invalid() {
         decide_for(&head(), "u1.c1", &ahead, &never),
         Err(Refusal::Invalid(_))
     ));
+}
+
+#[test]
+fn two_clients_adding_the_first_items_to_an_empty_list_both_succeed() {
+    let h0 = Head {
+        seq: 0,
+        doc: load(json!({"sketch": {"entities": []}})),
+        index: Index::default(),
+    };
+    let edit = |who: &str| {
+        let target =
+            common::to_plain(json!({"sketch": {"entities": [{"id": format!("{who}.1")}]}}));
+        change(who, 0, diff(&h0.doc, &target).unwrap())
+    };
+    let h1 = adopt(decide_for(&h0, "u1.c1", &edit("u1.c1"), &never).unwrap());
+    let h2 = adopt(decide_for(&h1, "u2.c1", &edit("u2.c1"), &never).unwrap());
+    let Some(Value::Keyed(k)) = h2.doc.at(&["sketch", "entities"]) else {
+        panic!("a keyed list")
+    };
+    assert_eq!(k.len(), 2);
 }

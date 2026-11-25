@@ -159,12 +159,63 @@ fn type_changes_at_a_key() {
 
 #[test]
 fn empty_to_keyed_and_back() {
+    // Adding the first items to an empty list inserts them: two clients doing so concurrently do
+    // not conflict.
     let ops = check(json!({"l": []}), json!({"l": [{"id": "a"}, {"id": "b"}]}));
-    assert_eq!(ops.len(), 1);
-    assert!(matches!(&ops[0], Op::Set { path: p, .. } if p == &path(&["l"])));
-    let ops = check(json!({"l": [{"id": "a"}, {"id": "b"}]}), json!({"l": []}));
-    assert_eq!(ops.len(), 1);
-    assert!(matches!(&ops[0], Op::Set { path: p, .. } if p == &path(&["l"])));
+    assert_eq!(ops.len(), 2, "{ops:?}");
+    assert!(
+        ops.iter()
+            .all(|o| matches!(o, Op::Insert { list, .. } if list == &path(&["l"])))
+    );
+    // Emptying a list removes its items, so a removal is recorded, not a write.
+    let before = load(json!({"l": [{"id": "a"}, {"id": "b"}]}));
+    let ops = diff(&before, &to_plain(json!({"l": []}))).unwrap();
+    assert_eq!(
+        ops,
+        vec![
+            Op::Remove {
+                list: path(&["l"]),
+                id: Arc::from("a")
+            },
+            Op::Remove {
+                list: path(&["l"]),
+                id: Arc::from("b")
+            },
+        ]
+    );
+    // The emptied keyed list is unchanged against its own plain form, and takes inserts again.
+    let emptied = reach(&before, &ops);
+    assert!(matches!(emptied.at(&["l"]), Some(Value::Keyed(k)) if k.is_empty()));
+    assert_eq!(diff(&emptied, &emptied.to_plain()).unwrap(), vec![]);
+    let ops = diff(&emptied, &to_plain(json!({"l": [{"id": "c"}]}))).unwrap();
+    assert!(matches!(ops.as_slice(), [Op::Insert { .. }]), "{ops:?}");
+    assert_eq!(
+        reach(&emptied, &ops).to_plain(),
+        to_plain(json!({"l": [{"id": "c"}]}))
+    );
+    // An insert into an empty plain list leaves a list that diffs as unchanged.
+    let filled = reach(&load(json!({"l": []})), &ops);
+    assert_eq!(diff(&filled, &filled.to_plain()).unwrap(), vec![]);
+}
+
+#[test]
+fn empty_keyed_list_from_the_wire_is_an_empty_list() {
+    // The wire may carry an emptied keyed list (`{"$list": []}`); plain data reads it back as `[]`,
+    // a plain list. The two are the same to diff.
+    let wire = Plain::Map(vec![(
+        Plain::from("l"),
+        Plain::Map(vec![(Plain::from("$list"), Plain::Array(vec![]))]),
+    )]);
+    let doc = Value::from_wire(&wire).unwrap();
+    assert!(matches!(doc.at(&["l"]), Some(Value::Keyed(k)) if k.is_empty()));
+    assert!(matches!(
+        Value::from_plain(&doc.to_plain()).unwrap().at(&["l"]),
+        Some(Value::List(_))
+    ));
+    assert_eq!(diff(&doc, &doc.to_plain()).unwrap(), vec![]);
+    // A non-empty plain list in place of an empty keyed one is still a whole-value set.
+    let ops = diff(&doc, &to_plain(json!({"l": [1]}))).unwrap();
+    assert!(matches!(ops.as_slice(), [Op::Set { .. }]), "{ops:?}");
 }
 
 #[test]

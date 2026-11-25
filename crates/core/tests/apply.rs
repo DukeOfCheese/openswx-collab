@@ -672,7 +672,7 @@ proptest! {
         // it as plain data sees nothing to send.
         if let Ok(a) = run(&doc, &ops) {
             prop_assert_eq!(Value::from_wire(&a.doc.to_wire()), Ok(a.doc.clone()));
-            prop_assert!(diff(&a.doc, &a.doc.to_plain()).is_ok());
+            prop_assert_eq!(diff(&a.doc, &a.doc.to_plain()), Ok(vec![]));
         }
     }
 }
