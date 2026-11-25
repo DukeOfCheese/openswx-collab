@@ -48,7 +48,10 @@ use sqlx::sqlite::{
 };
 use sqlx::{Acquire, Sqlite, Transaction};
 
-use super::{PasswordReset, SchemaError, SchemaStatus, Session, Store, Tx, User, sql};
+use super::{
+    Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
+    ProjectWithRole, SchemaError, SchemaStatus, Session, Store, Tx, User, sql,
+};
 use crate::config::{Database, parse_database_url};
 
 /// The migrations in `migrations/sqlite/`, embedded in the binary.
@@ -306,6 +309,58 @@ impl Store for SqliteStore {
     async fn password_reset_by_hash(&self, token_hash: &str) -> Result<Option<PasswordReset>> {
         q::password_reset_by_hash(&mut *self.reader().await?, token_hash).await
     }
+
+    async fn org_by_id(&self, id: &str) -> Result<Option<Org>> {
+        q::org_by_id(&mut *self.reader().await?, id).await
+    }
+
+    async fn org_member(&self, org_id: &str, user_id: &str) -> Result<Option<OrgMember>> {
+        q::org_member(&mut *self.reader().await?, org_id, user_id).await
+    }
+
+    async fn orgs_of_user(&self, user_id: &str) -> Result<Vec<OrgSummary>> {
+        q::orgs_of_user(&mut *self.reader().await?, user_id).await
+    }
+
+    async fn org_members(&self, org_id: &str) -> Result<Vec<Member>> {
+        q::org_members(&mut *self.reader().await?, org_id).await
+    }
+
+    async fn org_member_count(&self, org_id: &str) -> Result<u64> {
+        q::org_member_count(&mut *self.reader().await?, org_id).await
+    }
+
+    async fn project_by_id(&self, id: &str) -> Result<Option<Project>> {
+        q::project_by_id(&mut *self.reader().await?, id).await
+    }
+
+    async fn project_member(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectMember>> {
+        q::project_member(&mut *self.reader().await?, project_id, user_id).await
+    }
+
+    async fn projects_in_org(&self, org_id: &str) -> Result<Vec<Project>> {
+        q::projects_in_org(&mut *self.reader().await?, org_id).await
+    }
+
+    async fn member_projects(&self, org_id: &str, user_id: &str) -> Result<Vec<ProjectWithRole>> {
+        q::member_projects(&mut *self.reader().await?, org_id, user_id).await
+    }
+
+    async fn project_members(&self, project_id: &str) -> Result<Vec<Member>> {
+        q::project_members(&mut *self.reader().await?, project_id).await
+    }
+
+    async fn invite_by_id(&self, id: &str) -> Result<Option<Invite>> {
+        q::invite_by_id(&mut *self.reader().await?, id).await
+    }
+
+    async fn open_invites(&self, org_id: &str, now: f64) -> Result<Vec<Invite>> {
+        q::open_invites(&mut *self.reader().await?, org_id, now).await
+    }
 }
 
 /// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
@@ -443,6 +498,111 @@ impl Tx for SqliteTx<'_> {
 
     async fn delete_expired_password_resets(&mut self, now: f64) -> Result<()> {
         q::delete_expired_password_resets(self.conn(), now).await
+    }
+
+    async fn insert_org(&mut self, org: &Org) -> Result<()> {
+        q::insert_org(self.conn(), org).await
+    }
+
+    async fn set_org_name(&mut self, id: &str, name: &str) -> Result<()> {
+        q::set_org_name(self.conn(), id, name).await
+    }
+
+    async fn org_by_id(&mut self, id: &str) -> Result<Option<Org>> {
+        q::org_by_id(self.conn(), id).await
+    }
+
+    async fn org_member(&mut self, org_id: &str, user_id: &str) -> Result<Option<OrgMember>> {
+        q::org_member(self.conn(), org_id, user_id).await
+    }
+
+    async fn insert_org_member(&mut self, member: &OrgMember) -> Result<()> {
+        q::insert_org_member(self.conn(), member).await
+    }
+
+    async fn set_org_member_role(&mut self, org_id: &str, user_id: &str, role: &str) -> Result<()> {
+        q::set_org_member_role(self.conn(), org_id, user_id, role).await
+    }
+
+    async fn delete_org_member(&mut self, org_id: &str, user_id: &str) -> Result<()> {
+        q::delete_org_member(self.conn(), org_id, user_id).await
+    }
+
+    async fn org_member_count(&mut self, org_id: &str) -> Result<u64> {
+        q::org_member_count(self.conn(), org_id).await
+    }
+
+    async fn org_owner_count(&mut self, org_id: &str) -> Result<u64> {
+        q::org_owner_count(self.conn(), org_id).await
+    }
+
+    async fn delete_project_members_in_org(&mut self, org_id: &str, user_id: &str) -> Result<()> {
+        q::delete_project_members_in_org(self.conn(), org_id, user_id).await
+    }
+
+    async fn invite_by_hash(&mut self, token_hash: &str) -> Result<Option<Invite>> {
+        q::invite_by_hash(self.conn(), token_hash).await
+    }
+
+    async fn insert_invite(&mut self, invite: &Invite) -> Result<()> {
+        q::insert_invite(self.conn(), invite).await
+    }
+
+    async fn claim_invite(&mut self, id: &str, user_id: &str) -> Result<bool> {
+        q::claim_invite(self.conn(), id, user_id).await
+    }
+
+    async fn delete_invite(&mut self, org_id: &str, id: &str) -> Result<bool> {
+        q::delete_invite(self.conn(), org_id, id).await
+    }
+
+    async fn insert_project(&mut self, project: &Project) -> Result<()> {
+        q::insert_project(self.conn(), project).await
+    }
+
+    async fn set_project_name(&mut self, id: &str, name: &str) -> Result<()> {
+        q::set_project_name(self.conn(), id, name).await
+    }
+
+    async fn delete_project(&mut self, id: &str) -> Result<()> {
+        q::delete_project(self.conn(), id).await
+    }
+
+    async fn project_by_id(&mut self, id: &str) -> Result<Option<Project>> {
+        q::project_by_id(self.conn(), id).await
+    }
+
+    async fn project_member(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectMember>> {
+        q::project_member(self.conn(), project_id, user_id).await
+    }
+
+    async fn insert_project_member(&mut self, member: &ProjectMember) -> Result<()> {
+        q::insert_project_member(self.conn(), member).await
+    }
+
+    async fn set_project_member_role(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> Result<()> {
+        q::set_project_member_role(self.conn(), project_id, user_id, role).await
+    }
+
+    async fn delete_project_member(&mut self, project_id: &str, user_id: &str) -> Result<bool> {
+        q::delete_project_member(self.conn(), project_id, user_id).await
+    }
+
+    async fn project_document_ids(&mut self, project_id: &str) -> Result<Vec<Id>> {
+        q::project_document_ids(self.conn(), project_id).await
+    }
+
+    async fn mark_project_documents_deleted(&mut self, project_id: &str, now: f64) -> Result<()> {
+        q::mark_project_documents_deleted(self.conn(), project_id, now).await
     }
 }
 
@@ -673,6 +833,325 @@ mod q {
 
     pub async fn delete_expired_password_resets(c: &mut SqliteConnection, now: f64) -> Result<()> {
         sqlx::query(sql::DELETE_EXPIRED_PASSWORD_RESETS)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_org(c: &mut SqliteConnection, o: &Org) -> Result<()> {
+        sqlx::query(sql::INSERT_ORG)
+            .bind(&o.id)
+            .bind(&o.name)
+            .bind(o.created_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_org_name(c: &mut SqliteConnection, id: &str, name: &str) -> Result<()> {
+        sqlx::query(sql::SET_ORG_NAME)
+            .bind(id)
+            .bind(name)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn org_by_id(c: &mut SqliteConnection, id: &str) -> Result<Option<Org>> {
+        Ok(sqlx::query_as(sql::ORG_BY_ID)
+            .bind(id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn org_member(
+        c: &mut SqliteConnection,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Option<OrgMember>> {
+        Ok(sqlx::query_as(sql::ORG_MEMBER)
+            .bind(org_id)
+            .bind(user_id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn orgs_of_user(c: &mut SqliteConnection, user_id: &str) -> Result<Vec<OrgSummary>> {
+        Ok(sqlx::query_as(sql::ORGS_OF_USER)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn org_members(c: &mut SqliteConnection, org_id: &str) -> Result<Vec<Member>> {
+        Ok(sqlx::query_as(sql::ORG_MEMBERS)
+            .bind(org_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn insert_org_member(c: &mut SqliteConnection, m: &OrgMember) -> Result<()> {
+        sqlx::query(sql::INSERT_ORG_MEMBER)
+            .bind(&m.org_id)
+            .bind(&m.user_id)
+            .bind(&m.role)
+            .bind(m.created_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_org_member_role(
+        c: &mut SqliteConnection,
+        org_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_ORG_MEMBER_ROLE)
+            .bind(org_id)
+            .bind(user_id)
+            .bind(role)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_org_member(
+        c: &mut SqliteConnection,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_ORG_MEMBER)
+            .bind(org_id)
+            .bind(user_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn org_member_count(c: &mut SqliteConnection, org_id: &str) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(sql::ORG_MEMBER_COUNT)
+            .bind(org_id)
+            .fetch_one(c)
+            .await?;
+        Ok(u64::try_from(n)?)
+    }
+
+    pub async fn org_owner_count(c: &mut SqliteConnection, org_id: &str) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(sql::ORG_OWNER_COUNT)
+            .bind(org_id)
+            .bind("owner")
+            .fetch_one(c)
+            .await?;
+        Ok(u64::try_from(n)?)
+    }
+
+    pub async fn delete_project_members_in_org(
+        c: &mut SqliteConnection,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_PROJECT_MEMBERS_IN_ORG)
+            .bind(org_id)
+            .bind(user_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_invite(c: &mut SqliteConnection, i: &Invite) -> Result<()> {
+        sqlx::query(sql::INSERT_INVITE)
+            .bind(&i.id)
+            .bind(&i.token_hash)
+            .bind(&i.org_id)
+            .bind(&i.email)
+            .bind(&i.role)
+            .bind(&i.projects)
+            .bind(&i.created_by)
+            .bind(i.created_at)
+            .bind(i.expires_at)
+            .bind(&i.accepted_by)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn invite_by_id(c: &mut SqliteConnection, id: &str) -> Result<Option<Invite>> {
+        Ok(sqlx::query_as(sql::INVITE_BY_ID)
+            .bind(id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn invite_by_hash(
+        c: &mut SqliteConnection,
+        token_hash: &str,
+    ) -> Result<Option<Invite>> {
+        Ok(sqlx::query_as(sql::INVITE_BY_HASH)
+            .bind(token_hash)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn open_invites(
+        c: &mut SqliteConnection,
+        org_id: &str,
+        now: f64,
+    ) -> Result<Vec<Invite>> {
+        Ok(sqlx::query_as(sql::OPEN_INVITES)
+            .bind(org_id)
+            .bind(now)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn claim_invite(c: &mut SqliteConnection, id: &str, user_id: &str) -> Result<bool> {
+        let done = sqlx::query(sql::CLAIM_INVITE)
+            .bind(id)
+            .bind(user_id)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn delete_invite(c: &mut SqliteConnection, org_id: &str, id: &str) -> Result<bool> {
+        let done = sqlx::query(sql::DELETE_INVITE)
+            .bind(org_id)
+            .bind(id)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    pub async fn insert_project(c: &mut SqliteConnection, p: &Project) -> Result<()> {
+        sqlx::query(sql::INSERT_PROJECT)
+            .bind(&p.id)
+            .bind(&p.org_id)
+            .bind(&p.name)
+            .bind(p.created_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_project_name(c: &mut SqliteConnection, id: &str, name: &str) -> Result<()> {
+        sqlx::query(sql::SET_PROJECT_NAME)
+            .bind(id)
+            .bind(name)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_project(c: &mut SqliteConnection, id: &str) -> Result<()> {
+        sqlx::query(sql::DELETE_PROJECT).bind(id).execute(c).await?;
+        Ok(())
+    }
+
+    pub async fn project_by_id(c: &mut SqliteConnection, id: &str) -> Result<Option<Project>> {
+        Ok(sqlx::query_as(sql::PROJECT_BY_ID)
+            .bind(id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn projects_in_org(c: &mut SqliteConnection, org_id: &str) -> Result<Vec<Project>> {
+        Ok(sqlx::query_as(sql::PROJECTS_IN_ORG)
+            .bind(org_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn member_projects(
+        c: &mut SqliteConnection,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<ProjectWithRole>> {
+        Ok(sqlx::query_as(sql::MEMBER_PROJECTS)
+            .bind(org_id)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn project_member(
+        c: &mut SqliteConnection,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectMember>> {
+        Ok(sqlx::query_as(sql::PROJECT_MEMBER)
+            .bind(project_id)
+            .bind(user_id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn project_members(
+        c: &mut SqliteConnection,
+        project_id: &str,
+    ) -> Result<Vec<Member>> {
+        Ok(sqlx::query_as(sql::PROJECT_MEMBERS)
+            .bind(project_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn insert_project_member(c: &mut SqliteConnection, m: &ProjectMember) -> Result<()> {
+        sqlx::query(sql::INSERT_PROJECT_MEMBER)
+            .bind(&m.project_id)
+            .bind(&m.user_id)
+            .bind(&m.role)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_project_member_role(
+        c: &mut SqliteConnection,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_PROJECT_MEMBER_ROLE)
+            .bind(project_id)
+            .bind(user_id)
+            .bind(role)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_project_member(
+        c: &mut SqliteConnection,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(sql::DELETE_PROJECT_MEMBER)
+            .bind(project_id)
+            .bind(user_id)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    pub async fn project_document_ids(
+        c: &mut SqliteConnection,
+        project_id: &str,
+    ) -> Result<Vec<Id>> {
+        Ok(sqlx::query_scalar(sql::PROJECT_DOCUMENT_IDS)
+            .bind(project_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn mark_project_documents_deleted(
+        c: &mut SqliteConnection,
+        project_id: &str,
+        now: f64,
+    ) -> Result<()> {
+        sqlx::query(sql::MARK_PROJECT_DOCUMENTS_DELETED)
+            .bind(project_id)
             .bind(now)
             .execute(c)
             .await?;

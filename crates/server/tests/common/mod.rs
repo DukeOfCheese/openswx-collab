@@ -11,7 +11,10 @@ use oswx_server::blobs::{Blobs, NullBlobs};
 use oswx_server::hub::Hub;
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
-use oswx_server::store::{Id, PasswordReset, SchemaStatus, Session, SqliteStore, Store, Tx, User};
+use oswx_server::store::{
+    Id, Invite, Member, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
+    ProjectWithRole, SchemaStatus, Session, SqliteStore, Store, Tx, User,
+};
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -270,6 +273,38 @@ impl TestServer {
             .await
     }
 
+    pub async fn put(&self, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+        self.call(reqwest::Method::PUT, path, token, Some(body))
+            .await
+    }
+
+    pub async fn delete(&self, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+        self.call(reqwest::Method::DELETE, path, token, None).await
+    }
+
+    /// Registers an account with an invite token (password [`PASSWORD`], named `name` or the
+    /// address's local part) and answers its token and id; panics unless the server answers 201.
+    pub async fn register_invited(
+        &self,
+        email: &str,
+        name: Option<&str>,
+        invite: &str,
+    ) -> (Token, Id) {
+        let name = name.unwrap_or_else(|| email.split('@').next().unwrap_or_default());
+        let (status, body) = self
+            .post(
+                "/api/auth/register",
+                None,
+                json!({"email": email, "password": PASSWORD, "name": name, "invite": invite}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        (
+            body["token"].as_str().expect("a token").to_owned(),
+            body["user"]["id"].as_str().expect("an id").to_owned(),
+        )
+    }
+
     /// Registers an account (password [`PASSWORD`], name the address's local part) and answers its
     /// token and id; panics unless the server answers 201.
     pub async fn register(&self, email: &str) -> (Token, Id) {
@@ -510,6 +545,62 @@ impl Store for FlakyStore {
     ) -> anyhow::Result<Option<PasswordReset>> {
         self.inner().password_reset_by_hash(token_hash).await
     }
+
+    async fn org_by_id(&self, id: &str) -> anyhow::Result<Option<Org>> {
+        self.inner().org_by_id(id).await
+    }
+
+    async fn org_member(&self, org_id: &str, user_id: &str) -> anyhow::Result<Option<OrgMember>> {
+        self.inner().org_member(org_id, user_id).await
+    }
+
+    async fn orgs_of_user(&self, user_id: &str) -> anyhow::Result<Vec<OrgSummary>> {
+        self.inner().orgs_of_user(user_id).await
+    }
+
+    async fn org_members(&self, org_id: &str) -> anyhow::Result<Vec<Member>> {
+        self.inner().org_members(org_id).await
+    }
+
+    async fn org_member_count(&self, org_id: &str) -> anyhow::Result<u64> {
+        self.inner().org_member_count(org_id).await
+    }
+
+    async fn project_by_id(&self, id: &str) -> anyhow::Result<Option<Project>> {
+        self.inner().project_by_id(id).await
+    }
+
+    async fn project_member(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<ProjectMember>> {
+        self.inner().project_member(project_id, user_id).await
+    }
+
+    async fn projects_in_org(&self, org_id: &str) -> anyhow::Result<Vec<Project>> {
+        self.inner().projects_in_org(org_id).await
+    }
+
+    async fn member_projects(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<ProjectWithRole>> {
+        self.inner().member_projects(org_id, user_id).await
+    }
+
+    async fn project_members(&self, project_id: &str) -> anyhow::Result<Vec<Member>> {
+        self.inner().project_members(project_id).await
+    }
+
+    async fn invite_by_id(&self, id: &str) -> anyhow::Result<Option<Invite>> {
+        self.inner().invite_by_id(id).await
+    }
+
+    async fn open_invites(&self, org_id: &str, now: f64) -> anyhow::Result<Vec<Invite>> {
+        self.inner().open_invites(org_id, now).await
+    }
 }
 
 /// [`FlakyStore`]'s transaction. Every [`Tx`] method delegates; add yours when you add one.
@@ -618,9 +709,142 @@ impl Tx for FlakyTx {
     async fn delete_expired_password_resets(&mut self, now: f64) -> anyhow::Result<()> {
         self.inner.delete_expired_password_resets(now).await
     }
+
+    async fn insert_org(&mut self, org: &Org) -> anyhow::Result<()> {
+        self.inner.insert_org(org).await
+    }
+
+    async fn set_org_name(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.inner.set_org_name(id, name).await
+    }
+
+    async fn org_by_id(&mut self, id: &str) -> anyhow::Result<Option<Org>> {
+        self.inner.org_by_id(id).await
+    }
+
+    async fn org_member(
+        &mut self,
+        org_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<OrgMember>> {
+        self.inner.org_member(org_id, user_id).await
+    }
+
+    async fn insert_org_member(&mut self, member: &OrgMember) -> anyhow::Result<()> {
+        self.inner.insert_org_member(member).await
+    }
+
+    async fn set_org_member_role(
+        &mut self,
+        org_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.set_org_member_role(org_id, user_id, role).await
+    }
+
+    async fn delete_org_member(&mut self, org_id: &str, user_id: &str) -> anyhow::Result<()> {
+        self.inner.delete_org_member(org_id, user_id).await
+    }
+
+    async fn org_member_count(&mut self, org_id: &str) -> anyhow::Result<u64> {
+        self.inner.org_member_count(org_id).await
+    }
+
+    async fn org_owner_count(&mut self, org_id: &str) -> anyhow::Result<u64> {
+        self.inner.org_owner_count(org_id).await
+    }
+
+    async fn delete_project_members_in_org(
+        &mut self,
+        org_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .delete_project_members_in_org(org_id, user_id)
+            .await
+    }
+
+    async fn invite_by_hash(&mut self, token_hash: &str) -> anyhow::Result<Option<Invite>> {
+        self.inner.invite_by_hash(token_hash).await
+    }
+
+    async fn insert_invite(&mut self, invite: &Invite) -> anyhow::Result<()> {
+        self.inner.insert_invite(invite).await
+    }
+
+    async fn claim_invite(&mut self, id: &str, user_id: &str) -> anyhow::Result<bool> {
+        self.inner.claim_invite(id, user_id).await
+    }
+
+    async fn delete_invite(&mut self, org_id: &str, id: &str) -> anyhow::Result<bool> {
+        self.inner.delete_invite(org_id, id).await
+    }
+
+    async fn insert_project(&mut self, project: &Project) -> anyhow::Result<()> {
+        self.inner.insert_project(project).await
+    }
+
+    async fn set_project_name(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.inner.set_project_name(id, name).await
+    }
+
+    async fn delete_project(&mut self, id: &str) -> anyhow::Result<()> {
+        self.inner.delete_project(id).await
+    }
+
+    async fn project_by_id(&mut self, id: &str) -> anyhow::Result<Option<Project>> {
+        self.inner.project_by_id(id).await
+    }
+
+    async fn project_member(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<ProjectMember>> {
+        self.inner.project_member(project_id, user_id).await
+    }
+
+    async fn insert_project_member(&mut self, member: &ProjectMember) -> anyhow::Result<()> {
+        self.inner.insert_project_member(member).await
+    }
+
+    async fn set_project_member_role(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .set_project_member_role(project_id, user_id, role)
+            .await
+    }
+
+    async fn delete_project_member(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner.delete_project_member(project_id, user_id).await
+    }
+
+    async fn project_document_ids(&mut self, project_id: &str) -> anyhow::Result<Vec<Id>> {
+        self.inner.project_document_ids(project_id).await
+    }
+
+    async fn mark_project_documents_deleted(
+        &mut self,
+        project_id: &str,
+        now: f64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .mark_project_documents_deleted(project_id, now)
+            .await
+    }
 }
 
-/// A server admin with an organisation and a project, the starting point of most tests.
+/// A server admin (Ada, `ada@example.com`, the first account) who owns an organisation, "Robotics",
+/// with one project, "Rover": the starting point of most tests, as the Python `World`.
 pub struct World {
     pub admin: Token,
     pub admin_id: Id,
@@ -629,11 +853,83 @@ pub struct World {
 }
 
 impl World {
-    /// Not yet available: organisations and projects arrive with Task 5, which gives this its body
-    /// (the admin from [`TestServer::register`]).
-    pub async fn new(_server: &TestServer) -> anyhow::Result<Self> {
-        anyhow::bail!("World needs organisations and projects; Task 5 provides it")
+    /// Registers the admin on an empty server and creates the organisation and the project.
+    pub async fn new(server: &TestServer) -> anyhow::Result<Self> {
+        let (status, body) = server
+            .post(
+                "/api/auth/register",
+                None,
+                json!({"email": "ada@example.com", "password": PASSWORD, "name": "Ada"}),
+            )
+            .await;
+        anyhow::ensure!(status == StatusCode::CREATED, "register: {status} {body}");
+        let admin = body["token"].as_str().unwrap_or_default().to_owned();
+        let admin_id = body["user"]["id"].as_str().unwrap_or_default().to_owned();
+        let (status, body) = server
+            .post("/api/orgs", Some(&admin), json!({"name": "Robotics"}))
+            .await;
+        anyhow::ensure!(status == StatusCode::CREATED, "create org: {status} {body}");
+        let org = body["id"].as_str().unwrap_or_default().to_owned();
+        let (status, body) = server
+            .post(
+                &format!("/api/orgs/{org}/projects"),
+                Some(&admin),
+                json!({"name": "Rover"}),
+            )
+            .await;
+        anyhow::ensure!(
+            status == StatusCode::CREATED,
+            "create project: {status} {body}"
+        );
+        let project = body["id"].as_str().unwrap_or_default().to_owned();
+        Ok(Self {
+            admin,
+            admin_id,
+            org,
+            project,
+        })
     }
+
+    /// Invites `email` into the organisation with the organisation role `org_role` and, unless
+    /// `role` is `None`, the project role `role` in the project, then registers the account with the
+    /// invite (named `name`, or the address's local part). Answers its token and id; panics if
+    /// either step fails.
+    pub async fn invite(
+        &self,
+        server: &TestServer,
+        email: &str,
+        name: Option<&str>,
+        role: Option<&str>,
+        org_role: &str,
+    ) -> (Token, Id) {
+        let grants = match role {
+            Some(role) => json!([{"project_id": self.project, "role": role}]),
+            None => json!([]),
+        };
+        let (status, body) = server
+            .post(
+                &format!("/api/orgs/{}/invites", self.org),
+                Some(&self.admin),
+                json!({"email": email, "role": org_role, "projects": grants}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let token = body["token"].as_str().expect("an invite token");
+        server.register_invited(email, name, token).await
+    }
+
+    /// [`World::invite`] as a member of the organisation and an editor of the project.
+    pub async fn editor(&self, server: &TestServer, email: &str) -> (Token, Id) {
+        self.invite(server, email, None, Some("editor"), "member")
+            .await
+    }
+}
+
+/// A server with a [`World`] on it.
+pub async fn world() -> (TestServer, World) {
+    let server = TestServer::start().await;
+    let world = World::new(&server).await.expect("the world is made");
+    (server, world)
 }
 
 /// A v2 WebSocket client built on `oswx_core::wire`.

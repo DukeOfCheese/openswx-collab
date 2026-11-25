@@ -210,6 +210,90 @@ pub struct PasswordReset {
     pub expires_at: f64,
 }
 
+/// An organisation (`orgs`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Org {
+    pub id: Id,
+    pub name: String,
+    pub created_at: f64,
+}
+
+/// Someone's membership of an organisation (`org_members`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct OrgMember {
+    pub org_id: Id,
+    pub user_id: Id,
+    /// `owner`, `admin` or `member` ([`crate::security::OrgRole`]).
+    pub role: String,
+    pub created_at: f64,
+}
+
+/// One of an account's organisations, as `GET /api/orgs` lists it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct OrgSummary {
+    pub id: Id,
+    pub name: String,
+    /// The account's role in it.
+    pub role: String,
+    /// How many members it has.
+    pub members: i64,
+}
+
+/// A member of an organisation or a project, with their role there.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Member {
+    pub id: Id,
+    pub email: String,
+    pub name: String,
+    pub role: String,
+}
+
+/// An invite to an organisation (`invites`). Only the token's hash is stored.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Invite {
+    pub id: Id,
+    pub token_hash: String,
+    pub org_id: Id,
+    /// When set, only the account with this (normalised) address can use it.
+    pub email: Option<String>,
+    /// The organisation role it gives: `admin` or `member`.
+    pub role: String,
+    /// JSON: the projects it gives a role in, `[{"project_id": .., "role": ..}]`.
+    pub projects: String,
+    pub created_by: Id,
+    pub created_at: f64,
+    pub expires_at: f64,
+    /// Who used it; `None` while it is unused.
+    pub accepted_by: Option<Id>,
+}
+
+/// A project (`projects`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Project {
+    pub id: Id,
+    pub org_id: Id,
+    pub name: String,
+    pub created_at: f64,
+}
+
+/// Someone's role in a project (`project_members`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ProjectMember {
+    pub project_id: Id,
+    pub user_id: Id,
+    /// `owner`, `editor` or `viewer` ([`crate::security::ProjectRole`]).
+    pub role: String,
+}
+
+/// A project and someone's role in it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ProjectWithRole {
+    pub id: Id,
+    pub name: String,
+    pub org_id: Id,
+    pub role: String,
+}
+
 /// The database. One method per query; see the module documentation for how to add one.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
@@ -239,6 +323,49 @@ pub trait Store: Send + Sync + 'static {
         &self,
         token_hash: &str,
     ) -> anyhow::Result<Option<PasswordReset>>;
+
+    async fn org_by_id(&self, id: &str) -> anyhow::Result<Option<Org>>;
+
+    /// An account's membership of an organisation.
+    async fn org_member(&self, org_id: &str, user_id: &str) -> anyhow::Result<Option<OrgMember>>;
+
+    /// An account's organisations with its role and their member counts, by name then id (one
+    /// query, however many organisations).
+    async fn orgs_of_user(&self, user_id: &str) -> anyhow::Result<Vec<OrgSummary>>;
+
+    /// An organisation's members, by name then id.
+    async fn org_members(&self, org_id: &str) -> anyhow::Result<Vec<Member>>;
+
+    /// How many members an organisation has.
+    async fn org_member_count(&self, org_id: &str) -> anyhow::Result<u64>;
+
+    async fn project_by_id(&self, id: &str) -> anyhow::Result<Option<Project>>;
+
+    /// An account's role row in a project.
+    async fn project_member(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<ProjectMember>>;
+
+    /// Every project of an organisation, by name then id.
+    async fn projects_in_org(&self, org_id: &str) -> anyhow::Result<Vec<Project>>;
+
+    /// The projects of an organisation an account has a role row in, with that role, by name then
+    /// id.
+    async fn member_projects(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<ProjectWithRole>>;
+
+    /// The accounts with a role row in a project, by name then id.
+    async fn project_members(&self, project_id: &str) -> anyhow::Result<Vec<Member>>;
+
+    async fn invite_by_id(&self, id: &str) -> anyhow::Result<Option<Invite>>;
+
+    /// An organisation's invites that are unused and expire after `now`, oldest first.
+    async fn open_invites(&self, org_id: &str, now: f64) -> anyhow::Result<Vec<Invite>>;
 }
 
 /// A write transaction (or a savepoint within one). Dropping it without [`Tx::commit`] rolls it
@@ -308,4 +435,98 @@ pub trait Tx: Send {
 
     /// Removes every account's password resets that expired before `now`.
     async fn delete_expired_password_resets(&mut self, now: f64) -> anyhow::Result<()>;
+
+    async fn insert_org(&mut self, org: &Org) -> anyhow::Result<()>;
+
+    async fn set_org_name(&mut self, id: &str, name: &str) -> anyhow::Result<()>;
+
+    /// [`Store::org_by_id`], seeing this transaction's writes.
+    async fn org_by_id(&mut self, id: &str) -> anyhow::Result<Option<Org>>;
+
+    /// [`Store::org_member`], seeing this transaction's writes.
+    async fn org_member(
+        &mut self,
+        org_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<OrgMember>>;
+
+    async fn insert_org_member(&mut self, member: &OrgMember) -> anyhow::Result<()>;
+
+    async fn set_org_member_role(
+        &mut self,
+        org_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> anyhow::Result<()>;
+
+    async fn delete_org_member(&mut self, org_id: &str, user_id: &str) -> anyhow::Result<()>;
+
+    /// How many members an organisation has.
+    async fn org_member_count(&mut self, org_id: &str) -> anyhow::Result<u64>;
+
+    /// How many owners an organisation has.
+    async fn org_owner_count(&mut self, org_id: &str) -> anyhow::Result<u64>;
+
+    /// Removes an account's role rows in every project of an organisation.
+    async fn delete_project_members_in_org(
+        &mut self,
+        org_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<()>;
+
+    /// The invite whose token has this hash, used or expired or not.
+    async fn invite_by_hash(&mut self, token_hash: &str) -> anyhow::Result<Option<Invite>>;
+
+    async fn insert_invite(&mut self, invite: &Invite) -> anyhow::Result<()>;
+
+    /// Marks an unused invite as used by `user_id`; `false` if it was already used (or is gone):
+    /// of two people accepting one invite at once, one wins.
+    async fn claim_invite(&mut self, id: &str, user_id: &str) -> anyhow::Result<bool>;
+
+    /// Deletes an organisation's invite; `false` if it has no invite with that id.
+    async fn delete_invite(&mut self, org_id: &str, id: &str) -> anyhow::Result<bool>;
+
+    async fn insert_project(&mut self, project: &Project) -> anyhow::Result<()>;
+
+    async fn set_project_name(&mut self, id: &str, name: &str) -> anyhow::Result<()>;
+
+    /// Deletes a project; the database removes its documents, their journals, snapshot rows,
+    /// versions and references, and its role rows with it.
+    async fn delete_project(&mut self, id: &str) -> anyhow::Result<()>;
+
+    /// [`Store::project_by_id`], seeing this transaction's writes.
+    async fn project_by_id(&mut self, id: &str) -> anyhow::Result<Option<Project>>;
+
+    /// [`Store::project_member`], seeing this transaction's writes.
+    async fn project_member(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<ProjectMember>>;
+
+    async fn insert_project_member(&mut self, member: &ProjectMember) -> anyhow::Result<()>;
+
+    async fn set_project_member_role(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Removes an account's role in a project; `false` if it had none.
+    async fn delete_project_member(
+        &mut self,
+        project_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<bool>;
+
+    /// The ids of every document in a project, deleted ones included.
+    async fn project_document_ids(&mut self, project_id: &str) -> anyhow::Result<Vec<Id>>;
+
+    /// Marks every document of a project that is not yet deleted as deleted at `now`.
+    async fn mark_project_documents_deleted(
+        &mut self,
+        project_id: &str,
+        now: f64,
+    ) -> anyhow::Result<()>;
 }

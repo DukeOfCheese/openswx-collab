@@ -86,3 +86,145 @@ pub const DELETE_USER_PASSWORD_RESETS: &str = "DELETE FROM password_resets WHERE
 /// [`super::Tx::delete_expired_password_resets`].
 pub const DELETE_EXPIRED_PASSWORD_RESETS: &str =
     "DELETE FROM password_resets WHERE expires_at < $1";
+
+// ------------------------------------------------------------------ organisations
+
+/// [`super::Tx::insert_org`].
+pub const INSERT_ORG: &str = "INSERT INTO orgs (id, name, created_at) VALUES ($1, $2, $3)";
+
+/// [`super::Tx::set_org_name`].
+pub const SET_ORG_NAME: &str = "UPDATE orgs SET name = $2 WHERE id = $1";
+
+/// [`super::Store::org_by_id`], [`super::Tx::org_by_id`].
+pub const ORG_BY_ID: &str = "SELECT id, name, created_at FROM orgs WHERE id = $1";
+
+/// [`super::Store::org_member`], [`super::Tx::org_member`].
+pub const ORG_MEMBER: &str = "SELECT org_id, user_id, role, created_at FROM org_members \
+     WHERE org_id = $1 AND user_id = $2";
+
+/// [`super::Store::orgs_of_user`]: one query, whatever the number of organisations.
+pub const ORGS_OF_USER: &str = "SELECT o.id, o.name, mine.role, COUNT(everyone.user_id) AS members \
+     FROM orgs o \
+     JOIN org_members mine ON mine.org_id = o.id \
+     JOIN org_members everyone ON everyone.org_id = o.id \
+     WHERE mine.user_id = $1 \
+     GROUP BY o.id, o.name, mine.role \
+     ORDER BY o.name, o.id";
+
+/// [`super::Store::org_members`].
+pub const ORG_MEMBERS: &str = "SELECT u.id, u.email, u.name, m.role FROM users u \
+     JOIN org_members m ON m.user_id = u.id WHERE m.org_id = $1 ORDER BY u.name, u.id";
+
+/// [`super::Tx::insert_org_member`].
+pub const INSERT_ORG_MEMBER: &str =
+    "INSERT INTO org_members (org_id, user_id, role, created_at) VALUES ($1, $2, $3, $4)";
+
+/// [`super::Tx::set_org_member_role`].
+pub const SET_ORG_MEMBER_ROLE: &str =
+    "UPDATE org_members SET role = $3 WHERE org_id = $1 AND user_id = $2";
+
+/// [`super::Tx::delete_org_member`].
+pub const DELETE_ORG_MEMBER: &str = "DELETE FROM org_members WHERE org_id = $1 AND user_id = $2";
+
+/// [`super::Store::org_member_count`], [`super::Tx::org_member_count`].
+pub const ORG_MEMBER_COUNT: &str = "SELECT COUNT(*) FROM org_members WHERE org_id = $1";
+
+/// [`super::Tx::org_owner_count`] (bind `"owner"`).
+pub const ORG_OWNER_COUNT: &str =
+    "SELECT COUNT(*) FROM org_members WHERE org_id = $1 AND role = $2";
+
+/// [`super::Tx::delete_project_members_in_org`].
+pub const DELETE_PROJECT_MEMBERS_IN_ORG: &str = "DELETE FROM project_members WHERE user_id = $2 \
+     AND project_id IN (SELECT id FROM projects WHERE org_id = $1)";
+
+// ------------------------------------------------------------------ invites
+
+/// The columns of a [`super::Invite`], in order.
+macro_rules! invite_columns {
+    () => {
+        "id, token_hash, org_id, email, role, projects, created_by, created_at, expires_at, accepted_by"
+    };
+}
+
+/// [`super::Tx::insert_invite`].
+pub const INSERT_INVITE: &str = concat!(
+    "INSERT INTO invites (",
+    invite_columns!(),
+    ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+);
+
+/// [`super::Store::invite_by_id`].
+pub const INVITE_BY_ID: &str = concat!("SELECT ", invite_columns!(), " FROM invites WHERE id = $1");
+
+/// [`super::Tx::invite_by_hash`].
+pub const INVITE_BY_HASH: &str = concat!(
+    "SELECT ",
+    invite_columns!(),
+    " FROM invites WHERE token_hash = $1"
+);
+
+/// [`super::Store::open_invites`].
+pub const OPEN_INVITES: &str = concat!(
+    "SELECT ",
+    invite_columns!(),
+    " FROM invites WHERE org_id = $1 AND accepted_by IS NULL AND expires_at > $2 \
+     ORDER BY created_at, id"
+);
+
+/// [`super::Tx::claim_invite`].
+pub const CLAIM_INVITE: &str =
+    "UPDATE invites SET accepted_by = $2 WHERE id = $1 AND accepted_by IS NULL";
+
+/// [`super::Tx::delete_invite`].
+pub const DELETE_INVITE: &str = "DELETE FROM invites WHERE org_id = $1 AND id = $2";
+
+// ------------------------------------------------------------------ projects
+
+/// [`super::Tx::insert_project`].
+pub const INSERT_PROJECT: &str =
+    "INSERT INTO projects (id, org_id, name, created_at) VALUES ($1, $2, $3, $4)";
+
+/// [`super::Tx::set_project_name`].
+pub const SET_PROJECT_NAME: &str = "UPDATE projects SET name = $2 WHERE id = $1";
+
+/// [`super::Tx::delete_project`].
+pub const DELETE_PROJECT: &str = "DELETE FROM projects WHERE id = $1";
+
+/// [`super::Store::project_by_id`], [`super::Tx::project_by_id`].
+pub const PROJECT_BY_ID: &str = "SELECT id, org_id, name, created_at FROM projects WHERE id = $1";
+
+/// [`super::Store::projects_in_org`].
+pub const PROJECTS_IN_ORG: &str =
+    "SELECT id, org_id, name, created_at FROM projects WHERE org_id = $1 ORDER BY name, id";
+
+/// [`super::Store::member_projects`].
+pub const MEMBER_PROJECTS: &str = "SELECT p.id, p.name, p.org_id, pm.role FROM projects p \
+     JOIN project_members pm ON pm.project_id = p.id \
+     WHERE p.org_id = $1 AND pm.user_id = $2 ORDER BY p.name, p.id";
+
+/// [`super::Store::project_member`], [`super::Tx::project_member`].
+pub const PROJECT_MEMBER: &str = "SELECT project_id, user_id, role FROM project_members \
+     WHERE project_id = $1 AND user_id = $2";
+
+/// [`super::Store::project_members`].
+pub const PROJECT_MEMBERS: &str = "SELECT u.id, u.email, u.name, pm.role FROM users u \
+     JOIN project_members pm ON pm.user_id = u.id WHERE pm.project_id = $1 ORDER BY u.name, u.id";
+
+/// [`super::Tx::insert_project_member`].
+pub const INSERT_PROJECT_MEMBER: &str =
+    "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)";
+
+/// [`super::Tx::set_project_member_role`].
+pub const SET_PROJECT_MEMBER_ROLE: &str =
+    "UPDATE project_members SET role = $3 WHERE project_id = $1 AND user_id = $2";
+
+/// [`super::Tx::delete_project_member`].
+pub const DELETE_PROJECT_MEMBER: &str =
+    "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2";
+
+/// [`super::Tx::project_document_ids`].
+pub const PROJECT_DOCUMENT_IDS: &str = "SELECT id FROM documents WHERE project_id = $1 ORDER BY id";
+
+/// [`super::Tx::mark_project_documents_deleted`].
+pub const MARK_PROJECT_DOCUMENTS_DELETED: &str =
+    "UPDATE documents SET deleted_at = $2 WHERE project_id = $1 AND deleted_at IS NULL";

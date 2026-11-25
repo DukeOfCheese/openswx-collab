@@ -4,15 +4,22 @@
 //! for one take [`OptionalUser`]. Both read `Authorization: Bearer <token>` (the scheme in any case,
 //! the token trimmed, as the Python server's `bearer()`), and look the session up through
 //! [`crate::sessions::Sessions`], which asks the database when it has no recent answer.
+//!
+//! What they may do: organisation roles are `owner > admin > member`, project roles
+//! `owner > editor > viewer`. Organisation owners and admins own every project of the organisation;
+//! everyone else has the role they were given in a project, or cannot see it at all. A server admin
+//! has no role anywhere by being one. Something you have no role in does not exist for you:
+//! [`require_org`] and [`require_project`] answer 404 with the same body as for a missing one, and
+//! 403 only when you can see it but your role is too low.
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 
 use crate::error::ApiError;
-use crate::security::token_hash;
+use crate::security::{OrgRole, ProjectRole, token_hash};
 use crate::state::AppState;
-use crate::store::Id;
+use crate::store::{Id, Project, ProjectWithRole, Store};
 
 /// The signed-in account. Rejects with 401 `sign in first` when the token is missing, malformed or
 /// unknown, its session has expired, or its account is disabled or deleted.
@@ -73,6 +80,152 @@ impl FromRequestParts<AppState> for OptionalUser {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
         Ok(Self(lookup(parts, state).await?))
     }
+}
+
+// ------------------------------------------------------------------ roles
+
+/// What a caller with no role in an organisation is told: the same as for one that does not exist.
+pub const NO_SUCH_ORG: &str = "no such organisation";
+/// What a caller with no role in a project is told: the same as for one that does not exist.
+pub const NO_SUCH_PROJECT: &str = "no such project";
+
+/// The 403 for an organisation role that is too low.
+fn org_role_needed(need: OrgRole) -> &'static str {
+    match need {
+        OrgRole::Member => "needs the organisation role member",
+        OrgRole::Admin => "needs the organisation role admin",
+        OrgRole::Owner => "needs the organisation role owner",
+    }
+}
+
+/// The 403 for a project role that is too low.
+fn project_role_needed(need: ProjectRole) -> &'static str {
+    match need {
+        ProjectRole::Viewer => "needs the project role viewer",
+        ProjectRole::Editor => "needs the project role editor",
+        ProjectRole::Owner => "needs the project role owner",
+    }
+}
+
+/// A role read from the database; one this server does not know is an error, not a role.
+fn parse_role<R: std::str::FromStr>(role: &str) -> anyhow::Result<R> {
+    role.parse()
+        .map_err(|_| anyhow::anyhow!("unknown role {role:?} in the database"))
+}
+
+/// The account's role in an organisation, or `None` if it is not a member. A server admin has no
+/// role in an organisation it is not a member of.
+pub async fn org_role(
+    store: &dyn Store,
+    user: &str,
+    org: &str,
+) -> Result<Option<OrgRole>, ApiError> {
+    match store.org_member(org, user).await? {
+        Some(m) => Ok(Some(parse_role(&m.role)?)),
+        None => Ok(None),
+    }
+}
+
+/// The account's role in an organisation, which must be `need` or higher: 404 `no such
+/// organisation` when it has none (an organisation you are not in does not exist for you), 403
+/// `needs the organisation role <need>` when it is lower.
+pub async fn require_org(
+    store: &dyn Store,
+    user: &str,
+    org: &str,
+    need: OrgRole,
+) -> Result<OrgRole, ApiError> {
+    let role = org_role(store, user, org)
+        .await?
+        .ok_or(ApiError::NotFound(NO_SUCH_ORG))?;
+    if role < need {
+        return Err(ApiError::Forbidden(org_role_needed(need)));
+    }
+    Ok(role)
+}
+
+/// The account's role in `project`: owner for an organisation owner or admin; otherwise the role
+/// it was given in the project, or `None`. Someone not in the project's organisation has none,
+/// whatever their role row says.
+pub async fn role_in_project(
+    store: &dyn Store,
+    user: &str,
+    project: &Project,
+) -> Result<Option<ProjectRole>, ApiError> {
+    let Some(org) = org_role(store, user, &project.org_id).await? else {
+        return Ok(None);
+    };
+    if org >= OrgRole::Admin {
+        return Ok(Some(ProjectRole::Owner));
+    }
+    match store.project_member(&project.id, user).await? {
+        Some(m) => Ok(Some(parse_role(&m.role)?)),
+        None => Ok(None),
+    }
+}
+
+/// The account's role in the project with this id, or `None` if it has none or there is no such
+/// project.
+pub async fn project_role(
+    store: &dyn Store,
+    user: &str,
+    project: &str,
+) -> Result<Option<ProjectRole>, ApiError> {
+    match store.project_by_id(project).await? {
+        Some(p) => role_in_project(store, user, &p).await,
+        None => Ok(None),
+    }
+}
+
+/// The project and the account's role in it, which must be `need` or higher: 404 `no such project`
+/// when there is no such project or the account has no role in it (the same answer for both), 403
+/// `needs the project role <need>` when it is lower.
+pub async fn require_project(
+    store: &dyn Store,
+    user: &str,
+    project: &str,
+    need: ProjectRole,
+) -> Result<(Project, ProjectRole), ApiError> {
+    let found = store.project_by_id(project).await?;
+    let role = match &found {
+        Some(p) => role_in_project(store, user, p).await?,
+        None => None,
+    };
+    let (Some(project), Some(role)) = (found, role) else {
+        return Err(ApiError::NotFound(NO_SUCH_PROJECT));
+    };
+    if role < need {
+        return Err(ApiError::Forbidden(project_role_needed(need)));
+    }
+    Ok((project, role))
+}
+
+/// The projects of an organisation the account can see, with its role in each, by name: all of
+/// them as owner for an organisation admin or owner (`org_role`), otherwise those it has a role in.
+pub async fn visible_projects(
+    store: &dyn Store,
+    user: &str,
+    org: &str,
+    org_role: OrgRole,
+) -> Result<Vec<ProjectWithRole>, ApiError> {
+    if org_role >= OrgRole::Admin {
+        return Ok(store
+            .projects_in_org(org)
+            .await?
+            .into_iter()
+            .map(|p| ProjectWithRole {
+                id: p.id,
+                name: p.name,
+                org_id: p.org_id,
+                role: ProjectRole::Owner.as_str().to_owned(),
+            })
+            .collect());
+    }
+    let rows = store.member_projects(org, user).await?;
+    for row in &rows {
+        parse_role::<ProjectRole>(&row.role)?;
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
