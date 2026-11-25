@@ -16,6 +16,8 @@
 
 pub mod auth;
 pub mod blobs;
+pub mod documents;
+pub mod folders;
 pub mod meta;
 pub mod orgs;
 pub mod projects;
@@ -51,14 +53,21 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(auth::router())
         .merge(orgs::router())
         .merge(projects::router())
-        .merge(blobs::router());
+        .merge(blobs::router())
+        .merge(documents::router())
+        .merge(folders::router());
 
     // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document
     // creation).
-    let large: Router<AppState> = Router::new().merge(with_body_limit(
-        blobs::upload_router(),
-        state.settings.max_blob_bytes,
-    ));
+    let large: Router<AppState> = Router::new()
+        .merge(with_body_limit(
+            blobs::upload_router(),
+            state.settings.max_blob_bytes,
+        ))
+        .merge(with_body_limit(
+            documents::create_router(),
+            documents::MAX_DOCUMENT_BODY,
+        ));
 
     let extensions = with_body_limit(state.ext.routes(state.clone()), DEFAULT_BODY_LIMIT);
 

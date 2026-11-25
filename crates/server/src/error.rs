@@ -26,6 +26,10 @@ pub enum ApiError {
     Forbidden(&'static str),
     /// 409 with the message.
     Conflict(String),
+    /// 409 whose `detail` is this JSON object rather than a string (as some Python 409s are, e.g.
+    /// `{"message": "upload these blobs first", "blobs": [...]}`). Its [`ApiError::detail`] is the
+    /// object's `message`.
+    ConflictWith(serde_json::Value),
     /// 400 with the message.
     BadRequest(String),
     /// 422 with the message: well-formed input that fails validation (as FastAPI answers).
@@ -49,7 +53,7 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Unauthorized | Self::WrongCredentials => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) | Self::ConflictWith(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
@@ -71,6 +75,10 @@ impl ApiError {
             | Self::Unprocessable(m)
             | Self::PaymentRequired(m)
             | Self::NotImplemented(m) => m,
+            Self::ConflictWith(v) => v
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("conflict"),
             Self::TooLarge => "too large",
             Self::RateLimited => "too many attempts; try again in a few minutes",
             Self::Internal(_) => "server error",
@@ -86,8 +94,16 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        if let Self::Internal(err) = &self {
-            tracing::error!("request failed: {err:#}");
+        match &self {
+            Self::Internal(err) => tracing::error!("request failed: {err:#}"),
+            Self::ConflictWith(detail) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "detail": detail })),
+                )
+                    .into_response();
+            }
+            _ => {}
         }
         detail_response(self.status(), self.detail())
     }

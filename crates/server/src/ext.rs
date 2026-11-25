@@ -105,6 +105,64 @@ pub enum Event {
         user: Id,
         by: Id,
     },
+    /// A document was created.
+    DocumentCreated {
+        org: Id,
+        project: Id,
+        document: Id,
+        by: Id,
+    },
+    /// A document was renamed.
+    DocumentRenamed {
+        org: Id,
+        project: Id,
+        document: Id,
+        by: Id,
+    },
+    /// A document was moved into a folder (`None`: the top of the project).
+    DocumentMoved {
+        org: Id,
+        project: Id,
+        document: Id,
+        folder: Option<Id>,
+        by: Id,
+    },
+    /// A document was deleted (the row stays, marked deleted).
+    DocumentDeleted {
+        org: Id,
+        project: Id,
+        document: Id,
+        by: Id,
+    },
+    /// A folder was created.
+    FolderCreated {
+        org: Id,
+        project: Id,
+        folder: Id,
+        by: Id,
+    },
+    /// A folder was renamed.
+    FolderRenamed {
+        org: Id,
+        project: Id,
+        folder: Id,
+        by: Id,
+    },
+    /// A folder was moved into another (`parent: None`: the top of the project).
+    FolderMoved {
+        org: Id,
+        project: Id,
+        folder: Id,
+        parent: Option<Id>,
+        by: Id,
+    },
+    /// A folder was deleted; what was in it moved to its parent.
+    FolderDeleted {
+        org: Id,
+        project: Id,
+        folder: Id,
+        by: Id,
+    },
 }
 
 /// What an organisation is about to have one more of ([`Extensions::quota`]).

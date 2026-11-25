@@ -19,7 +19,7 @@ use axum::http::request::Parts;
 use crate::error::ApiError;
 use crate::security::{OrgRole, ProjectRole, token_hash};
 use crate::state::AppState;
-use crate::store::{Id, Project, ProjectWithRole, Store, Tx};
+use crate::store::{Document, Id, Project, ProjectWithRole, Store, Tx};
 
 /// The signed-in account. Rejects with 401 `sign in first` when the token is missing, malformed or
 /// unknown, its session has expired, or its account is disabled or deleted.
@@ -248,6 +248,56 @@ pub async fn recheck_project(
         }
     }
     decide_project(found, role, need)
+}
+
+/// What a caller who cannot open a document is told: the same as for one that does not exist.
+pub const NO_SUCH_DOCUMENT: &str = "no such document";
+
+/// A 404 from the project, said about the document instead (a 403 passes through).
+fn as_document_error(err: ApiError) -> ApiError {
+    match err {
+        ApiError::NotFound(_) => ApiError::NotFound(NO_SUCH_DOCUMENT),
+        other => other,
+    }
+}
+
+/// The document, its project and the account's role in it, which must be `need` or higher: 404 `no
+/// such document` when there is no such document, it was deleted, or the account has no role in its
+/// project (the same answer for all three); 403 `needs the project role <need>` when it is lower.
+pub async fn require_document(
+    store: &dyn Store,
+    user: &str,
+    document: &str,
+    need: ProjectRole,
+) -> Result<(Document, Project, ProjectRole), ApiError> {
+    let doc = store
+        .document_by_id(document)
+        .await?
+        .filter(|d| d.deleted_at.is_none())
+        .ok_or(ApiError::NotFound(NO_SUCH_DOCUMENT))?;
+    let (project, role) = require_project(store, user, &doc.project_id, need)
+        .await
+        .map_err(as_document_error)?;
+    Ok((doc, project, role))
+}
+
+/// [`require_document`] read again inside a transaction, so that a change made with it is refused
+/// (with the same answer) if the document was deleted or the caller's role lowered since.
+pub async fn recheck_document(
+    tx: &mut dyn Tx,
+    user: &str,
+    document: &str,
+    need: ProjectRole,
+) -> Result<(Document, Project, ProjectRole), ApiError> {
+    let doc = tx
+        .document_by_id(document)
+        .await?
+        .filter(|d| d.deleted_at.is_none())
+        .ok_or(ApiError::NotFound(NO_SUCH_DOCUMENT))?;
+    let (project, role) = recheck_project(tx, user, &doc.project_id, need)
+        .await
+        .map_err(as_document_error)?;
+    Ok((doc, project, role))
 }
 
 /// The projects of an organisation the account can see, with its role in each, by name: all of
