@@ -33,22 +33,6 @@ source it is `pip install openswx[collab]`.
 | Hosted service extras (seat limits, Stripe billing) | In a separate private package; billing not yet tried against Stripe's test mode |
 | Assemblies in openswx, company SSO, browser-only viewers | Later |
 
-## How many people one part takes
-
-From the load test in [docs/benchmarks/collaboration-load.md](docs/benchmarks/collaboration-load.md)
-(`tools/load_test.py`):
-
-| On one part, at once | SQLite | PostgreSQL |
-|---|---|---|
-| **People editing** (pointers moving, an edit every 5 s each) | **40**: edits reach everyone in 89 ms median, 250 ms at p95 | **40**: 73 ms median, 175 ms at p95 |
-| **People watching** and moving pointers | **40**: pointers arrive within 21 ms (p95) | **60**: within 0.9 s (p95); 50 within 0.16 s |
-| For a snappy session (edits within 40 ms, p95) | 30 | 30 |
-
-No change was lost or reordered and no error was logged at any of these loads, and a real openswx app in the
-part stayed in sync throughout. Measured on one Windows laptop (Intel Core i7-11800H, 16 GB) running the server
-and every simulated person at once; a dedicated Linux server (which also gets the faster uvloop) is expected to do better. The limit is the server relaying pointers and waiting on each document's lock, not the database; the
-write-up has the profile and the fixes that would raise it.
-
 ## How it works
 
 Each person's openswx applies an edit locally and sends the resulting change to the document, not the
