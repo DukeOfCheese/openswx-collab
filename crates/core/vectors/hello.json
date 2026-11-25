@@ -1,0 +1,14 @@
+{
+  "direction": "c2s",
+  "hex": "87a174a568656c6c6fa870726f746f636f6c02a5746f6b656eae746f6b2d30313233343536373839a9636c69656e745f6964ab636c69656e742d30303031ae666f726d61745f76657273696f6e03a86c6173745f73657129a3617070ab6f70656e73777820312e30",
+  "json": {
+    "app": "openswx 1.0",
+    "client_id": "client-0001",
+    "format_version": 3,
+    "last_seq": 41,
+    "protocol": 2,
+    "t": "hello",
+    "token": "tok-0123456789"
+  },
+  "name": "hello"
+}

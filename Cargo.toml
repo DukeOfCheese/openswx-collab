@@ -24,6 +24,7 @@ rmpv = "1"
 thiserror = "2"
 serde_json = "1"
 proptest = "1"
+bytes = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

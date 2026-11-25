@@ -9,6 +9,7 @@ publish = false
 name = "oswx_core"
 
 [dependencies]
+bytes.workspace = true
 imbl.workspace = true
 rmpv.workspace = true
 thiserror.workspace = true

@@ -1,0 +1,10 @@
+{
+  "direction": "s2c",
+  "hex": "83a174a56572726f72a4636f6465a96261645f746f6b656ea76d657373616765b674686520746f6b656e206973206e6f742076616c6964",
+  "json": {
+    "code": "bad_token",
+    "message": "the token is not valid",
+    "t": "error"
+  },
+  "name": "error"
+}

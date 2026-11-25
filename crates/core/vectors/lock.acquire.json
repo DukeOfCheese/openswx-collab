@@ -1,0 +1,18 @@
+{
+  "direction": "c2s",
+  "hex": "83a174ac6c6f636b2e61637175697265aa726571756573745f6964a3722d31a570617468739292a86665617475726573a2663191a7646973706c6179",
+  "json": {
+    "paths": [
+      [
+        "features",
+        "f1"
+      ],
+      [
+        "display"
+      ]
+    ],
+    "request_id": "r-1",
+    "t": "lock.acquire"
+  },
+  "name": "lock.acquire"
+}

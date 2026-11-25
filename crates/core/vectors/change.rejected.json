@@ -1,0 +1,24 @@
+{
+  "direction": "s2c",
+  "hex": "85a174af6368616e67652e72656a6563746564a96368616e67655f6964a6632d30303037a4636f6465a57374616c65a76d657373616765d92966656174757265732f66312f706172616d732f6465707468206368616e6765642073696e6365203431a9636f6e666c696374739184a47061746894a86665617475726573a26631a6706172616d73a56465707468a37365712ba26279ae75322e636c69656e742d30303032a46b696e64a77772697474656e",
+  "json": {
+    "change_id": "c-0007",
+    "code": "stale",
+    "conflicts": [
+      {
+        "by": "u2.client-0002",
+        "kind": "written",
+        "path": [
+          "features",
+          "f1",
+          "params",
+          "depth"
+        ],
+        "seq": 43
+      }
+    ],
+    "message": "features/f1/params/depth changed since 41",
+    "t": "change.rejected"
+  },
+  "name": "change.rejected"
+}
