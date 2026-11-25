@@ -15,9 +15,11 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::access::{CurrentUser, require_org, require_project, visible_projects};
+use crate::access::{
+    CurrentUser, recheck_org, recheck_project, require_org, require_project, visible_projects,
+};
 use crate::error::{ApiError, ApiJson, ApiPath};
-use crate::ext::{Event, Quota};
+use crate::ext::{Event, Quota, check_quota, emit};
 use crate::routes::orgs::clean_name;
 use crate::security::{OrgRole, ProjectRole};
 use crate::state::AppState;
@@ -69,17 +71,7 @@ async fn create_project(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let name = clean_name(&body.name)?;
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Member).await?;
-    state
-        .ext
-        .quota(&org_id, Quota::Projects)
-        .await
-        .map_err(|why| {
-            ApiError::PaymentRequired(if why.is_empty() {
-                "this organisation has no room for another project".to_owned()
-            } else {
-                why
-            })
-        })?;
+    check_quota(&state.ext, &org_id, Quota::Projects).await?;
     let project = Project {
         id: new_id(),
         org_id: org_id.clone(),
@@ -87,6 +79,7 @@ async fn create_project(
         created_at: state.clock.now(),
     };
     let mut tx = state.store.begin().await?;
+    recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Member).await?;
     tx.insert_project(&project).await?;
     tx.insert_project_member(&ProjectMember {
         project_id: project.id.clone(),
@@ -95,14 +88,15 @@ async fn create_project(
     })
     .await?;
     tx.commit().await?;
-    state
-        .ext
-        .on_event(&Event::ProjectCreated {
+    emit(
+        &state.ext,
+        Event::ProjectCreated {
             org: org_id.clone(),
             project: project.id.clone(),
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(json!({"id": project.id, "name": project.name, "org_id": org_id, "role": "owner"})),
@@ -124,16 +118,18 @@ async fn rename_project(
     )
     .await?;
     let mut tx = state.store.begin().await?;
+    recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     tx.set_project_name(&project.id, &name).await?;
     tx.commit().await?;
-    state
-        .ext
-        .on_event(&Event::ProjectRenamed {
+    emit(
+        &state.ext,
+        Event::ProjectRenamed {
             org: project.org_id.clone(),
             project: project.id.clone(),
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(Json(
         json!({"id": project.id, "name": name, "org_id": project.org_id}),
     ))
@@ -154,6 +150,7 @@ async fn delete_project(
     )
     .await?;
     let mut tx = state.store.begin().await?;
+    recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     let documents = tx.project_document_ids(&project.id).await?;
     // As for one document: mark them deleted first, then look for users outside the project, in one
     // transaction.
@@ -169,14 +166,15 @@ async fn delete_project(
             .close_document(document, "the project was deleted")
             .await;
     }
-    state
-        .ext
-        .on_event(&Event::ProjectDeleted {
+    emit(
+        &state.ext,
+        Event::ProjectDeleted {
             org: project.org_id,
             project: project.id,
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -228,6 +226,7 @@ async fn set_member(
     )
     .await?;
     let mut tx = state.store.begin().await?;
+    recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     if tx.org_member(&project.org_id, &user_id).await?.is_none() {
         return Err(ApiError::Unprocessable(
             "that person is not in the organisation; invite them first".into(),
@@ -246,16 +245,17 @@ async fn set_member(
     }
     tx.commit().await?;
     state.hub.drop_user(&user_id, &project.org_id).await;
-    state
-        .ext
-        .on_event(&Event::ProjectMemberSet {
+    emit(
+        &state.ext,
+        Event::ProjectMemberSet {
             org: project.org_id,
             project: project.id,
             user: user_id.clone(),
             role: role.as_str(),
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(Json(json!({"user_id": user_id, "role": role.as_str()})))
 }
 
@@ -273,19 +273,21 @@ async fn remove_member(
     )
     .await?;
     let mut tx = state.store.begin().await?;
+    recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     if !tx.delete_project_member(&project.id, &user_id).await? {
         return Err(ApiError::NotFound("not a member of the project"));
     }
     tx.commit().await?;
     state.hub.drop_user(&user_id, &project.org_id).await;
-    state
-        .ext
-        .on_event(&Event::ProjectMemberRemoved {
+    emit(
+        &state.ext,
+        Event::ProjectMemberRemoved {
             org: project.org_id,
             project: project.id,
             user: user_id,
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }

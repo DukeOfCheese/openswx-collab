@@ -23,9 +23,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::access::{CurrentUser, org_role, require_org};
+use crate::access::{CurrentUser, parse_role, recheck_org, require_org};
 use crate::error::{ApiError, ApiJson, ApiPath};
-use crate::ext::Event;
+use crate::ext::{Event, check_seat, emit, notify_member_added, notify_member_removed};
 use crate::mail::{invite_text, send_logged};
 use crate::security::{OrgRole, ProjectRole, clean_email, new_token, token_hash};
 use crate::state::AppState;
@@ -50,7 +50,9 @@ const NO_SUCH_INVITE: &str = "no such invite";
 const INVITE_INVALID: &str =
     "this invite is not valid (used, expired, or for another email address)";
 const INVITE_JUST_USED: &str = "this invite has just been used";
-const NO_FREE_SEATS: &str = "this organisation has no free seats";
+/// The members changed between the seat check and the transaction; the client tries again.
+const SEATS_CHANGED: &str = "the organisation's members changed while this invite was being \
+     accepted; try again";
 const NEEDS_AN_OWNER: &str = "an organisation needs at least one owner";
 
 pub(crate) fn router() -> Router<AppState> {
@@ -94,24 +96,6 @@ pub(crate) async fn load_user(state: &AppState, user: &CurrentUser) -> Result<Us
         .user_by_id(&user.id)
         .await?
         .ok_or(ApiError::Unauthorized)
-}
-
-/// A role stored in the database; one this server does not know is an error, not a role.
-fn stored_role<R: std::str::FromStr>(role: &str) -> anyhow::Result<R> {
-    role.parse()
-        .map_err(|_| anyhow::anyhow!("unknown role {role:?} in the database"))
-}
-
-/// Asks the extensions whether `org`, which has `members` members, may take one more (402 if not).
-async fn check_seat(state: &AppState, org: &Id, members: u64) -> Result<(), ApiError> {
-    let members = usize::try_from(members).unwrap_or(usize::MAX);
-    state.ext.may_add_member(org, members).await.map_err(|why| {
-        ApiError::PaymentRequired(if why.is_empty() {
-            NO_FREE_SEATS.to_owned()
-        } else {
-            why
-        })
-    })
 }
 
 // ------------------------------------------------------------------ organisations
@@ -165,13 +149,14 @@ async fn create_org(
     })
     .await?;
     tx.commit().await?;
-    state
-        .ext
-        .on_event(&Event::OrgCreated {
+    emit(
+        &state.ext,
+        Event::OrgCreated {
             org: org.id.clone(),
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(json!({"id": org.id, "name": org.name, "role": "owner", "members": 1})),
@@ -187,15 +172,17 @@ async fn rename_org(
     let name = clean_name(&body.name)?;
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Owner).await?;
     let mut tx = state.store.begin().await?;
+    recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Owner).await?;
     tx.set_org_name(&org_id, &name).await?;
     tx.commit().await?;
-    state
-        .ext
-        .on_event(&Event::OrgRenamed {
+    emit(
+        &state.ext,
+        Event::OrgRenamed {
             org: org_id.clone(),
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(Json(json!({"id": org_id, "name": name})))
 }
 
@@ -235,12 +222,13 @@ async fn set_member_role(
         .role
         .parse()
         .map_err(|_| ApiError::Unprocessable("role must be one of owner, admin, member".into()))?;
-    let mine = require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
+    require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
     let mut tx = state.store.begin().await?;
+    let mine = recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     let Some(member) = tx.org_member(&org_id, &user_id).await? else {
         return Err(ApiError::NotFound(NOT_A_MEMBER));
     };
-    let old: OrgRole = stored_role(&member.role)?;
+    let old: OrgRole = parse_role(&member.role)?;
     if (role == OrgRole::Owner || old == OrgRole::Owner) && mine != OrgRole::Owner {
         return Err(ApiError::Forbidden(
             "only an owner can change who is an owner",
@@ -253,15 +241,16 @@ async fn set_member_role(
         .await?;
     tx.commit().await?;
     state.hub.drop_user(&user_id, &org_id).await;
-    state
-        .ext
-        .on_event(&Event::MemberRoleChanged {
+    emit(
+        &state.ext,
+        Event::MemberRoleChanged {
             org: org_id,
             user: user_id.clone(),
             role: role.as_str(),
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(Json(json!({"user_id": user_id, "role": role.as_str()})))
 }
 
@@ -272,15 +261,16 @@ async fn remove_member(
     user: CurrentUser,
     ApiPath((org_id, user_id)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let mine = require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Member).await?;
+    require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Member).await?;
     let mut tx = state.store.begin().await?;
+    let mine = recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Member).await?;
     let Some(member) = tx.org_member(&org_id, &user_id).await? else {
         return Err(ApiError::NotFound(NOT_A_MEMBER));
     };
     if user_id != user.id && mine < OrgRole::Admin {
         return Err(ApiError::Forbidden("needs the organisation role admin"));
     }
-    if stored_role::<OrgRole>(&member.role)? == OrgRole::Owner {
+    if parse_role::<OrgRole>(&member.role)? == OrgRole::Owner {
         if mine != OrgRole::Owner {
             return Err(ApiError::Forbidden("only an owner can remove an owner"));
         }
@@ -291,16 +281,18 @@ async fn remove_member(
     tx.delete_project_members_in_org(&org_id, &user_id).await?;
     tx.delete_org_member(&org_id, &user_id).await?;
     tx.commit().await?;
-    state.ext.member_removed(&org_id, &user_id).await;
+    // Access goes first: their open documents close before any extension hears of it.
     state.hub.drop_user(&user_id, &org_id).await;
-    state
-        .ext
-        .on_event(&Event::MemberRemoved {
+    notify_member_removed(&state.ext, &org_id, &user_id).await;
+    emit(
+        &state.ext,
+        Event::MemberRemoved {
             org: org_id,
             user: user_id,
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -434,11 +426,18 @@ async fn create_invite(
         }
     }
     check_seat(
-        &state,
+        &state.ext,
         &org_id,
         state.store.org_member_count(&org_id).await?,
     )
     .await?;
+    // Read now: nothing that can fail runs between the commit and the answer but the email.
+    let inviter = load_user(&state, &user).await?;
+    let org = state
+        .store
+        .org_by_id(&org_id)
+        .await?
+        .ok_or(ApiError::NotFound(crate::access::NO_SUCH_ORG))?;
 
     let now = state.clock.now();
     let token = new_token();
@@ -455,6 +454,7 @@ async fn create_invite(
         accepted_by: None,
     };
     let mut tx = state.store.begin().await?;
+    recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     tx.insert_invite(&invite).await?;
     tx.commit().await?;
 
@@ -465,25 +465,20 @@ async fn create_invite(
     );
     let mut emailed = false;
     if let Some(to) = invite.email.as_deref().filter(|_| body.send_email) {
-        let inviter = load_user(&state, &user).await?;
-        let org = state
-            .store
-            .org_by_id(&org_id)
-            .await?
-            .ok_or(ApiError::NotFound(crate::access::NO_SUCH_ORG))?;
         let days = u32::try_from(body.days).unwrap_or(DAYS_DEFAULT as u32);
         let (subject, text) = invite_text(&org.name, &inviter.name, &url, days);
         emailed = send_logged(state.mailer.as_ref(), settings, to, &subject, &text).await;
     }
-    state
-        .ext
-        .on_event(&Event::InviteCreated {
+    emit(
+        &state.ext,
+        Event::InviteCreated {
             org: org_id,
             invite: invite.id.clone(),
             by: user.id,
-        })
-        .await;
-    let mut out = invite_out(&invite)?;
+        },
+    )
+    .await;
+    let mut out = invite_out(&invite)?; // (written by this request: it parses)
     out["token"] = json!(token);
     out["url"] = json!(url);
     out["emailed"] = json!(emailed);
@@ -515,23 +510,32 @@ async fn revoke_invite(
 ) -> Result<StatusCode, ApiError> {
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
     let mut tx = state.store.begin().await?;
+    recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     if !tx.delete_invite(&org_id, &invite_id).await? {
         return Err(ApiError::NotFound(NO_SUCH_INVITE));
     }
     tx.commit().await?;
-    state
-        .ext
-        .on_event(&Event::InviteRevoked {
+    emit(
+        &state.ext,
+        Event::InviteRevoked {
             org: org_id,
             invite: invite_id,
             by: user.id,
-        })
-        .await;
+        },
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The usable invite for this token, or `None`: it exists, is unused, has not expired by `now`, and
-/// names no address or exactly `email` (normalised). Read in the caller's transaction.
+/// Whether `invite` can be used now by the account with this (normalised) address: unused,
+/// unexpired by `now`, and naming no address or exactly this one.
+fn usable(invite: &Invite, email: &str, now: f64) -> bool {
+    invite.accepted_by.is_none()
+        && invite.expires_at >= now
+        && invite.email.as_deref().is_none_or(|e| e == email)
+}
+
+/// The usable invite for this token, or `None` ([`usable`]). Read in the caller's transaction.
 pub(crate) async fn find_invite(
     tx: &mut dyn Tx,
     token: Option<&str>,
@@ -541,16 +545,66 @@ pub(crate) async fn find_invite(
     let Some(token) = token.filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
-    let Some(invite) = tx.invite_by_hash(&token_hash(token)).await? else {
+    Ok(tx
+        .invite_by_hash(&token_hash(token))
+        .await?
+        .filter(|invite| usable(invite, email, now)))
+}
+
+/// What the seat check before the transaction approved ([`approve_invite`]), for
+/// [`accept_invite`] to hold the transaction to.
+#[derive(Debug)]
+pub(crate) struct Approval {
+    /// The invite as it was read then.
+    invite: Invite,
+    /// The organisation's member count the seat hook approved one more on; `None` when the account
+    /// was already a member (and the hook was not asked).
+    members: Option<u64>,
+    /// The organisation's name (for the answer, read before the transaction).
+    org_name: String,
+}
+
+/// Before the transaction: finds the usable invite for this token and, unless `user` is already a
+/// member of its organisation (a new account never is), asks the seat hook whether the organisation
+/// may take one more member (402, or 409 if the hook did not answer). `None` when there is no usable
+/// invite.
+pub(crate) async fn approve_invite(
+    state: &AppState,
+    token: Option<&str>,
+    email: &str,
+    user: Option<&str>,
+    now: f64,
+) -> Result<Option<Approval>, ApiError> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
-    if invite.accepted_by.is_some() || invite.expires_at < now {
+    let Some(invite) = state
+        .store
+        .invite_by_hash(&token_hash(token))
+        .await?
+        .filter(|invite| usable(invite, email, now))
+    else {
         return Ok(None);
-    }
-    if invite.email.as_deref().is_some_and(|e| e != email) {
+    };
+    let Some(org) = state.store.org_by_id(&invite.org_id).await? else {
         return Ok(None);
-    }
-    Ok(Some(invite))
+    };
+    let already = match user {
+        Some(user) => state.store.org_member(&org.id, user).await?.is_some(),
+        None => false,
+    };
+    let members = if already {
+        None
+    } else {
+        let n = state.store.org_member_count(&org.id).await?;
+        check_seat(&state.ext, &org.id, n).await?;
+        Some(n)
+    };
+    Ok(Some(Approval {
+        invite,
+        members,
+        org_name: org.name,
+    }))
 }
 
 /// What accepting an invite did, to report once the transaction is committed
@@ -560,45 +614,51 @@ pub(crate) struct Accepted {
     org: Id,
     invite: Id,
     user: Id,
-    /// The role they joined with, if they were not a member before.
-    joined: Option<OrgRole>,
+    /// The account's role in the organisation now.
+    role: OrgRole,
+    /// Whether they joined (they were not a member before).
+    joined: bool,
 }
 
 impl Accepted {
     /// Tells the extensions: `member_added` and the events. Call after the commit.
     pub(crate) async fn announce(self, state: &AppState) {
-        if let Some(role) = self.joined {
-            state.ext.member_added(&self.org, &self.user).await;
-            state
-                .ext
-                .on_event(&Event::MemberAdded {
+        if self.joined {
+            notify_member_added(&state.ext, &self.org, &self.user).await;
+            emit(
+                &state.ext,
+                Event::MemberAdded {
                     org: self.org.clone(),
                     user: self.user.clone(),
-                    role: role.as_str(),
-                })
-                .await;
+                    role: self.role.as_str(),
+                },
+            )
+            .await;
         }
-        state
-            .ext
-            .on_event(&Event::InviteAccepted {
+        emit(
+            &state.ext,
+            Event::InviteAccepted {
                 org: self.org,
                 invite: self.invite,
                 by: self.user,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 }
 
 /// Makes `user` a member as the invite (from [`find_invite`]) says, in the caller's transaction;
-/// does not commit. The invite is claimed first, so of two people using it at once one gets 404
-/// `this invite has just been used`. Someone already in the organisation keeps their role;
-/// someone new is counted against the extensions' seats (402) and joins with the invite's role.
-/// Each project the invite names, if it still exists in the organisation, gives its role unless
-/// they already have one there.
+/// does not commit; asks no hook. The invite is claimed first, so of two people using it at once
+/// one gets 404 `this invite has just been used`. Someone already in the organisation keeps their
+/// role. Someone new joins with the invite's role, if the seat check before the transaction
+/// (`approval`, from [`approve_invite`]) was for this invite and the organisation has no more
+/// members than it had then; otherwise 409 "try again" (the client asks again, and the hook is
+/// asked again). Each project the invite names, if it still exists in the organisation, gives its
+/// role unless they already have one there.
 pub(crate) async fn accept_invite(
-    state: &AppState,
     tx: &mut dyn Tx,
     invite: &Invite,
+    approval: Option<&Approval>,
     user: &str,
     now: f64,
 ) -> Result<Accepted, ApiError> {
@@ -608,19 +668,27 @@ pub(crate) async fn accept_invite(
     let org = &invite.org_id;
     // TASK 16: lock the organisation's row (FOR UPDATE) before counting; SQLite's single writer
     // already serialises this.
-    let mut joined = None;
-    if tx.org_member(org, user).await?.is_none() {
-        check_seat(state, org, tx.org_member_count(org).await?).await?;
-        let role: OrgRole = stored_role(&invite.role)?;
-        tx.insert_org_member(&OrgMember {
-            org_id: org.clone(),
-            user_id: user.to_owned(),
-            role: role.as_str().to_owned(),
-            created_at: now,
-        })
-        .await?;
-        joined = Some(role);
-    }
+    let (role, joined) = match tx.org_member(org, user).await? {
+        Some(member) => (parse_role(&member.role)?, false),
+        None => {
+            let approved = approval
+                .filter(|a| a.invite.id == invite.id)
+                .and_then(|a| a.members);
+            match approved {
+                Some(n) if tx.org_member_count(org).await? <= n => {}
+                _ => return Err(ApiError::Conflict(SEATS_CHANGED.into())),
+            }
+            let role: OrgRole = parse_role(&invite.role)?;
+            tx.insert_org_member(&OrgMember {
+                org_id: org.clone(),
+                user_id: user.to_owned(),
+                role: role.as_str().to_owned(),
+                created_at: now,
+            })
+            .await?;
+            (role, true)
+        }
+    };
     let grants: Vec<Grant> = serde_json::from_str(&invite.projects)?;
     for grant in grants {
         let Some(project) = tx.project_by_id(&grant.project_id).await? else {
@@ -650,6 +718,7 @@ pub(crate) async fn accept_invite(
         org: org.clone(),
         invite: invite.id.clone(),
         user: user.to_owned(),
+        role,
         joined,
     })
 }
@@ -672,21 +741,21 @@ async fn accept(
     }
     let me = load_user(&state, &user).await?;
     let now = state.clock.now();
+    let Some(approval) =
+        approve_invite(&state, Some(&body.token), &me.email, Some(&me.id), now).await?
+    else {
+        return Err(ApiError::NotFound(INVITE_INVALID));
+    };
     let mut tx = state.store.begin().await?;
     let Some(invite) = find_invite(&mut *tx, Some(&body.token), &me.email, now).await? else {
         return Err(ApiError::NotFound(INVITE_INVALID));
     };
-    let accepted = accept_invite(&state, &mut *tx, &invite, &me.id, now).await?;
+    let accepted = accept_invite(&mut *tx, &invite, Some(&approval), &me.id, now).await?;
     tx.commit().await?;
+    let answer = json!({
+        "org": {"id": invite.org_id, "name": approval.org_name},
+        "role": accepted.role.as_str(),
+    });
     accepted.announce(&state).await;
-    let org = state
-        .store
-        .org_by_id(&invite.org_id)
-        .await?
-        .ok_or(ApiError::NotFound(INVITE_INVALID))?;
-    let role = org_role(state.store.as_ref(), &me.id, &org.id).await?;
-    Ok(Json(json!({
-        "org": {"id": org.id, "name": org.name},
-        "role": role.map(OrgRole::as_str),
-    })))
+    Ok(Json(answer))
 }

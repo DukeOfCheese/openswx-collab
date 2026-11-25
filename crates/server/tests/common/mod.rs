@@ -598,6 +598,10 @@ impl Store for FlakyStore {
         self.inner().invite_by_id(id).await
     }
 
+    async fn invite_by_hash(&self, token_hash: &str) -> anyhow::Result<Option<Invite>> {
+        self.inner().invite_by_hash(token_hash).await
+    }
+
     async fn open_invites(&self, org_id: &str, now: f64) -> anyhow::Result<Vec<Invite>> {
         self.inner().open_invites(org_id, now).await
     }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use common::{TestServer, Token, World, world};
 use oswx_server::ext::{Extensions, Quota};
-use oswx_server::store::Id;
+use oswx_server::store::{Id, Store};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -543,5 +543,61 @@ async fn the_quota_hook_can_refuse_a_project() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// While the quota hook is being asked, removes an account from the organisation (as a concurrent
+/// request could).
+struct RemovesTheCaller(Arc<dyn Store>, std::sync::Mutex<Option<(Id, Id)>>);
+
+#[async_trait]
+impl Extensions for RemovesTheCaller {
+    async fn quota(&self, _org: &Id, _what: Quota) -> Result<(), String> {
+        let target = self.1.lock().unwrap().clone();
+        if let Some((org, user)) = target {
+            let mut tx = self.0.begin().await.unwrap();
+            tx.delete_org_member(&org, &user).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_membership_lost_after_the_first_check_still_refuses_a_new_project() {
+    let holder = Arc::new(std::sync::Mutex::new(None::<Arc<RemovesTheCaller>>));
+    let kept = holder.clone();
+    let server = TestServer::start_custom(
+        |_| {},
+        move |s| {
+            let ext = Arc::new(RemovesTheCaller(
+                s.store.clone(),
+                std::sync::Mutex::new(None),
+            ));
+            *kept.lock().unwrap() = Some(ext.clone());
+            s.ext = ext;
+        },
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let (bob, bob_id) = w.editor(&server, "bob@example.com").await;
+    let ext = holder.lock().unwrap().clone().unwrap();
+    *ext.1.lock().unwrap() = Some((w.org.clone(), bob_id));
+    assert_eq!(
+        new_project(&server, &w, &bob, "Arm").await,
+        (
+            StatusCode::NOT_FOUND,
+            json!({"detail": "no such organisation"})
+        )
+    );
+    assert_eq!(
+        server
+            .state
+            .store
+            .projects_in_org(&w.org)
+            .await
+            .unwrap()
+            .len(),
+        1
     );
 }

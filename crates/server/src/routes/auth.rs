@@ -34,10 +34,10 @@ use sha2::{Digest, Sha256};
 use crate::access::CurrentUser;
 use crate::config::Settings;
 use crate::error::{ApiError, ApiJson};
-use crate::ext::Event;
+use crate::ext::{Event, emit};
 use crate::mail::{reset_text, send_logged};
 use crate::routes::meta::{Registration, registration_for};
-use crate::routes::orgs::{accept_invite, find_invite};
+use crate::routes::orgs::{accept_invite, approve_invite, find_invite};
 use crate::security::{
     RateLimit, check_password_len, clean_email, hash_password, new_token, token_hash, verify_dummy,
     verify_password,
@@ -188,8 +188,8 @@ struct RegisterIn {
 
 /// Registers an account. In invite mode it needs a usable invite ([`find_invite`]: unknown, used,
 /// expired and mismatched invites are all refused with 403); with one, in any mode, the account
-/// joins as the invite says ([`accept_invite`]: 402 from the seat hook, 404 `this invite has just
-/// been used` on a race), in the same transaction.
+/// joins as the invite says, in the same transaction ([`approve_invite`] asks the seat hook first,
+/// 402; [`accept_invite`]: 404 `this invite has just been used` or 409 "try again" on a race).
 async fn register(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<RegisterIn>,
@@ -208,6 +208,8 @@ async fn register(
     }
     let password_hash = hash_password(&body.password).await;
     let now = state.clock.now();
+    // The seat hook is asked before the transaction (never while it holds the writer).
+    let approval = approve_invite(&state, body.invite.as_deref(), &email, None, now).await?;
 
     let mut tx = state.store.begin().await?;
     if tx.user_by_email(&email).await?.is_some() {
@@ -238,7 +240,9 @@ async fn register(
     };
     tx.insert_user(&user).await?;
     let accepted = match &invite {
-        Some(invite) => Some(accept_invite(&state, &mut *tx, invite, &user.id, now).await?),
+        Some(invite) => {
+            Some(accept_invite(&mut *tx, invite, approval.as_ref(), &user.id, now).await?)
+        }
         None => None,
     };
     let token = start_session(&mut *tx, &state.settings, &user.id, "", now).await?;
@@ -247,7 +251,7 @@ async fn register(
     let registered = Event::Registered {
         user: user.id.clone(),
     };
-    state.ext.on_event(&registered).await;
+    emit(&state.ext, registered).await;
     if let Some(accepted) = accepted {
         accepted.announce(&state).await;
     }
@@ -306,7 +310,7 @@ async fn login(
     let signed_in = Event::SignedIn {
         user: user.id.clone(),
     };
-    state.ext.on_event(&signed_in).await;
+    emit(&state.ext, signed_in).await;
     Ok(Json(json!({"token": token, "user": me_out(&user)})))
 }
 
@@ -316,10 +320,7 @@ async fn logout(State(state): State<AppState>, user: CurrentUser) -> Result<Stat
     tx.delete_session(&user.token_hash).await?;
     tx.commit().await?;
     state.sessions.forget_token(&user.token_hash);
-    state
-        .ext
-        .on_event(&Event::SignedOut { user: user.id })
-        .await;
+    emit(&state.ext, Event::SignedOut { user: user.id }).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -430,7 +431,7 @@ async fn update_me(
         let changed = Event::PasswordChanged {
             user: user.id.clone(),
         };
-        state.ext.on_event(&changed).await;
+        emit(&state.ext, changed).await;
     }
     Ok(Json(me_out(&load(&state, &current).await?)))
 }
@@ -501,7 +502,7 @@ async fn request_reset(
     )
     .await;
     let requested = Event::PasswordResetRequested { user: user.id };
-    state.ext.on_event(&requested).await;
+    emit(&state.ext, requested).await;
     Ok(answer)
 }
 
@@ -556,7 +557,7 @@ async fn confirm_reset(
     state.sessions.forget_user(&user.id);
     state.hub.drop_account(&user.id).await;
     let completed = Event::PasswordResetCompleted { user: user.id };
-    state.ext.on_event(&completed).await;
+    emit(&state.ext, completed).await;
     Ok(Json(
         json!({"message": "your password is set; sign in again in openswx"}),
     ))

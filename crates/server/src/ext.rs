@@ -2,20 +2,44 @@
 //! outside, as a [`Extensions`] implementation in [`crate::AppState::ext`].
 //!
 //! Every method has a default that does nothing (or allows everything), which is the open-source
-//! server, [`NoExtensions`]. The hooks run in the request that triggers them and are awaited; keep
-//! them quick.
+//! server, [`NoExtensions`].
 //!
-//! The member hooks are called after the change they report is committed (the Python server called
-//! them inside its transaction so they could write to it; an extension here keeps its own state).
-//! The refusing hooks ([`Extensions::may_add_member`], [`Extensions::quota`],
-//! [`Extensions::before_org_delete`]) are asked before anything is written; their message is shown
-//! to the person with status 402.
+//! The server never calls a hook directly: it goes through the functions of this module, which run
+//! each call on a task of its own, wait at most [`Extensions::hook_timeout`] for it, and never while
+//! a database transaction is open (so a slow hook delays only its own request):
+//!
+//! - The refusing hooks are asked **before the request's transaction begins**:
+//!   [`check_seat`] ([`Extensions::may_add_member`]) when an invite is made and when one is
+//!   accepted by someone not yet a member; [`check_quota`] ([`Extensions::quota`]) before a project
+//!   is created; [`check_org_delete`] ([`Extensions::before_org_delete`]) before an organisation is
+//!   deleted. A refusal answers 402 with the hook's message (or a default one). A hook that times
+//!   out or panics counts as a refusal and answers 409 "try again" (logged as an error with the
+//!   organisation's id). Because the answer is given before the transaction, the transaction checks
+//!   that what was approved still holds (e.g. the member count has not grown) and otherwise answers
+//!   409 "try again" without asking again.
+//! - The notifying hooks are called **after the commit**, after the session cache and the open
+//!   documents have been updated and after any email: [`notify_member_added`],
+//!   [`notify_member_removed`] and [`emit`] ([`Extensions::on_event`]). A timeout or panic is logged
+//!   and ignored: the request has already happened. (The Python server called the member hooks inside
+//!   its transaction so they could write to it; an extension here keeps its own state.)
+
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::error::ApiError;
 use crate::state::AppState;
 use crate::store::Id;
+
+/// How long the server waits for a hook unless the extension says otherwise.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a hook that did not answer in time (or panicked) is told to the person.
+pub const HOOK_FAILED: &str =
+    "the server could not check this with its extensions in time; try again";
 
 /// Something that happened, for an audit log ([`Extensions::on_event`]). Events carry ids and the
 /// acting account, never names, email addresses, tokens or content. `by` is the account that did it.
@@ -99,10 +123,15 @@ pub enum Quota {
 
 #[async_trait]
 pub trait Extensions: Send + Sync + 'static {
+    /// How long the server waits for one call of any hook below ([`HOOK_TIMEOUT`] by default).
+    fn hook_timeout(&self) -> Duration {
+        HOOK_TIMEOUT
+    }
+
     /// May this organisation take one more member? `current_members` is how many it has now.
-    /// Asked when an invite is made and when one is accepted by someone not yet a member;
-    /// `Err(reason)` refuses with 402 and the reason (or "this organisation has no free seats" if
-    /// it is empty).
+    /// Asked (before the transaction) when an invite is made and when one is accepted by someone not
+    /// yet a member; `Err(reason)` refuses with 402 and the reason (or "this organisation has no
+    /// free seats" if it is empty).
     async fn may_add_member(&self, _org: &Id, _current_members: usize) -> Result<(), String> {
         Ok(())
     }
@@ -110,11 +139,12 @@ pub trait Extensions: Send + Sync + 'static {
     /// Someone joined the organisation (after the commit).
     async fn member_added(&self, _org: &Id, _user: &Id) {}
 
-    /// Someone left the organisation or was removed (after the commit).
+    /// Someone left the organisation or was removed (after the commit, once their open documents
+    /// are closed).
     async fn member_removed(&self, _org: &Id, _user: &Id) {}
 
-    /// Asked before an organisation is deleted; `Err(reason)` refuses with 402 (it still has a paid
-    /// subscription, say).
+    /// Asked before an organisation is deleted (before the transaction); `Err(reason)` refuses with
+    /// 402 (it still has a paid subscription, say).
     async fn before_org_delete(&self, _org: &Id) -> Result<(), String> {
         Ok(())
     }
@@ -131,10 +161,11 @@ pub trait Extensions: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// Something happened (an audit sink). Called after the change is committed.
+    /// Something happened (an audit sink). Called after the change is committed, last.
     async fn on_event(&self, _event: &Event) {}
 
-    /// May this organisation have one more of `what`? `Err(reason)` refuses with 402.
+    /// May this organisation have one more of `what`? Asked before the transaction; `Err(reason)`
+    /// refuses with 402.
     async fn quota(&self, _org: &Id, _what: Quota) -> Result<(), String> {
         Ok(())
     }
@@ -150,6 +181,145 @@ pub trait Extensions: Send + Sync + 'static {
 pub struct NoExtensions;
 
 impl Extensions for NoExtensions {}
+
+/// How a hook call ended.
+enum Outcome<T> {
+    Answered(T),
+    /// Timed out or panicked (already logged).
+    Failed,
+}
+
+/// Runs one hook call on a task of its own and waits at most the extension's timeout for it. A
+/// call that takes longer is cancelled. A timeout or panic is logged (with the hook's name and the
+/// organisation's id, if any) and reported as [`Outcome::Failed`].
+async fn run<T, F, Fut>(
+    ext: &Arc<dyn Extensions>,
+    hook: &'static str,
+    org: &str,
+    call: F,
+) -> Outcome<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<dyn Extensions>) -> Fut,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    let timeout = ext.hook_timeout();
+    let task = tokio::spawn(call(ext.clone()));
+    let abort = task.abort_handle();
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(answer)) => Outcome::Answered(answer),
+        Ok(Err(_)) => {
+            tracing::error!(hook, org, "an extension hook panicked");
+            Outcome::Failed
+        }
+        Err(_) => {
+            abort.abort();
+            tracing::error!(
+                hook,
+                org,
+                ?timeout,
+                "an extension hook did not answer in time"
+            );
+            Outcome::Failed
+        }
+    }
+}
+
+/// A refusing hook's answer as a client sees it: 402 with the reason (or `default` for an empty
+/// one); 409 [`HOOK_FAILED`] when it timed out or panicked.
+async fn ask<F, Fut>(
+    ext: &Arc<dyn Extensions>,
+    hook: &'static str,
+    org: &str,
+    default: &str,
+    call: F,
+) -> Result<(), ApiError>
+where
+    F: FnOnce(Arc<dyn Extensions>) -> Fut,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    match run(ext, hook, org, call).await {
+        Outcome::Answered(Ok(())) => Ok(()),
+        Outcome::Answered(Err(why)) => Err(ApiError::PaymentRequired(if why.is_empty() {
+            default.to_owned()
+        } else {
+            why
+        })),
+        Outcome::Failed => Err(ApiError::Conflict(HOOK_FAILED.to_owned())),
+    }
+}
+
+/// [`Extensions::may_add_member`]: may `org`, with `current_members` members, take one more?
+/// Call before the transaction.
+pub async fn check_seat(
+    ext: &Arc<dyn Extensions>,
+    org: &Id,
+    current_members: u64,
+) -> Result<(), ApiError> {
+    let n = usize::try_from(current_members).unwrap_or(usize::MAX);
+    let org_id = org.clone();
+    ask(
+        ext,
+        "may_add_member",
+        org,
+        "this organisation has no free seats",
+        move |e| async move { e.may_add_member(&org_id, n).await },
+    )
+    .await
+}
+
+/// [`Extensions::quota`]: may `org` have one more of `what`? Call before the transaction.
+pub async fn check_quota(ext: &Arc<dyn Extensions>, org: &Id, what: Quota) -> Result<(), ApiError> {
+    let org_id = org.clone();
+    ask(
+        ext,
+        "quota",
+        org,
+        "this organisation has reached a limit of its plan",
+        move |e| async move { e.quota(&org_id, what).await },
+    )
+    .await
+}
+
+/// [`Extensions::before_org_delete`]: may `org` be deleted? Call before the transaction.
+pub async fn check_org_delete(ext: &Arc<dyn Extensions>, org: &Id) -> Result<(), ApiError> {
+    let org_id = org.clone();
+    ask(
+        ext,
+        "before_org_delete",
+        org,
+        "this organisation cannot be deleted now",
+        move |e| async move { e.before_org_delete(&org_id).await },
+    )
+    .await
+}
+
+/// [`Extensions::member_added`], after the commit.
+pub async fn notify_member_added(ext: &Arc<dyn Extensions>, org: &Id, user: &Id) {
+    let (org_id, user) = (org.clone(), user.clone());
+    run(ext, "member_added", org, move |e| async move {
+        e.member_added(&org_id, &user).await;
+    })
+    .await;
+}
+
+/// [`Extensions::member_removed`], after the commit and after the hub has closed the member's
+/// open documents.
+pub async fn notify_member_removed(ext: &Arc<dyn Extensions>, org: &Id, user: &Id) {
+    let (org_id, user) = (org.clone(), user.clone());
+    run(ext, "member_removed", org, move |e| async move {
+        e.member_removed(&org_id, &user).await;
+    })
+    .await;
+}
+
+/// [`Extensions::on_event`], after the commit, last.
+pub async fn emit(ext: &Arc<dyn Extensions>, event: Event) {
+    run(ext, "on_event", "", move |e| async move {
+        e.on_event(&event).await;
+    })
+    .await;
+}
 
 #[cfg(test)]
 mod tests {
@@ -179,5 +349,73 @@ mod tests {
         assert_eq!(ext.quota(&org, Quota::BlobBytes(u64::MAX)).await, Ok(()));
         assert_eq!(ext.before_org_delete(&org).await, Ok(()));
         assert!(ext.migrations().is_empty());
+    }
+
+    /// Never answers, panics in the notifications, and waits 50 ms at most.
+    struct Broken;
+
+    #[async_trait]
+    impl Extensions for Broken {
+        fn hook_timeout(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+
+        async fn may_add_member(&self, _org: &Id, _n: usize) -> Result<(), String> {
+            std::future::pending().await
+        }
+
+        async fn quota(&self, _org: &Id, _what: Quota) -> Result<(), String> {
+            panic!("a broken quota hook")
+        }
+
+        async fn member_added(&self, _org: &Id, _user: &Id) {
+            panic!("a broken notification")
+        }
+
+        async fn on_event(&self, _event: &Event) {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_hangs_or_panics_refuses_or_is_ignored() {
+        let ext: Arc<dyn Extensions> = Arc::new(Broken);
+        let org: Id = "o".into();
+        let started = std::time::Instant::now();
+        let e = check_seat(&ext, &org, 1).await.unwrap_err();
+        assert_eq!((e.status().as_u16(), e.detail()), (409, HOOK_FAILED));
+        let e = check_quota(&ext, &org, Quota::Projects).await.unwrap_err();
+        assert_eq!((e.status().as_u16(), e.detail()), (409, HOOK_FAILED));
+        notify_member_added(&ext, &org, &"u".to_owned()).await;
+        emit(&ext, Event::SignedIn { user: "u".into() }).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    struct Refuses;
+
+    #[async_trait]
+    impl Extensions for Refuses {
+        async fn may_add_member(&self, _org: &Id, _n: usize) -> Result<(), String> {
+            Err(String::new())
+        }
+
+        async fn quota(&self, _org: &Id, _what: Quota) -> Result<(), String> {
+            Err("no more".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_402_with_the_reason_or_a_default() {
+        let ext: Arc<dyn Extensions> = Arc::new(Refuses);
+        let org: Id = "o".into();
+        let e = check_seat(&ext, &org, 1).await.unwrap_err();
+        assert_eq!(
+            (e.status().as_u16(), e.detail()),
+            (402, "this organisation has no free seats")
+        );
+        let e = check_quota(&ext, &org, Quota::Projects).await.unwrap_err();
+        assert_eq!((e.status().as_u16(), e.detail()), (402, "no more"));
+        let ext: Arc<dyn Extensions> = Arc::new(NoExtensions);
+        assert!(check_org_delete(&ext, &org).await.is_ok());
     }
 }

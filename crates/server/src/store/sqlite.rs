@@ -358,6 +358,10 @@ impl Store for SqliteStore {
         q::invite_by_id(&mut *self.reader().await?, id).await
     }
 
+    async fn invite_by_hash(&self, token_hash: &str) -> Result<Option<Invite>> {
+        q::invite_by_hash(&mut *self.reader().await?, token_hash).await
+    }
+
     async fn open_invites(&self, org_id: &str, now: f64) -> Result<Vec<Invite>> {
         q::open_invites(&mut *self.reader().await?, org_id, now).await
     }

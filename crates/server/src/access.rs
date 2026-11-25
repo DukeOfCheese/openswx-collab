@@ -19,7 +19,7 @@ use axum::http::request::Parts;
 use crate::error::ApiError;
 use crate::security::{OrgRole, ProjectRole, token_hash};
 use crate::state::AppState;
-use crate::store::{Id, Project, ProjectWithRole, Store};
+use crate::store::{Id, Project, ProjectWithRole, Store, Tx};
 
 /// The signed-in account. Rejects with 401 `sign in first` when the token is missing, malformed or
 /// unknown, its session has expired, or its account is disabled or deleted.
@@ -108,7 +108,7 @@ fn project_role_needed(need: ProjectRole) -> &'static str {
 }
 
 /// A role read from the database; one this server does not know is an error, not a role.
-fn parse_role<R: std::str::FromStr>(role: &str) -> anyhow::Result<R> {
+pub(crate) fn parse_role<R: std::str::FromStr>(role: &str) -> anyhow::Result<R> {
     role.parse()
         .map_err(|_| anyhow::anyhow!("unknown role {role:?} in the database"))
 }
@@ -135,13 +135,31 @@ pub async fn require_org(
     org: &str,
     need: OrgRole,
 ) -> Result<OrgRole, ApiError> {
-    let role = org_role(store, user, org)
-        .await?
-        .ok_or(ApiError::NotFound(NO_SUCH_ORG))?;
+    decide_org(org_role(store, user, org).await?, need)
+}
+
+/// 404 for no role, 403 for one below `need`.
+fn decide_org(role: Option<OrgRole>, need: OrgRole) -> Result<OrgRole, ApiError> {
+    let role = role.ok_or(ApiError::NotFound(NO_SUCH_ORG))?;
     if role < need {
         return Err(ApiError::Forbidden(org_role_needed(need)));
     }
     Ok(role)
+}
+
+/// [`require_org`] read again inside a transaction, so that a change made with it is refused (with
+/// the same answer) if the caller's role was lowered or taken away since the first check.
+pub async fn recheck_org(
+    tx: &mut dyn Tx,
+    user: &str,
+    org: &str,
+    need: OrgRole,
+) -> Result<OrgRole, ApiError> {
+    let role = match tx.org_member(org, user).await? {
+        Some(m) => Some(parse_role(&m.role)?),
+        None => None,
+    };
+    decide_org(role, need)
 }
 
 /// The account's role in `project`: owner for an organisation owner or admin; otherwise the role
@@ -191,13 +209,45 @@ pub async fn require_project(
         Some(p) => role_in_project(store, user, p).await?,
         None => None,
     };
-    let (Some(project), Some(role)) = (found, role) else {
+    decide_project(found, role, need)
+}
+
+/// 404 for no project or no role, 403 for one below `need`.
+fn decide_project(
+    project: Option<Project>,
+    role: Option<ProjectRole>,
+    need: ProjectRole,
+) -> Result<(Project, ProjectRole), ApiError> {
+    let (Some(project), Some(role)) = (project, role) else {
         return Err(ApiError::NotFound(NO_SUCH_PROJECT));
     };
     if role < need {
         return Err(ApiError::Forbidden(project_role_needed(need)));
     }
     Ok((project, role))
+}
+
+/// [`require_project`] read again inside a transaction, so that a change made with it is refused
+/// (with the same answer) if the project went or the caller's role was lowered since the first
+/// check.
+pub async fn recheck_project(
+    tx: &mut dyn Tx,
+    user: &str,
+    project: &str,
+    need: ProjectRole,
+) -> Result<(Project, ProjectRole), ApiError> {
+    let found = tx.project_by_id(project).await?;
+    let mut role = None;
+    if let Some(p) = &found
+        && let Some(m) = tx.org_member(&p.org_id, user).await?
+    {
+        if parse_role::<OrgRole>(&m.role)? >= OrgRole::Admin {
+            role = Some(ProjectRole::Owner);
+        } else if let Some(pm) = tx.project_member(&p.id, user).await? {
+            role = Some(parse_role(&pm.role)?);
+        }
+    }
+    decide_project(found, role, need)
 }
 
 /// The projects of an organisation the account can see, with its role in each, by name: all of

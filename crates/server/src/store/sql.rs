@@ -156,7 +156,7 @@ pub const INSERT_INVITE: &str = concat!(
 /// [`super::Store::invite_by_id`].
 pub const INVITE_BY_ID: &str = concat!("SELECT ", invite_columns!(), " FROM invites WHERE id = $1");
 
-/// [`super::Tx::invite_by_hash`].
+/// [`super::Store::invite_by_hash`], [`super::Tx::invite_by_hash`].
 pub const INVITE_BY_HASH: &str = concat!(
     "SELECT ",
     invite_columns!(),

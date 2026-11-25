@@ -4,14 +4,17 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use common::{LogCapture, PASSWORD, TestServer, Token, World, world};
 use oswx_server::ext::{Event, Extensions, Quota};
+use oswx_server::hub::Hub;
 use oswx_server::mail::{Mailer, MemoryMailer};
 use oswx_server::security::token_hash;
-use oswx_server::store::Id;
+use oswx_server::store::{Id, Store};
 use oswx_server::{AppState, Clock};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -1620,4 +1623,321 @@ async fn the_organisation_queries_read_back_what_they_wrote() {
     // (ending on a request gives the writer connection time to go back to its pool before the
     // server is dropped)
     server.get("/api/health", None).await;
+}
+
+// ------------------------------------------------------------------ fix round 1: hooks, order, races
+
+/// A seat hook that, once `slow` is set, never answers for `slow_org`; waits 1 s at most.
+struct HangingSeats {
+    slow: AtomicBool,
+    slow_org: Mutex<Id>,
+}
+
+#[async_trait]
+impl Extensions for HangingSeats {
+    fn hook_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
+    async fn may_add_member(&self, org: &Id, _current: usize) -> Result<(), String> {
+        let slow = self.slow.load(Ordering::SeqCst)
+            && *org == *self.slow_org.lock().unwrap_or_else(PoisonError::into_inner);
+        if slow {
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_hook_that_hangs_blocks_nobody_else_and_its_request_ends_with_409() {
+    let ext = Arc::new(HangingSeats {
+        slow: false.into(),
+        slow_org: Mutex::new(String::new()),
+    });
+    let kept = ext.clone();
+    let server = TestServer::start_custom(|s| s.open_registration = true, |s| s.ext = kept).await;
+    let w = World::new(&server).await.unwrap();
+    let (_, other) = server
+        .post("/api/orgs", Some(&w.admin), json!({"name": "Other"}))
+        .await;
+    let other = other["id"].as_str().unwrap().to_owned();
+    let (_, inv) = invite(&server, &w, json!({})).await;
+    let (bob, bob_id) = server.register("bob@example.com").await;
+    *ext.slow_org.lock().unwrap() = w.org.clone();
+    ext.slow.store(true, Ordering::SeqCst);
+
+    let server = Arc::new(server);
+    let started = Instant::now();
+    let stuck = {
+        let server = server.clone();
+        let token = inv["token"].as_str().unwrap().to_owned();
+        tokio::spawn(async move { accept(&server, &bob, &token).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // another organisation's writes go on while the hook hangs
+    let (s, _) = server
+        .post(
+            &format!("/api/orgs/{other}/projects"),
+            Some(&w.admin),
+            json!({"name": "Meanwhile"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert!(!stuck.is_finished(), "the stuck request is still waiting");
+    let (s, body) = stuck.await.unwrap();
+    assert_eq!(
+        (s, body),
+        (
+            StatusCode::CONFLICT,
+            json!({"detail": "the server could not check this with its extensions in time; try again"})
+        )
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        server
+            .state
+            .store
+            .org_member(&w.org, &bob_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Two seats; once `gate` is set, each seat check waits until two of them are waiting.
+struct TwoSeatsTogether {
+    gate: AtomicBool,
+    both: tokio::sync::Barrier,
+}
+
+#[async_trait]
+impl Extensions for TwoSeatsTogether {
+    async fn may_add_member(&self, _org: &Id, current: usize) -> Result<(), String> {
+        if self.gate.load(Ordering::SeqCst) {
+            self.both.wait().await;
+        }
+        if current < 2 {
+            Ok(())
+        } else {
+            Err("this organisation has 2 seats".into())
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_acceptances_for_the_last_seat_add_exactly_one_member() {
+    let ext = Arc::new(TwoSeatsTogether {
+        gate: false.into(),
+        both: tokio::sync::Barrier::new(2),
+    });
+    let kept = ext.clone();
+    let server = TestServer::start_custom(|s| s.open_registration = true, |s| s.ext = kept).await;
+    let w = World::new(&server).await.unwrap();
+    let (_, one) = invite(&server, &w, json!({})).await;
+    let (_, two) = invite(&server, &w, json!({})).await;
+    let (bob, _) = server.register("bob@example.com").await;
+    let (cy, _) = server.register("cy@example.com").await;
+    ext.gate.store(true, Ordering::SeqCst);
+    let (a, b) = tokio::join!(
+        accept(&server, &bob, one["token"].as_str().unwrap()),
+        accept(&server, &cy, two["token"].as_str().unwrap()),
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::CONFLICT], "{a:?} {b:?}");
+    let refused = if a.0 == StatusCode::CONFLICT {
+        a.1
+    } else {
+        b.1
+    };
+    assert!(
+        refused["detail"].as_str().unwrap().ends_with("try again"),
+        "{refused}"
+    );
+    assert_eq!(
+        server.state.store.org_member_count(&w.org).await.unwrap(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_use_invite_accepted_three_times_at_once_works_once() {
+    let server = TestServer::start_with(|s| s.open_registration = true).await;
+    let w = World::new(&server).await.unwrap();
+    let (_, inv) = invite(&server, &w, json!({})).await;
+    let token = inv["token"].as_str().unwrap();
+    let (bob, _) = server.register("bob@example.com").await;
+    let (cy, _) = server.register("cy@example.com").await;
+    let (a, b, c) = tokio::join!(
+        accept(&server, &bob, token),
+        accept(&server, &cy, token),
+        accept(&server, &bob, token),
+    );
+    let answers = [&a, &b, &c];
+    assert_eq!(
+        answers.iter().filter(|r| r.0.is_success()).count(),
+        1,
+        "{answers:?}"
+    );
+    for r in answers {
+        assert!(
+            r.0 == StatusCode::OK || r.0 == StatusCode::NOT_FOUND,
+            "{r:?}"
+        );
+    }
+    assert_eq!(
+        server.state.store.org_member_count(&w.org).await.unwrap(),
+        2
+    );
+}
+
+/// Hooks that panic, and note whether the hub had already acted when they were called.
+struct PanicsAfterHub(Hub, Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl Extensions for PanicsAfterHub {
+    async fn member_removed(&self, _org: &Id, user: &Id) {
+        let dropped = self
+            .0
+            .recorded()
+            .iter()
+            .any(|c| c.starts_with(&format!("drop_user {user}")));
+        self.1
+            .lock()
+            .unwrap()
+            .push(format!("member_removed after drop: {dropped}"));
+        panic!("a broken member_removed hook");
+    }
+
+    async fn on_event(&self, _event: &Event) {
+        panic!("a broken audit sink");
+    }
+}
+
+#[tokio::test]
+async fn the_hub_closes_access_before_the_hooks_and_whatever_they_do() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let kept = seen.clone();
+    let server = TestServer::start_custom(
+        |_| {},
+        |s| s.ext = Arc::new(PanicsAfterHub(s.hub.clone(), kept)),
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let (_, bob_id) = w.editor(&server, "bob@example.com").await;
+    let (_, cy_id) = w.editor(&server, "cy@example.com").await;
+    let org = &w.org;
+    let p = &w.project;
+    let calls = [
+        server
+            .patch(
+                &format!("/api/orgs/{org}/members/{cy_id}"),
+                Some(&w.admin),
+                json!({"role": "admin"}),
+            )
+            .await,
+        server
+            .put(
+                &format!("/api/projects/{p}/members/{bob_id}"),
+                Some(&w.admin),
+                json!({"role": "viewer"}),
+            )
+            .await,
+        server
+            .delete(
+                &format!("/api/projects/{p}/members/{bob_id}"),
+                Some(&w.admin),
+            )
+            .await,
+        server
+            .delete(&format!("/api/orgs/{org}/members/{bob_id}"), Some(&w.admin))
+            .await,
+    ];
+    for (s, body) in calls {
+        assert!(s.is_success(), "{s} {body}");
+    }
+    assert_eq!(
+        server.state.hub.recorded(),
+        [
+            format!("drop_user {cy_id} {org}"),
+            format!("drop_user {bob_id} {org}"),
+            format!("drop_user {bob_id} {org}"),
+            format!("drop_user {bob_id} {org}"),
+        ]
+    );
+    assert_eq!(*seen.lock().unwrap(), ["member_removed after drop: true"]);
+    assert!(
+        server
+            .state
+            .store
+            .org_member(org, &bob_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// While the seat hook is being asked, lowers an account's role (as a concurrent request could).
+struct DemotesTheCaller(Arc<dyn Store>, Mutex<Option<(Id, Id)>>);
+
+#[async_trait]
+impl Extensions for DemotesTheCaller {
+    async fn may_add_member(&self, _org: &Id, _current: usize) -> Result<(), String> {
+        let target = self.1.lock().unwrap().clone();
+        if let Some((org, user)) = target {
+            let mut tx = self.0.begin().await.unwrap();
+            tx.set_org_member_role(&org, &user, "member").await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_role_lost_after_the_first_check_still_refuses_the_change() {
+    let holder = Arc::new(Mutex::new(None::<Arc<DemotesTheCaller>>));
+    let kept = holder.clone();
+    let server = TestServer::start_custom(
+        |_| {},
+        move |s| {
+            let ext = Arc::new(DemotesTheCaller(s.store.clone(), Mutex::new(None)));
+            *kept.lock().unwrap() = Some(ext.clone());
+            s.ext = ext;
+        },
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let (bob, bob_id) = w.editor(&server, "bob@example.com").await;
+    server
+        .patch(
+            &format!("/api/orgs/{}/members/{bob_id}", w.org),
+            Some(&w.admin),
+            json!({"role": "admin"}),
+        )
+        .await;
+    let ext = holder.lock().unwrap().clone().unwrap();
+    *ext.1.lock().unwrap() = Some((w.org.clone(), bob_id.clone()));
+    // Bob is an admin when the invite is asked for, and a member by the time it would be written
+    let (s, body) = server
+        .post(
+            &format!("/api/orgs/{}/invites", w.org),
+            Some(&bob),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        (s, body),
+        (
+            StatusCode::FORBIDDEN,
+            json!({"detail": "needs the organisation role admin"})
+        )
+    );
+    assert_eq!(
+        server
+            .get(&format!("/api/orgs/{}/invites", w.org), Some(&w.admin))
+            .await
+            .1,
+        json!([])
+    );
 }

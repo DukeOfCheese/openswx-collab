@@ -362,7 +362,12 @@ pub trait Store: Send + Sync + 'static {
     /// The accounts with a role row in a project, by name then id.
     async fn project_members(&self, project_id: &str) -> anyhow::Result<Vec<Member>>;
 
+    /// The invite with this id (for tests: the routes find invites by their token).
+    #[doc(hidden)]
     async fn invite_by_id(&self, id: &str) -> anyhow::Result<Option<Invite>>;
+
+    /// The invite whose token has this hash, used or expired or not.
+    async fn invite_by_hash(&self, token_hash: &str) -> anyhow::Result<Option<Invite>>;
 
     /// An organisation's invites that are unused and expire after `now`, oldest first.
     async fn open_invites(&self, org_id: &str, now: f64) -> anyhow::Result<Vec<Invite>>;
