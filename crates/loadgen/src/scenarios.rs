@@ -43,7 +43,10 @@ async fn connect_all(
     let mut peers = Vec::with_capacity(count);
     for (n, r) in results {
         match r {
-            Ok(p) => peers.push((n, p)),
+            Ok(p) => {
+                metrics.note_welcome(p.welcome_bytes());
+                peers.push((n, p));
+            }
             Err(e) => {
                 eprintln!("connection {n} failed: {e:#}");
                 metrics.connect_failed += 1;
@@ -93,6 +96,8 @@ pub async fn edit_run(
     }
 }
 
+/// One editor: edit slots at a fixed interval starting at `first`. A slot is never skipped: an editor that
+/// is behind schedule sends at once, and the lateness shows in the from-schedule latency.
 async fn editor(
     mut peer: Box<dyn Peer>,
     feature: usize,
@@ -101,12 +106,10 @@ async fn editor(
     deadline: Instant,
 ) -> Metrics {
     let mut m = Metrics::default();
-    let mut next = first;
-    loop {
-        tokio::time::sleep_until(next).await;
-        if Instant::now() >= deadline {
-            break;
-        }
+    m.note_welcome(peer.welcome_bytes());
+    let mut slot = first;
+    while slot < deadline {
+        tokio::time::sleep_until(slot).await;
         if !peer.is_open() {
             m.dropped += 1;
             break;
@@ -115,18 +118,20 @@ async fn editor(
         let sent_at = Instant::now();
         match tokio::time::timeout(EDIT_TIMEOUT, peer.edit(feature)).await {
             Ok(Ok(Outcome::Accepted)) => {
+                let done = Instant::now();
                 m.accepted += 1;
-                m.record_latency(sent_at.elapsed());
+                m.record_latency(done - sent_at);
+                m.record_schedule(done - slot);
             }
             Ok(Ok(Outcome::Rejected(code))) => *m.rejected.entry(code).or_default() += 1,
             Ok(Err(_)) => {
+                m.errors += 1;
                 m.dropped += 1;
                 break;
             }
-            Err(_) => m.timeouts += 1,
+            Err(_) => m.record_timeout(),
         }
-        // A fixed schedule, but a slow answer does not cause a burst afterwards.
-        next = (next + period).max(Instant::now());
+        slot += period;
     }
     if !peer.is_open() && m.dropped == 0 {
         m.dropped += 1;
@@ -146,7 +151,13 @@ pub async fn open_run(
     for n in 0..times {
         match dialect.connect(&target, n).await {
             Ok(peer) => {
-                metrics.record_latency(peer.open_time());
+                metrics.note_welcome(peer.welcome_bytes());
+                if metrics.first_open.is_none() {
+                    // Cold: the server may still be loading the document.
+                    metrics.first_open = Some(peer.open_time());
+                } else {
+                    metrics.record_latency(peer.open_time());
+                }
                 metrics.protocol_errors += peer.protocol_errors();
             }
             Err(e) => {
@@ -219,5 +230,124 @@ pub async fn idle_run(
             after_connect,
             end,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use async_trait::async_trait;
+
+    use super::*;
+
+    enum Step {
+        /// Answer after this many milliseconds.
+        Answer(u64, Outcome),
+        /// Never answer.
+        Hang,
+        /// The connection drops.
+        Fail,
+    }
+
+    struct Fake(VecDeque<Step>);
+
+    #[async_trait]
+    impl Peer for Fake {
+        async fn edit(&mut self, _feature: usize) -> anyhow::Result<Outcome> {
+            match self.0.pop_front() {
+                Some(Step::Answer(ms, o)) => {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Ok(o)
+                }
+                Some(Step::Hang) => std::future::pending().await,
+                Some(Step::Fail) | None => anyhow::bail!("closed"),
+            }
+        }
+        async fn presence(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn drain(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn open_time(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn welcome_bytes(&self) -> u64 {
+            1000
+        }
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn protocol_errors(&self) -> u64 {
+            0
+        }
+    }
+
+    async fn run(steps: Vec<Step>, period_ms: u64, duration_ms: u64) -> Metrics {
+        let now = Instant::now();
+        editor(
+            Box::new(Fake(steps.into())),
+            0,
+            Duration::from_millis(period_ms),
+            now,
+            now + Duration::from_millis(duration_ms),
+        )
+        .await
+    }
+
+    fn acc(ms: u64) -> Step {
+        Step::Answer(ms, Outcome::Accepted)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_shows_as_lateness_in_the_following_slots_and_skips_none() {
+        // Slots at 0, 100, ..., 900. The first answer takes 1 s; the rest take 1 ms.
+        let mut steps = vec![acc(1000)];
+        steps.extend((0..9).map(|_| acc(1)));
+        let m = run(steps, 100, 1000).await;
+        assert_eq!(m.sent, 10, "no slot is skipped");
+        assert_eq!(m.accepted, 10);
+        let service = m.latency().unwrap();
+        let sched = m.latency_from_schedule().unwrap();
+        assert!(
+            service.max < 1001.0 + 1.0 && service.p50 < 2.0,
+            "{service:?}"
+        );
+        // The second slot (100 ms) is answered at 1001 ms: 901 ms from its schedule; the last slot (900 ms)
+        // at 1009 ms: 109 ms from its schedule.
+        assert!(sched.max >= 1000.0, "{sched:?}");
+        assert!(sched.p50 > 100.0, "{sched:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_enters_both_histograms_and_is_counted() {
+        let m = run(vec![Step::Hang], 1000, 500).await;
+        assert_eq!((m.sent, m.timeouts, m.accepted), (1, 1, 0));
+        for l in [m.latency().unwrap(), m.latency_from_schedule().unwrap()] {
+            assert!((l.max - 30_000.0).abs() < 30.0, "{l:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counters_reconcile() {
+        let steps = vec![
+            acc(1),
+            Step::Answer(1, Outcome::Rejected("stale".into())),
+            Step::Hang,
+            acc(1),
+            Step::Fail,
+            acc(1),
+        ];
+        let m = run(steps, 100, 10_000).await;
+        assert_eq!(
+            (m.accepted, m.rejected_total(), m.timeouts, m.errors),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(
+            m.sent,
+            m.accepted + m.rejected_total() + m.timeouts + m.errors
+        );
+        assert_eq!(m.dropped, 1);
     }
 }

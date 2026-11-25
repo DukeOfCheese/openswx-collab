@@ -16,7 +16,7 @@ use serde_json::json;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::dialect::Dialect;
-use crate::report::{Host, Report};
+use crate::report::{Host, LATENCY_NOTE, Report, WelcomeBytes};
 use crate::scenarios::RunResult;
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -238,6 +238,9 @@ async fn run(cli: Cli) -> Result<Report> {
         };
 
     let m = &result.metrics;
+    if m.sent != m.accepted + m.rejected_total() + m.timeouts + m.errors {
+        eprintln!("warning: the counters do not add up (this is a loadgen bug)");
+    }
     let secs = result.elapsed.as_secs_f64().max(f64::EPSILON);
     Ok(Report {
         scenario: name.to_owned(),
@@ -250,15 +253,21 @@ async fn run(cli: Cli) -> Result<Report> {
         note: cli.note,
         host: host_info(),
         duration_s: result.elapsed.as_secs_f64(),
+        document_bytes: target.document_bytes,
         changes_sent: m.sent,
         accepted: m.accepted,
         rejected: m.rejected.clone(),
         timeouts: m.timeouts,
+        errors: m.errors,
         protocol_errors: m.protocol_errors,
         dropped_connections: m.dropped,
         connect_failed: m.connect_failed,
         latency_kind: kind.to_owned(),
         latency_ms: m.latency(),
+        latency_from_schedule_ms: m.latency_from_schedule(),
+        latency_note: LATENCY_NOTE.to_owned(),
+        first_open_ms: m.first_open.map(|d| d.as_secs_f64() * 1000.0),
+        welcome_bytes: m.welcome_bytes.map(|(min, max)| WelcomeBytes { min, max }),
         accepted_per_s: m.accepted as f64 / secs,
         server_rss_bytes: result.rss,
     })

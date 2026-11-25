@@ -40,9 +40,25 @@ valid JSON counts under `protocol_errors`. If the server cannot be reached loadg
 
 ## The result file
 
-One JSON object: the scenario and its parameters, the server's description, run time, changes sent, accepted,
-rejected by code, latency p50/p90/p99/max in milliseconds (`latency_kind` says whether that is edit latency,
-send to `change.accepted`, or open time), accepted changes per second, dropped connections.
+One JSON object: the scenario and its parameters, the server's description, run time, `document_bytes` (size of
+each generated document), changes sent, accepted, rejected by code, timeouts, errors, latencies in milliseconds,
+accepted changes per second and dropped connections. `changes_sent = accepted + rejected + timeouts + errors`,
+where `errors` are edits lost because the connection dropped before the answer.
+
+Two latency figures, both p50/p90/p99/max (the same text is in the file as `latency_note`):
+
+- `latency_ms` is service time: from just before an edit is sent until its answer arrives.
+- `latency_from_schedule_ms` is measured from the slot the edit was scheduled for. Each editor works to a fixed
+  interval (`--rate`, random start offset) and never skips a slot: when the server stalls, the editor sends the
+  waiting edits at once afterwards and the lateness counts. This is what a stall costs; `latency_ms` alone hides
+  it (coordinated omission).
+
+An edit with no answer after 30 s is a `timeout` and enters both figures as 30000 ms.
+
+For `open`, `first_open_ms` is the first sample on its own (cold: the server loads the document) and
+`latency_ms` covers the remaining ones, so use `--times` of at least 2 (5 or more for percentiles worth reading).
+`welcome_bytes` (min and max) is the size of the `welcome` frame; a connection whose welcome carries no
+document content fails instead of counting. Use it to check the document really was the size you asked for.
 
 Each result also records where it was measured: CPU, thread count, RAM and OS of the machine running loadgen,
 the database (from `--database`), the loadgen git commit and the start time (UTC). Run the server on the same

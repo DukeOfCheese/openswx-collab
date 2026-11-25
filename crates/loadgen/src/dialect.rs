@@ -32,6 +32,8 @@ pub trait Peer: Send {
     async fn drain(&mut self) -> anyhow::Result<()>;
     /// Time from sending `hello` until `welcome` arrived.
     fn open_time(&self) -> Duration;
+    /// Size of the `welcome` frame in bytes.
+    fn welcome_bytes(&self) -> u64;
     /// False once the server (or the network) closed the connection.
     fn is_open(&self) -> bool;
     /// Frames received that were not valid messages.
@@ -51,6 +53,8 @@ pub struct Target {
     pub token: String,
     pub documents: Vec<String>,
     pub features: usize,
+    /// Size of each created document, JSON bytes.
+    pub document_bytes: usize,
     /// Human-readable description of the server, for the report.
     pub server: String,
 }

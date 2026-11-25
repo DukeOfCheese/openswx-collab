@@ -127,6 +127,7 @@ impl Dialect for V1 {
         let project = project["id"].as_str().context("no project id")?;
 
         let content = build_document(features, doc_bytes);
+        let document_bytes = serde_json::to_vec(&content)?.len();
         let mut documents = Vec::with_capacity(docs);
         for i in 0..docs {
             let doc = http
@@ -143,6 +144,7 @@ impl Dialect for V1 {
             token,
             documents,
             features,
+            document_bytes,
             server,
         })
     }
@@ -179,7 +181,7 @@ impl Dialect for V1 {
         ws.send(Message::text(hello.to_string()))
             .await
             .context("sending hello")?;
-        let (seq, open_time) = loop {
+        let (seq, open_time, welcome_bytes) = loop {
             let frame = ws
                 .next()
                 .await
@@ -192,7 +194,10 @@ impl Dialect for V1 {
             };
             let v: Value = serde_json::from_str(text.as_str()).context("welcome was not JSON")?;
             match v["type"].as_str() {
-                Some("welcome") => break (v["seq"].as_u64().unwrap_or(0), started.elapsed()),
+                Some("welcome") => {
+                    let seq = parse_welcome(&v)?;
+                    break (seq, started.elapsed(), text.len() as u64);
+                }
                 Some("error") => bail!("the server refused hello: {v}"),
                 _ => {}
             }
@@ -254,8 +259,34 @@ impl Dialect for V1 {
             features: target.features.max(1),
             counter: 0,
             open_time,
+            welcome_bytes,
             tasks: vec![reader, ping, writer],
         }))
+    }
+}
+
+/// A welcome counts only if it carries the whole document (we send no `last_seq`); returns its `seq`.
+fn parse_welcome(v: &Value) -> Result<u64> {
+    if !v["content"].is_object() {
+        bail!("the welcome carried no document content (the server sent changes or nothing)");
+    }
+    v["seq"].as_u64().context("the welcome has no seq")
+}
+
+/// Takes the edit's entry out of the pending map when the edit ends, however it ends (answer, error, or the
+/// caller giving up on a timeout), so abandoned edits do not pile up.
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    id: String,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -326,6 +357,7 @@ struct V1Peer {
     features: usize,
     counter: u64,
     open_time: Duration,
+    welcome_bytes: u64,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -355,6 +387,10 @@ impl Peer for V1Peer {
         self.counter += 1;
         let change_id = uuid::Uuid::new_v4().to_string();
         let (done, answer) = oneshot::channel();
+        let _guard = PendingGuard {
+            shared: &self.shared,
+            id: change_id.clone(),
+        };
         self.shared
             .pending
             .lock()
@@ -369,14 +405,7 @@ impl Peer for V1Peer {
             }],
             "command": "bench",
         });
-        if let Err(e) = self.send(&msg) {
-            self.shared
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&change_id);
-            return Err(e);
-        }
+        self.send(&msg)?;
         answer
             .await
             .map_err(|_| anyhow!("the connection closed before the answer"))
@@ -396,6 +425,10 @@ impl Peer for V1Peer {
 
     fn open_time(&self) -> Duration {
         self.open_time
+    }
+
+    fn welcome_bytes(&self) -> u64 {
+        self.welcome_bytes
     }
 
     fn is_open(&self) -> bool {
@@ -452,6 +485,32 @@ mod tests {
         s.on_text(r#"{"type":"change.accepted"}"#); // no change_id: ignored
         s.on_text(r#"{"type":"change.accepted","change_id":"unknown","seq":1}"#);
         assert_eq!(s.protocol_errors.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn welcome_without_content_is_an_error() {
+        let with: Value =
+            serde_json::from_str(r#"{"type":"welcome","seq":3,"content":{"features":[]}}"#)
+                .unwrap();
+        assert_eq!(parse_welcome(&with).unwrap(), 3);
+        let changes: Value =
+            serde_json::from_str(r#"{"type":"welcome","seq":3,"changes":[]}"#).unwrap();
+        assert!(parse_welcome(&changes).is_err());
+        let null: Value =
+            serde_json::from_str(r#"{"type":"welcome","seq":3,"content":null}"#).unwrap();
+        assert!(parse_welcome(&null).is_err());
+    }
+
+    #[test]
+    fn abandoned_edit_leaves_nothing_pending() {
+        let s = shared();
+        let (tx, _rx) = oneshot::channel::<Outcome>();
+        s.pending.lock().unwrap().insert("x".into(), tx);
+        drop(PendingGuard {
+            shared: &s,
+            id: "x".into(),
+        });
+        assert!(s.pending.lock().unwrap().is_empty());
     }
 
     #[test]
