@@ -260,6 +260,57 @@ To be checked with `loadgen` on a stated machine; they are proposals until the b
 - Two real openswx processes end to end, including offline edit, reconnect and a refused change.
 - Container and compose files checked on a real host.
 
+## Amendments after review
+
+An independent read found gaps. These rulings replace the text above where they differ. All are the
+author's calls, not owner decisions.
+
+1. **Dependent changes.** A change lists `depends`: the ids of the sender's own unanswered changes whose
+   writes or reads overlap its own (or which created something it touches). The server refuses a change
+   whose dependency was refused (`dependency`). The client rolls back a refused change together with
+   everything that depends on it, newest first, using the inverses it kept.
+2. **What list operations write.** `insert` writes only the new item's path. `remove` writes the item's
+   path (so it conflicts with any concurrent edit inside the item). `move` writes the item's position
+   only. Two inserts never conflict. Order is kept by a **position key** per item (a fractional index,
+   as Figma does): `insert` and `move` carry a position between two neighbours, so there is no anchor
+   that can go missing; equal positions are ordered by id. "Structural writes also write the list's
+   order" is withdrawn.
+3. **References.** The server has no schema of which fields are references. Instead a change carries
+   `reads`: paths of items it relies on existing (the client knows them: a feature's sketch, a mate's
+   components). The conflict rule gains a second half: a change is refused if another client removed
+   anything in its `reads` after its base, and a `remove` is refused if another client's accepted change
+   since the remover's base read the item. Assembly cycles and component access stay explicit checks as
+   today. References the client does not declare are not protected; rebuild reports ("broken by") remain
+   the backstop.
+4. **Ids.** Every new id, at any depth (features, sketch entities, dimensions, components), is
+   `<user>.<client>.<counter>`. The client id is per installation and stored with its counter, which
+   never goes backwards. Ids that do not have this form are legacy ids: allowed only in a document's
+   initial content and in imports, never in a new `insert`. The client shows names, not ids; where
+   openswx shows entity ids today (`Line3`), it gains a per-sketch display label (project 2).
+5. **Names.** The server does not substitute names, because documents refer to features by name
+   (`D1@Sketch1`). A clash at commit is refused with `name_taken`; the client engine renames (rewriting
+   its queued changes) and resends without involving the user. Explicit renames by a user are refused
+   the same way and shown. `next_id` and `counters` stop being server-owned and stop being synced.
+6. **Journal writer.**
+   - A record must not be able to fail on its own: duplicates are detected in the room before the
+     tentative apply (in memory for everything since the last snapshot, by lookup for older bases).
+     Records that touch assembly references run in their own savepoint and can be refused individually.
+   - If a commit's outcome is unknown (timeout, lost connection), affected rooms discard tentative
+     versions, reload from the store, and tell clients to reconnect.
+   - Fencing: the batch transaction locks each room's lease row and checks the epoch inside the
+     transaction; takeover bumps the epoch under the same lock. Expiry clocks are a hint, never the
+     guard.
+   - Snapshots are written only from published versions and keyed by `(document, epoch, seq)`.
+   - A change refused because of a tentative change that is later discarded is accepted as a rare
+     spurious refusal; the client resends it once automatically.
+7. **Undo.** Undo is a local inverse sent as an ordinary change marked `undo_of`, so it works offline and
+   follows the normal conflict rule. Journal records also keep `inverse` so an editor can revert anyone's
+   change from history, as today.
+8. **Import** converts full history (v1 operations map mechanically to v2), so restore and named
+   versions keep working.
+9. **Derived data.** Any map key beginning `~` holds data each client can recompute (solver output).
+   It is synced last-writer-wins and never causes a conflict. The client decides what goes there.
+
 ## Left to the builder
 
 Crate choices, operation and message field names, batch sizes, snapshot thresholds, table layout, test
