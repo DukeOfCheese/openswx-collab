@@ -43,19 +43,26 @@
 //! that started it, signed in as that account and holding the verifier, attaches it at
 //! `link/finish`.
 //!
-//! The error codes the loopback address can get: `cancelled`, `provider_refused`,
-//! `provider_unreachable`, `identity_in_use`, `no_verified_email`, `invite_required`, `not_allowed`
-//! (the seat hook or the invite refused), `account_exists_use_password`, `account_disabled`, and a
-//! provider's own error code passed through (lower-case letters, digits and `_`, at most 64; the
-//! provider's `access_denied` becomes `cancelled`; anything else becomes `provider_refused`).
+//! The loopback address gets `?code=` or `?error=` with one of a closed set of codes,
+//! [`LOOPBACK_ERRORS`]:
+//!
+//! - this server's: `cancelled` (the provider said the person declined, `access_denied`, or sent
+//!   no code), `provider_refused`, `provider_unreachable`, `identity_in_use`, `no_verified_email`,
+//!   `invite_required`, `not_allowed` (the seat hook or the invite refused),
+//!   `account_exists_use_password`, `account_disabled`, `server_error` (this server failed after
+//!   the sign-in state was used; logged);
+//! - the provider's own RFC 6749 §4.1.2.1 codes, passed through: `invalid_request`,
+//!   `unauthorized_client`, `unsupported_response_type`, `invalid_scope`, `server_error`,
+//!   `temporarily_unavailable`. Any other provider error becomes `provider_refused`.
 //!
 //! # Limits
 //!
-//! `start` and `link` together, and `exchange` and `link/finish` together, are each limited to
-//! [`OAUTH_LIMIT`] requests per [`OAUTH_WINDOW_SECS`] per client address (429), so the endpoints
-//! cannot be used to make this server hammer the providers or to guess codes (codes are 32 random
-//! bytes, so guessing is hopeless anyway). Each `start` allows at most one callback, so the
-//! callback needs no limit of its own.
+//! `start` and `link` together are limited to [`START_LIMIT`] requests per [`START_WINDOW_SECS`]
+//! per client address (429, the address worked out as for password sign-in), so they cannot be
+//! used to make this server hammer the providers; each `start` allows at most one callback, so the
+//! callback needs no limit of its own. `exchange` and `link/finish` are not limited: codes are 32
+//! random bytes and used once, so guessing is hopeless, and behind a proxy that hides client
+//! addresses a limit would be one budget for everybody.
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -81,7 +88,9 @@ use crate::routes::auth::{
     start_session,
 };
 use crate::routes::meta::{Registration, registration_for};
-use crate::routes::orgs::{Accepted, accept_invite, approve_invite_by_hash, find_invite_by_hash};
+use crate::routes::orgs::{
+    Accepted, Approval, accept_invite, approve_invite_by_hash, find_invite_by_hash,
+};
 use crate::security::{RateLimit, clean_email, new_token, token_hash};
 use crate::state::AppState;
 use crate::store::{LoginCode, OAuthIdentity, OAuthState, Tx, User, new_id};
@@ -96,13 +105,39 @@ const REDIRECT_MAX: usize = 2048;
 const VERIFIER_LEN: RangeInclusive<usize> = 43..=200;
 /// The longest code a provider may send to the callback.
 const PROVIDER_CODE_MAX: usize = 2048;
-/// The longest provider error code passed through to the app.
-const PROVIDER_ERROR_MAX: usize = 64;
-/// Requests per [`OAUTH_WINDOW_SECS`] per client address, for each of the two limits (see the
-/// module documentation).
-pub const OAUTH_LIMIT: usize = 60;
-/// The window of [`OAUTH_LIMIT`]: ten minutes.
-pub const OAUTH_WINDOW_SECS: u64 = 600;
+/// `start` and `link` requests per [`START_WINDOW_SECS`] per client address (see the module
+/// documentation).
+pub const START_LIMIT: usize = 600;
+/// The window of [`START_LIMIT`]: ten minutes.
+pub const START_WINDOW_SECS: u64 = 600;
+/// The provider error codes (RFC 6749 section 4.1.2.1) passed through to the app as they are.
+/// (`access_denied` becomes `cancelled`.)
+const PROVIDER_ERRORS: [&str; 6] = [
+    "invalid_request",
+    "unauthorized_client",
+    "unsupported_response_type",
+    "invalid_scope",
+    "server_error",
+    "temporarily_unavailable",
+];
+/// Every `error` the app's loopback address can get (see the module documentation).
+pub const LOOPBACK_ERRORS: [&str; 15] = [
+    "cancelled",
+    "provider_refused",
+    "provider_unreachable",
+    "identity_in_use",
+    "no_verified_email",
+    "invite_required",
+    "not_allowed",
+    "account_exists_use_password",
+    "account_disabled",
+    "server_error",
+    "invalid_request",
+    "unauthorized_client",
+    "unsupported_response_type",
+    "invalid_scope",
+    "temporarily_unavailable",
+];
 /// How many times a sign-in that creates an account with an invite is tried when the
 /// organisation's members changed between the seat check and the transaction.
 const SEAT_ATTEMPTS: usize = 3;
@@ -123,17 +158,15 @@ const NOT_THIS_LINK: &str = "this code was not issued to this app and account; s
 const IDENTITY_TAKEN: &str = "that provider account already signs in to another account here";
 const ONLY_WAY_IN: &str = "this is the only way into the account; set a password first";
 
-/// The two limits; one set per app.
+/// The limit on `start` and `link`; one per app.
 #[derive(Debug)]
 struct Limits {
     start: RateLimit,
-    exchange: RateLimit,
 }
 
 pub(crate) fn router() -> Router<AppState> {
     let limits = Arc::new(Limits {
-        start: RateLimit::new(OAUTH_LIMIT, OAUTH_WINDOW_SECS),
-        exchange: RateLimit::new(OAUTH_LIMIT, OAUTH_WINDOW_SECS),
+        start: RateLimit::new(START_LIMIT, START_WINDOW_SECS),
     });
     Router::new()
         .route("/api/auth/oauth/{name}/start", get(start))
@@ -420,13 +453,14 @@ fn redirect(url: &str) -> Result<Response, ApiError> {
 enum Back {
     /// `?code=`: a one-time code for `exchange` or `link/finish`.
     Code(String),
-    /// `?error=`.
-    Error(String),
+    /// `?error=`, one of [`LOOPBACK_ERRORS`].
+    Error(&'static str),
 }
 
 impl Back {
-    fn error(code: &str) -> Self {
-        Self::Error(code.to_owned())
+    fn error(code: &'static str) -> Self {
+        debug_assert!(LOOPBACK_ERRORS.contains(&code), "{code}");
+        Self::Error(code)
     }
 }
 
@@ -435,7 +469,7 @@ impl Back {
 fn back(redirect_uri: &str, outcome: &Back) -> Result<Response, ApiError> {
     let (key, value) = match outcome {
         Back::Code(code) => ("code", code.as_str()),
-        Back::Error(error) => ("error", error.as_str()),
+        Back::Error(error) => ("error", *error),
     };
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair(key, value)
@@ -445,18 +479,14 @@ fn back(redirect_uri: &str, outcome: &Back) -> Result<Response, ApiError> {
 }
 
 /// What a provider's own `error` becomes for the app (see the module documentation).
-fn provider_error(error: &str) -> String {
+fn provider_error(error: &str) -> &'static str {
     if error == "access_denied" {
-        "cancelled".to_owned()
-    } else if error.len() <= PROVIDER_ERROR_MAX
-        && error
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    {
-        error.to_owned()
-    } else {
-        "provider_refused".to_owned()
+        return "cancelled";
     }
+    PROVIDER_ERRORS
+        .into_iter()
+        .find(|known| *known == error)
+        .unwrap_or("provider_refused")
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,41 +530,56 @@ async fn callback(
         query.error.as_deref().filter(|e| !e.is_empty()),
         &query.code,
     ) {
-        (Some(error), _) => Back::Error(provider_error(error)),
+        (Some(error), _) => Back::error(provider_error(error)),
         (None, None) => Back::error("cancelled"),
         (None, Some(code)) if code.is_empty() => Back::error("cancelled"),
         (None, Some(code)) if code.len() > PROVIDER_CODE_MAX => Back::error("provider_refused"),
         (None, Some(code)) => match ask_provider(&state, provider, code).await {
             Err(OAuthError::Refused) => Back::error("provider_refused"),
             Err(OAuthError::Unreachable) => Back::error("provider_unreachable"),
-            Ok(identity) => match &sign_in.link_user_id {
-                Some(link_user_id) => {
-                    link_code(
-                        &state,
-                        provider,
-                        &identity,
-                        link_user_id,
-                        &sign_in.challenge,
-                    )
-                    .await?
-                }
-                None => {
-                    sign_in_code(
-                        &state,
-                        provider,
-                        &identity,
-                        sign_in.invite.as_deref(),
-                        &sign_in.challenge,
-                    )
-                    .await?
-                }
-            },
+            Ok(identity) => {
+                let ended = match &sign_in.link_user_id {
+                    Some(link_user_id) => {
+                        link_code(
+                            &state,
+                            provider,
+                            &identity,
+                            link_user_id,
+                            &sign_in.challenge,
+                        )
+                        .await
+                    }
+                    None => {
+                        sign_in_code(
+                            &state,
+                            provider,
+                            &identity,
+                            sign_in.invite.as_deref(),
+                            &sign_in.challenge,
+                        )
+                        .await
+                    }
+                };
+                // The state is used up and the app's address is known: a failure goes back there
+                // too, so the app is not left waiting.
+                ended.unwrap_or_else(|err| {
+                    match &err {
+                        ApiError::Internal(e) => tracing::error!("a browser sign-in failed: {e:#}"),
+                        other => tracing::error!(
+                            status = other.status().as_u16(),
+                            "a browser sign-in failed: {}",
+                            other.detail()
+                        ),
+                    }
+                    Back::error("server_error")
+                })
+            }
         },
     };
     if let Back::Error(error) = &outcome {
         tracing::info!(
             provider = provider.name(),
-            error = error.as_str(),
+            error = *error,
             "a browser sign-in ended without a code"
         );
     }
@@ -651,7 +696,7 @@ async fn sign_in_once(
 ) -> Result<Attempt, ApiError> {
     let now = state.clock.now();
     let email = verified_email(identity);
-    let done = |code: &str| Ok(Attempt::Done(Back::error(code)));
+    let done = |code: &'static str| Ok(Attempt::Done(Back::error(code)));
 
     // Before the transaction: the seat hook, when this sign-in would create an account with an
     // invite (never asked while the transaction holds the writer). Checked again inside.
@@ -689,56 +734,21 @@ async fn sign_in_once(
             };
             match tx.user_by_email(&email).await? {
                 None => {
-                    // Counted in the transaction: two first sign-ins at once cannot both be admin.
-                    let mode = registration_for(tx.user_count().await?, &state.settings);
-                    let invite = find_invite_by_hash(&mut *tx, invite_hash, &email, now).await?;
-                    if mode == Registration::Invite && invite.is_none() {
-                        return done("invite_required");
-                    }
-                    let first = mode == Registration::FirstUser;
-                    let name: String = match identity.name.trim() {
-                        "" => email.split('@').next().unwrap_or_default(),
-                        name => name,
-                    }
-                    .chars()
-                    .take(NAME_MAX)
-                    .collect();
-                    let user = User {
-                        id: new_id(),
+                    let new = NewAccount {
                         email,
-                        name,
-                        password_hash: None,
-                        is_server_admin: first,
-                        disabled: false,
-                        // The provider vouches for the address.
-                        email_verified: true,
-                        created_at: now,
-                        deleted_at: None,
+                        invite_hash,
+                        approval: approval.as_ref(),
+                        attempt,
+                        now,
                     };
-                    tx.insert_user(&user).await?;
-                    let accepted = match &invite {
-                        None => None,
-                        Some(invite) => {
-                            match accept_invite(&mut *tx, invite, approval.as_ref(), &user.id, now)
-                                .await
-                            {
-                                Ok(accepted) => Some(accepted),
-                                // The members changed since the seat check: ask again.
-                                Err(ApiError::Conflict(_)) if attempt < SEAT_ATTEMPTS => {
-                                    return Ok(Attempt::Again);
-                                }
-                                Err(
-                                    ApiError::Conflict(_)
-                                    | ApiError::NotFound(_)
-                                    | ApiError::PaymentRequired(_),
-                                ) => return done("not_allowed"),
-                                Err(e) => return Err(e),
-                            }
+                    match create_account(&mut *tx, state, provider, identity, new).await? {
+                        Ok((user, first, accepted)) => {
+                            created = Some((first, accepted));
+                            Some(user)
                         }
-                    };
-                    created = Some((first, accepted));
-                    attach(&mut *tx, provider, identity, &user.id).await?;
-                    Some(user)
+                        // (Returning drops the transaction: nothing above is kept.)
+                        Err(stop) => return Ok(stop),
+                    }
                 }
                 // Nobody ever confirmed that whoever made this account owns the address: joining
                 // it now could hand this person's sign-in to a stranger.
@@ -805,6 +815,85 @@ async fn sign_in_once(
     Ok(Attempt::Done(Back::Code(value)))
 }
 
+/// What [`create_account`] needs besides the identity.
+struct NewAccount<'a> {
+    /// The provider's verified address, cleaned; no account has it.
+    email: String,
+    /// The hash of the invite the sign-in carries.
+    invite_hash: Option<&'a str>,
+    /// What the seat hook approved before the transaction.
+    approval: Option<&'a Approval>,
+    /// Which try of [`sign_in_code`] this is.
+    attempt: usize,
+    now: f64,
+}
+
+/// Creates the account a first sign-in through a provider makes, with the identity attached and
+/// the invite (if any) accepted, in `tx`; does not commit. Answers the account, whether it is the
+/// server's first (its admin), and what accepting the invite did. `Err(attempt)` when the sign-in
+/// ends here instead (`invite_required`, `not_allowed`) or is to be tried again (the members
+/// changed since the seat check): the caller then drops `tx`, which undoes everything written in
+/// it.
+async fn create_account(
+    tx: &mut dyn Tx,
+    state: &AppState,
+    provider: Provider,
+    identity: &Identity,
+    new: NewAccount<'_>,
+) -> Result<Result<(User, bool, Option<Accepted>), Attempt>, ApiError> {
+    let stop = |code: &'static str| Ok(Err(Attempt::Done(Back::error(code))));
+    let NewAccount {
+        email,
+        invite_hash,
+        approval,
+        attempt,
+        now,
+    } = new;
+    // Counted in the transaction: two first sign-ins at once cannot both be admin.
+    let mode = registration_for(tx.user_count().await?, &state.settings);
+    let invite = find_invite_by_hash(&mut *tx, invite_hash, &email, now).await?;
+    if mode == Registration::Invite && invite.is_none() {
+        return stop("invite_required");
+    }
+    let first = mode == Registration::FirstUser;
+    let name: String = match identity.name.trim() {
+        "" => email.split('@').next().unwrap_or_default(),
+        name => name,
+    }
+    .chars()
+    .take(NAME_MAX)
+    .collect();
+    let user = User {
+        id: new_id(),
+        email,
+        name,
+        password_hash: None,
+        is_server_admin: first,
+        disabled: false,
+        // The provider vouches for the address.
+        email_verified: true,
+        created_at: now,
+        deleted_at: None,
+    };
+    tx.insert_user(&user).await?;
+    let accepted = match &invite {
+        None => None,
+        Some(invite) => match accept_invite(&mut *tx, invite, approval, &user.id, now).await {
+            Ok(accepted) => Some(accepted),
+            // The members changed since the seat check: ask again.
+            Err(ApiError::Conflict(_)) if attempt < SEAT_ATTEMPTS => {
+                return Ok(Err(Attempt::Again));
+            }
+            Err(ApiError::Conflict(_) | ApiError::NotFound(_) | ApiError::PaymentRequired(_)) => {
+                return stop("not_allowed");
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    attach(&mut *tx, provider, identity, &user.id).await?;
+    Ok(Ok((user, first, accepted)))
+}
+
 /// Attaches the identity to the account. Does not commit.
 async fn attach(
     tx: &mut dyn Tx,
@@ -835,12 +924,9 @@ struct ExchangeIn {
 /// [`LINK_CODE`] for a code from a link (used up); 403 for a disabled account (used up).
 async fn exchange(
     State(state): State<AppState>,
-    Extension(limits): Extension<Arc<Limits>>,
-    ClientAddr(ip): ClientAddr,
     ApiJson(body): ApiJson<ExchangeIn>,
 ) -> Result<Json<Value>, ApiError> {
     let now = state.clock.now();
-    limited(&limits.exchange, &ip, now)?;
     max_len("code", &body.code, TOKEN_MAX)?;
     check_verifier(&body.code_verifier)?;
     let mut tx = state.store.begin().await?;
@@ -900,13 +986,10 @@ struct LinkFinishIn {
 /// for that very address.
 async fn link_finish(
     State(state): State<AppState>,
-    Extension(limits): Extension<Arc<Limits>>,
-    ClientAddr(ip): ClientAddr,
     current: CurrentUser,
     ApiJson(body): ApiJson<LinkFinishIn>,
 ) -> Result<Json<Value>, ApiError> {
     let now = state.clock.now();
-    limited(&limits.exchange, &ip, now)?;
     max_len("code", &body.code, TOKEN_MAX)?;
     check_verifier(&body.code_verifier)?;
     let mut tx = state.store.begin().await?;
@@ -1103,8 +1186,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_errors_are_passed_through_only_when_they_look_like_error_codes() {
+    fn provider_errors_are_passed_through_only_when_they_are_rfc_6749_codes() {
         assert_eq!(provider_error("access_denied"), "cancelled");
+        for code in PROVIDER_ERRORS {
+            assert_eq!(provider_error(code), code);
+            assert!(LOOPBACK_ERRORS.contains(&code));
+        }
+        assert_eq!(provider_error("some_other_code"), "provider_refused");
         assert_eq!(
             provider_error("temporarily_unavailable"),
             "temporarily_unavailable"

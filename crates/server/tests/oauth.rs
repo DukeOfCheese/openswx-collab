@@ -928,32 +928,7 @@ async fn every_error_code_reaches_the_loopback_address() {
         .await,
         1
     );
-    // identity_in_use: adding Ada's Google identity to another account
-    let (s, body) = server
-        .post(
-            "/api/auth/oauth/google/link",
-            Some(&ada),
-            json!({"redirect_uri": REDIRECT, "code_challenge": c}),
-        )
-        .await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    server
-        .providers
-        .answer("someone", "ada", "ada@example.com", true);
-    server
-        .sql(&format!(
-            "UPDATE oauth_states SET link_user_id = '{}'",
-            "p".repeat(32)
-        ))
-        .await;
-    let state = query(body["url"].as_str().unwrap())["state"][0].clone();
-    let r = callback(
-        &server,
-        "google",
-        &[("code", "someone"), ("state", state.as_str())],
-    )
-    .await;
-    assert_eq!(error(&query(&location(&r))), "identity_in_use");
+    // (identity_in_use: test_oauth_does_not_join_an_account_nobody_verified, through the API)
     // account_disabled: a disabled account with a provider identity cannot sign in
     let (back, _) = oauth(&server, "google", "ada", None).await; // (a code from before)
     server
@@ -1160,27 +1135,235 @@ async fn a_hanging_provider_is_unreachable_in_time_and_holds_no_writer() {
 }
 
 #[tokio::test]
-async fn start_and_exchange_are_limited_per_client() {
+async fn start_is_limited_per_client_and_exchange_is_not() {
     let server = TestServer::start_with(google).await;
+    server.providers.person("ada", "ada@example.com");
+    // Codes are 256 bits and used once: junk exchanges and finishes block nobody.
+    let junk = json!({"code": "guess", "code_verifier": VERIFIER});
+    for _ in 0..100 {
+        let (s, _) = server.post("/api/auth/exchange", None, junk.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+    let (token, _) = sign_in(&server, "google", "ada").await;
+    for _ in 0..100 {
+        let (s, _) = server
+            .post("/api/auth/oauth/link/finish", Some(&token), junk.clone())
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+    // start and link share 600 per ten minutes per client address (one was the sign-in above)
     let c = challenge(VERIFIER);
     let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
-    for _ in 0..60 {
+    for _ in 0..598 {
         assert_eq!(
             start(&server, "google", &params).await.status(),
             StatusCode::FOUND
         );
     }
+    let link = json!({"redirect_uri": REDIRECT, "code_challenge": c});
+    let (s, _) = server
+        .post("/api/auth/oauth/google/link", Some(&token), link.clone())
+        .await;
+    assert_eq!(s, StatusCode::OK);
     assert_eq!(
         start(&server, "google", &params).await.status(),
         StatusCode::TOO_MANY_REQUESTS
     );
-    let body = json!({"code": "guess", "code_verifier": VERIFIER});
-    for _ in 0..60 {
-        let (s, _) = server.post("/api/auth/exchange", None, body.clone()).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-    }
-    let (s, _) = server.post("/api/auth/exchange", None, body).await;
+    let (s, _) = server
+        .post("/api/auth/oauth/google/link", Some(&token), link)
+        .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    // exchanges still go through
+    let (s, _) = server.post("/api/auth/exchange", None, junk).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_store_error_after_the_state_is_taken_still_goes_back_to_the_app() {
+    let server = TestServer::start_with(|s| {
+        google(s);
+        s.open_registration = true;
+    })
+    .await;
+    server.providers.person("ada", "ada@example.com");
+    let (admin, _) = server.register("bob@example.com").await;
+    server
+        .sql(
+            "CREATE TRIGGER no_codes BEFORE INSERT ON login_codes \
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+        )
+        .await;
+    // a sign-in
+    let (back, _) = oauth(&server, "google", "ada", None).await;
+    assert_eq!(error(&back), "server_error");
+    // ... rolled back: no account was made
+    assert_eq!(
+        count(
+            &server,
+            "SELECT COUNT(*) FROM users WHERE email = 'ada@example.com'"
+        )
+        .await,
+        0
+    );
+    // a link
+    let (s, body) = server
+        .post(
+            "/api/auth/oauth/google/link",
+            Some(&admin),
+            json!({"redirect_uri": REDIRECT, "code_challenge": challenge(VERIFIER),
+                "current_password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let state = query(body["url"].as_str().unwrap())["state"][0].clone();
+    let r = callback(
+        &server,
+        "google",
+        &[("code", "ada"), ("state", state.as_str())],
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::FOUND);
+    assert_eq!(error(&query(&location(&r))), "server_error");
+}
+
+#[tokio::test]
+async fn hostile_finish_and_unlink_bodies_are_refused() {
+    let server = TestServer::start_with(google).await;
+    server.providers.person("ada", "ada@example.com");
+    let (token, _) = sign_in(&server, "google", "ada").await;
+    for body in [
+        json!({"code": "x", "code_verifier": "v".repeat(42)}),
+        json!({"code": "x", "code_verifier": "v".repeat(201)}),
+        json!({"code": "x".repeat(300), "code_verifier": VERIFIER}),
+        json!({"code": 5, "code_verifier": VERIFIER}),
+        json!({"code": "x", "code_verifier": ["v"]}),
+        json!({"code_verifier": VERIFIER}),
+        json!({"code": "x"}),
+    ] {
+        let (s, _) = server
+            .post("/api/auth/oauth/link/finish", Some(&token), body.clone())
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+    for body in [
+        json!({"current_password": "p".repeat(1025)}),
+        json!({"current_password": 5}),
+        json!({"current_password": {"a": 1}}),
+    ] {
+        let (s, _) = server
+            .post(
+                "/api/me/providers/google/unlink",
+                Some(&token),
+                body.clone(),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+    // a provider the account does not have
+    let (s, body) = server
+        .post("/api/me/providers/github/unlink", Some(&token), json!({}))
+        .await;
+    assert_eq!(
+        (s, &body["detail"]),
+        (StatusCode::NOT_FOUND, &json!("not linked"))
+    );
+    assert_eq!(
+        server.get("/api/me/providers", Some(&token)).await.1["providers"],
+        json!(["google"])
+    );
+}
+
+#[tokio::test]
+async fn a_link_whose_account_was_disabled_meanwhile_is_account_disabled() {
+    let server = TestServer::start_with(google).await;
+    server.providers.person("zed", "zed@example.com");
+    let (admin, admin_id) = server.register("ada@example.com").await;
+    let (s, body) = server
+        .post(
+            "/api/auth/oauth/google/link",
+            Some(&admin),
+            json!({"redirect_uri": REDIRECT, "code_challenge": challenge(VERIFIER),
+                "current_password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    server
+        .sql(&format!(
+            "UPDATE users SET disabled = TRUE WHERE id = '{admin_id}'"
+        ))
+        .await;
+    let state = query(body["url"].as_str().unwrap())["state"][0].clone();
+    let r = callback(
+        &server,
+        "google",
+        &[("code", "zed"), ("state", state.as_str())],
+    )
+    .await;
+    assert_eq!(error(&query(&location(&r))), "account_disabled");
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM login_codes").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_callbacks_with_one_state_at_once_proceed_once() {
+    let server = TestServer::start_with(google).await;
+    server.providers.person("ada", "ada@example.com");
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    for round in 0..10 {
+        let r = start(&server, "google", &params).await;
+        let state = query(&location(&r))["state"][0].clone();
+        let back = [("code", "ada"), ("state", state.as_str())];
+        let (a, b) = tokio::join!(
+            callback(&server, "google", &back),
+            callback(&server, "google", &back)
+        );
+        let mut statuses = [a.status(), b.status()];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::FOUND, StatusCode::BAD_REQUEST],
+            "round {round}"
+        );
+    }
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM users").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_sign_ins_at_once_make_one_admin() {
+    let server = TestServer::start_with(google).await;
+    server.providers.person("ada", "ada@example.com");
+    server.providers.person("bob", "bob@example.com");
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    let mut states = Vec::new();
+    for _ in 0..2 {
+        let r = start(&server, "google", &params).await;
+        states.push(query(&location(&r))["state"][0].clone());
+    }
+    let ada = [("code", "ada"), ("state", states[0].as_str())];
+    let bob = [("code", "bob"), ("state", states[1].as_str())];
+    let (a, b) = tokio::join!(
+        callback(&server, "google", &ada),
+        callback(&server, "google", &bob)
+    );
+    let mut outcomes: Vec<String> = [a, b]
+        .iter()
+        .map(|r| {
+            let back = query(&location(r));
+            if back.contains_key("code") {
+                "code".to_owned()
+            } else {
+                error(&back).to_owned()
+            }
+        })
+        .collect();
+    outcomes.sort();
+    assert_eq!(outcomes, ["code", "invite_required"]);
+    assert_eq!(
+        count(&server, "SELECT COUNT(*) FROM users WHERE is_server_admin").await,
+        1
+    );
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM users").await, 1);
 }
 
 #[tokio::test]
