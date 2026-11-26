@@ -200,6 +200,16 @@ pub enum Event {
         folder: Id,
         by: Id,
     },
+    /// An account was deleted by its owner: emptied, signed out everywhere and taken out of its
+    /// organisations (a [`Event::MemberRemoved`] for each comes first).
+    AccountDeleted { user: Id },
+    /// An account's owner began downloading what the server holds about them.
+    AccountExported { user: Id },
+    /// An organisation was deleted with everything in it.
+    OrgDeleted { org: Id, by: Id },
+    /// An owner began downloading an organisation's export (which may not have been read to its
+    /// end).
+    OrgExported { org: Id, by: Id },
 }
 
 /// What an organisation is about to have one more of ([`Extensions::quota`]).

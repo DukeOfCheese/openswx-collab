@@ -572,6 +572,27 @@ pub struct RoomLease {
     pub expires_at: f64,
 }
 
+/// One of an account's organisations, as its own export lists it ([`Store::user_memberships`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Membership {
+    pub id: Id,
+    pub name: String,
+    /// The account's role in it.
+    pub role: String,
+    /// When the account joined.
+    pub since: f64,
+}
+
+/// A change as its author's own export lists it ([`Store::changes_by_author`]): where and when,
+/// never what.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct AuthoredChange {
+    pub document_id: Id,
+    pub seq: i64,
+    pub created_at: f64,
+    pub command: String,
+}
+
 /// The database. One method per query; see the module documentation for how to add one.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
@@ -793,6 +814,35 @@ pub trait Store: Send + Sync + 'static {
 
     /// The components pinned to a state of a part before `seq`, by assembly then component.
     async fn pinned_before(&self, part_id: &str, seq: i64) -> anyhow::Result<Vec<PinnedComponent>>;
+
+    /// An account's organisations with its role and when it joined, by name then id.
+    async fn user_memberships(&self, user_id: &str) -> anyhow::Result<Vec<Membership>>;
+
+    /// The projects an account has a role row in (in any organisation), with that role, by name
+    /// then id.
+    async fn user_project_roles(&self, user_id: &str) -> anyhow::Result<Vec<ProjectWithRole>>;
+
+    /// An account's sessions, expired ones included, oldest first.
+    async fn user_sessions(&self, user_id: &str) -> anyhow::Result<Vec<Session>>;
+
+    /// The changes an account made, by document then seq, after `(after_document, after_seq)`
+    /// (`("", 0)` for the first page), at most `limit`.
+    async fn changes_by_author(
+        &self,
+        user_id: &str,
+        after_document: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<AuthoredChange>>;
+
+    /// The versions an account named, by id, after the id `after` (`""` for the first page), at
+    /// most `limit`.
+    async fn versions_by_author(
+        &self,
+        user_id: &str,
+        after: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Version>>;
 }
 
 /// A write transaction (or a savepoint within one). Dropping it without [`Tx::commit`] rolls it
@@ -1134,4 +1184,38 @@ pub trait Tx: Send {
         node_id: &str,
         expires_at: f64,
     ) -> anyhow::Result<Option<i64>>;
+
+    /// The organisations an account owns that have no other owner, by name then id.
+    async fn orgs_owned_alone(&mut self, user_id: &str) -> anyhow::Result<Vec<Org>>;
+
+    /// How many server admins are not disabled.
+    async fn active_admin_count(&mut self) -> anyhow::Result<u64>;
+
+    /// How many accounts other than `user_id` are not disabled.
+    async fn other_active_user_count(&mut self, user_id: &str) -> anyhow::Result<u64>;
+
+    /// The organisations an account is a member of, by id.
+    async fn user_org_ids(&mut self, user_id: &str) -> anyhow::Result<Vec<Id>>;
+
+    /// Empties an account (it is not removed: history refers to it): its sessions, sign-in
+    /// providers, login codes, password resets, memberships and project roles go; its address
+    /// becomes `email` and its name `name`; it has no password, is no admin, is not verified, is
+    /// disabled, and is deleted at `now`.
+    async fn erase_user(
+        &mut self,
+        id: &str,
+        email: &str,
+        name: &str,
+        now: f64,
+    ) -> anyhow::Result<()>;
+
+    /// The ids of every document of an organisation, deleted ones included, by id.
+    async fn org_document_ids(&mut self, org_id: &str) -> anyhow::Result<Vec<Id>>;
+
+    /// The accounts that are members of an organisation, by id.
+    async fn org_member_ids(&mut self, org_id: &str) -> anyhow::Result<Vec<Id>>;
+
+    /// Deletes an organisation; the database removes its members, invites and projects with it
+    /// (and with those what [`Tx::delete_project`] removes).
+    async fn delete_org(&mut self, id: &str) -> anyhow::Result<()>;
 }

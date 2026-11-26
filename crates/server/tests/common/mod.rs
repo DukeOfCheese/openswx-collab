@@ -21,11 +21,11 @@ use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    AssemblyRefRow, AssemblyUse, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder,
-    HistoryRow, Id, Invite, LoginCode, Member, NewChange, OAuthIdentity, OAuthState, Org,
-    OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project, ProjectMember,
-    ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx,
-    UndoTarget, User, Version, VersionWithAuthor,
+    AssemblyRefRow, AssemblyUse, AuthoredChange, ChangeEventRow, ChangeRow, ChangeSize, Document,
+    Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange, OAuthIdentity,
+    OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project,
+    ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore,
+    Store, Tx, UndoTarget, User, Version, VersionWithAuthor,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -1106,6 +1106,39 @@ impl Store for FlakyStore {
     async fn refs_to_part(&self, part_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>> {
         self.inner().refs_to_part(part_id).await
     }
+
+    async fn user_memberships(&self, user_id: &str) -> anyhow::Result<Vec<Membership>> {
+        self.inner().user_memberships(user_id).await
+    }
+
+    async fn user_project_roles(&self, user_id: &str) -> anyhow::Result<Vec<ProjectWithRole>> {
+        self.inner().user_project_roles(user_id).await
+    }
+
+    async fn user_sessions(&self, user_id: &str) -> anyhow::Result<Vec<Session>> {
+        self.inner().user_sessions(user_id).await
+    }
+
+    async fn changes_by_author(
+        &self,
+        user_id: &str,
+        after_document: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<AuthoredChange>> {
+        self.inner()
+            .changes_by_author(user_id, after_document, after_seq, limit)
+            .await
+    }
+
+    async fn versions_by_author(
+        &self,
+        user_id: &str,
+        after: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Version>> {
+        self.inner().versions_by_author(user_id, after, limit).await
+    }
 }
 
 /// [`FlakyStore`]'s transaction (or a savepoint in one). Every [`Tx`] method delegates; add yours
@@ -1635,6 +1668,44 @@ impl Tx for FlakyTx<'_> {
         self.inner
             .take_room_lease(document_id, node_id, expires_at)
             .await
+    }
+
+    async fn orgs_owned_alone(&mut self, user_id: &str) -> anyhow::Result<Vec<Org>> {
+        self.inner.orgs_owned_alone(user_id).await
+    }
+
+    async fn active_admin_count(&mut self) -> anyhow::Result<u64> {
+        self.inner.active_admin_count().await
+    }
+
+    async fn other_active_user_count(&mut self, user_id: &str) -> anyhow::Result<u64> {
+        self.inner.other_active_user_count(user_id).await
+    }
+
+    async fn user_org_ids(&mut self, user_id: &str) -> anyhow::Result<Vec<Id>> {
+        self.inner.user_org_ids(user_id).await
+    }
+
+    async fn erase_user(
+        &mut self,
+        id: &str,
+        email: &str,
+        name: &str,
+        now: f64,
+    ) -> anyhow::Result<()> {
+        self.inner.erase_user(id, email, name, now).await
+    }
+
+    async fn org_document_ids(&mut self, org_id: &str) -> anyhow::Result<Vec<Id>> {
+        self.inner.org_document_ids(org_id).await
+    }
+
+    async fn org_member_ids(&mut self, org_id: &str) -> anyhow::Result<Vec<Id>> {
+        self.inner.org_member_ids(org_id).await
+    }
+
+    async fn delete_org(&mut self, id: &str) -> anyhow::Result<()> {
+        self.inner.delete_org(id).await
     }
 }
 

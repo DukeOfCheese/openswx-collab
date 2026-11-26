@@ -42,6 +42,8 @@ pub enum ApiError {
     TooLarge,
     /// 429 `too many attempts; try again in a few minutes`.
     RateLimited,
+    /// 429 with the message: the server is doing as much of this as it does at once.
+    Busy(&'static str),
     /// 501 with the message.
     NotImplemented(String),
     /// 500 `server error`; the error itself goes to the log only.
@@ -60,7 +62,7 @@ impl ApiError {
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimited | Self::Busy(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -71,7 +73,7 @@ impl ApiError {
         match self {
             Self::Unauthorized => "sign in first",
             Self::WrongCredentials => "wrong email address or password",
-            Self::NotFound(m) | Self::Forbidden(m) => m,
+            Self::NotFound(m) | Self::Forbidden(m) | Self::Busy(m) => m,
             Self::Conflict(m)
             | Self::NotFoundDetail(m)
             | Self::BadRequest(m)

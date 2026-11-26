@@ -49,11 +49,11 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    AssemblyRefRow, AssemblyUse, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder,
-    HistoryRow, Id, Invite, LoginCode, Member, NewChange, OAuthIdentity, OAuthState, Org,
-    OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project, ProjectMember,
-    ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx,
-    UndoTarget, User, Version, VersionWithAuthor, sql,
+    AssemblyRefRow, AssemblyUse, AuthoredChange, ChangeEventRow, ChangeRow, ChangeSize, Document,
+    Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange, OAuthIdentity,
+    OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project,
+    ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow,
+    Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -546,6 +546,38 @@ impl Store for SqliteStore {
     async fn pinned_before(&self, part_id: &str, seq: i64) -> Result<Vec<PinnedComponent>> {
         q::pinned_before(&mut *self.reader().await?, part_id, seq).await
     }
+
+    async fn user_memberships(&self, user_id: &str) -> Result<Vec<Membership>> {
+        q::user_memberships(&mut *self.reader().await?, user_id).await
+    }
+
+    async fn user_project_roles(&self, user_id: &str) -> Result<Vec<ProjectWithRole>> {
+        q::user_project_roles(&mut *self.reader().await?, user_id).await
+    }
+
+    async fn user_sessions(&self, user_id: &str) -> Result<Vec<Session>> {
+        q::user_sessions(&mut *self.reader().await?, user_id).await
+    }
+
+    async fn changes_by_author(
+        &self,
+        user_id: &str,
+        after_document: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<AuthoredChange>> {
+        let mut c = self.reader().await?;
+        q::changes_by_author(&mut c, user_id, after_document, after_seq, limit).await
+    }
+
+    async fn versions_by_author(
+        &self,
+        user_id: &str,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<Version>> {
+        q::versions_by_author(&mut *self.reader().await?, user_id, after, limit).await
+    }
 }
 
 /// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
@@ -974,6 +1006,38 @@ impl Tx for SqliteTx<'_> {
         expires_at: f64,
     ) -> Result<Option<i64>> {
         q::take_room_lease(self.conn(), document_id, node_id, expires_at).await
+    }
+
+    async fn orgs_owned_alone(&mut self, user_id: &str) -> Result<Vec<Org>> {
+        q::orgs_owned_alone(self.conn(), user_id).await
+    }
+
+    async fn active_admin_count(&mut self) -> Result<u64> {
+        q::active_admin_count(self.conn()).await
+    }
+
+    async fn other_active_user_count(&mut self, user_id: &str) -> Result<u64> {
+        q::other_active_user_count(self.conn(), user_id).await
+    }
+
+    async fn user_org_ids(&mut self, user_id: &str) -> Result<Vec<Id>> {
+        q::user_org_ids(self.conn(), user_id).await
+    }
+
+    async fn erase_user(&mut self, id: &str, email: &str, name: &str, now: f64) -> Result<()> {
+        q::erase_user(self.conn(), id, email, name, now).await
+    }
+
+    async fn org_document_ids(&mut self, org_id: &str) -> Result<Vec<Id>> {
+        q::org_document_ids(self.conn(), org_id).await
+    }
+
+    async fn org_member_ids(&mut self, org_id: &str) -> Result<Vec<Id>> {
+        q::org_member_ids(self.conn(), org_id).await
+    }
+
+    async fn delete_org(&mut self, id: &str) -> Result<()> {
+        q::delete_org(self.conn(), id).await
     }
 }
 
@@ -2254,6 +2318,144 @@ mod q {
             .bind(node_id)
             .bind(expires_at)
             .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn orgs_owned_alone(c: &mut SqliteConnection, user_id: &str) -> Result<Vec<Org>> {
+        Ok(sqlx::query_as(sql::ORGS_OWNED_ALONE)
+            .bind(user_id)
+            .bind("owner")
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn active_admin_count(c: &mut SqliteConnection) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(sql::ACTIVE_ADMIN_COUNT)
+            .bind(true)
+            .bind(false)
+            .fetch_one(c)
+            .await?;
+        Ok(u64::try_from(n)?)
+    }
+
+    pub async fn other_active_user_count(c: &mut SqliteConnection, user_id: &str) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(sql::OTHER_ACTIVE_USER_COUNT)
+            .bind(user_id)
+            .bind(false)
+            .fetch_one(c)
+            .await?;
+        Ok(u64::try_from(n)?)
+    }
+
+    pub async fn user_org_ids(c: &mut SqliteConnection, user_id: &str) -> Result<Vec<Id>> {
+        Ok(sqlx::query_scalar(sql::USER_ORG_IDS)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn erase_user(
+        c: &mut SqliteConnection,
+        id: &str,
+        email: &str,
+        name: &str,
+        now: f64,
+    ) -> Result<()> {
+        for statement in [
+            sql::DELETE_USER_SESSIONS,
+            sql::DELETE_ALL_USER_IDENTITIES,
+            sql::DELETE_USER_LOGIN_CODES,
+            sql::DELETE_USER_PASSWORD_RESETS,
+            sql::DELETE_USER_ORG_MEMBERS,
+            sql::DELETE_USER_PROJECT_MEMBERS,
+        ] {
+            sqlx::query(statement).bind(id).execute(&mut *c).await?;
+        }
+        sqlx::query(sql::ERASE_USER)
+            .bind(id)
+            .bind(email)
+            .bind(name)
+            .bind(false)
+            .bind(true)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn org_document_ids(c: &mut SqliteConnection, org_id: &str) -> Result<Vec<Id>> {
+        Ok(sqlx::query_scalar(sql::ORG_DOCUMENT_IDS)
+            .bind(org_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn org_member_ids(c: &mut SqliteConnection, org_id: &str) -> Result<Vec<Id>> {
+        Ok(sqlx::query_scalar(sql::ORG_MEMBER_IDS)
+            .bind(org_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn delete_org(c: &mut SqliteConnection, id: &str) -> Result<()> {
+        sqlx::query(sql::DELETE_ORG).bind(id).execute(c).await?;
+        Ok(())
+    }
+
+    pub async fn user_memberships(
+        c: &mut SqliteConnection,
+        user_id: &str,
+    ) -> Result<Vec<Membership>> {
+        Ok(sqlx::query_as(sql::USER_MEMBERSHIPS)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn user_project_roles(
+        c: &mut SqliteConnection,
+        user_id: &str,
+    ) -> Result<Vec<ProjectWithRole>> {
+        Ok(sqlx::query_as(sql::USER_PROJECT_ROLES)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn user_sessions(c: &mut SqliteConnection, user_id: &str) -> Result<Vec<Session>> {
+        Ok(sqlx::query_as(sql::USER_SESSIONS)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn changes_by_author(
+        c: &mut SqliteConnection,
+        user_id: &str,
+        after_document: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<AuthoredChange>> {
+        Ok(sqlx::query_as(sql::CHANGES_BY_AUTHOR)
+            .bind(user_id)
+            .bind(after_document)
+            .bind(after_seq)
+            .bind(limit)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn versions_by_author(
+        c: &mut SqliteConnection,
+        user_id: &str,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<Version>> {
+        Ok(sqlx::query_as(sql::VERSIONS_BY_AUTHOR)
+            .bind(user_id)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(c)
             .await?)
     }
 }

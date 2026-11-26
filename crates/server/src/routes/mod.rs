@@ -20,6 +20,7 @@ pub mod blobs;
 pub mod documents;
 pub mod folders;
 pub mod history;
+pub mod lifecycle;
 pub mod meta;
 pub mod oauth;
 pub mod orgs;
@@ -62,6 +63,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(documents::router())
         .merge(folders::router())
         .merge(history::router())
+        .merge(lifecycle::router())
         .merge(assemblies::router())
         .merge(crate::ws::router());
 

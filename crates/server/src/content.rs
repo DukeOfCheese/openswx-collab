@@ -121,6 +121,22 @@ fn collect_refs(v: &Value, out: &mut BTreeSet<String>) {
     }
 }
 
+/// The blob references in the values a change's operations carry (what it sets and what it
+/// inserts), as [`blob_refs`] finds them.
+pub fn ops_blob_refs(ops: &[oswx_core::Op]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for op in ops {
+        match op {
+            oswx_core::Op::Set { value, .. } => collect_refs(value, &mut out),
+            oswx_core::Op::Insert { item, .. } => collect_refs(item, &mut out),
+            oswx_core::Op::Unset { .. }
+            | oswx_core::Op::Remove { .. }
+            | oswx_core::Op::Move { .. } => {}
+        }
+    }
+    out
+}
+
 /// The content with the [`LOCAL_ONLY`] keys removed from its top level (`v` is a map; anything
 /// else is returned as it is).
 pub fn without_local_keys(v: Value) -> Value {
@@ -231,6 +247,28 @@ mod tests {
         }));
         let got: Vec<String> = blob_refs(&v).into_iter().collect();
         assert_eq!(got, vec![a, "deep".to_owned(), "short".to_owned()]);
+    }
+
+    #[test]
+    fn blob_references_are_found_in_what_operations_set_and_insert() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let path = |segments: &[&str]| -> oswx_core::Path {
+            segments.iter().map(|s| (*s).into()).collect()
+        };
+        let ops = [
+            oswx_core::Op::Set {
+                path: path(&["x"]),
+                value: value(json!({"deep": [{"$blob": a, "len": 1}]})),
+            },
+            oswx_core::Op::Insert {
+                list: path(&["features"]),
+                item: value(json!({"id": "f9", "body": {"$blob": b}})),
+                pos: oswx_core::Pos::between(None, None),
+            },
+            oswx_core::Op::Unset { path: path(&["y"]) },
+        ];
+        let got: Vec<String> = ops_blob_refs(&ops).into_iter().collect();
+        assert_eq!(got, vec![a, b]);
     }
 
     #[test]

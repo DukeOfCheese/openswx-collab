@@ -530,3 +530,72 @@ pub const LOCK_ROOM_LEASE: &str =
 /// [`super::Tx::take_room_lease`]: the next epoch, for `$2` until `$3`.
 pub const TAKE_ROOM_LEASE: &str = "UPDATE room_leases SET node_id = $2, epoch = epoch + 1, \
      expires_at = $3 WHERE document_id = $1 RETURNING epoch";
+
+// ------------------------------------------------------------------ leaving
+
+/// [`super::Tx::orgs_owned_alone`] (bind the account, then `"owner"`).
+pub const ORGS_OWNED_ALONE: &str = "SELECT o.id, o.name, o.created_at FROM orgs o \
+     JOIN org_members m ON m.org_id = o.id \
+     WHERE m.user_id = $1 AND m.role = $2 \
+     AND (SELECT COUNT(*) FROM org_members w WHERE w.org_id = o.id AND w.role = $2) <= 1 \
+     ORDER BY o.name, o.id";
+
+/// [`super::Tx::active_admin_count`] (bind `true`, `false`).
+pub const ACTIVE_ADMIN_COUNT: &str =
+    "SELECT COUNT(*) FROM users WHERE is_server_admin = $1 AND disabled = $2";
+
+/// [`super::Tx::other_active_user_count`] (bind the account, then `false`).
+pub const OTHER_ACTIVE_USER_COUNT: &str =
+    "SELECT COUNT(*) FROM users WHERE disabled = $2 AND id <> $1";
+
+/// [`super::Tx::user_org_ids`].
+pub const USER_ORG_IDS: &str = "SELECT org_id FROM org_members WHERE user_id = $1 ORDER BY org_id";
+
+/// [`super::Tx::erase_user`]: the account's sign-in providers ...
+pub const DELETE_ALL_USER_IDENTITIES: &str = "DELETE FROM oauth_identities WHERE user_id = $1";
+
+/// ... its unused login codes ...
+pub const DELETE_USER_LOGIN_CODES: &str = "DELETE FROM login_codes WHERE user_id = $1";
+
+/// ... its memberships ...
+pub const DELETE_USER_ORG_MEMBERS: &str = "DELETE FROM org_members WHERE user_id = $1";
+
+/// ... its project roles ...
+pub const DELETE_USER_PROJECT_MEMBERS: &str = "DELETE FROM project_members WHERE user_id = $1";
+
+/// ... and the row itself, emptied (bind the id, the new address, the new name, `false`, `true`,
+/// the time).
+pub const ERASE_USER: &str = "UPDATE users SET email = $2, name = $3, password_hash = NULL, \
+     email_verified = $4, is_server_admin = $4, disabled = $5, deleted_at = $6 WHERE id = $1";
+
+/// [`super::Tx::org_document_ids`]: deleted documents included.
+pub const ORG_DOCUMENT_IDS: &str = "SELECT d.id FROM documents d \
+     JOIN projects p ON p.id = d.project_id WHERE p.org_id = $1 ORDER BY d.id";
+
+/// [`super::Tx::org_member_ids`].
+pub const ORG_MEMBER_IDS: &str =
+    "SELECT user_id FROM org_members WHERE org_id = $1 ORDER BY user_id";
+
+/// [`super::Tx::delete_org`].
+pub const DELETE_ORG: &str = "DELETE FROM orgs WHERE id = $1";
+
+/// [`super::Store::user_memberships`].
+pub const USER_MEMBERSHIPS: &str = "SELECT o.id, o.name, m.role, m.created_at AS since \
+     FROM orgs o JOIN org_members m ON m.org_id = o.id WHERE m.user_id = $1 ORDER BY o.name, o.id";
+
+/// [`super::Store::user_project_roles`].
+pub const USER_PROJECT_ROLES: &str = "SELECT p.id, p.name, p.org_id, pm.role FROM projects p \
+     JOIN project_members pm ON pm.project_id = p.id WHERE pm.user_id = $1 ORDER BY p.name, p.id";
+
+/// [`super::Store::user_sessions`].
+pub const USER_SESSIONS: &str = "SELECT token_hash, user_id, created_at, expires_at, label \
+     FROM sessions WHERE user_id = $1 ORDER BY created_at, token_hash";
+
+/// [`super::Store::changes_by_author`]: in the order of the journal's primary key, from just after
+/// `(document, seq)`, so that reading every page walks the journal once.
+pub const CHANGES_BY_AUTHOR: &str = "SELECT document_id, seq, created_at, command FROM changes \
+     WHERE author_id = $1 AND (document_id, seq) > ($2, $3) ORDER BY document_id, seq LIMIT $4";
+
+/// [`super::Store::versions_by_author`]: by id, from just after `$2`.
+pub const VERSIONS_BY_AUTHOR: &str = "SELECT id, document_id, seq, name, note, author_id, \
+     created_at FROM versions WHERE author_id = $1 AND id > $2 ORDER BY id LIMIT $3";

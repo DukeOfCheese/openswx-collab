@@ -160,13 +160,28 @@ struct HistoryQuery {
 
 /// One history entry.
 fn history_entry(doc: &str, row: HistoryRow) -> serde_json::Value {
-    let ops = match decode_ops(&row.ops) {
-        Ok(ops) => ops_json(&ops),
+    let ops = stored_ops(doc, &row);
+    history_entry_of(row, ops.as_deref())
+}
+
+/// The operations a journal row stores; `None` (logged) when they cannot be read.
+pub(crate) fn stored_ops(doc: &str, row: &HistoryRow) -> Option<Vec<oswx_core::Op>> {
+    match decode_ops(&row.ops) {
+        Ok(ops) => Some(ops),
         Err(e) => {
             tracing::error!("change {} of document {doc} is damaged: {e}", row.seq);
-            serde_json::Value::Null
+            None
         }
-    };
+    }
+}
+
+/// One history entry, from a row and its operations ([`stored_ops`]; `null` for none). The
+/// organisation export writes the same shape, one a line.
+pub(crate) fn history_entry_of(
+    row: HistoryRow,
+    ops: Option<&[oswx_core::Op]>,
+) -> serde_json::Value {
+    let ops = ops.map_or(serde_json::Value::Null, ops_json);
     let broke = row
         .broke
         .as_deref()

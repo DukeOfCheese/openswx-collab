@@ -10,6 +10,8 @@ license = "Apache-2.0"
 anyhow = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-trait = "0.1"
+# The Astral fork of async_zip: its streamed entries end with a correct ZIP64 data descriptor.
+async_zip = { package = "astral_async_zip", version = "0.0.24", default-features = false, features = ["deflate-write", "tokio"] }
 base64 = "0.22"
 axum = { version = "0.8", features = ["ws", "macros"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -41,6 +43,7 @@ tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 zstd = "0.14"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "migrate", "macros", "derive"] }
 
@@ -63,4 +66,11 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.zstd-sys]
+opt-level = 3
+
+# An organisation export deflates every blob (and its tests inflate them again).
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
 opt-level = 3

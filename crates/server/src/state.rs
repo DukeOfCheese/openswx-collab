@@ -16,6 +16,7 @@ use crate::hub::Hub;
 use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
+use crate::routes::lifecycle::Exports;
 use crate::sessions::Sessions;
 use crate::store::{SqliteStore, Store, Tx, new_id};
 
@@ -41,6 +42,8 @@ pub struct AppState {
     pub room_hooks: Arc<crate::room::Hooks>,
     /// The steps after REST commits still running ([`AppState::after_commit`]).
     pub after_commits: Arc<InFlight>,
+    /// How many exports run at once, and how patient they are ([`Exports`]).
+    pub exports: Arc<Exports>,
 }
 
 /// What the revoking steps of [`AppState::commit_then`] know of the commit.
@@ -136,6 +139,7 @@ impl AppState {
             oauth: Arc::new(NoProviders),
             room_hooks: Arc::default(),
             after_commits: Arc::default(),
+            exports: Arc::default(),
         }
     }
 
@@ -168,6 +172,10 @@ impl AppState {
     /// | ends one session (sign-out) | `sessions.forget_token`, then [`Hub::drop_session`] |
     /// | changes or removes a role in an organisation or one of its projects (member role, member removal, project member set or removed) | [`Hub::drop_user`] for that user and organisation |
     /// | deletes a document, or a project or organisation with its documents | [`Hub::close_document`] for each document |
+    ///
+    /// Files in storage that a commit orphans (an organisation's blobs and snapshots) are removed
+    /// among the `announcing` steps, never the `revoking` ones: only a commit known to have taken
+    /// effect may remove them.
     ///
     /// # Panics
     ///
