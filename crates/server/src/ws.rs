@@ -62,6 +62,12 @@ const RECENT_IDS: i64 = 1000;
 const SETTLE_TRIES: usize = 3;
 /// The longest close reason sent.
 const MAX_REASON: usize = 120;
+/// How much a connection reads from its socket at once, and what its read buffer holds when no
+/// frame larger than that is coming in. The WebSocket layer's default, 128 KiB, is allocated and
+/// filled with zeros for every connection at its first read: with it an idle connection cost the
+/// server about 170 KB, with this about 25 KB (`bench/results/README.md`). Messages here are
+/// mostly far smaller; a larger frame grows the buffer while it is read.
+const READ_BUFFER: usize = 8 * 1024;
 
 /// The largest frame a client may send: `max_change_bytes` plus room for the envelope.
 pub fn frame_limit(settings: &crate::Settings) -> usize {
@@ -81,6 +87,7 @@ async fn document_ws(
     upgrade
         .max_message_size(conn::read_limit(max))
         .max_frame_size(conn::read_limit(max))
+        .read_buffer_size(READ_BUFFER)
         .on_upgrade(move |socket| serve(state, document_id, socket))
 }
 
