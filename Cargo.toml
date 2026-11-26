@@ -50,6 +50,10 @@ unsafe_code = "forbid"
 all = "warn"
 
 # scrypt at N=2^15 takes seconds unoptimised; tests hash passwords.
+# Incremental compilation is off: with some thirty test binaries its cache grew past 30 GB.
+[profile.dev]
+incremental = false
+
 [profile.dev.package.scrypt]
 opt-level = 3
 
