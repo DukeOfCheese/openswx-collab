@@ -212,6 +212,53 @@ pub enum Event {
     OrgExported { org: Id, by: Id },
 }
 
+/// The databases the server runs on, for [`Extensions::migrations`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+/// Why an extension's migrations cannot be used ([`check_migrations`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MigrationsError {
+    /// The two dialects do not have the same number of migrations.
+    #[error(
+        "the extension has {sqlite} migrations for SQLite and {postgres} for PostgreSQL; it \
+         must have the same number, in the same order, for both"
+    )]
+    Counts { sqlite: usize, postgres: usize },
+    /// A migration has no SQL in it.
+    #[error("the extension's migration {version} for {dialect:?} is empty")]
+    Empty { dialect: Dialect, version: usize },
+}
+
+/// Checks the rule of [`Extensions::migrations`] as far as it can be seen without a database:
+/// both dialects have the same number of migrations, and none is empty. The server checks this
+/// before it opens a database for an extension; an extension's own tests should call it, and
+/// apply both lists to a database of each kind.
+pub fn check_migrations(ext: &dyn Extensions) -> Result<(), MigrationsError> {
+    let (sqlite, postgres) = (
+        ext.migrations(Dialect::Sqlite),
+        ext.migrations(Dialect::Postgres),
+    );
+    if sqlite.len() != postgres.len() {
+        return Err(MigrationsError::Counts {
+            sqlite: sqlite.len(),
+            postgres: postgres.len(),
+        });
+    }
+    for (dialect, list) in [(Dialect::Sqlite, sqlite), (Dialect::Postgres, postgres)] {
+        if let Some(place) = list.iter().position(|sql| sql.trim().is_empty()) {
+            return Err(MigrationsError::Empty {
+                dialect,
+                version: place + 1,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// What an organisation is about to have one more of ([`Extensions::quota`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -260,9 +307,17 @@ pub trait Extensions: Send + Sync + 'static {
         axum::Router::new()
     }
 
-    /// SQL migrations for the extension's own tables, applied in order after the server's own.
-    /// They must never touch the server's tables.
-    fn migrations(&self) -> Vec<&'static str> {
+    /// SQL migrations for the extension's own tables, in the words of the database `dialect`,
+    /// applied in order after the server's own. They must never touch the server's tables.
+    ///
+    /// **The same number, in the same order, for both dialects**: migration *n* is one step of
+    /// the extension's schema, written twice. The database records which steps it has had by
+    /// their place in the list, so a step that one database does not need is still there for
+    /// it, as a statement that changes nothing (`SELECT 1`). A released migration is never
+    /// edited or removed; a new one goes at the end. [`check_migrations`] checks what can be
+    /// checked of this without a database (the server does at start; call it from a test of
+    /// the extension too).
+    fn migrations(&self, _dialect: Dialect) -> Vec<&'static str> {
         Vec::new()
     }
 
@@ -453,7 +508,9 @@ mod tests {
         assert_eq!(ext.may_add_member(&org, 1_000_000).await, Ok(()));
         assert_eq!(ext.quota(&org, Quota::BlobBytes(u64::MAX)).await, Ok(()));
         assert_eq!(ext.before_org_delete(&org).await, Ok(()));
-        assert!(ext.migrations().is_empty());
+        assert!(ext.migrations(Dialect::Sqlite).is_empty());
+        assert!(ext.migrations(Dialect::Postgres).is_empty());
+        assert_eq!(check_migrations(&ext), Ok(()));
     }
 
     /// Never answers, panics in the notifications, and waits 50 ms at most.
@@ -480,6 +537,50 @@ mod tests {
         async fn on_event(&self, _event: &Event) {
             std::future::pending().await
         }
+    }
+
+    /// An extension with these migrations for SQLite and those for PostgreSQL.
+    struct Migrating(Vec<&'static str>, Vec<&'static str>);
+
+    impl Extensions for Migrating {
+        fn migrations(&self, dialect: Dialect) -> Vec<&'static str> {
+            match dialect {
+                Dialect::Sqlite => self.0.clone(),
+                Dialect::Postgres => self.1.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn both_dialects_must_have_the_same_number_of_migrations_and_none_empty() {
+        let ok = Migrating(
+            vec!["CREATE TABLE a (x BLOB)", "SELECT 1"],
+            vec!["CREATE TABLE a (x BYTEA)", "CREATE INDEX i ON a (x)"],
+        );
+        assert_eq!(check_migrations(&ok), Ok(()));
+        let one_more = Migrating(vec!["SELECT 1"], vec!["SELECT 1", "SELECT 2"]);
+        assert_eq!(
+            check_migrations(&one_more),
+            Err(MigrationsError::Counts {
+                sqlite: 1,
+                postgres: 2
+            })
+        );
+        assert_eq!(
+            check_migrations(&Migrating(vec![], vec!["SELECT 1"])),
+            Err(MigrationsError::Counts {
+                sqlite: 0,
+                postgres: 1
+            })
+        );
+        let empty = Migrating(vec!["SELECT 1", "SELECT 1"], vec!["SELECT 1", " \n "]);
+        assert_eq!(
+            check_migrations(&empty),
+            Err(MigrationsError::Empty {
+                dialect: Dialect::Postgres,
+                version: 2
+            })
+        );
     }
 
     #[tokio::test]

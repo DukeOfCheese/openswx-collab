@@ -168,6 +168,7 @@ impl AppState {
         let journal = JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT);
         let uploads = Uploads::new(
             settings.max_blob_uploads,
+            settings.max_blob_uploads_per_org,
             settings.max_blob_uploads_per_user,
         );
         Self {
@@ -303,6 +304,20 @@ impl AppState {
             steps.await
         })
         .await
+    }
+
+    /// Starts `work` in a task of its own that nobody need wait for, but that shutdown waits (a
+    /// while) for: a message to the mail server, say.
+    pub fn in_background<T, F>(&self, work: F) -> tokio::task::JoinHandle<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let running = self.after_commits.start();
+        tokio::spawn(async move {
+            let _running = running;
+            work.await
+        })
     }
 
     /// Runs `work` in a tracked task of its own, which a dropped caller does not cancel.

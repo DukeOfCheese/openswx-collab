@@ -68,7 +68,9 @@ static PURGE_REMOVED: AtomicU64 = AtomicU64::new(0);
 static PURGE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static ORG_QUEUE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static DB_ACQUIRE_TIMEOUTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-static UPLOADS_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static UPLOADS_REFUSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static MAIL_SENT: AtomicU64 = AtomicU64::new(0);
+static MAIL_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Seconds, as the nanoseconds the histograms of durations count in.
 const fn secs(s: f64) -> u64 {
@@ -220,6 +222,8 @@ pub enum UploadLimit {
     Account = 0,
     /// The server's (503).
     Server = 1,
+    /// The organisation's (429).
+    Organisation = 2,
 }
 
 const DROP_CAUSES: [&str; 5] = ["account", "session", "expired", "access", "document"];
@@ -332,6 +336,16 @@ pub async fn acquiring<T>(
     outcome
 }
 
+/// A message was handed to the mail server.
+pub fn mail_sent() {
+    MAIL_SENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A message could not be handed to the mail server.
+pub fn mail_failed() {
+    MAIL_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A blob upload was refused because as many were running as `limit` allows.
 pub fn upload_refused(limit: UploadLimit) {
     UPLOADS_REFUSED[limit as usize].fetch_add(1, Ordering::Relaxed);
@@ -430,7 +444,10 @@ pub struct Counters {
     /// Waits for a database connection that ran out, by [`DbPool`].
     pub db_acquire_timeouts: [u64; 3],
     /// Blob uploads refused, by [`UploadLimit`].
-    pub uploads_refused: [u64; 2],
+    pub uploads_refused: [u64; 3],
+    /// Messages handed to the mail server, and messages it did not take.
+    pub mail_sent: u64,
+    pub mail_failures: u64,
 }
 
 /// Reads every counter.
@@ -463,6 +480,8 @@ pub fn counters() -> Counters {
         org_queue_refusals: get(&ORG_QUEUE_REFUSALS),
         db_acquire_timeouts: std::array::from_fn(|i| get(&DB_ACQUIRE_TIMEOUTS[i])),
         uploads_refused: std::array::from_fn(|i| get(&UPLOADS_REFUSED[i])),
+        mail_sent: get(&MAIL_SENT),
+        mail_failures: get(&MAIL_FAILURES),
     }
 }
 
@@ -470,8 +489,20 @@ pub fn counters() -> Counters {
 #[derive(Debug, Default)]
 pub struct HttpStats {
     open: AtomicUsize,
+    handling: AtomicUsize,
+    refused: AtomicU64,
     request_timeouts: AtomicU64,
     write_timeouts: AtomicU64,
+}
+
+/// One request in its handler in [`HttpStats`]; it is counted until this is dropped.
+#[derive(Debug)]
+pub struct InHandler(std::sync::Arc<HttpStats>);
+
+impl Drop for InHandler {
+    fn drop(&mut self) {
+        self.0.handling.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// One open connection in [`HttpStats`]; it is counted until this is dropped.
@@ -494,6 +525,27 @@ impl HttpStats {
     /// How many connections (HTTP and document connections alike) are open.
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
+    }
+
+    /// Counts a request as in its handler until what this answers is dropped.
+    pub fn handling(self: &std::sync::Arc<Self>) -> InHandler {
+        self.handling.fetch_add(1, Ordering::SeqCst);
+        InHandler(self.clone())
+    }
+
+    /// How many requests are in their handlers (an answer being sent is not).
+    pub fn in_handlers(&self) -> usize {
+        self.handling.load(Ordering::SeqCst)
+    }
+
+    /// A connection was closed as soon as it was accepted: the server had `max_connections`.
+    pub fn refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many connections were closed as soon as they were accepted.
+    pub fn refusals(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
     }
 
     /// A request took longer than `request_timeout` and was answered 503.
@@ -755,14 +807,43 @@ pub fn render(state: &AppState) -> String {
         "limit",
         [
             ("account", c.uploads_refused[UploadLimit::Account as usize]),
+            (
+                "organisation",
+                c.uploads_refused[UploadLimit::Organisation as usize],
+            ),
             ("server", c.uploads_refused[UploadLimit::Server as usize]),
         ],
+    );
+    t.gauge(
+        "blob_uploads_queued",
+        "Blob uploads waiting for a place on the server.",
+        state.uploads.queued(),
+    );
+    t.counter(
+        "mail_sent_total",
+        "Messages handed to the mail server.",
+        c.mail_sent,
+    );
+    t.counter(
+        "mail_failures_total",
+        "Messages the mail server did not take.",
+        c.mail_failures,
     );
 
     t.gauge(
         "http_connections",
         "Open connections to the server (document connections included).",
         state.http.open(),
+    );
+    t.gauge(
+        "http_requests_in_handlers",
+        "Requests whose answer has not begun.",
+        state.http.in_handlers(),
+    );
+    t.counter(
+        "http_connections_refused_total",
+        "Connections closed as soon as they were accepted: the server had as many as it holds.",
+        state.http.refusals(),
     );
     t.counter(
         "http_request_timeouts_total",
@@ -789,6 +870,7 @@ pub(crate) async fn metrics(
     if expected.is_empty() {
         return Err(ApiError::NotFound("Not Found"));
     }
+    // `Bearer`, one space, the token and nothing else: no second space, nothing after it.
     let given = headers
         .get(header::AUTHORIZATION)
         .map(HeaderValue::as_bytes)

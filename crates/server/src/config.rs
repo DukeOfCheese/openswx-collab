@@ -92,6 +92,11 @@ impl IpNet {
         Self { addr, prefix }
     }
 
+    /// Whether the range is every address of its family (`0.0.0.0/0`, `::/0`).
+    pub fn is_everything(&self) -> bool {
+        self.prefix == 0
+    }
+
     /// Whether `ip` is in the range.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip.to_canonical()) {
@@ -182,11 +187,23 @@ pub struct Settings {
     /// The most blob uploads the server takes at once; one more is answered 503. (An upload to S3
     /// holds up to about 40 MiB in memory.)
     pub max_blob_uploads: usize,
+    /// The most blob uploads one organisation may have running at once (at most
+    /// `max_blob_uploads`); one more is answered 429.
+    pub max_blob_uploads_per_org: usize,
     /// The most blob uploads one account may have running at once; one more is answered 429.
     pub max_blob_uploads_per_user: usize,
-    /// Seconds a request may take until its answer begins (its headers and body read, its handler
-    /// run); a longer one is answered 503. Blob uploads are not under it (they are given up on
-    /// when no bytes move, `blob_idle_timeout`), and neither is the sending of an answer (a
+    /// Bytes a second a request body (a blob upload, a document being created, any other) must
+    /// keep up on average ([`crate::blobs::Pace`]); 0: no floor.
+    pub min_upload_rate: u64,
+    /// Seconds a body may fall behind `min_upload_rate` before it is given up on.
+    pub upload_rate_grace: f64,
+    /// The most connections the server holds open at once (document connections included); one
+    /// more is accepted and closed at once.
+    pub max_connections: usize,
+    /// Seconds a request may take from its head, or from the last of its body, to the beginning
+    /// of its answer; a longer one is answered 503. A body that is arriving at `min_upload_rate`
+    /// or faster does not count against it. Blob uploads are not under it (they have
+    /// `blob_idle_timeout` and the same minimum rate), and neither is the sending of an answer (a
     /// download, an export) nor an open document connection.
     pub request_timeout: f64,
     /// Seconds: a connection whose client takes nothing of what the server is sending it for this
@@ -264,12 +281,20 @@ impl Default for Settings {
             s3_path_style: None,
             blob_idle_timeout: 60.0,
             max_blob_uploads: 16,
+            max_blob_uploads_per_org: 8,
             max_blob_uploads_per_user: 4,
+            min_upload_rate: 4096,
+            upload_rate_grace: 30.0,
+            max_connections: 4096,
             request_timeout: 60.0,
             write_timeout: 60.0,
             shutdown_timeout: 8.0,
-            // (What uvicorn believes by default, and so what the Python server did.)
-            trusted_proxies: vec![IpNet::one(IpAddr::from([127, 0, 0, 1]))],
+            // A proxy on this machine, over IPv4 or IPv6. (uvicorn, and so the Python server,
+            // believed 127.0.0.1.)
+            trusted_proxies: vec![
+                IpNet::one(IpAddr::from([127, 0, 0, 1])),
+                IpNet::one(IpAddr::from(std::net::Ipv6Addr::LOCALHOST)),
+            ],
             metrics_token: String::new(),
             public_url: "http://localhost:8787".into(),
             open_registration: false,
@@ -344,6 +369,10 @@ impl Settings {
             "MAX_BLOB_UPLOADS_PER_USER",
             &mut s.max_blob_uploads_per_user,
         )?;
+        e.positive_whole("MAX_BLOB_UPLOADS_PER_ORG", &mut s.max_blob_uploads_per_org)?;
+        e.whole("MIN_UPLOAD_RATE", &mut s.min_upload_rate)?;
+        e.positive_seconds("UPLOAD_RATE_GRACE", &mut s.upload_rate_grace)?;
+        e.positive_whole("MAX_CONNECTIONS", &mut s.max_connections)?;
         e.positive_seconds("REQUEST_TIMEOUT", &mut s.request_timeout)?;
         e.positive_seconds("WRITE_TIMEOUT", &mut s.write_timeout)?;
         e.positive_seconds("SHUTDOWN_TIMEOUT", &mut s.shutdown_timeout)?;
@@ -359,6 +388,14 @@ impl Settings {
                         "a list of addresses and CIDR ranges (e.g. `127.0.0.1, 172.16.0.0/12`)",
                     )
                 })?;
+            // "Everybody is a trusted proxy" lets any client name its own address.
+            if s.trusted_proxies.iter().any(IpNet::is_everything) {
+                return Err(ConfigError::new(
+                    "TRUSTED_PROXIES",
+                    "a list of your proxies' addresses and ranges, not every address there is \
+                     (a range ending in /0)",
+                ));
+            }
         }
         if let Some(raw) = e.get("METRICS_TOKEN") {
             let token = raw.trim();
@@ -594,7 +631,11 @@ impl fmt::Debug for Settings {
             .field("s3_path_style", &self.s3_path_style)
             .field("blob_idle_timeout", &self.blob_idle_timeout)
             .field("max_blob_uploads", &self.max_blob_uploads)
+            .field("max_blob_uploads_per_org", &self.max_blob_uploads_per_org)
             .field("max_blob_uploads_per_user", &self.max_blob_uploads_per_user)
+            .field("min_upload_rate", &self.min_upload_rate)
+            .field("upload_rate_grace", &self.upload_rate_grace)
+            .field("max_connections", &self.max_connections)
             .field("request_timeout", &self.request_timeout)
             .field("write_timeout", &self.write_timeout)
             .field("shutdown_timeout", &self.shutdown_timeout)
@@ -940,11 +981,30 @@ mod tests {
     fn the_serving_limits_have_defaults_and_are_read() {
         let s = read(&[]);
         assert_eq!((s.max_blob_uploads, s.max_blob_uploads_per_user), (16, 4));
+        assert_eq!((s.max_blob_uploads_per_org, s.max_connections), (8, 4096));
+        assert_eq!((s.min_upload_rate, s.upload_rate_grace), (4096, 30.0));
         assert_eq!(
             (s.request_timeout, s.write_timeout, s.shutdown_timeout),
             (60.0, 60.0, 8.0)
         );
         assert!(s.metrics_token.is_empty());
+        let s = read(&[
+            ("MAX_BLOB_UPLOADS_PER_ORG", "2"),
+            ("MIN_UPLOAD_RATE", "0"),
+            ("UPLOAD_RATE_GRACE", "1.5"),
+            ("MAX_CONNECTIONS", "10"),
+        ]);
+        assert_eq!((s.max_blob_uploads_per_org, s.max_connections), (2, 10));
+        assert_eq!((s.min_upload_rate, s.upload_rate_grace), (0, 1.5));
+        for (var, bad) in [
+            ("MAX_BLOB_UPLOADS_PER_ORG", "0"),
+            ("MAX_CONNECTIONS", "0"),
+            ("MIN_UPLOAD_RATE", "-1"),
+            ("MIN_UPLOAD_RATE", "fast"),
+            ("UPLOAD_RATE_GRACE", "0"),
+        ] {
+            assert_eq!(refused(&[(var, bad)]).var, format!("{PREFIX}{var}"));
+        }
         let s = read(&[
             ("MAX_BLOB_UPLOADS", "3"),
             ("MAX_BLOB_UPLOADS_PER_USER", "1"),
@@ -1036,7 +1096,24 @@ mod tests {
 
     #[test]
     fn trusted_proxies_are_a_list_of_addresses_and_ranges() {
-        assert_eq!(read(&[]).trusted_proxies, vec![net("127.0.0.1")]);
+        assert_eq!(
+            read(&[]).trusted_proxies,
+            vec![net("127.0.0.1"), net("::1")]
+        );
+        // Every address there is, in either family and any spelling, is not a list of proxies.
+        for everything in [
+            "0.0.0.0/0",
+            "::/0",
+            "10.1.2.3/0",
+            "127.0.0.1, 0.0.0.0/0",
+            "::ffff:0.0.0.0/96",
+            "fd00::/00",
+        ] {
+            let e = refused(&[("TRUSTED_PROXIES", everything)]);
+            assert_eq!(e.var, "OSWX_COLLAB_TRUSTED_PROXIES", "{everything}");
+        }
+        // (The widest ranges that are not everything are the operator's business.)
+        read(&[("TRUSTED_PROXIES", "0.0.0.0/1, 8000::/1")]);
         assert_eq!(read(&[("TRUSTED_PROXIES", "")]).trusted_proxies, vec![]);
         assert_eq!(read(&[("TRUSTED_PROXIES", " , ")]).trusted_proxies, vec![]);
         assert_eq!(

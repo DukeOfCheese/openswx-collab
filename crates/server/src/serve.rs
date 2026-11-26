@@ -8,13 +8,20 @@
 //! - **A request's head must arrive in time**: 30 s, or `request_timeout` if that is shorter. A
 //!   client that opens a connection and sends nothing, or its headers a byte at a time, is cut
 //!   off. (An idle kept-alive connection is closed after the same time.)
-//! - **A request must be answered in time**: `request_timeout` (60 s unless set) from its head to
-//!   the beginning of its answer, body read and handler run, or it is answered 503
-//!   ([`within_time`], which the routes apply). What follows a commit still runs
-//!   ([`crate::AppState::commit_then`]).
+//! - **A request must be answered in time**: `request_timeout` (60 s unless set) from its head,
+//!   or from the last of its body, to the beginning of its answer, or it is answered 503
+//!   ([`within_time`], which the routes apply). A body that is arriving does not count against
+//!   it, as long as it keeps up the minimum rate ([`crate::blobs::Pace`]): a document of 8 MB on
+//!   a slow uplink is read for as long as it takes, a body that stops or trickles is not. What
+//!   follows a commit still runs ([`crate::AppState::commit_then`]).
 //! - **A client must take what it is sent**: when nothing at all could be written to a connection
 //!   for `write_timeout` (60 s unless set), the connection is closed, and with it whatever the
 //!   answer held (a file, a connection to the bucket, an export's place).
+//! - **There are only so many connections**: `max_connections` (4,096 unless set), document
+//!   connections included. One more is accepted and closed at once, and counted. (Not left
+//!   unaccepted: the kernel's queue would fill and every later client, a health check too,
+//!   would wait for a time it cannot know; a closed connection is an answer.) Keep the process's
+//!   limit on open files above it.
 //!
 //! # Long transfers
 //!
@@ -23,33 +30,43 @@
 //!
 //! | | while it moves | when it stops |
 //! |---|---|---|
-//! | blob upload | not under `request_timeout`; at most `max_blob_uploads` at once ([`crate::uploads`]) | no bytes for `blob_idle_timeout`: 400, nothing stored |
+//! | blob upload | not under `request_timeout`; at most `max_blob_uploads` at once ([`crate::uploads`]) | no bytes for `blob_idle_timeout`, or slower than the minimum rate: 400, nothing stored |
+//! | any other request body | does not count against `request_timeout` while it keeps up the minimum rate | 503 `request_timeout` after it stopped, or after it fell behind the rate |
 //! | blob download, export | the handler has answered long before; the body is sent for as long as the client reads | nothing written for `write_timeout`: the connection is closed (and the storage's side after `blob_idle_timeout`, an export after its own stall time) |
 //! | document connection | the upgrade is answered at once | the room closes a slow consumer; a socket that takes nothing for `write_timeout` is closed |
 //!
 //! # Stopping
 //!
-//! When `stop` resolves, [`serve`] stops accepting, tells every connection to finish, and runs
-//! [`crate::AppState::shutdown_within`]: rooms are closed and snapshotted first, then the journal
-//! is written out. A connection with a request in its handler is waited for; one without (idle,
-//! in the middle of sending a request, or still being sent a long answer) is closed a moment
-//! later ([`LINGER`]). All of that is given `shutdown_timeout` (8 s unless set: `docker stop`
-//! kills after 10); what has not finished by then is abandoned, and [`serve`] says so.
+//! When `stop` resolves, [`serve`]:
+//!
+//! 1. stops accepting, and tells every connection to take no further request;
+//! 2. lets the requests that are in their handlers finish, for up to half of `shutdown_timeout`,
+//!    while everything still works (so a restart does not turn the edits in flight into
+//!    errors); a connection without a request in its handler (idle, in the middle of sending
+//!    one, or still being sent a long answer) is closed a moment later ([`LINGER`]);
+//! 3. runs [`crate::AppState::shutdown_within`] with what is left: rooms are closed and
+//!    snapshotted first, then the journal is written out;
+//! 4. waits for the requests still in their handlers and for the document sockets to close.
+//!
+//! All of that is given `shutdown_timeout` (8 s unless set: `docker stop` kills after 10); what
+//! has not finished by then is abandoned, and [`serve`] says so.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
+use futures_util::StreamExt as _;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -104,6 +121,11 @@ pub async fn serve(
         tokio::select! {
             () = &mut stop => break,
             accepted = listener.accept() => match accepted {
+                Ok((stream, _)) if state.http.open() >= settings.max_connections => {
+                    // Closed at once (see the module documentation).
+                    state.http.refused();
+                    drop(stream);
+                }
                 Ok((stream, peer)) => {
                     connections.spawn(connection(
                         stream,
@@ -123,8 +145,28 @@ pub async fn serve(
     drop(listener);
     closing.send_replace(true);
     let bound = Duration::from_secs_f64(settings.shutdown_timeout);
+    let stopping_at = Instant::now();
     let ending = async {
-        state.shutdown_within(bound).await;
+        // The requests in their handlers finish while the rooms, the journal and everything
+        // they need still run.
+        let handlers_done = async {
+            while state.http.in_handlers() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(bound / 2, handlers_done)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                requests = state.http.in_handlers(),
+                "requests were still in their handlers {:?} after the stop; going on without them",
+                bound / 2
+            );
+        }
+        state
+            .shutdown_within(bound.saturating_sub(stopping_at.elapsed()))
+            .await;
         // Requests in their handlers are answered.
         while connections.join_next().await.is_some() {}
         // Document connections were closed by their rooms: a moment for their close frames to
@@ -178,6 +220,7 @@ async fn connection(
     stats: Arc<HttpStats>,
     mut closing: watch::Receiver<bool>,
 ) {
+    let in_handlers = stats.clone();
     let io = TokioIo::new(TakenInTime::new(stream, limits.write, stats));
     // How many of the connection's requests are in their handlers (one at most, on HTTP/1).
     let handling = Arc::new(AtomicUsize::new(0));
@@ -185,7 +228,7 @@ async fn connection(
     let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
         let mut app = app.clone();
-        let handled = Handling::begin(&counted);
+        let handled = (Handling::begin(&counted), in_handlers.handling());
         async move {
             let response = app.call(request).await;
             drop(handled);
@@ -235,10 +278,14 @@ impl Drop for Handling {
     }
 }
 
-/// The routes' time limit: a request whose answer has not begun `request_timeout` after its head
-/// arrived is answered 503 [`TOO_SLOW`], and whatever it was doing is dropped (what follows a
-/// commit goes on by itself). The log names the route, never the address asked for (which can
-/// hold a reset token).
+/// The routes' time limit: a request whose answer has not begun `request_timeout` after its
+/// head arrived, or after the last of its body did, is answered 503 [`TOO_SLOW`], and whatever
+/// it was doing is dropped (what follows a commit goes on by itself). The log names the route,
+/// never the address asked for (which can hold a reset token).
+///
+/// While the body arrives the clock is put forward: every byte earns `1 / min_upload_rate`
+/// seconds, up to a full `request_timeout` from now ([`BodyClock`]). So a large body on a slow
+/// uplink is not cut for being slow, and one that stops, or sends a byte now and then, is.
 pub(crate) async fn within_time(
     State(state): State<AppState>,
     req: Request,
@@ -247,17 +294,85 @@ pub(crate) async fn within_time(
     let limit = Duration::from_secs_f64(state.settings.request_timeout);
     let method = req.method().clone();
     let route = req.extensions().get::<MatchedPath>().cloned();
-    match tokio::time::timeout(limit, next.run(req)).await {
-        Ok(response) => response,
-        Err(_) => {
-            state.http.request_timed_out();
-            tracing::warn!(
-                %method,
-                route = route.as_ref().map_or("", MatchedPath::as_str),
-                "a request took longer than {limit:?} and was given up on"
-            );
-            detail_response(StatusCode::SERVICE_UNAVAILABLE, TOO_SLOW)
+    let clock = Arc::new(BodyClock::new(limit, state.settings.min_upload_rate));
+    let req = req.map(|body| clock.clone().watch(body));
+    let mut answering = pin!(next.run(req));
+    loop {
+        tokio::select! {
+            response = answering.as_mut() => return response,
+            () = tokio::time::sleep_until(clock.deadline()) => {
+                // (The body may have put the clock forward meanwhile.)
+                if clock.deadline() > Instant::now() {
+                    continue;
+                }
+            }
         }
+        state.http.request_timed_out();
+        tracing::warn!(
+            %method,
+            route = route.as_ref().map_or("", MatchedPath::as_str),
+            "a request was not answered within {limit:?} of its head or its body and was given \
+             up on"
+        );
+        return detail_response(StatusCode::SERVICE_UNAVAILABLE, TOO_SLOW);
+    }
+}
+
+/// When a request must be answered by: `limit` after its head; put forward by its body as that
+/// arrives; `limit` after the body's end.
+struct BodyClock {
+    limit: Duration,
+    /// Bytes a second the body must keep up to put the clock forward; 0: any byte gives a full
+    /// `limit`.
+    floor: u64,
+    deadline: Mutex<Instant>,
+}
+
+impl BodyClock {
+    fn new(limit: Duration, floor: u64) -> Self {
+        Self {
+            limit,
+            floor,
+            deadline: Mutex::new(Instant::now() + limit),
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `bytes` more of the body arrived (`None`: its end).
+    fn arrived(&self, bytes: Option<usize>) {
+        let latest = Instant::now() + self.limit;
+        let mut deadline = self.deadline.lock().unwrap_or_else(PoisonError::into_inner);
+        *deadline = match bytes {
+            Some(bytes) if self.floor > 0 => {
+                let earned = Duration::from_secs_f64(bytes as f64 / self.floor as f64);
+                (*deadline + earned).min(latest)
+            }
+            _ => latest,
+        };
+    }
+
+    /// `body`, telling this clock of every chunk that arrives and of its end.
+    fn watch(self: Arc<Self>, body: Body) -> Body {
+        let chunks = body.into_data_stream();
+        Body::from_stream(futures_util::stream::unfold(
+            (chunks, self, false),
+            |(mut chunks, clock, ended)| async move {
+                if ended {
+                    return None;
+                }
+                let next = chunks.next().await;
+                match &next {
+                    Some(Ok(chunk)) => clock.arrived(Some(chunk.len())),
+                    // (An error ends the body as well: the handler has what it will get.)
+                    Some(Err(_)) | None => clock.arrived(None),
+                }
+                let ended = !matches!(next, Some(Ok(_)));
+                next.map(|item| (item, (chunks, clock, ended)))
+            },
+        ))
     }
 }
 
@@ -270,6 +385,8 @@ struct TakenInTime {
     timeout: Duration,
     /// Runs while a write waits for the peer.
     waiting: Option<Pin<Box<Sleep>>>,
+    /// A write waited for the whole of `timeout`: every write from then on fails.
+    timed_out: bool,
     stats: Arc<HttpStats>,
     /// Counted as open for as long as the socket lives: as a document connection too, which
     /// outlives the HTTP connection it began as.
@@ -282,6 +399,7 @@ impl TakenInTime {
             stream,
             timeout,
             waiting: None,
+            timed_out: false,
             _open: stats.opened(),
             stats,
         }
@@ -293,6 +411,15 @@ impl TakenInTime {
         cx: &mut Context<'_>,
         outcome: Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
+        let failed = || {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the peer took nothing of what was sent in time",
+            )))
+        };
+        if self.timed_out {
+            return failed();
+        }
         if outcome.is_ready() {
             self.waiting = None;
             return outcome;
@@ -304,12 +431,12 @@ impl TakenInTime {
         if waiting.as_mut().poll(cx).is_pending() {
             return Poll::Pending;
         }
-        // (Left in place: it stays elapsed, so every later write fails as well.)
+        // Counted once; the flag (not the timer, which must not be polled again once it has
+        // fired) fails whatever is written after this.
+        self.timed_out = true;
+        self.waiting = None;
         self.stats.write_timed_out();
-        Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the peer took nothing of what was sent in time",
-        )))
+        failed()
     }
 }
 

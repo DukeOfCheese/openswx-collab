@@ -25,6 +25,7 @@ use lettre::transport::smtp::client::{Certificate, CertificateStore, Tls, TlsPar
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::config::{Settings, SmtpSecurity};
+use crate::state::AppState;
 
 #[async_trait]
 pub trait Mailer: Send + Sync + 'static {
@@ -54,8 +55,12 @@ pub async fn send_logged(
         return false;
     }
     match mailer.send(to, subject, text, None).await {
-        Ok(()) => true,
+        Ok(()) => {
+            crate::metrics::mail_sent();
+            true
+        }
         Err(err) => {
+            crate::metrics::mail_failed();
             tracing::warn!(
                 "could not send email to the mail server {}: {err:#}",
                 settings.smtp_host
@@ -63,6 +68,33 @@ pub async fn send_logged(
             false
         }
     }
+}
+
+/// How long a request waits for the mail it sends before it answers without knowing.
+pub const MAIL_WAIT: Duration = Duration::from_secs(10);
+
+/// Sends a message for a request that has already committed, without letting the mail server
+/// hold the request up: the send runs in a task of its own ([`send_logged`]: a failure is logged
+/// and counted), and the request waits for it for [`MAIL_WAIT`] at most. Answers whether the
+/// message was handed to the mail server **within that time**; `false` also when it is still
+/// being sent (it goes on, and shutdown waits a while for it).
+///
+/// A mail server can take a minute to refuse or accept (20 s a step). Awaited in the handler,
+/// that passed the request limit and answered 503 "try again" for something already stored.
+pub async fn send_after_commit(
+    state: &AppState,
+    to: String,
+    subject: String,
+    text: String,
+) -> bool {
+    let wait = state.room_hooks.mail_wait;
+    let sending = {
+        let state = state.clone();
+        state.clone().in_background(async move {
+            send_logged(state.mailer.as_ref(), &state.settings, &to, &subject, &text).await
+        })
+    };
+    matches!(tokio::time::timeout(wait, sending).await, Ok(Ok(true)))
 }
 
 /// The invitation email: subject and body.

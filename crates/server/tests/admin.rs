@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::{PgSchema, TestServer, on_postgres};
 use oswx_server::admin::{self, Db};
-use oswx_server::ext::{Extensions, NoExtensions};
+use oswx_server::ext::{Dialect, Extensions, MigrationsError, NoExtensions, check_migrations};
 use oswx_server::security::verify_password;
 use oswx_server::store::{ExtensionSchema, SchemaError, Session, new_id};
 use oswx_server::{AppState, Settings};
@@ -19,8 +19,20 @@ use tempfile::TempDir;
 struct Ext(Vec<&'static str>);
 
 impl Extensions for Ext {
-    fn migrations(&self) -> Vec<&'static str> {
+    fn migrations(&self, _dialect: Dialect) -> Vec<&'static str> {
         self.0.clone()
+    }
+}
+
+/// An extension whose migrations are these on SQLite and those on PostgreSQL.
+struct PerDialect(Vec<&'static str>, Vec<&'static str>);
+
+impl Extensions for PerDialect {
+    fn migrations(&self, dialect: Dialect) -> Vec<&'static str> {
+        match dialect {
+            Dialect::Sqlite => self.0.clone(),
+            Dialect::Postgres => self.1.clone(),
+        }
     }
 }
 
@@ -66,6 +78,33 @@ impl Place {
             storage_url: format!("{dir}/storage"),
             auto_migrate,
             ..Settings::default()
+        }
+    }
+
+    /// Checks what `db-status` says of the database while nothing has been made in it: on
+    /// PostgreSQL, that it is empty; on SQLite, that there is no file, without making one.
+    async fn nothing_yet(&self, ext: &dyn Extensions) {
+        let said = admin::db_status(&self.settings(false), ext).await;
+        if self.schema.is_some() {
+            let said = said.unwrap();
+            assert!(
+                said.starts_with("database at none (an empty database); this server needs 1"),
+                "{said}"
+            );
+            let ours = ext.migrations(Dialect::Postgres).len();
+            assert_eq!(
+                said.ends_with(&format!(
+                    "extension migrations at 0, this server needs {ours}"
+                )),
+                ours > 0,
+                "{said}"
+            );
+        } else {
+            let said = said.unwrap_err().to_string();
+            assert!(said.starts_with("there is no database at "), "{said}");
+            assert!(said.contains("nothing was created"), "{said}");
+            let left: Vec<_> = std::fs::read_dir(self.dir.path()).unwrap().collect();
+            assert!(left.is_empty(), "db-status made {left:?}");
         }
     }
 
@@ -228,13 +267,7 @@ async fn an_older_database_gets_them_from_migrate_or_at_start_when_that_is_allow
 async fn migrate_builds_an_empty_database_with_both() {
     let place = Place::new().await;
     let ext = Ext(vec![FIRST, SECOND]);
-    assert_eq!(
-        admin::db_status(&place.settings(false), &ext)
-            .await
-            .unwrap(),
-        "database at none (an empty database); this server needs 1; extension migrations at 0, \
-         this server needs 2"
-    );
+    place.nothing_yet(&ext).await;
     assert_eq!(
         admin::migrate(&place.settings(false), &ext).await.unwrap(),
         "schema none -> 1; extension migrations 0 -> 2"
@@ -242,12 +275,7 @@ async fn migrate_builds_an_empty_database_with_both() {
     assert_eq!(place.recorded().await, vec![1, 2]);
     // Without an extension nothing is said of extensions.
     let plain = Place::new().await;
-    assert_eq!(
-        admin::db_status(&plain.settings(false), &NoExtensions)
-            .await
-            .unwrap(),
-        "database at none (an empty database); this server needs 1"
-    );
+    plain.nothing_yet(&NoExtensions).await;
     assert_eq!(
         admin::migrate(&plain.settings(false), &NoExtensions)
             .await
@@ -433,7 +461,7 @@ async fn a_server_built_from_settings_starts_with_its_extensions_tables() {
     let state = AppState::from_settings_with(place.settings(true), ext.clone())
         .await
         .unwrap();
-    assert_eq!(state.ext.migrations().len(), 2);
+    assert_eq!(state.ext.migrations(Dialect::Sqlite).len(), 2);
     assert_eq!(state.store.user_count().await.unwrap(), 0);
     state.shutdown().await;
     assert_eq!(place.recorded().await, vec![1, 2]);
@@ -675,4 +703,63 @@ async fn the_account_commands_refuse_what_is_not_an_address_or_a_password() {
     let db = Db::connect(&settings).await.unwrap();
     assert_eq!(db.status(&none).await.unwrap().0.current, None);
     db.close().await;
+}
+
+// ------------------------------------------------------------------ a list for each dialect
+
+/// Only SQLite takes this.
+const SQLITE_ONLY: &str =
+    "CREATE TABLE ext_counter (id INTEGER PRIMARY KEY AUTOINCREMENT, n BIGINT)";
+/// Only PostgreSQL takes this.
+const POSTGRES_ONLY: &str =
+    "CREATE TABLE ext_counter (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, n BIGINT)";
+
+#[tokio::test]
+async fn each_database_gets_the_migrations_written_for_it() {
+    let place = Place::new().await;
+    let ext = PerDialect(vec![SQLITE_ONLY, SECOND], vec![POSTGRES_ONLY, SECOND]);
+    assert_eq!(check_migrations(&ext), Ok(()));
+    start(&place, true, &ext).await.unwrap();
+    assert_eq!(place.recorded().await, vec![1, 2]);
+    place
+        .sql("INSERT INTO ext_counter (n) VALUES (5)")
+        .await
+        .unwrap();
+    // The other database's words would not have done: the lists really are apart.
+    let other = Place::new().await;
+    let swapped = PerDialect(vec![POSTGRES_ONLY, SECOND], vec![SQLITE_ONLY, SECOND]);
+    let failed = start(&other, true, &swapped).await.unwrap_err();
+    assert!(
+        format!("{failed:#}").contains("extension migration 1 failed"),
+        "{failed:#}"
+    );
+    assert!(other.recorded().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_extension_with_a_different_number_of_migrations_per_dialect_is_refused() {
+    let place = Place::new().await;
+    // Whichever database this runs on has the right number for itself; the other has one more.
+    for uneven in [
+        PerDialect(vec![FIRST], vec![FIRST, SECOND]),
+        PerDialect(vec![FIRST, SECOND], vec![FIRST]),
+    ] {
+        let sqlite = uneven.0.len();
+        let counts = MigrationsError::Counts {
+            sqlite,
+            postgres: 3 - sqlite,
+        };
+        assert_eq!(check_migrations(&uneven), Err(counts.clone()));
+        for refused in [
+            start(&place, true, &uneven).await.unwrap_err(),
+            admin::migrate(&place.settings(true), &uneven)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(refused.downcast::<MigrationsError>().unwrap(), counts);
+        }
+    }
+    // Nothing was applied by any of that.
+    start(&place, true, &NoExtensions).await.unwrap();
+    assert!(place.recorded().await.is_empty());
 }

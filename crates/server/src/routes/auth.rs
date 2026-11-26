@@ -29,7 +29,7 @@ use crate::access::CurrentUser;
 use crate::config::{IpNet, Settings};
 use crate::error::{ApiError, ApiJson};
 use crate::ext::{Event, emit};
-use crate::mail::{reset_text, send_logged};
+use crate::mail::{reset_text, send_after_commit};
 use crate::routes::meta::{Registration, registration_for};
 use crate::routes::orgs::{accept_invite, approve_invite, find_invite};
 use crate::routes::reset_page::reset_page;
@@ -556,14 +556,8 @@ async fn request_reset(
     let after = state.clone();
     state
         .commit_then(tx, |_| async {}, async move {
-            send_logged(
-                after.mailer.as_ref(),
-                &after.settings,
-                &user.email,
-                &subject,
-                &text,
-            )
-            .await;
+            // (Not held up by a slow mail server: see `send_after_commit`.)
+            send_after_commit(&after, user.email.clone(), subject, text).await;
             tracing::info!(user = %user.id, "password reset link sent");
             let requested = Event::PasswordResetRequested { user: user.id };
             emit(&after.ext, requested).await;

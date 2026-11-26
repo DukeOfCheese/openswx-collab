@@ -823,3 +823,122 @@ async fn a_mail_server_is_trusted_by_the_machines_trust_store() {
     assert!(said.contains("MAIL-WAS-REFUSED"), "{said}");
     assert_eq!(recipients.lock().unwrap().len(), 1, "{said}");
 }
+
+// ------------------------------------------------------------------ a slow mail server
+
+/// A mail server that takes its time over every message, then takes it.
+struct SlowMailer {
+    taken: MemoryMailer,
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl Mailer for SlowMailer {
+    fn configured(&self) -> bool {
+        true
+    }
+
+    async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> anyhow::Result<()> {
+        tokio::time::sleep(self.delay).await;
+        self.taken.send(to, subject, text, html).await
+    }
+}
+
+#[tokio::test]
+async fn a_slow_mail_server_does_not_hold_a_request_up_and_the_mail_still_goes() {
+    use std::time::{Duration, Instant};
+    let mailer = Arc::new(SlowMailer {
+        taken: MemoryMailer::new(true),
+        delay: Duration::from_millis(1500),
+    });
+    let kept = mailer.clone();
+    // A request waits 200 ms for its mail, not the ten seconds of a real server.
+    let hooks = oswx_server::room::Hooks {
+        mail_wait: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(
+        |s| {
+            s.smtp_host = "127.0.0.1".into();
+            s.smtp_from = "collab@example.org".into();
+        },
+        |s| {
+            s.mailer = kept;
+            s.room_hooks = Arc::new(hooks);
+        },
+    )
+    .await;
+    let world = common::World::new(&server).await.unwrap();
+
+    // A reset link: the answer is the same as ever, and comes without the mail server.
+    let started = Instant::now();
+    assert_eq!(
+        reset(&server, "ada@example.com").await.0,
+        StatusCode::ACCEPTED
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(150) && took < Duration::from_millis(1200),
+        "the request took {took:?}"
+    );
+    assert!(mailer.taken.sent().is_empty());
+
+    // An invite: made, with its link, and `emailed` says only what is known by now.
+    let started = Instant::now();
+    let (status, invite) = server
+        .post(
+            &format!("/api/orgs/{}/invites", world.org),
+            Some(&world.admin),
+            json!({"email": "bob@example.com"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{invite}");
+    assert!(started.elapsed() < Duration::from_millis(1200));
+    assert_eq!(invite["emailed"], false, "{invite}");
+    assert!(invite["url"].as_str().unwrap().contains("/invite/"));
+
+    // Both messages are still handed over, each when the mail server is done with it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while mailer.taken.sent().len() < 2 {
+        assert!(Instant::now() < deadline, "the mail never went");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let sent = mailer.taken.sent();
+    assert_eq!(sent[0].to, "ada@example.com");
+    assert_eq!(sent[1].to, "bob@example.com");
+    assert!(sent[1].text.contains(invite["url"].as_str().unwrap()));
+    // One invite was made, not two: nothing told the client to try again.
+    let invites: i64 = server.scalar("SELECT COUNT(*) FROM invites").await;
+    assert_eq!(invites, 1);
+    assert_eq!(server.state.http.request_timeouts(), 0);
+    // A stop waits for mail that is on its way (it is tracked with the steps after commits).
+    assert_eq!(server.state.after_commits.running(), 0);
+}
+
+#[tokio::test]
+async fn mail_that_was_sent_and_mail_that_was_not_are_counted() {
+    let before = oswx_server::metrics::counters();
+    let (server, mailer) = TestServer::start_mailing(|_| {}).await;
+    server.register("ada@example.com").await;
+    reset(&server, "ada@example.com").await;
+    assert_eq!(mailer.sent().len(), 1);
+    let broken = TestServer::start_custom(
+        |s| {
+            s.smtp_host = "mail.invalid".into();
+            s.smtp_from = "c@example.org".into();
+        },
+        |s| s.mailer = Arc::new(BrokenMailer),
+    )
+    .await;
+    broken.register("ada@example.com").await;
+    reset(&broken, "ada@example.com").await;
+    let after = oswx_server::metrics::counters();
+    assert!(after.mail_sent > before.mail_sent);
+    assert!(after.mail_failures > before.mail_failures);
+}

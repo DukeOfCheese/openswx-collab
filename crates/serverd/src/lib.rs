@@ -21,13 +21,14 @@
 //!
 //! **Logs** go to standard error: lines of text, or one JSON object a line when
 //! `OSWX_COLLAB_LOG=json`. `OSWX_COLLAB_LOG_LEVEL` (`error`, `warn`, `info`, `debug`, `trace`;
-//! `info` unless set) says how much. What a command answers goes to standard output.
+//! `info` unless set) says how much this project's own crates log; every other crate logs
+//! warnings and errors only, unless the variable names it (`debug,sqlx=info`). What a command answers goes to standard output.
 //!
 //! **Panics.** A panic's message can hold what the code was working on (a document's content, a
 //! request), so the program's panic hook logs only where the panic was, never its message.
 //!
-//! **Stopping.** `serve` stops on Ctrl-C or SIGTERM (on Windows: Ctrl-C, Ctrl-Break, the console
-//! closing, the system shutting down): it stops accepting connections, closes every open
+//! **Stopping.** `serve` stops on Ctrl-C (SIGINT), SIGTERM or SIGHUP (on Windows: Ctrl-C,
+//! Ctrl-Break, the console closing, the system shutting down): it stops accepting connections, closes every open
 //! document with its snapshot written, writes out the journal and ends, all within
 //! `OSWX_COLLAB_SHUTDOWN_TIMEOUT` (8 s unless set; `docker stop` kills after 10). Told a second
 //! time, it ends at once.
@@ -42,6 +43,8 @@ use oswx_server::config::Storage;
 use oswx_server::ext::Extensions;
 use oswx_server::serve::{Stopped, serve};
 use oswx_server::{AppState, Settings, admin};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::SubscriberExt as _;
 
 /// Every setting, as `--help` shows them. (A test holds this against what the server reads.)
 pub const SETTINGS_HELP: &str = "\
@@ -70,19 +73,28 @@ Settings (environment variables; the default is in brackets):
     OSWX_COLLAB_BLOB_IDLE_TIMEOUT  seconds without a byte before a blob transfer is given up [60]
     OSWX_COLLAB_MAX_BLOB_BYTES     the largest blob [268435456]
     OSWX_COLLAB_MAX_BLOB_UPLOADS   blob uploads at once on the server; one more: 503 [16]
+    OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG
+                                   blob uploads at once for one organisation; one more: 429 [8]
     OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_USER
                                    blob uploads at once for one account; one more: 429 [4]
+    OSWX_COLLAB_MIN_UPLOAD_RATE    bytes a second an upload, or any request body, must keep up
+                                   on average; 0: no floor [4096]
+    OSWX_COLLAB_UPLOAD_RATE_GRACE  seconds a body may fall behind that rate [30]
 
   Serving
     OSWX_COLLAB_PUBLIC_URL         how clients and browsers reach the server [http://localhost:8787]
     OSWX_COLLAB_TRUSTED_PROXIES    addresses and CIDR ranges of the proxies whose X-Forwarded-For
-                                   is believed, e.g. `127.0.0.1, 172.16.0.0/12` [127.0.0.1]
-    OSWX_COLLAB_REQUEST_TIMEOUT    seconds a request may take before it is answered 503 [60]
+                                   is believed, e.g. `127.0.0.1, 172.16.0.0/12` [127.0.0.1, ::1]
+    OSWX_COLLAB_REQUEST_TIMEOUT    seconds from a request's head, or the last of its body, to
+                                   the beginning of its answer, before it is answered 503 [60]
+    OSWX_COLLAB_MAX_CONNECTIONS    connections held open at once; one more is closed [4096]
     OSWX_COLLAB_WRITE_TIMEOUT      seconds a client may take nothing of an answer [60]
     OSWX_COLLAB_SHUTDOWN_TIMEOUT   seconds an orderly stop may take [8]
     OSWX_COLLAB_METRICS_TOKEN      the bearer token GET /metrics asks for; empty: no /metrics []
     OSWX_COLLAB_LOG                text or json [text]
-    OSWX_COLLAB_LOG_LEVEL          error, warn, info, debug or trace [info]
+    OSWX_COLLAB_LOG_LEVEL          error, warn, info, debug or trace, for the server's own
+                                   crates [info]; other crates log warnings and errors only,
+                                   unless named: `debug,sqlx=info,hyper=trace`
 
   Accounts
     OSWX_COLLAB_OPEN_REGISTRATION  anyone may register; off: the first account, then invites [off]
@@ -160,6 +172,8 @@ enum Command {
 /// The program's own environment variables, which are not settings of the server.
 const LOG: &str = "OSWX_COLLAB_LOG";
 const LOG_LEVEL: &str = "OSWX_COLLAB_LOG_LEVEL";
+/// What the names of this project's crates begin with, as log targets.
+const OUR_CRATES: &str = "oswx";
 const PASSWORD: &str = "OSWX_COLLAB_PASSWORD";
 
 /// A command line or a setting that was wrong.
@@ -230,38 +244,69 @@ fn failed(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// What is logged, from `OSWX_COLLAB_LOG_LEVEL`: a level for this project's own crates (those
+/// whose names start `oswx`; `info` unless given), and `warn` for every other crate unless the
+/// variable asks for more by name: `debug,sqlx=info,hyper=trace`. (Other crates log at `info`
+/// and below what is theirs to say, statements and addresses included; it is there for the
+/// asking, not by default.)
+fn log_targets(raw: &str) -> Result<Targets, String> {
+    let wrong = || {
+        format!(
+            "{LOG_LEVEL} must be error, warn, info, debug or trace, optionally followed by \
+             `<crate>=<level>` entries separated by commas"
+        )
+    };
+    let level = |word: &str| match word.trim().to_ascii_lowercase().as_str() {
+        "error" => Ok(tracing::Level::ERROR),
+        "warn" | "warning" => Ok(tracing::Level::WARN),
+        "info" => Ok(tracing::Level::INFO),
+        "debug" => Ok(tracing::Level::DEBUG),
+        "trace" => Ok(tracing::Level::TRACE),
+        _ => Err(wrong()),
+    };
+    let mut ours = tracing::Level::INFO;
+    let mut targets = Targets::new().with_default(tracing::Level::WARN);
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        match entry.split_once('=') {
+            None => ours = level(entry)?,
+            Some((name, asked)) => {
+                let name = name.trim();
+                let named = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+                if !named {
+                    return Err(wrong());
+                }
+                targets = targets.with_target(name.to_owned(), level(asked)?);
+            }
+        }
+    }
+    // (A target is matched by its beginning: `oswx` is oswx_server, oswx_serverd, oswx_core. An
+    // entry that names one of them more exactly wins over this one.)
+    Ok(targets.with_target(OUR_CRATES, ours))
+}
+
 /// Starts logging to standard error as `OSWX_COLLAB_LOG` and `OSWX_COLLAB_LOG_LEVEL` say. The
 /// error names the variable that could not be read.
 fn start_logging() -> Result<(), String> {
-    let var = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-    };
-    let level = match var(LOG_LEVEL).as_deref() {
-        None | Some("" | "info") => tracing::Level::INFO,
-        Some("error") => tracing::Level::ERROR,
-        Some("warn" | "warning") => tracing::Level::WARN,
-        Some("debug") => tracing::Level::DEBUG,
-        Some("trace") => tracing::Level::TRACE,
-        Some(_) => {
-            return Err(format!(
-                "{LOG_LEVEL} must be error, warn, info, debug or trace"
-            ));
-        }
-    };
-    let logs = tracing_subscriber::fmt()
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    let targets = log_targets(&var(LOG_LEVEL))?;
+    let lines = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_max_level(level)
         .with_ansi(false);
     // (Set as the default directly, not with `init`: that would also pass on what libraries
     // write through the `log` crate, when some crate of the build turns that feature on.)
-    let set = match var(LOG).as_deref() {
-        None | Some("" | "text") => tracing::subscriber::set_global_default(logs.finish()),
-        Some("json") => {
-            tracing::subscriber::set_global_default(logs.json().flatten_event(true).finish())
-        }
-        Some(_) => return Err(format!("{LOG} must be text or json")),
+    let set = match var(LOG).trim().to_ascii_lowercase().as_str() {
+        "" | "text" => tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(targets).with(lines),
+        ),
+        "json" => tracing::subscriber::set_global_default(
+            tracing_subscriber::registry()
+                .with(targets)
+                .with(lines.json().flatten_event(true)),
+        ),
+        _ => return Err(format!("{LOG} must be text or json")),
     };
     set.map_err(|e| format!("logging could not be started: {e}"))
 }
@@ -375,6 +420,8 @@ struct Signals {
     terminate: tokio::signal::unix::Signal,
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
@@ -392,6 +439,7 @@ impl Signals {
         Ok(Self {
             terminate: signal(SignalKind::terminate())?,
             interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
         })
     }
 
@@ -412,6 +460,7 @@ impl Signals {
         tokio::select! {
             _ = self.terminate.recv() => "SIGTERM",
             _ = self.interrupt.recv() => "SIGINT",
+            _ = self.hangup.recv() => "SIGHUP",
         }
     }
 
@@ -430,6 +479,71 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_level_is_for_our_crates_and_others_stay_at_warn_unless_named() {
+        use tracing::Level;
+        let would = |raw: &str, target: &str, level: Level| {
+            log_targets(raw).unwrap().would_enable(target, &level)
+        };
+        // Unset: info for ours, warnings for everyone else.
+        for ours in [
+            "oswx_server",
+            "oswx_server::room::change",
+            "oswx_serverd",
+            "oswx_core",
+        ] {
+            assert!(would("", ours, Level::INFO), "{ours}");
+            assert!(!would("", ours, Level::DEBUG), "{ours}");
+            assert!(would(" Debug ", ours, Level::DEBUG), "{ours}");
+            assert!(!would("debug", ours, Level::TRACE), "{ours}");
+            assert!(!would("error", ours, Level::WARN), "{ours}");
+        }
+        for theirs in [
+            "sqlx::query",
+            "hyper_util::client",
+            "object_store::aws",
+            "lettre",
+        ] {
+            assert!(would("", theirs, Level::WARN), "{theirs}");
+            assert!(!would("", theirs, Level::INFO), "{theirs}");
+            assert!(!would("trace", theirs, Level::INFO), "{theirs}");
+        }
+        // Named: exactly what was asked, for that crate.
+        let asked = "debug, sqlx=info ,hyper_util=TRACE";
+        assert!(would(asked, "sqlx::query", Level::INFO));
+        assert!(!would(asked, "sqlx::query", Level::DEBUG));
+        assert!(would(asked, "hyper_util::client", Level::TRACE));
+        assert!(!would(asked, "lettre", Level::INFO));
+        assert!(would(asked, "oswx_server", Level::DEBUG));
+        // One of ours named more exactly wins over the level for all of ours.
+        assert!(would(
+            "warn,oswx_server::journal=trace",
+            "oswx_server::journal",
+            Level::TRACE
+        ));
+        assert!(!would(
+            "warn,oswx_server::journal=trace",
+            "oswx_server::hub",
+            Level::INFO
+        ));
+        for bad in [
+            "chatty",
+            "debug,sqlx",
+            "sqlx=",
+            "=debug",
+            "sqlx=loud",
+            "a b=info",
+            "info;x",
+        ] {
+            let said = log_targets(bad).unwrap_err();
+            assert!(
+                said.starts_with("OSWX_COLLAB_LOG_LEVEL must be "),
+                "{bad}: {said}"
+            );
+            assert!(!said.contains("chatty") && !said.contains("loud"), "{said}");
+        }
+    }
 
     #[test]
     fn the_command_line_is_well_formed() {

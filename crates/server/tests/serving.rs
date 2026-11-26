@@ -6,6 +6,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -15,6 +16,7 @@ use oswx_core::Seq;
 use oswx_core::wire::RejectCode;
 use oswx_server::blobs::blob_key;
 use oswx_server::serve::{Stopped, TOO_SLOW, serve};
+use oswx_server::uploads::Uploads;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -274,12 +276,7 @@ async fn a_client_that_never_finishes_its_request_head_is_cut_off() {
     assert_eq!(server.get("/api/health", None).await.0, 200);
     let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
     socket
-        .write_all(
-            b"GET /api/health HTTP/1.1
-Host: x
-
-",
-        )
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
         .await
         .unwrap();
     let answer = read_until(&mut socket, b"}").await;
@@ -293,7 +290,12 @@ Host: x
         .await
         .expect("the idle connection is closed");
     assert_eq!(more, 0);
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // After the limit (half a second here), not before and not long after.
+    let idle = started.elapsed();
+    assert!(
+        idle >= Duration::from_millis(400) && idle < Duration::from_secs(5),
+        "the idle connection was closed after {idle:?}"
+    );
 }
 
 // ------------------------------------------------------------------ uploads at once
@@ -343,16 +345,51 @@ async fn upload_now(
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// A server whose uploads have these limits (server, organisation, account) and wait `queue`
+/// for a place; anyone may register and make an organisation.
+async fn server_with_uploads(at_once: usize, per_org: usize, per_account: usize) -> TestServer {
+    TestServer::start_custom(
+        |s| s.open_registration = true,
+        |s| {
+            let uploads = Uploads::new(at_once, per_org, per_account);
+            s.uploads = Arc::new(uploads.queue_wait(Duration::from_millis(300)));
+        },
+    )
+    .await
+}
+
+/// Another account with an organisation and a project of its own: its token and a [`World`] to
+/// upload into.
+async fn another_world(server: &TestServer, email: &str) -> World {
+    let (token, id) = server.register(email).await;
+    let (status, org) = server
+        .post("/api/orgs", Some(&token), json!({"name": email}))
+        .await;
+    assert_eq!(status, 201, "{org}");
+    let org = org["id"].as_str().unwrap().to_owned();
+    let (status, project) = server
+        .post(
+            &format!("/api/orgs/{org}/projects"),
+            Some(&token),
+            json!({"name": "Theirs"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{project}");
+    World {
+        admin: token,
+        admin_id: id,
+        org,
+        project: project["id"].as_str().unwrap().to_owned(),
+    }
+}
+
 #[tokio::test]
-async fn only_so_many_uploads_run_at_once_per_account_and_on_the_server() {
-    let server = TestServer::start_with(|s| {
-        s.max_blob_uploads = 2;
-        s.max_blob_uploads_per_user = 1;
-    })
-    .await;
+async fn only_so_many_uploads_run_at_once_per_account_organisation_and_server() {
+    let server = server_with_uploads(2, 2, 1).await;
     let w = World::new(&server).await.unwrap();
     let (bob, _) = w.editor(&server, "bob@example.com").await;
     let (cy, _) = w.editor(&server, "cy@example.com").await;
+    let other = another_world(&server, "dee@example.org").await;
     let uploads = server.state.uploads.clone();
     let (one, two, three) = (noise(MIB, 1), noise(MIB, 2), noise(MIB, 3));
 
@@ -365,15 +402,27 @@ async fn only_so_many_uploads_run_at_once_per_account_and_on_the_server() {
         body["detail"]
             .as_str()
             .unwrap()
-            .contains("too many uploads running"),
+            .starts_with("you have too many uploads running"),
         "{body}"
     );
     assert_eq!(uploads.running(), 1);
-    // Another account is not held up by it...
+    // Another account of the organisation is not held up by it...
     let (finish_bob, bob_upload) = held_upload(&server, &w, &bob, &two);
     assert!(eventually(|| uploads.running() == 2).await);
-    // ... until the server has as many as it takes: 503 for a third account.
+    // ... until the organisation has as many as it may: 429 for a third member.
     let (status, body) = upload_now(&server, &w, &cy, &three).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("your organisation has too many uploads running"),
+        "{body}"
+    );
+    // And the server has as many as it takes: 503 for someone else's organisation, after a
+    // short wait for a place.
+    let started = Instant::now();
+    let (status, body) = upload_now(&server, &other, &other.admin, &three).await;
     assert_eq!(status, 503, "{body}");
     assert!(
         body["detail"]
@@ -382,6 +431,7 @@ async fn only_so_many_uploads_run_at_once_per_account_and_on_the_server() {
             .contains("as many uploads as it takes"),
         "{body}"
     );
+    assert!(started.elapsed() >= Duration::from_millis(250));
     // Asking what is missing, downloading and everything else go on meanwhile.
     let (status, missing) = server
         .post(
@@ -394,7 +444,7 @@ async fn only_so_many_uploads_run_at_once_per_account_and_on_the_server() {
     // Someone who may not upload at all takes no place and hears nothing of the limit.
     let (status, _) = upload_now(&server, &w, "not-a-token", b"x").await;
     assert_eq!(status, 401);
-    assert_eq!(uploads.running(), 2);
+    assert_eq!((uploads.running(), uploads.queued()), (2, 0));
 
     // The held uploads finish, and the places are free again.
     finish_admin.send(()).unwrap();
@@ -404,9 +454,231 @@ async fn only_so_many_uploads_run_at_once_per_account_and_on_the_server() {
     assert!(eventually(|| uploads.running() == 0).await);
     assert_eq!(upload_now(&server, &w, &cy, &three).await.0, 204);
     assert_eq!(upload_now(&server, &w, &w.admin, &three).await.0, 204);
+    assert_eq!(
+        upload_now(&server, &other, &other.admin, &three).await.0,
+        204
+    );
     assert!(eventually(|| uploads.running() == 0).await);
     let counted = oswx_server::metrics::counters().uploads_refused;
-    assert!(counted[0] >= 1 && counted[1] >= 1, "{counted:?}");
+    assert!(counted.iter().all(|n| *n >= 1), "{counted:?}");
+}
+
+#[tokio::test]
+async fn an_upload_waits_for_a_place_on_the_server_and_gets_one_that_comes_free() {
+    let server = TestServer::start_custom(
+        |s| s.open_registration = true,
+        |s| s.uploads = Arc::new(Uploads::new(1, 1, 1).queue_wait(Duration::from_secs(20))),
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let other = another_world(&server, "dee@example.org").await;
+    let uploads = server.state.uploads.clone();
+    let (one, two) = (noise(MIB, 1), noise(MIB, 2));
+    let (finish, held) = held_upload(&server, &w, &w.admin, &one);
+    assert!(eventually(|| uploads.running() == 1).await);
+    let waiting = {
+        let request = reqwest::Client::new()
+            .put(server.url(&blob_path(&other, &sha_of(&two))))
+            .bearer_auth(&other.admin)
+            .body(two.clone());
+        tokio::spawn(async move { request.send().await.unwrap().status() })
+    };
+    assert!(eventually(|| uploads.queued() == 1).await);
+    assert!(!waiting.is_finished());
+    finish.send(()).unwrap();
+    assert_eq!(held.await.unwrap(), 204);
+    assert_eq!(waiting.await.unwrap(), 204);
+    assert!(eventually(|| (uploads.running(), uploads.queued()) == (0, 0)).await);
+}
+
+#[tokio::test]
+async fn two_sessions_of_one_account_share_its_uploads() {
+    let server = server_with_uploads(8, 8, 1).await;
+    let w = World::new(&server).await.unwrap();
+    // The same person, signed in on another machine.
+    let laptop = server.login("ada@example.com", PASSWORD).await;
+    assert_ne!(laptop, w.admin);
+    let (one, two) = (noise(MIB, 1), noise(MIB, 2));
+    let (finish, held) = held_upload(&server, &w, &w.admin, &one);
+    assert!(eventually(|| server.state.uploads.running() == 1).await);
+    let (status, body) = upload_now(&server, &w, &laptop, &two).await;
+    assert_eq!(status, 429, "{body}");
+    finish.send(()).unwrap();
+    assert_eq!(held.await.unwrap(), 204);
+    assert!(eventually(|| server.state.uploads.running() == 0).await);
+    assert_eq!(upload_now(&server, &w, &laptop, &two).await.0, 204);
+}
+
+#[tokio::test]
+async fn an_organisation_at_its_limit_does_not_stop_anothers_upload() {
+    let server = server_with_uploads(4, 1, 4).await;
+    let w = World::new(&server).await.unwrap();
+    let (bob, _) = w.editor(&server, "bob@example.com").await;
+    let other = another_world(&server, "dee@example.org").await;
+    let (one, two) = (noise(MIB, 1), noise(MIB, 2));
+    let (finish, held) = held_upload(&server, &w, &w.admin, &one);
+    assert!(eventually(|| server.state.uploads.running() == 1).await);
+    // The organisation has its one: a colleague is told so ...
+    let (status, body) = upload_now(&server, &w, &bob, &two).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().contains("organisation"),
+        "{body}"
+    );
+    // ... and another organisation uploads as if nothing were (the same blob, even: blobs
+    // belong to the organisation).
+    assert_eq!(upload_now(&server, &other, &other.admin, &two).await.0, 204);
+    assert_eq!(upload_now(&server, &other, &other.admin, &one).await.0, 204);
+    finish.send(()).unwrap();
+    assert_eq!(held.await.unwrap(), 204);
+    assert_eq!(upload_now(&server, &w, &bob, &two).await.0, 204);
+}
+
+/// An upload of `body` by `w`'s admin in pieces of `piece` bytes, `gap` apart, over a socket of
+/// the test's own (so that an answer that comes before the body is all sent is read, whatever the
+/// server then does with the connection): its status and its body's `detail`.
+async fn paced_upload(
+    server: &TestServer,
+    w: &World,
+    body: &[u8],
+    piece: usize,
+    gap: Duration,
+) -> (u16, String) {
+    let mut socket = TcpStream::connect(addr(server)).await.unwrap();
+    let head = format!(
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        blob_path(w, &sha_of(body)),
+        addr(server),
+        w.admin,
+        body.len()
+    );
+    socket.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    for piece in body.chunks(piece) {
+        if socket.write_all(piece).await.is_err() {
+            break;
+        }
+        // The gap, spent listening: an answer now means the server has given the upload up.
+        if let Ok(Ok(n)) = tokio::time::timeout(gap, socket.read(&mut buf)).await {
+            answer.extend_from_slice(&buf[..n]);
+            break;
+        }
+    }
+    let rest = tokio::time::timeout(WAIT, async {
+        let mut rest = Vec::new();
+        let _ = socket.read_to_end(&mut rest).await;
+        rest
+    })
+    .await
+    .expect("the server answers");
+    answer.extend_from_slice(&rest);
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    let status = answer
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {answer:?}"));
+    let detail = answer
+        .split_once("{\"detail\":\"")
+        .map(|(_, rest)| rest.split('"').next().unwrap_or_default().to_owned())
+        .unwrap_or_default();
+    (status, detail)
+}
+
+#[tokio::test]
+async fn an_upload_that_drips_is_given_up_on_and_frees_its_place() {
+    // No idle limit to speak of: only the rate can end a drip. 2,000 bytes a second, with a
+    // second to spare.
+    let server = TestServer::start_custom(
+        |s| {
+            s.blob_idle_timeout = 300.0;
+            s.min_upload_rate = 2000;
+            s.upload_rate_grace = 1.0;
+        },
+        |s| s.uploads = Arc::new(Uploads::new(2, 2, 2).queue_wait(Duration::from_millis(100))),
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let uploads = server.state.uploads.clone();
+    // The attack: every place taken by an upload that sends ten bytes five times a second
+    // (never idle, 50 bytes a second).
+    let body = noise(64 << 10, 7);
+    let started = Instant::now();
+    let (first, second) = (noise(64 << 10, 70), noise(64 << 10, 71));
+    let gap = Duration::from_millis(200);
+    let drips = async {
+        tokio::join!(
+            paced_upload(&server, &w, &first, 10, gap),
+            paced_upload(&server, &w, &second, 10, gap),
+        )
+    };
+    let others = async {
+        assert!(eventually(|| uploads.running() == 2).await);
+        // While they hold the places nobody else gets in ...
+        assert_eq!(upload_now(&server, &w, &w.admin, &body).await.0, 429);
+    };
+    // ... but not for long: each is given up on about a second after it began.
+    let ((one, two), ()) = tokio::join!(drips, others);
+    for (status, detail) in [one, two] {
+        assert_eq!(
+            (status, detail.as_str()),
+            (400, "the upload was too slow and was given up on")
+        );
+    }
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(8),
+        "{took:?}"
+    );
+    assert!(
+        eventually(|| uploads.running() == 0).await,
+        "the places were kept"
+    );
+    // Nothing of them is in storage, and an honest upload goes through.
+    assert_eq!(upload_now(&server, &w, &w.admin, &body).await.0, 204);
+    let stored = server.stored_under("").await;
+    assert_eq!(stored.len(), 1, "{stored:?}");
+}
+
+#[tokio::test]
+async fn an_honest_slow_upload_is_not_cut_by_the_minimum_rate() {
+    let server = TestServer::start_with(|s| {
+        s.min_upload_rate = 2000;
+        s.upload_rate_grace = 1.0;
+        s.request_timeout = 1.0;
+    })
+    .await;
+    let w = World::new(&server).await.unwrap();
+    // 4,000 bytes every 250 ms: 16,000 bytes a second, for five seconds, five times the grace.
+    let body = noise(80_000, 11);
+    let started = Instant::now();
+    let (status, answer) = paced_upload(&server, &w, &body, 4000, Duration::from_millis(250)).await;
+    assert_eq!(status, 204, "{answer}");
+    assert!(started.elapsed() > Duration::from_secs(4));
+    // A pause shorter than the grace, once the sender has earned it, is forgiven: 700 ms
+    // between pieces of 4,000 bytes (two seconds' worth each).
+    let body = noise(24_000, 12);
+    let (status, answer) = paced_upload(&server, &w, &body, 4000, Duration::from_millis(700)).await;
+    assert_eq!(status, 204, "{answer}");
+    // Right at the floor is enough: 500 bytes every 250 ms.
+    let body = noise(6000, 13);
+    let (status, answer) = paced_upload(&server, &w, &body, 500, Duration::from_millis(250)).await;
+    assert_eq!(status, 204, "{answer}");
+    // Below it is not: 100 bytes every 250 ms (400 bytes a second).
+    let body = noise(6000, 14);
+    let (status, answer) = paced_upload(&server, &w, &body, 100, Duration::from_millis(250)).await;
+    assert_eq!(
+        (status, answer.as_str()),
+        (400, "the upload was too slow and was given up on")
+    );
+    // And with no floor set, even that is taken (the idle limit is all there is).
+    let server = TestServer::start_with(|s| s.min_upload_rate = 0).await;
+    let w = World::new(&server).await.unwrap();
+    let body = noise(1000, 15);
+    let (status, answer) = paced_upload(&server, &w, &body, 100, Duration::from_millis(250)).await;
+    assert_eq!(status, 204, "{answer}");
 }
 
 #[tokio::test]
@@ -605,8 +877,20 @@ async fn there_is_no_metrics_route_unless_a_token_is_set_and_then_only_with_it()
         assert_eq!(status, 401, "{bearer:?}");
         assert!(!body.contains("oswx_collab"), "{body}");
     }
-    // Not as a query, not as another scheme.
+    // Not as a query, not as another scheme, not with anything but one space before it.
     for request in [
+        reqwest::Client::new()
+            .get(server.url("/metrics"))
+            .header("authorization", format!("Bearer  {METRICS_TOKEN}")),
+        reqwest::Client::new()
+            .get(server.url("/metrics"))
+            .header("authorization", format!("Bearer\t{METRICS_TOKEN}")),
+        reqwest::Client::new()
+            .get(server.url("/metrics"))
+            .header("authorization", format!("Bearer {METRICS_TOKEN} x")),
+        reqwest::Client::new()
+            .get(server.url("/metrics"))
+            .header("authorization", format!("Bearer {METRICS_TOKEN},")),
         reqwest::Client::new().get(server.url(&format!("/metrics?token={METRICS_TOKEN}"))),
         reqwest::Client::new()
             .get(server.url("/metrics"))
@@ -625,6 +909,15 @@ async fn there_is_no_metrics_route_unless_a_token_is_set_and_then_only_with_it()
     let r = reqwest::Client::new()
         .get(server.url("/metrics"))
         .header("authorization", format!("bearer {METRICS_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // (White space after the header's value is not part of it: HTTP takes it off before the
+    // server sees it, so a trailing space changes nothing.)
+    let r = reqwest::Client::new()
+        .get(server.url("/metrics"))
+        .header("authorization", format!("Bearer {METRICS_TOKEN} "))
         .send()
         .await
         .unwrap();
@@ -760,6 +1053,7 @@ async fn no_metric_names_a_user_document_project_or_organisation() {
         "reads",
         "journal",
         "server",
+        "organisation",
     ]
     .into();
     let mut announced = BTreeSet::new();
@@ -928,7 +1222,7 @@ async fn a_stop_closes_every_room_snapshotted_and_every_connection_in_order() {
 
 #[tokio::test]
 async fn a_stop_that_cannot_finish_ends_at_its_bound_with_the_rooms_closed_first() {
-    let mut server = TestServer::start_with(|s| s.shutdown_timeout = 1.5).await;
+    let mut server = TestServer::start_with(|s| s.shutdown_timeout = 3.0).await;
     let world = World::new(&server).await.unwrap();
     let (stop, serving) = serve_again(&mut server).await;
     let doc = world.document(&server, None, None, None).await;
@@ -959,11 +1253,17 @@ async fn a_stop_that_cannot_finish_ends_at_its_bound_with_the_rooms_closed_first
 
     let started = Instant::now();
     stop.send(()).unwrap();
-    // The room is closed and snapshotted at once, whatever else is stuck.
+    // The request gets half the bound to finish (it never does); then the room is closed and
+    // snapshotted, whatever else is stuck.
     assert_eq!(live.closed().await.0, 1001);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1400),
+        "the room was closed {:?} after the stop, before the request had its time",
+        started.elapsed()
+    );
     while snapshot_seq(&server, &doc, 1).await != 1 {
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_millis(2500),
             "no snapshot at the head {:?} after the stop",
             started.elapsed()
         );
@@ -976,11 +1276,186 @@ async fn a_stop_that_cannot_finish_ends_at_its_bound_with_the_rooms_closed_first
     assert_eq!(stopped, Stopped::OutOfTime);
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(1400) && took < Duration::from_secs(4),
+        took >= Duration::from_millis(2900) && took < Duration::from_secs(6),
         "the stop took {took:?}"
     );
     // The journal was still written out and stopped inside the bound.
     assert!(!server.state.journal.healthy());
     gate.open();
     let _ = renaming.await;
+}
+
+// ------------------------------------------------------------------ fix round 1
+
+/// Sends a document creation whose body arrives in pieces of `piece` bytes, `gap` apart; answers
+/// the status line and body of the answer.
+async fn paced_creation(
+    server: &TestServer,
+    w: &World,
+    body: &[u8],
+    piece: usize,
+    gap: Duration,
+) -> String {
+    let mut socket = TcpStream::connect(addr(server)).await.unwrap();
+    let head = format!(
+        "POST /api/projects/{}/documents HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        w.project,
+        addr(server),
+        w.admin,
+        body.len()
+    );
+    socket.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    for piece in body.chunks(piece) {
+        if socket.write_all(piece).await.is_err() {
+            break;
+        }
+        if let Ok(Ok(n)) = tokio::time::timeout(gap, socket.read(&mut buf)).await {
+            answer.extend_from_slice(&buf[..n]);
+            break;
+        }
+    }
+    let rest = tokio::time::timeout(WAIT, async {
+        let mut rest = Vec::new();
+        let _ = socket.read_to_end(&mut rest).await;
+        rest
+    })
+    .await
+    .expect("the server answers");
+    answer.extend_from_slice(&rest);
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+#[tokio::test]
+async fn a_body_that_keeps_coming_does_not_count_against_the_request_limit() {
+    // Half a second to answer; 2,000 bytes a second is fast enough.
+    let server = TestServer::start_with(|s| {
+        s.request_timeout = 0.5;
+        s.min_upload_rate = 2000;
+    })
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let mut content = part();
+    content["note"] = json!("x".repeat(30_000));
+    let body = serde_json::to_vec(&json!({"name": "Slow but sure", "content": content})).unwrap();
+    assert!(body.len() > 30_000);
+    // 2,000 bytes every 100 ms: 20,000 bytes a second, a body that takes over 1.5 s to arrive,
+    // three times the limit.
+    let started = Instant::now();
+    let answer = paced_creation(&server, &w, &body, 2000, Duration::from_millis(100)).await;
+    assert!(answer.starts_with("HTTP/1.1 201"), "{answer}");
+    assert!(started.elapsed() > Duration::from_millis(1400));
+    assert_eq!(server.state.http.request_timeouts(), 0);
+
+    // The same body at 200 bytes a second (20 bytes every 100 ms) is below the rate: the clock
+    // is hardly put forward, and the request is answered 503 a little after the limit.
+    let started = Instant::now();
+    let answer = paced_creation(&server, &w, &body, 20, Duration::from_millis(100)).await;
+    assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+    assert!(answer.contains(TOO_SLOW), "{answer}");
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(450) && took < Duration::from_secs(3),
+        "{took:?}"
+    );
+    assert_eq!(server.state.http.request_timeouts(), 1);
+    // Once the body is all there, the handler has the whole limit again, however long the body
+    // took: nothing was cut in the first request, which ended 1.5 s after its head.
+    let documents: i64 = server.scalar("SELECT COUNT(*) FROM documents").await;
+    assert_eq!(documents, 1);
+}
+
+#[tokio::test]
+async fn one_connection_more_than_the_server_holds_is_closed_at_once() {
+    let server = TestServer::start_with(|s| s.max_connections = 3).await;
+    let stats = server.state.http.clone();
+    assert!(eventually(|| stats.open() == 0).await);
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(TcpStream::connect(addr(&server)).await.unwrap());
+    }
+    assert!(eventually(|| stats.open() == 3).await);
+    assert_eq!(stats.refusals(), 0);
+    // The fourth is accepted and closed: it reads the end of the connection, not an answer.
+    let mut fourth = TcpStream::connect(addr(&server)).await.unwrap();
+    let _ = fourth
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await;
+    let got = tokio::time::timeout(WAIT, read_to_end(&mut fourth))
+        .await
+        .expect("the connection is closed");
+    assert_eq!(got, 0);
+    assert!(eventually(|| stats.refusals() == 1).await);
+    assert_eq!(stats.open(), 3);
+    // The ones that are held still work.
+    held[0]
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let answer = read_until(&mut held[0], b"}").await;
+    assert!(answer.starts_with(b"HTTP/1.1 200"));
+    // One goes: there is room for another.
+    held.pop();
+    assert!(eventually(|| stats.open() == 2).await);
+    assert_eq!(server.get("/api/health", None).await.0, 200);
+    assert_eq!(stats.refusals(), 1);
+}
+
+#[tokio::test]
+async fn a_stop_lets_the_requests_in_their_handlers_finish_before_the_rooms_close() {
+    let mut server = TestServer::start_with(|s| s.shutdown_timeout = 6.0).await;
+    let world = World::new(&server).await.unwrap();
+    let (stop, serving) = serve_again(&mut server).await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut live = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(edit(&mut live, 7).await, 1);
+    // A request in its handler when the stop comes (parked after its commit).
+    let gate = server.state.room_hooks.after_commit.clone();
+    gate.shut();
+    let renaming = {
+        let (base, token, project) = (
+            server.base.clone(),
+            world.admin.clone(),
+            world.project.clone(),
+        );
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .patch(format!("{base}/api/projects/{project}"))
+                .bearer_auth(token)
+                .json(&json!({"name": "Renamed"}))
+                .send()
+                .await
+                .map(|r| r.status())
+        })
+    };
+    tokio::time::timeout(WAIT, gate.until_waiting(1))
+        .await
+        .expect("the rename committed");
+    assert!(eventually(|| server.state.http.in_handlers() == 1).await);
+
+    let started = Instant::now();
+    stop.send(()).unwrap();
+    // Nobody new is taken ...
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(TcpStream::connect(addr(&server)).await.is_err());
+    // ... but while that request finishes, the room is still open and takes changes.
+    assert_eq!(edit(&mut live, 8).await, 2);
+    assert!(!server.state.hub.is_closing());
+    gate.open();
+    assert_eq!(renaming.await.unwrap().ok(), Some(StatusCode::OK));
+    // Then the rooms close, snapshotted, and the stop is in order, long before its bound.
+    assert_eq!(live.closed().await.0, 1001);
+    let stopped = tokio::time::timeout(WAIT, serving)
+        .await
+        .expect("serve ends")
+        .unwrap();
+    assert_eq!(stopped, Stopped::InOrder);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(snapshot_seq(&server, &doc, 2).await, 2);
 }

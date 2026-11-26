@@ -234,6 +234,78 @@ pub fn fail_when_stalled(source: ByteStream, idle: Duration) -> ByteStream {
     .boxed()
 }
 
+/// The error of a body that was given up on because it came too slowly ([`fail_when_slow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the sender did not keep up {0} bytes a second")]
+pub struct TooSlow(pub u64);
+
+/// How fast a body must come, on average: `floor` bytes a second, with `grace` to spare.
+///
+/// The sender starts with an allowance of `grace`. Waiting for it uses the allowance up; every
+/// byte it sends earns `1 / floor` seconds back, up to `grace` again. When the allowance is gone
+/// the body is given up on. So a sender at or above the floor is never cut, however long its
+/// body takes; a pause of up to `grace` is forgiven once the sender has earned it back; and one
+/// that sends a byte now and then (which no idle limit catches) is cut `grace` after it began.
+/// Only the time spent waiting for the sender counts, never the time the server took to store
+/// what it sent.
+///
+/// The default floor is 4,096 bytes a second (`OSWX_COLLAB_MIN_UPLOAD_RATE`; 0: none): below
+/// what a 56k modem or a poor 2G connection carries, so no honest uplink is cut, and enough
+/// that the largest blob (256 MiB) cannot hold a place for more than about 18 hours.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    /// Bytes a second; 0: no floor.
+    pub floor: u64,
+    pub grace: Duration,
+}
+
+impl Pace {
+    /// As the settings say (`min_upload_rate`, `upload_rate_grace`).
+    pub fn from_settings(settings: &crate::Settings) -> Self {
+        Self {
+            floor: settings.min_upload_rate,
+            grace: Duration::from_secs_f64(settings.upload_rate_grace),
+        }
+    }
+
+    /// The allowance left after waiting `waited` for `bytes` bytes with `allowance` in hand.
+    pub fn after(&self, allowance: Duration, waited: Duration, bytes: usize) -> Duration {
+        if self.floor == 0 {
+            return self.grace;
+        }
+        let earned = Duration::from_secs_f64(bytes as f64 / self.floor as f64);
+        (allowance.saturating_sub(waited) + earned).min(self.grace)
+    }
+}
+
+/// `source`, for a body a client sends: it fails with [`TooSlow`] when the sender does not keep
+/// up `pace` (see [`Pace`]).
+pub fn fail_when_slow(source: ByteStream, pace: Pace) -> ByteStream {
+    if pace.floor == 0 {
+        return source;
+    }
+    let slow = move || io::Error::new(io::ErrorKind::TimedOut, TooSlow(pace.floor));
+    stream::unfold(
+        (source, pace.grace, false),
+        move |(mut source, allowance, done)| async move {
+            if done {
+                return None;
+            }
+            let asked = tokio::time::Instant::now();
+            match tokio::time::timeout(allowance, source.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    let left = pace.after(allowance, asked.elapsed(), chunk.len());
+                    Some((Ok(chunk), (source, left, false)))
+                }
+                Ok(Some(Err(err))) => Some((Err(err), (source, allowance, true))),
+                Ok(None) => None,
+                Err(_) => Some((Err(slow()), (source, allowance, true))),
+            }
+        },
+    )
+    .boxed()
+}
+
 /// `source`, for a reader this server does not drive (a download a client pulls at its own pace):
 /// `source` is dropped, and whatever it holds released (an open file, a connection to the bucket),
 /// once the reader has taken nothing for `idle` or `source` has produced nothing for `idle`. The

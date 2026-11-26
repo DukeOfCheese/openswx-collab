@@ -137,7 +137,16 @@ fn help_names_the_commands_and_the_settings_and_version_the_version() {
         "OSWX_COLLAB_S3_ENDPOINT",
         "OSWX_COLLAB_S3_PATH_STYLE",
         "OSWX_COLLAB_BLOB_IDLE_TIMEOUT",
+        "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+        "OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG",
+        "OSWX_COLLAB_MIN_UPLOAD_RATE",
+        "OSWX_COLLAB_UPLOAD_RATE_GRACE",
+        "OSWX_COLLAB_MAX_CONNECTIONS",
+        "OSWX_COLLAB_LOG_LEVEL",
         "OSWX_COLLAB_TRUSTED_PROXIES",
         "OSWX_COLLAB_METRICS_TOKEN",
         "OSWX_COLLAB_LOG",
@@ -170,10 +179,23 @@ fn help_names_the_commands_and_the_settings_and_version_the_version() {
 #[test]
 fn migrate_and_db_status_say_where_the_schema_is() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(
-        ok(dir.path(), &["db-status"], &[]),
-        "database at none (an empty database); this server needs 1"
+    // Nothing there yet: `db-status` says so, fails, and makes nothing (a command that only
+    // looks must not leave an empty database behind).
+    let ran = run(dir.path(), &["db-status"], &[]);
+    assert_eq!((ran.code, ran.out.as_str()), (Some(1), ""), "{}", ran.err);
+    assert!(
+        ran.err.starts_with("error: there is no database at ")
+            && ran.err.contains("nothing was created"),
+        "{}",
+        ran.err
     );
+    let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert!(left.is_empty(), "db-status made {left:?}");
+    // The same for a folder that does not exist: it is not made either.
+    let elsewhere = format!("sqlite://{}/not/made/collab.db", slashes(dir.path()));
+    let elsewhere = [("OSWX_COLLAB_DATABASE_URL", elsewhere.as_str())];
+    assert_eq!(run(dir.path(), &["db-status"], &elsewhere).code, Some(1));
+    assert!(!dir.path().join("not").exists());
     // (With upgrading at start turned off: `migrate` is the way to do it then.)
     let manual = [("OSWX_COLLAB_AUTO_MIGRATE", "0")];
     assert_eq!(ok(dir.path(), &["migrate"], &manual), "schema none -> 1");
@@ -337,6 +359,14 @@ fn a_setting_that_cannot_be_read_stops_every_command_and_is_never_repeated() {
         ("OSWX_COLLAB_SMTP_SECURITY", "tls1.0"),
         ("OSWX_COLLAB_LOG", "xml"),
         ("OSWX_COLLAB_LOG_LEVEL", "chatty"),
+        ("OSWX_COLLAB_LOG_LEVEL", "debug,sqlx=loud"),
+        // Every address there is, is not a list of proxies.
+        ("OSWX_COLLAB_TRUSTED_PROXIES", "0.0.0.0/0"),
+        ("OSWX_COLLAB_TRUSTED_PROXIES", "172.16.0.0/12, ::/0"),
+        ("OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG", "0"),
+        ("OSWX_COLLAB_MIN_UPLOAD_RATE", "slowly"),
+        ("OSWX_COLLAB_UPLOAD_RATE_GRACE", "0"),
+        ("OSWX_COLLAB_MAX_CONNECTIONS", "0"),
     ] {
         for command in [&["serve", "--port", "0"][..], &["migrate"], &["db-status"]] {
             let ran = run(dir.path(), command, &[(name, value)]);
@@ -479,44 +509,57 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 impl Server {
-    /// Starts `serve` in `dir` and waits until it answers `/api/health`.
+    /// Starts `serve` in `dir` on a port the system picks (`--port 0`), reads the address from
+    /// the line the server logs once it listens, and checks that it answers `/api/health`.
     async fn start(dir: &Path, env: &[(&str, &str)]) -> Self {
-        let port = free_port();
-        let log = dir.join(format!("server-{port}.log"));
-        let mut command = program(dir, &["serve", "--port", &port.to_string()], env);
+        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let log = dir.join(format!("server-{n}.log"));
+        let mut command = program(dir, &["serve", "--port", "0"], env);
         command
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
         own_console(&mut command);
         let mut server = Self {
             child: command.spawn().expect("the server starts"),
-            base: format!("http://127.0.0.1:{port}"),
+            base: String::new(),
             log,
             dir: dir.to_path_buf(),
         };
         let started = Instant::now();
         loop {
-            if let Ok(r) = reqwest::get(format!("{}/api/health", server.base)).await {
-                assert_eq!(r.status(), 200);
-                assert_eq!(r.json::<Value>().await.unwrap(), json!({"ok": true}));
-                return server;
+            // Text: `... listening on http://127.0.0.1:50123 version=...`; JSON:
+            // `..."message":"listening on http://127.0.0.1:50123",...`.
+            let logged = server.logged();
+            if let Some((_, rest)) = logged.split_once("listening on http://") {
+                let address: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
+                    .collect();
+                assert!(
+                    address.starts_with("127.0.0.1:") && !address.ends_with(":0"),
+                    "{logged}"
+                );
+                server.base = format!("http://{address}");
+                break;
             }
             if let Some(status) = server.child.try_wait().unwrap() {
-                panic!("the server ended ({status}): {}", server.logged());
+                panic!("the server ended ({status}): {logged}");
             }
             assert!(
                 started.elapsed() < WAIT,
-                "the server did not start: {}",
-                server.logged()
+                "the server did not start: {logged}"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // It listens before it says so: the first request is answered.
+        let health = reqwest::get(format!("{}/api/health", server.base))
+            .await
+            .unwrap_or_else(|e| panic!("{e}: {}", server.logged()));
+        assert_eq!(health.status(), 200);
+        assert_eq!(health.json::<Value>().await.unwrap(), json!({"ok": true}));
+        server
     }
 
     fn logged(&self) -> String {
@@ -565,6 +608,9 @@ enum Signal {
     Interrupt,
     /// SIGTERM, what `docker stop` sends; on Windows (which has none), Ctrl-Break as well.
     Terminate,
+    /// SIGHUP: the terminal the server was started from went away.
+    #[cfg(unix)]
+    Hangup,
 }
 
 #[cfg(unix)]
@@ -575,6 +621,7 @@ fn send_signal(pid: u32, signal: Signal, _dir: &Path) {
     let name = match signal {
         Signal::Interrupt => "-INT",
         Signal::Terminate => "-TERM",
+        Signal::Hangup => "-HUP",
     };
     let status = Command::new("kill")
         .arg(name)
@@ -923,6 +970,12 @@ async fn serve_stops_in_order_on_an_interrupt() {
 #[tokio::test]
 async fn serve_stops_in_order_on_a_termination_and_logs_json_when_asked() {
     serve_answers_and_a_signal_stops_it_with_every_room_snapshotted(Signal::Terminate, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_stops_in_order_on_a_hangup() {
+    serve_answers_and_a_signal_stops_it_with_every_room_snapshotted(Signal::Hangup, false).await;
 }
 
 #[tokio::test]

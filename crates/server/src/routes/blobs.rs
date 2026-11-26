@@ -9,8 +9,11 @@
 //!   `Content-Length` says so, and as soon as the streamed size passes it otherwise. 204 when stored.
 //!   A blob that is already stored is not written again: the body is still read and checked, and the
 //!   answer is the same 204. A path that is not a SHA-256 is 400. The server takes only so many
-//!   uploads at once, and so many from one account ([`crate::uploads`]): one more is refused
-//!   before any of it is stored, with 429 (the account's own limit) or 503 (the server's).
+//!   uploads at once, and so many from one organisation and from one account
+//!   ([`crate::uploads`]): one more is refused before any of it is stored, with 429 (the
+//!   account's or the organisation's own limit) or 503 (the server's, after a short wait for a
+//!   place). An upload that does not keep up the minimum average rate
+//!   ([`crate::blobs::Pace`]) is answered 400 [`TOO_SLOW`] and leaves nothing in storage.
 //! - `GET /api/projects/{project}/blobs/{sha256}` (viewer): the raw bytes, streamed, as
 //!   `application/octet-stream` with their `Content-Length`, `Cache-Control: private,
 //!   max-age=31536000, immutable` and `ETag: "<sha256>"`. `If-None-Match` with that tag answers 304.
@@ -41,7 +44,8 @@ use sha2::{Digest, Sha256};
 
 use crate::access::{CurrentUser, require_project};
 use crate::blobs::{
-    ByteStream, PutError, blob_key, drop_when_stalled, fail_when_stalled, is_sha256,
+    ByteStream, Pace, PutError, TooSlow, blob_key, drop_when_stalled, fail_when_slow,
+    fail_when_stalled, is_sha256,
 };
 use crate::error::{ApiError, ApiJson, ApiPath};
 use crate::routes::{DRAIN_AT_MOST, DRAIN_TIMEOUT};
@@ -54,6 +58,8 @@ pub const MAX_MISSING: usize = 2000;
 const LOOKUPS_AT_ONCE: usize = 16;
 
 const NO_SUCH_BLOB: &str = "no such blob";
+/// What an upload that did not keep up the minimum rate is answered (400).
+pub const TOO_SLOW: &str = "the upload was too slow and was given up on";
 const CACHE_FOREVER: &str = "private, max-age=31536000, immutable";
 
 /// The routes whose bodies are at most the default limit.
@@ -145,7 +151,7 @@ async fn upload(
         ));
     }
     // Held until this request ends, however it ends.
-    let _place = match state.uploads.place(&user.id) {
+    let _place = match state.uploads.place(&user.id, &project.org_id).await {
         Ok(place) => place,
         Err(refusal) => {
             unread(&headers, body).await;
@@ -156,6 +162,7 @@ async fn upload(
     let key = blob_key(&project.org_id, &sha);
     let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);
     let body = fail_when_stalled(verified(body, sha), idle);
+    let body = fail_when_slow(body, Pace::from_settings(&state.settings));
     if state.blobs.exists(&key).await? {
         // Already stored: read and check the body (so the client is answered, not cut off), but
         // write nothing.
@@ -247,6 +254,7 @@ fn upload_error(err: anyhow::Error) -> ApiError {
             Some(inner) if inner.is::<DigestMismatch>() => {
                 ApiError::BadRequest(DigestMismatch.to_string())
             }
+            Some(inner) if inner.is::<TooSlow>() => ApiError::BadRequest(TOO_SLOW.into()),
             _ => {
                 tracing::debug!("a blob upload ended early: {e}");
                 ApiError::BadRequest("the upload did not finish".into())

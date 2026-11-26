@@ -8,8 +8,8 @@
 //!
 //! # Extension migrations
 //!
-//! An extension's migrations ([`Extensions::migrations`]) are applied in its order **after** the
-//! server's own, by `migrate` and when a server starts ([`Db::open`], as the server's own are:
+//! An extension's migrations ([`Extensions::migrations`]: a list for each kind of database, of
+//! the same length) are applied in its order **after** the server's own, by `migrate` and when a server starts ([`Db::open`], as the server's own are:
 //! always to a database that was empty, to an older one only with `auto_migrate`), and are
 //! recorded in the table `extension_migrations`. `db-status` shows them. A server whose extension
 //! carries fewer than the database has had refuses it, as one whose own migrations are older
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 
 use crate::config::{Database, Settings};
-use crate::ext::Extensions;
+use crate::ext::{Dialect, Extensions, check_migrations};
 use crate::security::{PASSWORD_LEN, clean_email, hash_password};
 use crate::store::postgres::PgConfig;
 use crate::store::{
@@ -50,16 +50,14 @@ impl Db {
     /// Opens the database for a server with the extension `ext` and brings its schema up to date
     /// as `settings.auto_migrate` allows: the server's own migrations, then the extension's.
     pub async fn open(settings: &Settings, ext: &dyn Extensions) -> anyhow::Result<Self> {
-        let (url, auto, extension) = (
-            settings.database_url.as_str(),
-            settings.auto_migrate,
-            ext.migrations(),
-        );
+        let (url, auto) = (settings.database_url.as_str(), settings.auto_migrate);
         Ok(match settings.database()? {
             Database::Sqlite(_) => {
+                let extension = migrations_of(ext, Dialect::Sqlite)?;
                 Self::Sqlite(SqliteStore::open_with_extension(url, auto, &extension).await?)
             }
             Database::Postgres(_) => {
+                let extension = migrations_of(ext, Dialect::Postgres)?;
                 let config = PgConfig::from_settings(settings);
                 Self::Postgres(PgStore::open_with_extension(url, auto, config, &extension).await?)
             }
@@ -71,7 +69,7 @@ impl Db {
         &self,
         ext: &dyn Extensions,
     ) -> anyhow::Result<(SchemaStatus, ExtensionSchema)> {
-        let extension = ext.migrations();
+        let extension = migrations_of(ext, self.dialect())?;
         Ok(match self {
             Self::Sqlite(db) => (db.migrate().await?, db.migrate_extension(&extension).await?),
             Self::Postgres(db) => (db.migrate().await?, db.migrate_extension(&extension).await?),
@@ -84,7 +82,7 @@ impl Db {
         &self,
         ext: &dyn Extensions,
     ) -> anyhow::Result<(SchemaStatus, ExtensionSchema)> {
-        let extension = ext.migrations();
+        let extension = migrations_of(ext, self.dialect())?;
         let schema = self.store().schema_status().await?;
         let ours = if schema.current.is_none() {
             ExtensionSchema {
@@ -98,6 +96,14 @@ impl Db {
             }
         };
         Ok((schema, ours))
+    }
+
+    /// Which kind of database it is.
+    pub fn dialect(&self) -> Dialect {
+        match self {
+            Self::Sqlite(_) => Dialect::Sqlite,
+            Self::Postgres(_) => Dialect::Postgres,
+        }
     }
 
     /// The database as the server uses it.
@@ -115,6 +121,13 @@ impl Db {
             Self::Postgres(db) => db.close().await,
         }
     }
+}
+
+/// The extension's migrations for `dialect`, once they are known to keep the rule of
+/// [`Extensions::migrations`] (the same number for both dialects).
+fn migrations_of(ext: &dyn Extensions, dialect: Dialect) -> anyhow::Result<Vec<&'static str>> {
+    check_migrations(ext)?;
+    Ok(ext.migrations(dialect))
 }
 
 fn version(v: Option<i64>) -> String {
@@ -158,8 +171,19 @@ pub async fn migrate(settings: &Settings, ext: &dyn Extensions) -> anyhow::Resul
 }
 
 /// `db-status`: where the schema is and what this server needs, without changing anything. A
-/// database this server could not use (newer, edited, not its own) is an error saying why.
+/// database this server could not use (newer, edited, not its own) is an error saying why, and so
+/// is a SQLite file that does not exist (it is not created).
 pub async fn db_status(settings: &Settings, ext: &dyn Extensions) -> anyhow::Result<String> {
+    // Connecting to a SQLite file that is not there would make it (and its folder): a command
+    // that only looks must not.
+    match settings.database()? {
+        Database::Sqlite(path) if !path.is_file() => bail!(
+            "there is no database at {} (nothing was created; `migrate`, or the server's start, \
+             makes it)",
+            path.display()
+        ),
+        _ => {}
+    }
     let db = Db::connect(settings).await?;
     let told = async {
         let (schema, ours) = db.status(ext).await?;

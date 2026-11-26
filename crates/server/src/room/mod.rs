@@ -194,6 +194,8 @@ pub struct Hooks {
     pub revoke_order: Arc<RevokeOrder>,
     /// How long a snapshot may take ([`SNAPSHOT_WAIT`]).
     pub snapshot_wait: Duration,
+    /// How long a request waits for the mail it sends ([`crate::mail::MAIL_WAIT`]).
+    pub mail_wait: Duration,
 }
 
 /// A gate tests shut to hold work at a point and open to let it go on.
@@ -343,6 +345,7 @@ impl Default for Hooks {
             revoke_delay_ms: Arc::default(),
             revoke_order: Arc::default(),
             snapshot_wait: SNAPSHOT_WAIT,
+            mail_wait: crate::mail::MAIL_WAIT,
         }
     }
 }
