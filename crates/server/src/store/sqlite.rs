@@ -49,9 +49,10 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange,
-    Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease,
-    SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx, User, sql,
+    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, HistoryRow, Id, Invite, Member,
+    NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole,
+    RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx, UndoTarget, User,
+    Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -435,6 +436,46 @@ impl Store for SqliteStore {
         q::recent_change_ids(&mut *self.reader().await?, document_id, client_id, limit).await
     }
 
+    async fn undo_target(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> Result<Option<UndoTarget>> {
+        q::undo_target(
+            &mut *self.reader().await?,
+            document_id,
+            client_id,
+            change_id,
+        )
+        .await
+    }
+
+    async fn history(
+        &self,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<HistoryRow>> {
+        q::history(
+            &mut *self.reader().await?,
+            document_id,
+            before,
+            after,
+            limit,
+        )
+        .await
+    }
+
+    async fn versions(&self, document_id: &str) -> Result<Vec<VersionWithAuthor>> {
+        q::versions(&mut *self.reader().await?, document_id).await
+    }
+
+    async fn version_by_name(&self, document_id: &str, name: &str) -> Result<Option<Version>> {
+        q::version_by_name(&mut *self.reader().await?, document_id, name).await
+    }
+
     async fn snapshot_at_or_before(
         &self,
         document_id: &str,
@@ -773,6 +814,26 @@ impl Tx for SqliteTx<'_> {
 
     async fn set_reverted_by(&mut self, document_id: &str, seq: i64, by: i64) -> Result<bool> {
         q::set_reverted_by(self.conn(), document_id, seq, by).await
+    }
+
+    async fn change_broke(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+    ) -> Result<Option<Option<String>>> {
+        q::change_broke(self.conn(), document_id, seq).await
+    }
+
+    async fn set_change_broke(&mut self, document_id: &str, seq: i64, broke: &str) -> Result<()> {
+        q::set_change_broke(self.conn(), document_id, seq, broke).await
+    }
+
+    async fn insert_version(&mut self, version: &Version) -> Result<bool> {
+        q::insert_version(self.conn(), version).await
+    }
+
+    async fn delete_version(&mut self, document_id: &str, id: &str) -> Result<bool> {
+        q::delete_version(self.conn(), document_id, id).await
     }
 
     async fn replace_assembly_refs(
@@ -1663,6 +1724,112 @@ mod q {
             .bind(document_id)
             .bind(seq)
             .bind(by)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn undo_target(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> Result<Option<UndoTarget>> {
+        Ok(sqlx::query_as(sql::UNDO_TARGET)
+            .bind(document_id)
+            .bind(client_id)
+            .bind(change_id)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn history(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<HistoryRow>> {
+        Ok(sqlx::query_as(sql::HISTORY)
+            .bind(document_id)
+            .bind(before)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn change_broke(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        seq: i64,
+    ) -> Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar(sql::CHANGE_BROKE)
+            .bind(document_id)
+            .bind(seq)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn set_change_broke(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        seq: i64,
+        broke: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::SET_CHANGE_BROKE)
+            .bind(document_id)
+            .bind(seq)
+            .bind(broke)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn versions(
+        c: &mut SqliteConnection,
+        document_id: &str,
+    ) -> Result<Vec<VersionWithAuthor>> {
+        Ok(sqlx::query_as(sql::VERSIONS)
+            .bind(document_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn version_by_name(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        name: &str,
+    ) -> Result<Option<Version>> {
+        Ok(sqlx::query_as(sql::VERSION_BY_NAME)
+            .bind(document_id)
+            .bind(name)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn insert_version(c: &mut SqliteConnection, v: &Version) -> Result<bool> {
+        let done = sqlx::query(sql::INSERT_VERSION)
+            .bind(&v.id)
+            .bind(&v.document_id)
+            .bind(v.seq)
+            .bind(&v.name)
+            .bind(&v.note)
+            .bind(&v.author_id)
+            .bind(v.created_at)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn delete_version(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(sql::DELETE_VERSION)
+            .bind(document_id)
+            .bind(id)
             .execute(c)
             .await?;
         Ok(done.rows_affected() == 1)

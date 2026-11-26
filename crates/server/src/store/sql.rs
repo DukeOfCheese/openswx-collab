@@ -340,10 +340,51 @@ pub const CHANGE_BY_SEQ: &str = concat!(
     " FROM changes WHERE document_id = $1 AND seq = $2"
 );
 
-/// [`super::Store::change_events_between`]: what a change event carries, with the author's name.
+/// [`super::Store::change_events_between`]: what a change event carries, with the author's name
+/// and, for an undo, the change id of the change it undoes.
 pub const CHANGE_EVENTS_BETWEEN: &str = "SELECT c.seq, c.author_id, u.name AS author_name, \
-     c.client_id, c.change_id, c.command, c.ops FROM changes c LEFT JOIN users u ON u.id = c.author_id \
+     c.client_id, c.change_id, c.command, c.ops, c.reverts, uc.change_id AS undo_of \
+     FROM changes c LEFT JOIN users u ON u.id = c.author_id \
+     LEFT JOIN changes uc ON uc.document_id = c.document_id AND uc.seq = c.undo_of \
      WHERE c.document_id = $1 AND c.seq > $2 AND c.seq <= $3 ORDER BY c.seq LIMIT $4";
+
+/// [`super::Store::undo_target`].
+pub const UNDO_TARGET: &str = "SELECT seq, inverse, reverted_by FROM changes \
+     WHERE document_id = $1 AND client_id = $2 AND change_id = $3";
+
+/// [`super::Store::history`]: newest first, `after < seq < before`.
+pub const HISTORY: &str = "SELECT c.seq, c.author_id, u.name AS author_name, c.client_id, \
+     c.change_id, c.created_at, c.command, c.ops, c.reverts, c.reverted_by, c.broke \
+     FROM changes c LEFT JOIN users u ON u.id = c.author_id \
+     WHERE c.document_id = $1 AND c.seq < $2 AND c.seq > $3 ORDER BY c.seq DESC LIMIT $4";
+
+/// [`super::Tx::change_broke`]: an update that changes nothing, so that the row stays locked until
+/// the transaction ends (PostgreSQL), answering the column.
+pub const CHANGE_BROKE: &str = "UPDATE changes SET broke = broke \
+     WHERE document_id = $1 AND seq = $2 RETURNING broke";
+
+/// [`super::Tx::set_change_broke`].
+pub const SET_CHANGE_BROKE: &str =
+    "UPDATE changes SET broke = $3 WHERE document_id = $1 AND seq = $2";
+
+// ------------------------------------------------------------------ versions
+
+/// [`super::Store::versions`]: newest seq first, then newest first.
+pub const VERSIONS: &str = "SELECT v.id, v.document_id, v.seq, v.name, v.note, v.author_id, \
+     u.name AS author_name, v.created_at FROM versions v LEFT JOIN users u ON u.id = v.author_id \
+     WHERE v.document_id = $1 ORDER BY v.seq DESC, v.created_at DESC, v.id";
+
+/// [`super::Store::version_by_name`].
+pub const VERSION_BY_NAME: &str = "SELECT id, document_id, seq, name, note, author_id, created_at \
+     FROM versions WHERE document_id = $1 AND name = $2";
+
+/// [`super::Tx::insert_version`]: nothing when the document has a version of that name.
+pub const INSERT_VERSION: &str = "INSERT INTO versions (id, document_id, seq, name, note, \
+     author_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+     ON CONFLICT (document_id, name) DO NOTHING";
+
+/// [`super::Tx::delete_version`].
+pub const DELETE_VERSION: &str = "DELETE FROM versions WHERE document_id = $1 AND id = $2";
 
 /// [`super::Store::change_seq_by_client`].
 pub const CHANGE_SEQ_BY_CLIENT: &str =

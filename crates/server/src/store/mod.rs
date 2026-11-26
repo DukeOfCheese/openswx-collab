@@ -384,6 +384,65 @@ pub struct ChangeEventRow {
     pub change_id: Option<String>,
     pub command: String,
     pub ops: Vec<u8>,
+    /// The seq of the change it takes back (an undo or a revert).
+    pub reverts: Option<i64>,
+    /// For an undo: the change id of the change it undoes.
+    pub undo_of: Option<String>,
+}
+
+/// What undoing a client's change needs of its journal row ([`Store::undo_target`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct UndoTarget {
+    pub seq: i64,
+    /// MessagePack ([`crate::record::encode_ops`]): what takes the change back out.
+    pub inverse: Vec<u8>,
+    /// Set once something undid or reverted it.
+    pub reverted_by: Option<i64>,
+}
+
+/// A journal row as the history lists it ([`Store::history`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct HistoryRow {
+    pub seq: i64,
+    pub author_id: Id,
+    /// `None` if the account row is gone.
+    pub author_name: Option<String>,
+    pub client_id: Option<String>,
+    pub change_id: Option<String>,
+    pub created_at: f64,
+    pub command: String,
+    pub ops: Vec<u8>,
+    pub reverts: Option<i64>,
+    pub reverted_by: Option<i64>,
+    /// JSON: `{feature id: error}`, what rebuild reports blamed on it.
+    pub broke: Option<String>,
+}
+
+/// A named version of a document (`versions`): a label on a seq.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Version {
+    pub id: Id,
+    pub document_id: Id,
+    pub seq: i64,
+    /// 1 to 200 characters, unique per document.
+    pub name: String,
+    pub note: String,
+    pub author_id: Id,
+    pub created_at: f64,
+}
+
+/// A named version with its author's name ([`Store::versions`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct VersionWithAuthor {
+    pub id: Id,
+    pub document_id: Id,
+    pub seq: i64,
+    pub name: String,
+    pub note: String,
+    pub author_id: Id,
+    /// `None` if the account row is gone.
+    pub author_name: Option<String>,
+    pub created_at: f64,
 }
 
 /// A journal row to insert: [`ChangeRow`]'s columns, borrowed from the record that carries them
@@ -555,6 +614,35 @@ pub trait Store: Send + Sync + 'static {
         client_id: &str,
         change_id: &str,
     ) -> anyhow::Result<Option<i64>>;
+
+    /// The seq, inverse and `reverted_by` of the change a client sent under `change_id`, if the
+    /// journal has it: what an undo of it needs.
+    async fn undo_target(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> anyhow::Result<Option<UndoTarget>>;
+
+    /// A document's journal rows with `after < seq < before`, newest first, at most `limit`, with
+    /// their authors' names.
+    async fn history(
+        &self,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<HistoryRow>>;
+
+    /// A document's named versions, newest seq first (then newest first).
+    async fn versions(&self, document_id: &str) -> anyhow::Result<Vec<VersionWithAuthor>>;
+
+    /// A document's version with this name.
+    async fn version_by_name(
+        &self,
+        document_id: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Version>>;
 
     /// A client's most recent change ids in a document with their seqs, newest first, at most
     /// `limit`.
@@ -821,6 +909,28 @@ pub trait Tx: Send {
         seq: i64,
         by: i64,
     ) -> anyhow::Result<bool>;
+
+    /// Locks the journal row `seq` until the transaction ends and answers its `broke` JSON (`None`:
+    /// no such row; `Some(None)`: nothing blamed on it yet).
+    async fn change_broke(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+    ) -> anyhow::Result<Option<Option<String>>>;
+
+    /// Sets the `broke` JSON of the journal row `seq`.
+    async fn set_change_broke(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+        broke: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Adds a named version; `false` (nothing written) when the document has one of that name.
+    async fn insert_version(&mut self, version: &Version) -> anyhow::Result<bool>;
+
+    /// Deletes a document's version; `false` if it has none with that id.
+    async fn delete_version(&mut self, document_id: &str, id: &str) -> anyhow::Result<bool>;
 
     /// Replaces every component reference of an assembly with `rows`.
     async fn replace_assembly_refs(

@@ -18,9 +18,10 @@ use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, Id, Invite, Member, NewChange,
-    Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole, RoomLease,
-    SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx, User,
+    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, HistoryRow, Id, Invite, Member,
+    NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole,
+    RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx, UndoTarget, User,
+    Version, VersionWithAuthor,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -868,6 +869,46 @@ impl Store for FlakyStore {
             .await
     }
 
+    async fn undo_target(
+        &self,
+        document_id: &str,
+        client_id: &str,
+        change_id: &str,
+    ) -> anyhow::Result<Option<UndoTarget>> {
+        let delay = *self
+            .lookup_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pause(delay).await;
+        self.inner()
+            .undo_target(document_id, client_id, change_id)
+            .await
+    }
+
+    async fn history(
+        &self,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<HistoryRow>> {
+        self.inner()
+            .history(document_id, before, after, limit)
+            .await
+    }
+
+    async fn versions(&self, document_id: &str) -> anyhow::Result<Vec<VersionWithAuthor>> {
+        self.inner().versions(document_id).await
+    }
+
+    async fn version_by_name(
+        &self,
+        document_id: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Version>> {
+        self.inner().version_by_name(document_id, name).await
+    }
+
     async fn snapshot_at_or_before(
         &self,
         document_id: &str,
@@ -1253,6 +1294,31 @@ impl Tx for FlakyTx {
         by: i64,
     ) -> anyhow::Result<bool> {
         self.inner.set_reverted_by(document_id, seq, by).await
+    }
+
+    async fn change_broke(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        self.inner.change_broke(document_id, seq).await
+    }
+
+    async fn set_change_broke(
+        &mut self,
+        document_id: &str,
+        seq: i64,
+        broke: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.set_change_broke(document_id, seq, broke).await
+    }
+
+    async fn insert_version(&mut self, version: &Version) -> anyhow::Result<bool> {
+        self.inner.insert_version(version).await
+    }
+
+    async fn delete_version(&mut self, document_id: &str, id: &str) -> anyhow::Result<bool> {
+        self.inner.delete_version(document_id, id).await
     }
 
     async fn replace_assembly_refs(
