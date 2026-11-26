@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -1142,7 +1143,7 @@ fn heard_a_change(live: &Live) -> bool {
     live.seen.iter().any(|m| matches!(m, ServerMsg::Change(_)))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_change_being_judged_is_never_written_even_behind_a_full_queue() {
     let hooks = Hooks {
         judge_delay: Duration::from_millis(2000),
@@ -1236,7 +1237,7 @@ async fn a_revoked_undo_waiting_for_its_target_is_never_written() {
     assert!(!heard_a_change(&a), "{:?}", a.seen);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_users_locks_are_released_at_once() {
     let (server, world) = world().await;
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
@@ -1259,7 +1260,7 @@ async fn a_revoked_users_locks_are_released_at_once() {
     assert_eq!(mine.granted, vec![path(f1)], "{mine:?}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_already_in_the_journal_lands_but_the_revoked_socket_hears_only_the_close() {
     // The journal holds a record 1.5 s before writing it (REST commits are not delayed).
     let slow = |store: &Arc<dyn oswx_server::store::Store>| {
@@ -1392,4 +1393,233 @@ async fn a_join_a_stuck_room_never_takes_is_told_to_reconnect() {
     hooks.stall.release();
     a.close().await;
     connections_become(&server, &world.admin_id, 0).await;
+}
+
+// ------------------------------------------------------------------ fix round 2
+
+const F1: &[&str] = &["features", "f1"];
+
+/// Waits for the next `lock.changed` at `live` and answers it.
+async fn lock_news(live: &mut Live) -> LockChanged {
+    live.expect().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_users_locks_go_at_once_whichever_message_reaches_the_room_first() {
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
+    let world = World::new(&server).await.unwrap();
+    let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    for round in 0..200u64 {
+        // Every other round the hub's `Revoked` is held back: the connection's `Leave` comes first.
+        hooks
+            .revoke_delay_ms
+            .store(if round % 2 == 1 { 30 } else { 0 }, Ordering::SeqCst);
+        let mut b = Live::connect(&server, &doc, &bob).await;
+        b.lock(&[F1]).await;
+        let taken = lock_news(&mut a).await;
+        assert_eq!(taken.locks.len(), 1, "round {round}: {taken:?}");
+        server.state.hub.drop_account(&bob_id).await;
+        assert_eq!(b.closed().await.0, 4401, "round {round}");
+        let news = lock_news(&mut a).await;
+        assert!(
+            news.locks.is_empty() && news.released == vec![path(F1)],
+            "round {round}: released at once, never detached: {news:?}"
+        );
+        let mine = a.lock(&[F1]).await;
+        assert_eq!(mine.granted, vec![path(F1)], "round {round}: {mine:?}");
+        a.unlock(&[F1]).await;
+    }
+    let order = &hooks.revoke_order;
+    let (revoked, leave) = (
+        order.revoked_first.load(Ordering::SeqCst),
+        order.leave_first.load(Ordering::SeqCst),
+    );
+    assert!(revoked > 0 && leave > 0, "both orders: {revoked} {leave}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_detached_locks_of_someone_removed_just_after_leaving_go_at_once() {
+    let (server, world) = world().await;
+    let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    b.lock(&[F1]).await;
+    lock_news(&mut a).await;
+    // An ordinary disconnect: the lock waits for its client (detached).
+    b.close().await;
+    let waiting = lock_news(&mut a).await;
+    assert!(
+        waiting.locks.len() == 1 && waiting.locks[0].detached,
+        "{waiting:?}"
+    );
+    assert_eq!(server.room(&doc).detached_locks(), 1);
+    // Then Bob loses his access: the lock goes now, not when the grace period ends.
+    let (status, _) = server
+        .delete(
+            &format!("/api/projects/{}/members/{bob_id}", world.project),
+            Some(&world.admin),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let news = lock_news(&mut a).await;
+    assert_eq!(news.released, vec![path(F1)], "{news:?}");
+    let mine = a.lock(&[F1]).await;
+    assert_eq!(mine.granted, vec![path(F1)], "{mine:?}");
+}
+
+/// A journal that holds every record `ms` milliseconds before writing it.
+fn slow_journal(
+    ms: u64,
+) -> impl FnOnce(&Arc<dyn oswx_server::store::Store>) -> oswx_server::journal::JournalWriter {
+    move |store| {
+        oswx_server::journal::JournalWriter::start(
+            store.clone(),
+            oswx_server::journal::MAX_BATCH,
+            Duration::from_millis(ms),
+        )
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_inherits_the_changes_its_predecessor_had_in_the_journal() {
+    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let desk = Hello::client("takeover-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    // The journal refuses the first change; the second waits behind it.
+    let first = a.make_change(0, vec![set(&["variables", "x"], json!(1))]);
+    flaky.refuse_change_once(&first.change_id);
+    a.send_change(&first).await;
+    let second = a.make_change(0, vec![set_depth(7)]);
+    a.send_change(&second).await;
+    let deadline = Instant::now() + WAIT;
+    while server.room_status(&doc).await.tentative < 2 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The same client reconnects (its old socket replaced) and sends the second change again.
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    b.send_change(&second).await;
+    // The refused record makes the room judge the second again: its new owner is answered.
+    assert_eq!(b.outcome(&second.change_id).await.seq(), 1);
+    // And what B sends later is answered too.
+    assert_eq!(edit(&mut b, 9).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_is_answered_for_a_big_change_its_predecessor_sent() {
+    let hooks = Hooks {
+        judge_delay: Duration::from_millis(1500),
+        ..Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let desk = Hello::client("takeover-big");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let ops = (0..300)
+        .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
+        .collect();
+    let big = a.make_change(0, ops);
+    a.send_change(&big).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(
+        b.outcome(&big.change_id).await.seq(),
+        1,
+        "the successor is answered"
+    );
+    assert_eq!(edit(&mut b, 3).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_whose_access_then_ends_writes_nothing() {
+    let hooks = Hooks {
+        judge_delay: Duration::from_millis(1500),
+        ..Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
+    let doc = world.document(&server, None, None, None).await;
+    let desk = Hello::client("takeover-gone");
+    let mut a = Live::connect_with(&server, &doc, &bob, desk.clone()).await;
+    let ops = (0..300)
+        .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
+        .collect();
+    let big = a.make_change(0, ops);
+    a.send_change(&big).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut b = Live::connect_with(&server, &doc, &bob, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    server.state.hub.drop_account(&bob_id).await;
+    assert_eq!(b.closed().await.0, 4401);
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(content(&server, &doc, &world.admin).await["seq"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_taken_just_as_its_wait_ran_out_leaves_no_ghost() {
+    let hooks = Arc::new(Hooks {
+        join_wait: Duration::from_millis(300),
+        ..Hooks::default()
+    });
+    let h = hooks.clone();
+    let server =
+        TestServer::start_custom(|s| s.sweep_interval = 3600.0, move |s| s.room_hooks = h).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let _a = Live::connect(&server, &doc, &world.admin).await;
+    let room = server.room(&doc);
+    // The room stops; a join waits for it until its wait runs out, then holds there ...
+    hooks.stall.stall(&doc);
+    server.state.hub.sweep();
+    tokio::time::timeout(WAIT, hooks.stall.until_stopped(1))
+        .await
+        .expect("the room stopped");
+    hooks.after_join_timeout.shut();
+    let joining = {
+        let (base, token, doc) = (server.base.clone(), world.admin.clone(), doc.clone());
+        tokio::spawn(async move {
+            let ws_url = format!("{}/api/documents/{doc}/ws", base.replacen("http", "ws", 1));
+            let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+            let hello = hello_frame(&token, &Hello::default(), "ghost-client");
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Binary(hello.into()),
+            )
+            .await
+            .unwrap();
+            // Read until the socket closes.
+            while let Some(Ok(_)) = futures_util::StreamExt::next(&mut ws).await {}
+        })
+    };
+    tokio::time::timeout(WAIT, hooks.after_join_timeout.until_waiting(1))
+        .await
+        .expect("the join wait ran out");
+    // ... while the room goes on and takes the join after all.
+    hooks.stall.release();
+    let deadline = Instant::now() + WAIT;
+    while room.status().await.expect("open").connections.len() < 2 {
+        assert!(Instant::now() < deadline, "the room took the join");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    hooks.after_join_timeout.open();
+    tokio::time::timeout(WAIT, joining)
+        .await
+        .expect("the connection closed")
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while room.status().await.expect("open").connections.len() != 1 {
+        assert!(Instant::now() < deadline, "the ghost connection went");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
