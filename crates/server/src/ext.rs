@@ -51,6 +51,19 @@ pub enum Event {
     Registered { user: Id },
     /// An account signed in with its password.
     SignedIn { user: Id },
+    /// An account was created by signing in through a provider (`google` or `github`) for the
+    /// first time. (The session itself starts when the app exchanges its code:
+    /// [`Event::SignedInWithProvider`].)
+    RegisteredWithProvider { user: Id, provider: String },
+    /// An account signed in through a provider: the app exchanged the browser's one-time code for a
+    /// session. (Which provider is not known at that point: the code's row does not say; the
+    /// account's providers are in `oauth_identities`.)
+    SignedInWithProvider { user: Id },
+    /// A provider identity was attached to an account: by its owner (link), or on a first sign-in
+    /// through it to an account whose address was confirmed.
+    ProviderLinked { user: Id, provider: String },
+    /// An account's owner removed a provider from it.
+    ProviderUnlinked { user: Id, provider: String },
     /// A session was ended by its owner.
     SignedOut { user: Id },
     /// An account changed its password (its other sessions ended).

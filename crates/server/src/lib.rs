@@ -17,6 +17,7 @@ pub mod journal;
 pub mod lease;
 pub mod mail;
 pub mod metrics;
+pub mod oauth;
 pub mod record;
 pub mod room;
 pub mod routes;

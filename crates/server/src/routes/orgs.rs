@@ -563,11 +563,23 @@ pub(crate) async fn find_invite(
     email: &str,
     now: f64,
 ) -> Result<Option<Invite>, ApiError> {
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
+    let hash = token.filter(|t| !t.is_empty()).map(token_hash);
+    find_invite_by_hash(tx, hash.as_deref(), email, now).await
+}
+
+/// [`find_invite`] for the hash of the token (what a browser sign-in keeps while it is away at the
+/// provider).
+pub(crate) async fn find_invite_by_hash(
+    tx: &mut dyn Tx,
+    hash: Option<&str>,
+    email: &str,
+    now: f64,
+) -> Result<Option<Invite>, ApiError> {
+    let Some(hash) = hash else {
         return Ok(None);
     };
     Ok(tx
-        .invite_by_hash(&token_hash(token))
+        .invite_by_hash(hash)
         .await?
         .filter(|invite| usable(invite, email, now)))
 }
@@ -596,12 +608,24 @@ pub(crate) async fn approve_invite(
     user: Option<&str>,
     now: f64,
 ) -> Result<Option<Approval>, ApiError> {
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
+    let hash = token.filter(|t| !t.is_empty()).map(token_hash);
+    approve_invite_by_hash(state, hash.as_deref(), email, user, now).await
+}
+
+/// [`approve_invite`] for the hash of the token.
+pub(crate) async fn approve_invite_by_hash(
+    state: &AppState,
+    hash: Option<&str>,
+    email: &str,
+    user: Option<&str>,
+    now: f64,
+) -> Result<Option<Approval>, ApiError> {
+    let Some(hash) = hash else {
         return Ok(None);
     };
     let Some(invite) = state
         .store
-        .invite_by_hash(&token_hash(token))
+        .invite_by_hash(hash)
         .await?
         .filter(|invite| usable(invite, email, now))
     else {

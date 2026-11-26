@@ -15,6 +15,7 @@ use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
 use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
+use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
 use crate::sessions::Sessions;
 use crate::store::{SqliteStore, Store, Tx, new_id};
 
@@ -29,6 +30,8 @@ pub struct AppState {
     pub settings: Arc<Settings>,
     pub sessions: Sessions,
     pub clock: Clock,
+    /// Google and GitHub, for browser sign-in ([`HttpProviders`] in a running server).
+    pub oauth: Arc<dyn OAuthHttp>,
     /// Makes accepted changes durable; started on `store` by [`AppState::new`].
     pub journal: JournalWriter,
     /// This process, as room leases name it: random per process.
@@ -108,7 +111,8 @@ impl Drop for Running {
 }
 
 impl AppState {
-    /// State over a store and blob storage, with no extensions, the system clock and a
+    /// State over a store and blob storage, with no extensions, the system clock, no sign-in
+    /// providers ([`NoProviders`]: every call to one fails) and a
     /// [`MemoryMailer`] (which keeps messages rather than sending them; it reports itself as
     /// configured exactly when the settings name a mail server and a sender). Replace any public
     /// field afterwards to change it (after replacing `store`, start a new `journal` on it). A
@@ -129,6 +133,7 @@ impl AppState {
             settings: Arc::new(settings),
             sessions: Sessions::default(),
             clock: Clock::system(),
+            oauth: Arc::new(NoProviders),
             room_hooks: Arc::default(),
             after_commits: Arc::default(),
         }
@@ -238,8 +243,9 @@ impl AppState {
 
     /// The state of a running server: the database `settings.database_url` names (opened, and its
     /// schema brought up to date as [`SqliteStore::open`] does), the blob storage
-    /// `settings.storage_url` names (a folder, [`LocalBlobs`]; S3 is refused until Task 17), and mail
-    /// through the operator's SMTP server ([`SmtpMailer`]).
+    /// `settings.storage_url` names (a folder, [`LocalBlobs`]; S3 is refused until Task 17), mail
+    /// through the operator's SMTP server ([`SmtpMailer`]) and the real Google and GitHub
+    /// ([`HttpProviders`]).
     pub async fn from_settings(settings: Settings) -> anyhow::Result<Self> {
         let store: Arc<dyn Store> = match settings.database()? {
             Database::Sqlite(_) => {
@@ -256,8 +262,10 @@ impl AppState {
             }
         };
         let mailer = Arc::new(SmtpMailer::new(&settings)?);
+        let oauth = Arc::new(HttpProviders::new(&settings)?);
         let mut state = Self::new(settings, store, blobs);
         state.mailer = mailer;
+        state.oauth = oauth;
         Ok(state)
     }
 

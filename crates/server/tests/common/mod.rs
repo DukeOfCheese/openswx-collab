@@ -2,9 +2,12 @@
 #![allow(dead_code)] // each test file uses part of the harness
 
 mod live;
+mod providers;
 
 #[allow(unused_imports)] // (not every test file uses the live client)
 pub use live::*;
+#[allow(unused_imports)] // (only the sign-in tests use the fake providers)
+pub use providers::*;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -39,6 +42,9 @@ pub struct TestServer {
     /// `http://127.0.0.1:<port>`, no trailing slash.
     pub base: String,
     pub state: AppState,
+    /// The fake Google and GitHub every server starts with (in `state.oauth`, unless the test put
+    /// in something else).
+    pub providers: Arc<FakeProviders>,
     /// The test database, for statements of the test's own ([`TestServer::sql`]).
     db: SqliteStore,
     /// What `state.store` is, so that `restart` can put the reopened database in its place.
@@ -121,6 +127,8 @@ impl TestServer {
         let blobs = open_blobs(&s);
         let plain: Arc<dyn Store> = Arc::new(db.clone());
         let mut app_state = AppState::new(s, plain.clone(), blobs);
+        let providers = Arc::new(FakeProviders::default());
+        app_state.oauth = providers.clone();
         state(&mut app_state);
         if !std::ptr::addr_eq(Arc::as_ptr(&app_state.store), Arc::as_ptr(&plain)) {
             // The test put in a store of its own: the journal writes through it too.
@@ -131,7 +139,7 @@ impl TestServer {
         } else {
             StoreKind::Custom
         };
-        Self::serve(app_state, db, store_kind, dir).await
+        Self::serve(app_state, providers, db, store_kind, dir).await
     }
 
     /// Starts with the test settings changed by `settings` and the store wrapped in a [`FlakyStore`],
@@ -203,11 +211,20 @@ impl TestServer {
         }
         state.journal = new_journal(&state.store);
         state.node_id = oswx_server::store::new_id();
-        Self::serve(state, db, self.store_kind.clone(), self.dir.clone()).await
+        let providers = self.providers.clone();
+        Self::serve(
+            state,
+            providers,
+            db,
+            self.store_kind.clone(),
+            self.dir.clone(),
+        )
+        .await
     }
 
     async fn serve(
         state: AppState,
+        providers: Arc<FakeProviders>,
         db: SqliteStore,
         store_kind: StoreKind,
         dir: Arc<TempDir>,
@@ -230,6 +247,7 @@ impl TestServer {
         Self {
             base,
             state,
+            providers,
             db,
             store_kind,
             dir,

@@ -21,6 +21,7 @@ pub mod documents;
 pub mod folders;
 pub mod history;
 pub mod meta;
+pub mod oauth;
 pub mod orgs;
 pub mod projects;
 pub mod reset_page;
@@ -54,6 +55,7 @@ pub(crate) fn router(state: AppState) -> Router {
     let standard = Router::new()
         .merge(meta::router())
         .merge(auth::router())
+        .merge(oauth::router())
         .merge(orgs::router())
         .merge(projects::router())
         .merge(blobs::router())
