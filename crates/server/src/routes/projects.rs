@@ -154,8 +154,18 @@ async fn delete_project(
     // transaction.
     tx.mark_project_documents_deleted(&project.id, state.clock.now())
         .await?;
-    // TASK 13: refuse with 409 when assemblies in other projects use parts of this one
-    // (`{"message", "assemblies" the caller can open, "in_projects_you_cannot_open"}`).
+    let users = tx.assemblies_using_project(&project.id).await?;
+    if !users.is_empty() {
+        tx.rollback().await?;
+        return Err(crate::routes::assemblies::in_use(
+            &state,
+            &user.id,
+            &project.org_id,
+            "assemblies in other projects use parts of this project",
+            users,
+        )
+        .await?);
+    }
     tx.delete_project(&project.id).await?;
     let event = Event::ProjectDeleted {
         org: project.org_id,

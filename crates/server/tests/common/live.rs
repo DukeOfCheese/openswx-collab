@@ -913,3 +913,56 @@ pub fn remove(list: &[&str], id: &str) -> Op {
         id: Arc::from(id),
     }
 }
+
+// ------------------------------------------------------------------ assemblies
+
+/// A component as the Python suite's `comp` makes it: `Bracket-<id>` pinned to state `seq` of
+/// `part` (labelled `version`).
+pub fn component(id: &str, part: &str, seq: i64, version: Option<&str>) -> serde_json::Value {
+    serde_json::json!({"id": id, "name": format!("Bracket-{id}"), "x": [0, 0, 0, 0, 0, 0],
+                       "fixed": false, "ref": {"document": part, "seq": seq, "version": version}})
+}
+
+/// An assembly's content, as the Python suite's `assembly` makes it.
+pub fn assembly(
+    components: Vec<serde_json::Value>,
+    mates: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({"format": "openswx-assembly", "version": 3, "components": components,
+                       "mates": mates, "features": [], "display_states": {}})
+}
+
+/// `Insert` of a component (JSON) into `components`.
+pub fn add_component(item: serde_json::Value) -> Op {
+    insert(&["components"], item, Pos::between(None, None))
+}
+
+/// `Insert` of a mate (JSON) into `mates`.
+pub fn add_mate(item: serde_json::Value) -> Op {
+    insert(&["mates"], item, Pos::between(None, None))
+}
+
+/// The Python suite's `set_ref`: component `id` pinned to state `seq` of the part it uses,
+/// labelled `version`.
+pub fn set_ref(id: &str, seq: i64, version: Option<&str>) -> Vec<Op> {
+    vec![
+        set(&["components", id, "ref", "seq"], seq.into()),
+        set(&["components", id, "ref", "version"], version.into()),
+    ]
+}
+
+/// Component `id` pointed at state `seq` of `part` (its whole `ref` replaced).
+pub fn repin(id: &str, part: &str, seq: i64) -> Op {
+    set(
+        &["components", id, "ref"],
+        serde_json::json!({"document": part, "seq": seq, "version": null}),
+    )
+}
+
+/// Component `id` moved to `x` (its placement only).
+pub fn move_component(id: &str, x: f64) -> Op {
+    set(
+        &["components", id, "x"],
+        serde_json::json!([x, 0, 0, 0, 0, 0]),
+    )
+}

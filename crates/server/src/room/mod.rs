@@ -784,6 +784,8 @@ pub(crate) struct RoomInit {
     pub org: Id,
     /// The document's `format_version`; a client with another one may only look.
     pub format_version: Option<i64>,
+    /// The document is an assembly (its components' references are checked and recorded).
+    pub assembly: bool,
     pub head: Head,
     /// The epoch [`crate::lease::acquire`] gave for this load.
     pub epoch: u64,
@@ -849,6 +851,7 @@ enum Internal {
     Journal(change::Outcome),
     Lookup(change::Lookup),
     Blobs(change::BlobCheck),
+    References(change::RefCheck),
     Decided(change::Offloaded),
     Duplicate(change::DuplicateCheck),
     Undo(history::UndoLookup),
@@ -885,6 +888,7 @@ struct Room {
     project: Id,
     org: Id,
     format_version: Option<i64>,
+    assembly: bool,
     epoch: u64,
     durable: Head,
     tentative: Head,
@@ -981,6 +985,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         project: init.project,
         org: init.org,
         format_version: init.format_version,
+        assembly: init.assembly,
         epoch: init.epoch,
         tentative: init.head.clone(),
         durable: init.head.clone(),
@@ -1197,6 +1202,7 @@ impl Room {
             Internal::Journal(outcome) => self.on_journal(outcome),
             Internal::Lookup(lookup) => self.on_lookup(lookup),
             Internal::Blobs(check) => self.on_blobs(check),
+            Internal::References(check) => self.on_references(check),
             Internal::Decided(decided) => self.on_offloaded(decided),
             Internal::Duplicate(check) => self.on_duplicate(check),
             Internal::Undo(lookup) => self.on_undo_lookup(lookup),

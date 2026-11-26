@@ -8,7 +8,8 @@
 //!   handler, `create_document`.
 //! - `GET /api/documents/{document}` (viewer), `PATCH` (editor: `name` and/or `folder_id`, `null`
 //!   being the top of the project), `DELETE` (project owner, as in the Python server; 204, a soft
-//!   delete: the row stays, marked deleted, and open connections are closed).
+//!   delete: the row stays, marked deleted, and open connections are closed; 409 while assemblies
+//!   use it, see `routes::assemblies::in_use`).
 //! - `GET /api/documents/{document}/content` (viewer): `{"document", "seq", "content"}`, the
 //!   document as it is now; `?seq=N` (an integer, else 422) or `?version=<name>` (which wins) for
 //!   an earlier state (see `routes::history`: 404 `the document has no state N` / `no version
@@ -32,18 +33,21 @@ use serde_json::json;
 use crate::access::{
     CurrentUser, recheck_document, recheck_project, require_document, require_project,
 };
+use crate::assemblies;
 use crate::content::{
     blob_refs, check_shape, format_version, json_from_plain, plain_from_json, with_item_lists,
     without_local_keys,
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, detail_response};
 use crate::ext::{Event, Quota, check_quota, emit};
+use crate::record::{AssemblyRef, ChosenPart};
+use crate::routes::assemblies::in_use;
 use crate::routes::history;
 use crate::routes::orgs::clean_name;
 use crate::security::ProjectRole;
 use crate::snapshot::{self, load_head_doc, snapshot_key};
 use crate::state::AppState;
-use crate::store::{Document, Folder, SnapshotRow, new_id};
+use crate::store::{AssemblyRefRow, AssemblyUse, Document, Folder, SnapshotRow, new_id};
 
 /// The largest request body document creation takes: 8 MiB.
 pub const MAX_DOCUMENT_BODY: usize = 8 << 20;
@@ -247,7 +251,9 @@ async fn parse_body(request: Request, state: &AppState) -> Result<Parsed, Box<Re
 /// (in the same project) are checked (422); the content must be one the core takes, with an object
 /// at the top, and its item lists must be editable ([`check_shape`]; 422); the per-person keys
 /// ([`crate::content::LOCAL_ONLY`]) are dropped and missing item lists filled in; at most
-/// [`MAX_BLOB_REFS`] distinct blob references (422), each naming a blob this organisation has (409
+/// [`MAX_BLOB_REFS`] distinct blob references (422); for an assembly, every component's `ref` must
+/// be valid and name a part the caller can use at that state (422, one message for every failure:
+/// [`crate::assemblies::no_part`]); each blob reference must name a blob this organisation has (409
 /// `{"message": "upload these blobs first", "blobs": [...]}` listing the missing and malformed
 /// hashes); then the snapshot (seq 0, epoch 0) is written to storage, and the document and its
 /// snapshot row are committed. A failure before the commit removes the snapshot file again; see
@@ -300,7 +306,7 @@ async fn create(
     }
     let doc = body.content?;
     let shape_kind = kind.clone();
-    let (doc, refs) = tokio::task::spawn_blocking(move || {
+    let (doc, refs, chosen, rows) = tokio::task::spawn_blocking(move || {
         if !matches!(doc, Value::Map(_)) {
             return Err(ApiError::Unprocessable(
                 "content must be a JSON object".into(),
@@ -309,7 +315,11 @@ async fn create(
         check_shape(&shape_kind, &doc)?;
         let doc = with_item_lists(&shape_kind, without_local_keys(doc));
         let refs = blob_refs(&doc);
-        Ok((doc, refs))
+        // An assembly's every component chooses its part (`components` is a keyed list, or
+        // empty, by now).
+        let chosen = assemblies::chosen_in(&doc).map_err(ApiError::Unprocessable)?;
+        let rows = assemblies::rows(&doc);
+        Ok((doc, refs, chosen, rows))
     })
     .await??;
     if refs.len() > MAX_BLOB_REFS {
@@ -317,8 +327,18 @@ async fn create(
             "content refers to more than {MAX_BLOB_REFS} blobs"
         )));
     }
-    // TASK 13: for an assembly, check its components' references (access to every part, no
-    // cycles) and record them as assembly_refs rows in the transaction below.
+    // Each part must be one the caller can use, at that state (one answer for every failure, so a
+    // part in a project the caller cannot open is told apart from nothing); the transaction below
+    // finds each still there and records the references.
+    if let Err(message) =
+        assemblies::check_choices(state.store.as_ref(), &org_id, &user.id, &chosen).await?
+    {
+        return Err(ApiError::Unprocessable(message));
+    }
+    let references = References {
+        rows,
+        chosen: assemblies::chosen_parts(&chosen),
+    };
     let missing = missing_blobs(&state, &org_id, refs).await?;
     if !missing.is_empty() {
         return Err(ApiError::ConflictWith(
@@ -352,7 +372,7 @@ async fn create(
         created_at: now,
     };
     state.blobs.put(&key, bytes).await?;
-    let role = match insert_document(&state, &user, &document, &snapshot).await {
+    let role = match insert_document(&state, &user, &document, &snapshot, &references).await {
         Ok(role) => role,
         Err(InsertError::BeforeCommit(err)) => {
             forget_snapshot(&state, &key).await;
@@ -438,13 +458,21 @@ impl<E: Into<ApiError>> From<E> for InsertError {
     }
 }
 
+/// A new assembly's component references: its rows, and the parts they use.
+struct References {
+    rows: Vec<AssemblyRef>,
+    chosen: Vec<ChosenPart>,
+}
+
 /// The transaction of [`create_document`]: the caller's role and the folder read again, then the
-/// document and its snapshot row. Answers the caller's role.
+/// document and its snapshot row, and for an assembly its references, each part locked and found
+/// still there (422 as the reference check otherwise). Answers the caller's role.
 async fn insert_document(
     state: &AppState,
     user: &CurrentUser,
     document: &Document,
     snapshot: &SnapshotRow,
+    references: &References,
 ) -> Result<ProjectRole, InsertError> {
     let mut tx = state.store.begin().await?;
     let (_, role) = recheck_project(
@@ -459,6 +487,24 @@ async fn insert_document(
     }
     tx.insert_document(document).await?;
     tx.insert_snapshot(snapshot).await?;
+    for c in &references.chosen {
+        if !tx.lock_live_document(&c.part_id).await? {
+            return Err(ApiError::Unprocessable(assemblies::no_part(&c.component_id)).into());
+        }
+    }
+    if !references.rows.is_empty() {
+        let rows: Vec<AssemblyRefRow> = references
+            .rows
+            .iter()
+            .map(|r| AssemblyRefRow {
+                assembly_id: document.id.clone(),
+                component_id: r.component_id.clone(),
+                part_id: r.part_id.clone(),
+                seq: i64::try_from(r.seq).unwrap_or(i64::MAX),
+            })
+            .collect();
+        tx.replace_assembly_refs(&document.id, &rows).await?;
+    }
     if let Err(err) = tx.commit().await {
         return Err(InsertError::Commit(err, role));
     }
@@ -581,10 +627,21 @@ async fn delete_document(
     if !tx.mark_document_deleted(&doc.id, state.clock.now()).await? {
         return Err(ApiError::NotFound(crate::access::NO_SUCH_DOCUMENT));
     }
-    // TASK 13: after marking it deleted (which locks the row), refuse with 409 `{"message":
-    // "assemblies use this part; remove it from them first", "assemblies": [those the caller can
-    // open], "in_projects_you_cannot_open": n}` when assemblies that are not deleted use it
-    // (rolling back).
+    // Marked deleted first (which locks the row), then asked whether assemblies use it, in one
+    // transaction: a change adding a reference either committed before (and is found here) or
+    // finds the part deleted when its record is written (and is refused).
+    let users: Vec<AssemblyUse> = tx.assemblies_using(&doc.id).await?;
+    if !users.is_empty() {
+        tx.rollback().await?;
+        return Err(in_use(
+            &state,
+            &user.id,
+            &project.org_id,
+            "assemblies use this part; remove it from them first",
+            users,
+        )
+        .await?);
+    }
     let event = Event::DocumentDeleted {
         org: project.org_id,
         project: project.id,

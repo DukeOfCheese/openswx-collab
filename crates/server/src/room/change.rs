@@ -28,6 +28,18 @@
 //!    frame over [`BIG_FRAME`]) is judged on the blocking pool against a copy of the head (a
 //!    persistent value, so the copy is cheap) while the room takes no other frame but goes on with
 //!    everything else; the sender's later messages wait for it.
+//!    In a part, a change that writes `components` or `mates` is `invalid`. In an assembly, the
+//!    components a change writes are compared before and after ([`assemblies::ref_change`]): each
+//!    must keep a valid `ref`, and those given a `(document, seq)` they did not have (not counting
+//!    components an undo, revert or restore brings back as they were) are **checked** against the
+//!    store for the author ([`assemblies::check_choices`]) off the task, the sender's later
+//!    messages waiting (a change the server makes holds the room's frames instead, as a big one
+//!    does); a failure is `invalid` with one message whatever failed, a store error
+//!    `server_error`. A change judged again after a check needs no new check for the pins already
+//!    checked. A change that alters the assembly's `(component, part, seq)` set carries the whole
+//!    new set to the journal ([`Extra::AssemblyRefs`]), with the parts it chose, which the journal
+//!    locks and finds still there, or refuses the record (`PartGone`: `invalid`, the same
+//!    message).
 //! 4. **Blobs**: at most [`MAX_BLOB_REFS`] distinct `{"$blob": sha}` references (more is
 //!    `invalid`); those the room has not seen are looked up in the organisation's storage (16 at a
 //!    time) off the task, the sender's later messages waiting. A missing one is `missing_blob` (and
@@ -73,6 +85,7 @@ use oswx_core::{
 use tokio::sync::{mpsc, oneshot};
 
 use super::{ConnId, Internal, Reply, Room, ServerChange, ServerChangeError, close};
+use crate::assemblies::{self, Pin, RefChange};
 use crate::blobs::missing_blobs;
 use crate::content::blob_refs;
 use crate::journal::{Extra, JournalError, JournalWriter, Receipt, Record, RefusedWhy};
@@ -104,6 +117,8 @@ const MAX_COMMAND: usize = 100;
 const MAX_MESSAGE: usize = 300;
 /// What the sender of a change that could not be written is told.
 const NOT_STORED: &str = "the server could not store the change; try again";
+/// What the sender of a change whose parts could not be checked is told.
+const NOT_CHECKED: &str = "the server could not check the parts this change uses; try again";
 
 /// Names a change in the pipeline from its first adoption on; answers wait on it.
 pub(super) type Ticket = u64;
@@ -338,6 +353,9 @@ pub(super) struct Item {
     rejudged: u8,
     /// Its blob references were checked.
     blobs_checked: bool,
+    /// The assembly pins checked for its author so far (judged again, it needs no new check for
+    /// these).
+    pins_checked: HashSet<Pin>,
     /// What it takes back, if anything.
     reverts: Option<Reverts>,
     /// For a restore: the state to reach. Its operations (`change.ops`, empty until then) are
@@ -375,6 +393,7 @@ impl Item {
             rejudged: 0,
             // (Its operations put back what the journal held: blobs that were there then.)
             blobs_checked: true,
+            pins_checked: HashSet::new(),
             reverts: Some(Reverts {
                 seq,
                 inverse: None,
@@ -383,6 +402,14 @@ impl Item {
             }),
             target: None,
         }
+    }
+
+    /// Whether its operations bring back an earlier state and come from the server itself (a
+    /// revert from history, whose operations are the journal's inverse; a restore, the diff to a
+    /// stored state): a component it adds comes back as it was, and needs no reference check. (A
+    /// client's undo sends its own operations: only what the kept inverse puts back counts.)
+    fn trusted_history(&self) -> bool {
+        self.target.is_some() || matches!(self.origin, Origin::Revert { .. })
     }
 
     /// The connection waiting for its answer: the sender of a client's change, or the requester
@@ -472,6 +499,17 @@ pub(super) struct BlobCheck {
     result: anyhow::Result<Vec<String>>,
 }
 
+/// A check of the parts an assembly change chooses, coming back with what was decided before it.
+pub(super) struct RefCheck {
+    item: Item,
+    version: u64,
+    decision: Decision,
+    /// The pins it checked.
+    asked: Vec<Pin>,
+    /// `Ok(Err(message))`: a choice failed.
+    result: anyhow::Result<Result<(), String>>,
+}
+
 /// A big change judged off the task, coming back (`None`: the judging panicked).
 pub(super) struct Offloaded {
     item: Item,
@@ -482,6 +520,8 @@ pub(super) struct Offloaded {
 /// An accepted change with everything its record and broadcast need, made where it was judged.
 pub(super) struct Decision {
     accepted: Accepted,
+    /// What it does to an assembly's references (`None`: nothing).
+    references: Option<RefChange>,
     blobs: BTreeSet<String>,
     ops: Bytes,
     inverse: Bytes,
@@ -547,12 +587,24 @@ fn blob_refs_of(ops: &[Op]) -> BTreeSet<String> {
     out
 }
 
+/// What judging needs to know about the document's kind and the change's origin.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Kind {
+    /// The document is an assembly.
+    assembly: bool,
+    /// The change brings back an earlier state with the server's own operations
+    /// ([`Item::trusted_history`]).
+    trusted_history: bool,
+}
+
 /// Judges a change against `head` and, if it is accepted, makes everything its record and broadcast
 /// need. `server_stale` is `Some(check_stale)` for a change the server makes itself
 /// ([`decide_server`]). `reverts` is what it takes back (for an undo, the kept inverse `decide`
 /// exempts ids by). For a restore, `target` is the state to reach: the operations are
 /// `diff(head, target)`, worked out here, against the very head they are applied to (none:
-/// [`NotTaken::Unchanged`]). Pure and `Send`, so it can run on the blocking pool.
+/// [`NotTaken::Unchanged`]). `kind` decides how `components` and `mates` are judged. Pure and
+/// `Send`, so it can run on the blocking pool.
+#[allow(clippy::too_many_arguments)]
 fn judge(
     head: &Head,
     author: &Author,
@@ -561,6 +613,7 @@ fn judge(
     server_stale: Option<bool>,
     reverts: Option<&Reverts>,
     target: Option<&Value>,
+    kind: Kind,
 ) -> Result<Decision, NotTaken> {
     let restore;
     let change = match target {
@@ -601,6 +654,25 @@ fn judge(
             )?
         }
     };
+    let references = if kind.assembly {
+        // A component the change adds is brought back as it was (and needs no check) when the
+        // server's own operations do it, or when an undo puts back exactly what the kept inverse
+        // of the undone change holds.
+        let kept = reverts
+            .and_then(|r| r.inverse.as_deref())
+            .map(assemblies::inserted_pins)
+            .unwrap_or_default();
+        let restored = |id: &str, pin: &assemblies::Pin| {
+            kind.trusted_history || kept.get(id).is_some_and(|p| p == pin)
+        };
+        let found = assemblies::ref_change(&head.doc, &accepted.doc, &accepted.writes, restored)
+            .map_err(Refusal::Invalid)?;
+        (!found.is_empty()).then_some(found)
+    } else if assemblies::touches_assembly_lists(&accepted.writes) {
+        return Err(Refusal::Invalid(assemblies::ONLY_ASSEMBLIES.to_owned()).into());
+    } else {
+        None
+    };
     let server = &*author.client == SERVER_CLIENT;
     let event = wire::encode_server(&ServerMsg::Change(ChangeEvent {
         seq: accepted.seq,
@@ -620,6 +692,7 @@ fn judge(
         reverts: reverts.map(|r| r.seq),
     }));
     Ok(Decision {
+        references,
         blobs,
         ops: encode_ops(&change.ops),
         inverse: encode_ops(&accepted.inverse),
@@ -627,6 +700,17 @@ fn judge(
         reads: encode_reads(&accepted.reads),
         event,
         accepted,
+    })
+}
+
+/// The pins a decided change chooses that were not checked for its author yet.
+fn unchecked_pins(decision: &Decision, item: &Item) -> Vec<(Arc<str>, Pin)> {
+    decision.references.as_ref().map_or_else(Vec::new, |r| {
+        r.chosen
+            .iter()
+            .filter(|(_, pin)| !item.pins_checked.contains(pin))
+            .cloned()
+            .collect()
     })
 }
 
@@ -793,6 +877,7 @@ impl Room {
             waiters: Vec::new(),
             rejudged: 0,
             blobs_checked: true,
+            pins_checked: HashSet::new(),
             reverts: None,
             target: sc.target.map(Arc::new),
         });
@@ -807,6 +892,14 @@ impl Room {
     }
 
     // ------------------------------------------------------------------ judging
+
+    /// How `components` and `mates` are judged for `item`.
+    fn kind(&self, item: &Item) -> Kind {
+        Kind {
+            assembly: self.assembly,
+            trusted_history: item.trusted_history(),
+        }
+    }
 
     /// What the room knows of the client's changes named in `depends`.
     fn known(&self, client: &ClientId, depends: &[Arc<str>]) -> HashMap<Arc<str>, Known> {
@@ -854,6 +947,7 @@ impl Room {
             waiters: Vec::new(),
             rejudged: 0,
             blobs_checked: false,
+            pins_checked: HashSet::new(),
             reverts,
             target: None,
         };
@@ -930,6 +1024,7 @@ impl Room {
             }
             let head = self.tentative.clone();
             let stale = item.origin.server_stale();
+            let kind = self.kind(&item);
             let (author, change) = (item.author.clone(), item.change.clone());
             let (reverts, target) = (item.reverts.clone(), item.target.clone());
             let (internal, encodes) = (self.internal.clone(), self.encodes.clone());
@@ -946,6 +1041,7 @@ impl Room {
                         stale,
                         reverts.as_ref(),
                         target.as_deref(),
+                        kind,
                     );
                     metrics::decided(started.elapsed());
                     result
@@ -973,6 +1069,7 @@ impl Room {
             stale,
             item.reverts.as_ref(),
             item.target.as_deref(),
+            self.kind(&item),
         );
         metrics::decided(started.elapsed());
         if result.is_ok() {
@@ -1034,6 +1131,86 @@ impl Room {
             Err(NotTaken::Refused(refusal)) => return self.refuse_item(item, refusal),
             Err(NotTaken::Unchanged) => return self.unchanged(item),
         };
+        let unchecked = unchecked_pins(&decision, &item);
+        if unchecked.is_empty() {
+            return self.check_blobs(item, version, decision);
+        }
+        // The parts it chooses are checked off the task. A client's later messages wait; a change
+        // the server makes holds the room's frames (and the server's queue), as a big one does.
+        match item.conn() {
+            Some(conn) => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.busy = true;
+                }
+            }
+            None => self.paused += 1,
+        }
+        let (store, org) = (self.state.store.clone(), self.org.clone());
+        let user = item.author.user.clone();
+        let internal = self.internal.clone();
+        tokio::spawn(async move {
+            let result = caught(assemblies::check_choices(
+                store.as_ref(),
+                &org,
+                &user,
+                &unchecked,
+            ))
+            .await;
+            let check = RefCheck {
+                item,
+                version,
+                decision,
+                asked: unchecked.into_iter().map(|(_, pin)| pin).collect(),
+                result,
+            };
+            let _ = internal.send(Internal::References(check));
+        });
+    }
+
+    pub(super) fn on_references(&mut self, check: RefCheck) {
+        let RefCheck {
+            mut item,
+            version,
+            decision,
+            asked,
+            result,
+        } = check;
+        match item.conn() {
+            Some(conn) => {
+                self.unpark(conn);
+                if self.live_conn(conn).is_none() {
+                    return;
+                }
+            }
+            None => self.paused = self.paused.saturating_sub(1),
+        }
+        if self.closing.is_some() {
+            return self.not_written(item);
+        }
+        match result {
+            Err(e) => {
+                tracing::error!(
+                    "could not check the parts a change of document {} uses: {e:#}",
+                    self.doc
+                );
+                self.answer_refused(item, RejectCode::ServerError, NOT_CHECKED, Vec::new(), None);
+            }
+            Ok(Err(message)) => self.refuse_item(item, Refusal::Invalid(message)),
+            Ok(Ok(())) => {
+                item.pins_checked.extend(asked);
+                if version == self.tentative_version {
+                    self.check_blobs(item, version, decision);
+                } else {
+                    // The head moved while the store was asked: judge again (these pins are
+                    // checked now).
+                    self.judge_again(item);
+                }
+            }
+        }
+    }
+
+    /// The blob step of a decided change, then its adoption.
+    fn check_blobs(&mut self, item: Item, version: u64, decision: Decision) {
         if item.blobs_checked {
             return self.adopt(item, decision);
         }
@@ -1163,6 +1340,7 @@ impl Room {
         };
         let client = item.key().map(|_| item.author.client.to_string());
         let reverts = item.reverts.as_ref().map(|r| r.seq);
+        let references = d.references;
         let record = Record {
             document: self.doc.clone(),
             seq,
@@ -1182,10 +1360,15 @@ impl Room {
             reverts,
             created_at: self.state.clock.now(),
             // The taken-back change is marked in the same transaction (refused if something else
-            // took it back first). TASK 13: an assembly's component references.
+            // took it back first), and an assembly's references are replaced when they change.
             extra: reverts
-                .map(|seq| vec![Extra::SetRevertedBy { seq }])
-                .unwrap_or_default(),
+                .map(|seq| Extra::SetRevertedBy { seq })
+                .into_iter()
+                .chain(references.and_then(|r| {
+                    let chosen = r.chosen_parts();
+                    r.rows.map(|rows| Extra::AssemblyRefs { rows, chosen })
+                }))
+                .collect(),
         };
         self.tentative = Head {
             seq,
@@ -1569,6 +1752,18 @@ impl Room {
                         Vec::new(),
                         None,
                     );
+                } else if let RefusedWhy::PartGone { component } = why {
+                    // A part it chose was deleted after the room checked it: the same answer as
+                    // the room's own check gives.
+                    let message = assemblies::no_part(component);
+                    let refusal = Refusal::Invalid(message.clone());
+                    self.answer_refused(
+                        front.item,
+                        RejectCode::Invalid,
+                        &message,
+                        Vec::new(),
+                        Some(refusal),
+                    );
                 } else {
                     tracing::warn!(
                         "the journal refused change {seq} of document {}: {why}",
@@ -1629,9 +1824,23 @@ impl Room {
                 stale,
                 item.reverts.as_ref(),
                 item.target.as_deref(),
+                self.kind(&item),
             );
             metrics::decided(started.elapsed());
             match result {
+                // Judged against another head, it chooses a pin its check did not cover (rare: a
+                // later change that re-pins only the seq of a component an earlier refused one
+                // re-pointed). There is no checking it here without breaking the order: answered
+                // as a write that failed, which the client sends again.
+                Ok(decision) if !unchecked_pins(&decision, &item).is_empty() => {
+                    self.answer_refused(
+                        item,
+                        RejectCode::ServerError,
+                        NOT_STORED,
+                        Vec::new(),
+                        None,
+                    );
+                }
                 Ok(decision) => {
                     self.encodes.fetch_add(1, Ordering::Relaxed);
                     self.adopt(item, decision);

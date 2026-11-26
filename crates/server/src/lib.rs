@@ -5,6 +5,7 @@
 //! shape `{"detail": "..."}`.
 
 pub mod access;
+pub mod assemblies;
 pub mod blobs;
 pub mod clock;
 pub mod config;

@@ -662,6 +662,7 @@ async fn load(state: &AppState, doc: &str) -> Result<RoomInit, OpenError> {
         project: project.id,
         org: project.org_id,
         format_version: document.format_version,
+        assembly: document.kind == "assembly",
         head,
         epoch,
         snapshot_seq,

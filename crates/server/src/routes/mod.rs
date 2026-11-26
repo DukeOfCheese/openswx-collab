@@ -14,6 +14,7 @@
 //! into `large` must set one. A path may have its methods split between the groups (e.g. `GET` in
 //! `standard`, `POST` in `large`).
 
+pub mod assemblies;
 pub mod auth;
 pub mod blobs;
 pub mod documents;
@@ -58,6 +59,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(documents::router())
         .merge(folders::router())
         .merge(history::router())
+        .merge(assemblies::router())
         .merge(crate::ws::router());
 
     // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document

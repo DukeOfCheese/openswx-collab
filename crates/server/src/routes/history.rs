@@ -15,9 +15,10 @@
 //! - `POST /api/documents/{document}/versions` (editor): `{name, note?, seq?}` — `name` 1 to 200
 //!   characters (trimmed), unique in the document (409); `note` at most 4000; `seq` defaults to the
 //!   head and must be within `0..=head` (422). 201 with the version. An open room hears
-//!   `version.created`.
+//!   `version.created`; open assemblies with components pinned to an older state of the document
+//!   hear `reference.update`.
 //! - `DELETE /api/documents/{document}/versions/{version}` (project owner, as in the Python
-//!   server: versions are what others pin to). 204; 404 `no such version`.
+//!   server). 204; 404 `no such version`. A version assemblies pin may go: they pin its seq.
 //! - `POST /api/documents/{document}/restore` (editor): `{seq}` or `{version}` (a name; it wins
 //!   over `seq`; 422 when neither is given). The document becomes, as one new change, what it was
 //!   at that state: the target goes to the room ([`crate::room::RoomHandle::restore`]), which works
@@ -34,6 +35,8 @@
 //! A state that does not exist (below 0, beyond the head) is 404 `the document has no state N`; a
 //! version name that does not exist 404 `no version named 'x'`. A document the caller cannot see is
 //! 404 `no such document`, as everywhere.
+
+use std::collections::BTreeMap;
 
 use axum::Router;
 use axum::body::Body;
@@ -363,10 +366,10 @@ async fn create_version(
     let after = state.clone();
     state
         .commit_then(tx, async {}, async move {
+            // (The assemblies first: that step reads the store, so that once the document's own
+            // room has heard of the version, only the event is left.)
+            announce_newer(&after, &doc.id, seq).await;
             after.hub.notify(&doc.id, created).await;
-            // TASK 13: every open assembly with components pinned to an older state of this part
-            // hears `reference.update {document, components}` (ids only), as the Python
-            // `where_pinned_older`.
             emit(&after.ext, event).await;
         })
         .await?;
@@ -374,6 +377,35 @@ async fn create_version(
         StatusCode::CREATED,
         ApiJson(version_out(&version, &author_name)),
     ))
+}
+
+/// Tells every open assembly with components pinned to a state of `part` before `seq` (its new
+/// named version) `reference.update {document, components}`: the part's id and those components'
+/// ids, nothing more (not everyone in the assembly may open the part; `GET .../references` says
+/// the rest to those who can). Rooms that are not open are not opened. A store that cannot answer
+/// is logged: the version exists all the same.
+async fn announce_newer(state: &AppState, part: &str, seq: i64) {
+    let pinned = match state.store.pinned_before(part, seq).await {
+        Ok(pinned) => pinned,
+        Err(e) => {
+            tracing::warn!("could not find the assemblies that use document {part}: {e:#}");
+            return;
+        }
+    };
+    let mut by_assembly: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in pinned {
+        by_assembly
+            .entry(p.assembly_id)
+            .or_default()
+            .push(p.component_id);
+    }
+    for (assembly, components) in by_assembly {
+        let msg = oswx_core::wire::ServerMsg::ReferenceUpdate {
+            document: part.to_owned(),
+            components,
+        };
+        state.hub.notify(&assembly, msg).await;
+    }
 }
 
 async fn delete_version(
@@ -391,8 +423,8 @@ async fn delete_version(
     let mut tx = state.store.begin().await?;
     let (doc, project, _) =
         recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Owner).await?;
-    // TASK 13: a version that assemblies pin is Task 13's rule (refuse or keep the pins working)
-    // and is checked here, inside the transaction.
+    // A version assemblies pin may go, as in the Python server: a component is pinned to a seq,
+    // which never changes; the version name in its `ref` is a label kept for display.
     if !tx.delete_version(&doc.id, &version_id).await? {
         return Err(ApiError::NotFound("no such version"));
     }
