@@ -87,6 +87,48 @@ pub const DELETE_USER_PASSWORD_RESETS: &str = "DELETE FROM password_resets WHERE
 pub const DELETE_EXPIRED_PASSWORD_RESETS: &str =
     "DELETE FROM password_resets WHERE expires_at < $1";
 
+// ------------------------------------------------------------------ sign-in through a provider
+
+/// [`super::Store::oauth_identity`], [`super::Tx::oauth_identity`].
+pub const OAUTH_IDENTITY: &str = "SELECT provider, subject, user_id FROM oauth_identities \
+     WHERE provider = $1 AND subject = $2";
+
+/// [`super::Store::user_identities`], [`super::Tx::user_identities`].
+pub const USER_IDENTITIES: &str = "SELECT provider, subject, user_id FROM oauth_identities \
+     WHERE user_id = $1 ORDER BY provider, subject";
+
+/// [`super::Tx::insert_oauth_identity`].
+pub const INSERT_OAUTH_IDENTITY: &str =
+    "INSERT INTO oauth_identities (provider, subject, user_id) VALUES ($1, $2, $3)";
+
+/// [`super::Tx::delete_user_identities`].
+pub const DELETE_USER_IDENTITIES: &str =
+    "DELETE FROM oauth_identities WHERE user_id = $1 AND provider = $2";
+
+/// [`super::Tx::insert_oauth_state`].
+pub const INSERT_OAUTH_STATE: &str = "INSERT INTO oauth_states \
+     (state_hash, provider, redirect_uri, invite, challenge, link_user_id, expires_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
+/// [`super::Tx::take_oauth_state`].
+pub const TAKE_OAUTH_STATE: &str = "DELETE FROM oauth_states WHERE state_hash = $1 \
+     RETURNING state_hash, provider, redirect_uri, invite, challenge, link_user_id, expires_at";
+
+/// [`super::Tx::delete_expired_oauth_states`].
+pub const DELETE_EXPIRED_OAUTH_STATES: &str = "DELETE FROM oauth_states WHERE expires_at < $1";
+
+/// [`super::Tx::insert_login_code`].
+pub const INSERT_LOGIN_CODE: &str = "INSERT INTO login_codes \
+     (code_hash, user_id, challenge, link_provider, link_subject, link_email, expires_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
+/// [`super::Tx::take_login_code`].
+pub const TAKE_LOGIN_CODE: &str = "DELETE FROM login_codes WHERE code_hash = $1 \
+     RETURNING code_hash, user_id, challenge, link_provider, link_subject, link_email, expires_at";
+
+/// [`super::Tx::delete_expired_login_codes`].
+pub const DELETE_EXPIRED_LOGIN_CODES: &str = "DELETE FROM login_codes WHERE expires_at < $1";
+
 // ------------------------------------------------------------------ organisations
 
 /// [`super::Tx::insert_org`].

@@ -50,9 +50,10 @@ use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
     AssemblyRefRow, AssemblyUse, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder,
-    HistoryRow, Id, Invite, Member, NewChange, Org, OrgMember, OrgSummary, PartRow, PasswordReset,
-    PinnedComponent, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus,
-    Session, SnapshotRow, Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
+    HistoryRow, Id, Invite, LoginCode, Member, NewChange, OAuthIdentity, OAuthState, Org,
+    OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project, ProjectMember,
+    ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx,
+    UndoTarget, User, Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -310,6 +311,14 @@ impl Store for SqliteStore {
 
     async fn password_reset_by_hash(&self, token_hash: &str) -> Result<Option<PasswordReset>> {
         q::password_reset_by_hash(&mut *self.reader().await?, token_hash).await
+    }
+
+    async fn oauth_identity(&self, provider: &str, subject: &str) -> Result<Option<OAuthIdentity>> {
+        q::oauth_identity(&mut *self.reader().await?, provider, subject).await
+    }
+
+    async fn user_identities(&self, user_id: &str) -> Result<Vec<OAuthIdentity>> {
+        q::user_identities(&mut *self.reader().await?, user_id).await
     }
 
     async fn org_by_id(&self, id: &str) -> Result<Option<Org>> {
@@ -674,6 +683,50 @@ impl Tx for SqliteTx<'_> {
 
     async fn delete_expired_password_resets(&mut self, now: f64) -> Result<()> {
         q::delete_expired_password_resets(self.conn(), now).await
+    }
+
+    async fn oauth_identity(
+        &mut self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<OAuthIdentity>> {
+        q::oauth_identity(self.conn(), provider, subject).await
+    }
+
+    async fn user_identities(&mut self, user_id: &str) -> Result<Vec<OAuthIdentity>> {
+        q::user_identities(self.conn(), user_id).await
+    }
+
+    async fn insert_oauth_identity(&mut self, identity: &OAuthIdentity) -> Result<()> {
+        q::insert_oauth_identity(self.conn(), identity).await
+    }
+
+    async fn delete_user_identities(&mut self, user_id: &str, provider: &str) -> Result<()> {
+        q::delete_user_identities(self.conn(), user_id, provider).await
+    }
+
+    async fn insert_oauth_state(&mut self, state: &OAuthState) -> Result<()> {
+        q::insert_oauth_state(self.conn(), state).await
+    }
+
+    async fn take_oauth_state(&mut self, state_hash: &str) -> Result<Option<OAuthState>> {
+        q::take_oauth_state(self.conn(), state_hash).await
+    }
+
+    async fn delete_expired_oauth_states(&mut self, now: f64) -> Result<()> {
+        q::delete_expired_oauth_states(self.conn(), now).await
+    }
+
+    async fn insert_login_code(&mut self, code: &LoginCode) -> Result<()> {
+        q::insert_login_code(self.conn(), code).await
+    }
+
+    async fn take_login_code(&mut self, code_hash: &str) -> Result<Option<LoginCode>> {
+        q::take_login_code(self.conn(), code_hash).await
+    }
+
+    async fn delete_expired_login_codes(&mut self, now: f64) -> Result<()> {
+        q::delete_expired_login_codes(self.conn(), now).await
     }
 
     async fn insert_org(&mut self, org: &Org) -> Result<()> {
@@ -1151,6 +1204,115 @@ mod q {
 
     pub async fn delete_expired_password_resets(c: &mut SqliteConnection, now: f64) -> Result<()> {
         sqlx::query(sql::DELETE_EXPIRED_PASSWORD_RESETS)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn oauth_identity(
+        c: &mut SqliteConnection,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<OAuthIdentity>> {
+        Ok(sqlx::query_as(sql::OAUTH_IDENTITY)
+            .bind(provider)
+            .bind(subject)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn user_identities(
+        c: &mut SqliteConnection,
+        user_id: &str,
+    ) -> Result<Vec<OAuthIdentity>> {
+        Ok(sqlx::query_as(sql::USER_IDENTITIES)
+            .bind(user_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn insert_oauth_identity(c: &mut SqliteConnection, i: &OAuthIdentity) -> Result<()> {
+        sqlx::query(sql::INSERT_OAUTH_IDENTITY)
+            .bind(&i.provider)
+            .bind(&i.subject)
+            .bind(&i.user_id)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_user_identities(
+        c: &mut SqliteConnection,
+        user_id: &str,
+        provider: &str,
+    ) -> Result<()> {
+        sqlx::query(sql::DELETE_USER_IDENTITIES)
+            .bind(user_id)
+            .bind(provider)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_oauth_state(c: &mut SqliteConnection, s: &OAuthState) -> Result<()> {
+        sqlx::query(sql::INSERT_OAUTH_STATE)
+            .bind(&s.state_hash)
+            .bind(&s.provider)
+            .bind(&s.redirect_uri)
+            .bind(&s.invite)
+            .bind(&s.challenge)
+            .bind(&s.link_user_id)
+            .bind(s.expires_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn take_oauth_state(
+        c: &mut SqliteConnection,
+        state_hash: &str,
+    ) -> Result<Option<OAuthState>> {
+        Ok(sqlx::query_as(sql::TAKE_OAUTH_STATE)
+            .bind(state_hash)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn delete_expired_oauth_states(c: &mut SqliteConnection, now: f64) -> Result<()> {
+        sqlx::query(sql::DELETE_EXPIRED_OAUTH_STATES)
+            .bind(now)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_login_code(c: &mut SqliteConnection, l: &LoginCode) -> Result<()> {
+        sqlx::query(sql::INSERT_LOGIN_CODE)
+            .bind(&l.code_hash)
+            .bind(&l.user_id)
+            .bind(&l.challenge)
+            .bind(&l.link_provider)
+            .bind(&l.link_subject)
+            .bind(&l.link_email)
+            .bind(l.expires_at)
+            .execute(c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn take_login_code(
+        c: &mut SqliteConnection,
+        code_hash: &str,
+    ) -> Result<Option<LoginCode>> {
+        Ok(sqlx::query_as(sql::TAKE_LOGIN_CODE)
+            .bind(code_hash)
+            .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn delete_expired_login_codes(c: &mut SqliteConnection, now: f64) -> Result<()> {
+        sqlx::query(sql::DELETE_EXPIRED_LOGIN_CODES)
             .bind(now)
             .execute(c)
             .await?;

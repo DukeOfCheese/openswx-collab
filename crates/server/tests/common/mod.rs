@@ -19,9 +19,10 @@ use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
     AssemblyRefRow, AssemblyUse, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder,
-    HistoryRow, Id, Invite, Member, NewChange, Org, OrgMember, OrgSummary, PartRow, PasswordReset,
-    PinnedComponent, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session,
-    SnapshotRow, SqliteStore, Store, Tx, UndoTarget, User, Version, VersionWithAuthor,
+    HistoryRow, Id, Invite, LoginCode, Member, NewChange, OAuthIdentity, OAuthState, Org,
+    OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project, ProjectMember,
+    ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx,
+    UndoTarget, User, Version, VersionWithAuthor,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -804,6 +805,18 @@ impl Store for FlakyStore {
         self.inner().password_reset_by_hash(token_hash).await
     }
 
+    async fn oauth_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> anyhow::Result<Option<OAuthIdentity>> {
+        self.inner().oauth_identity(provider, subject).await
+    }
+
+    async fn user_identities(&self, user_id: &str) -> anyhow::Result<Vec<OAuthIdentity>> {
+        self.inner().user_identities(user_id).await
+    }
+
     async fn org_by_id(&self, id: &str) -> anyhow::Result<Option<Org>> {
         self.inner().org_by_id(id).await
     }
@@ -1228,6 +1241,54 @@ impl Tx for FlakyTx<'_> {
 
     async fn delete_expired_password_resets(&mut self, now: f64) -> anyhow::Result<()> {
         self.inner.delete_expired_password_resets(now).await
+    }
+
+    async fn oauth_identity(
+        &mut self,
+        provider: &str,
+        subject: &str,
+    ) -> anyhow::Result<Option<OAuthIdentity>> {
+        self.inner.oauth_identity(provider, subject).await
+    }
+
+    async fn user_identities(&mut self, user_id: &str) -> anyhow::Result<Vec<OAuthIdentity>> {
+        self.inner.user_identities(user_id).await
+    }
+
+    async fn insert_oauth_identity(&mut self, identity: &OAuthIdentity) -> anyhow::Result<()> {
+        self.inner.insert_oauth_identity(identity).await
+    }
+
+    async fn delete_user_identities(
+        &mut self,
+        user_id: &str,
+        provider: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_user_identities(user_id, provider).await
+    }
+
+    async fn insert_oauth_state(&mut self, state: &OAuthState) -> anyhow::Result<()> {
+        self.inner.insert_oauth_state(state).await
+    }
+
+    async fn take_oauth_state(&mut self, state_hash: &str) -> anyhow::Result<Option<OAuthState>> {
+        self.inner.take_oauth_state(state_hash).await
+    }
+
+    async fn delete_expired_oauth_states(&mut self, now: f64) -> anyhow::Result<()> {
+        self.inner.delete_expired_oauth_states(now).await
+    }
+
+    async fn insert_login_code(&mut self, code: &LoginCode) -> anyhow::Result<()> {
+        self.inner.insert_login_code(code).await
+    }
+
+    async fn take_login_code(&mut self, code_hash: &str) -> anyhow::Result<Option<LoginCode>> {
+        self.inner.take_login_code(code_hash).await
+    }
+
+    async fn delete_expired_login_codes(&mut self, now: f64) -> anyhow::Result<()> {
+        self.inner.delete_expired_login_codes(now).await
     }
 
     async fn insert_org(&mut self, org: &Org) -> anyhow::Result<()> {

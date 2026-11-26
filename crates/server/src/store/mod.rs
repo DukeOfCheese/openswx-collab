@@ -210,6 +210,48 @@ pub struct PasswordReset {
     pub expires_at: f64,
 }
 
+/// A Google or GitHub account that signs in to an account here (`oauth_identities`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct OAuthIdentity {
+    /// `google` or `github`.
+    pub provider: String,
+    /// The provider's id for the person (Google's `sub`, GitHub's numeric `id`).
+    pub subject: String,
+    pub user_id: Id,
+}
+
+/// A browser sign-in that has started and not yet come back from the provider (`oauth_states`).
+/// Only the state value's hash is stored.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct OAuthState {
+    pub state_hash: String,
+    pub provider: String,
+    /// The app's loopback address the browser is sent back to.
+    pub redirect_uri: String,
+    /// The hash of the invite token the sign-in carries, if any.
+    pub invite: Option<String>,
+    /// The SHA-256 (lower-case hex) of the app's `code_verifier`.
+    pub challenge: String,
+    /// The account adding this provider, for a link (`None` for a sign-in).
+    pub link_user_id: Option<Id>,
+    pub expires_at: f64,
+}
+
+/// A one-time code the browser brought back to the app (`login_codes`). Only its hash is stored.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct LoginCode {
+    pub code_hash: String,
+    /// The account it signs in to, or (a link) the account that asked to add the provider.
+    pub user_id: Id,
+    /// The SHA-256 (lower-case hex) of the app's `code_verifier`.
+    pub challenge: String,
+    /// For a link: the provider, its subject and the address it gave (cleaned, if verified).
+    pub link_provider: Option<String>,
+    pub link_subject: Option<String>,
+    pub link_email: Option<String>,
+    pub expires_at: f64,
+}
+
 /// An organisation (`orgs`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Org {
@@ -560,6 +602,16 @@ pub trait Store: Send + Sync + 'static {
         token_hash: &str,
     ) -> anyhow::Result<Option<PasswordReset>>;
 
+    /// The account a provider identity signs in to.
+    async fn oauth_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> anyhow::Result<Option<OAuthIdentity>>;
+
+    /// The provider identities of an account, by provider and subject.
+    async fn user_identities(&self, user_id: &str) -> anyhow::Result<Vec<OAuthIdentity>>;
+
     async fn org_by_id(&self, id: &str) -> anyhow::Result<Option<Org>>;
 
     /// An account's membership of an organisation.
@@ -810,6 +862,38 @@ pub trait Tx: Send {
 
     /// Removes every account's password resets that expired before `now`.
     async fn delete_expired_password_resets(&mut self, now: f64) -> anyhow::Result<()>;
+
+    async fn oauth_identity(
+        &mut self,
+        provider: &str,
+        subject: &str,
+    ) -> anyhow::Result<Option<OAuthIdentity>>;
+
+    async fn user_identities(&mut self, user_id: &str) -> anyhow::Result<Vec<OAuthIdentity>>;
+
+    async fn insert_oauth_identity(&mut self, identity: &OAuthIdentity) -> anyhow::Result<()>;
+
+    /// Removes an account's identities with this provider.
+    async fn delete_user_identities(&mut self, user_id: &str, provider: &str)
+    -> anyhow::Result<()>;
+
+    async fn insert_oauth_state(&mut self, state: &OAuthState) -> anyhow::Result<()>;
+
+    /// Removes the sign-in state with this hash and answers it (`None` if there was none): a state
+    /// is used once, even when two callbacks race.
+    async fn take_oauth_state(&mut self, state_hash: &str) -> anyhow::Result<Option<OAuthState>>;
+
+    /// Removes the sign-in states that expired before `now`.
+    async fn delete_expired_oauth_states(&mut self, now: f64) -> anyhow::Result<()>;
+
+    async fn insert_login_code(&mut self, code: &LoginCode) -> anyhow::Result<()>;
+
+    /// Removes the login code with this hash and answers it (`None` if there was none): a code is
+    /// used once, even when two exchanges race.
+    async fn take_login_code(&mut self, code_hash: &str) -> anyhow::Result<Option<LoginCode>>;
+
+    /// Removes the login codes that expired before `now`.
+    async fn delete_expired_login_codes(&mut self, now: f64) -> anyhow::Result<()>;
 
     async fn insert_org(&mut self, org: &Org) -> anyhow::Result<()>;
 
