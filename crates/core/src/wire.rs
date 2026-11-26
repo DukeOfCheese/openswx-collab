@@ -157,6 +157,30 @@ impl fmt::Debug for ClientMsg {
     }
 }
 
+/// Every `code` a failed `change.revert.result` may carry:
+///
+/// - `read_only`: the connection may only look;
+/// - `not_found`: there is no such change (seq 0 is the document as created; nothing beyond the
+///   head);
+/// - `already_reverted`: something already took that change back;
+/// - `stale`: something wrote what the revert writes since that change;
+/// - `locked`: another client holds a lock on what it writes;
+/// - `invalid`: it no longer applies, it has nothing to take back, or the change is older than the
+///   history the server keeps (it can never be reverted);
+/// - `name_taken`, `id_taken`: putting it back would repeat a feature name or an item id;
+/// - `server_error`: the server could not read or write the history; try again.
+pub const REVERT_CODES: [&str; 9] = [
+    "read_only",
+    "not_found",
+    "already_reverted",
+    "stale",
+    "locked",
+    "invalid",
+    "name_taken",
+    "id_taken",
+    "server_error",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectCode {
     Stale,
@@ -332,8 +356,8 @@ pub enum ServerMsg {
         conflicts: Vec<Conflict>,
     },
     Change(ChangeEvent),
-    /// The answer to a `change.revert`: `seq` and the applied `ops` when `ok`, otherwise `code` and
-    /// `message`.
+    /// The answer to a `change.revert`: `seq` and the applied `ops` when `ok`, otherwise `code` (one
+    /// of [`REVERT_CODES`]) and `message`.
     RevertResult {
         request_id: String,
         ok: bool,
