@@ -172,7 +172,7 @@ async fn create_folder(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok((StatusCode::CREATED, ApiJson(folder_out(&folder))))
 }
@@ -288,7 +288,7 @@ async fn patch_folder(
     }
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move {
+        .commit_then(tx, |_| async {}, async move {
             for event in events {
                 emit(&ext, event).await;
             }
@@ -319,7 +319,7 @@ async fn delete_folder(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

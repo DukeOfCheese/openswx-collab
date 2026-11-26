@@ -599,7 +599,7 @@ async fn patch_document(
     }
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move {
+        .commit_then(tx, |_| async {}, async move {
             for event in events {
                 emit(&ext, event).await;
             }
@@ -652,7 +652,7 @@ async fn delete_document(
     state
         .commit_then(
             tx,
-            async move {
+            |_| async move {
                 revoker
                     .hub
                     .close_document(&doc.id, "the document was deleted")

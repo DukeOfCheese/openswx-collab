@@ -42,7 +42,7 @@ use crate::security::{
     RateLimit, check_password_len, clean_email, hash_password, new_token, token_hash, verify_dummy,
     verify_password,
 };
-use crate::state::AppState;
+use crate::state::{AppState, Committed};
 use crate::store::{PasswordReset, Session, Tx, User, new_id};
 
 /// The longest email address accepted (the column's size).
@@ -251,7 +251,7 @@ async fn register(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move {
+        .commit_then(tx, |_| async {}, async move {
             emit(&ext, registered).await;
             if let Some(accepted) = accepted {
                 accepted.announce(ext).await;
@@ -315,7 +315,7 @@ async fn login(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, signed_in).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, signed_in).await })
         .await?;
     Ok(Json(json!({"token": token, "user": me_out(&user)})))
 }
@@ -330,9 +330,10 @@ async fn logout(State(state): State<AppState>, user: CurrentUser) -> Result<Stat
     state
         .commit_then(
             tx,
-            async move {
+            move |committed: Committed| async move {
+                let (code, reason) = committed.session_close();
                 revoker.sessions.forget_token(&hash);
-                revoker.hub.drop_session(&hash).await;
+                revoker.hub.drop_session_with(&hash, code, reason).await;
             },
             async move { emit(&ext, Event::SignedOut { user: user.id }).await },
         )
@@ -446,10 +447,11 @@ async fn update_me(
     state
         .commit_then(
             tx,
-            async move {
+            move |committed: Committed| async move {
                 if changed {
+                    let (code, reason) = committed.session_close();
                     revoker.sessions.forget_user(&revoked);
-                    revoker.hub.drop_account(&revoked).await;
+                    revoker.hub.drop_account_with(&revoked, code, reason).await;
                 }
             },
             async move {
@@ -520,7 +522,7 @@ async fn request_reset(
     let (subject, text) = reset_text(&url, settings.reset_minutes);
     let after = state.clone();
     state
-        .commit_then(tx, async {}, async move {
+        .commit_then(tx, |_| async {}, async move {
             send_logged(
                 after.mailer.as_ref(),
                 &after.settings,
@@ -588,9 +590,10 @@ async fn confirm_reset(
     state
         .commit_then(
             tx,
-            async move {
+            move |committed: Committed| async move {
+                let (code, reason) = committed.session_close();
                 revoker.sessions.forget_user(&revoked);
-                revoker.hub.drop_account(&revoked).await;
+                revoker.hub.drop_account_with(&revoked, code, reason).await;
             },
             async move {
                 let completed = Event::PasswordResetCompleted { user: user.id };

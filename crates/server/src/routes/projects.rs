@@ -94,7 +94,7 @@ async fn create_project(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -126,7 +126,7 @@ async fn rename_project(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok(Json(
         json!({"id": project.id, "name": name, "org_id": project.org_id}),
@@ -176,7 +176,7 @@ async fn delete_project(
     state
         .commit_then(
             tx,
-            async move {
+            |_| async move {
                 for document in &documents {
                     revoker
                         .hub
@@ -267,7 +267,7 @@ async fn set_member(
     state
         .commit_then(
             tx,
-            async move {
+            |_| async move {
                 revoker
                     .hub
                     .drop_user(revoker.store.as_ref(), &member, &org)
@@ -308,7 +308,7 @@ async fn remove_member(
     state
         .commit_then(
             tx,
-            async move {
+            |_| async move {
                 revoker
                     .hub
                     .drop_user(revoker.store.as_ref(), &user_id, &org)

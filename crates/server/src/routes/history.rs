@@ -365,7 +365,7 @@ async fn create_version(
     };
     let after = state.clone();
     state
-        .commit_then(tx, async {}, async move {
+        .commit_then(tx, |_| async {}, async move {
             // (The assemblies first: that step reads the store, so that once the document's own
             // room has heard of the version, only the event is left.)
             announce_newer(&after, &doc.id, seq).await;
@@ -437,7 +437,7 @@ async fn delete_version(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

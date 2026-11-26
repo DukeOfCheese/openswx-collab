@@ -40,6 +40,27 @@ pub struct AppState {
     pub after_commits: Arc<InFlight>,
 }
 
+/// What the revoking steps of [`AppState::commit_then`] know of the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Committed {
+    /// It took effect.
+    Yes,
+    /// It reported an error: it may or may not have taken effect. A step that closes connections
+    /// then says "reconnect" (4410) rather than "sign in again": the sessions may still be valid.
+    Uncertain,
+}
+
+impl Committed {
+    /// The close code and reason for connections whose sessions the commit ended: 4401 `sign in
+    /// again` when it took effect, 4410 `reconnect` when that is uncertain (a reconnect finds out).
+    pub fn session_close(self) -> (u16, &'static str) {
+        match self {
+            Self::Yes => (crate::room::close::SIGN_IN, "sign in again"),
+            Self::Uncertain => (crate::room::close::MOVED, "reconnect"),
+        }
+    }
+}
+
 /// How long shutdown waits for the steps after REST commits that are still running.
 const AFTER_COMMIT_WAIT: Duration = Duration::from_secs(10);
 
@@ -120,8 +141,9 @@ impl AppState {
     ///
     /// The steps come in two kinds, in this order:
     ///
-    /// - `revoking`: forgetting sessions and the hub's drops and closes. They run after the
-    ///   commit **whether it succeeded or reported an error** (an error can come after the commit
+    /// - `revoking`: forgetting sessions and the hub's drops and closes, made from what the commit
+    ///   was ([`Committed`]). They run after the commit **whether it succeeded or reported an
+    ///   error** (an error can come after the commit
     ///   took effect: a connection lost during `COMMIT`). That is safe: [`Hub::drop_user`] reads
     ///   the roles again and drops nobody whose role did not change, and the other drops cost at
     ///   worst a reconnect.
@@ -145,14 +167,15 @@ impl AppState {
     /// # Panics
     ///
     /// If the steps panic (the panic is passed on to the request).
-    pub async fn commit_then<T, R, A>(
+    pub async fn commit_then<T, F, R, A>(
         &self,
         tx: Box<dyn Tx>,
-        revoking: R,
+        revoking: F,
         announcing: A,
     ) -> Result<T, ApiError>
     where
         T: Send + 'static,
+        F: FnOnce(Committed) -> R + Send + 'static,
         R: Future<Output = ()> + Send + 'static,
         A: Future<Output = T> + Send + 'static,
     {
@@ -160,7 +183,12 @@ impl AppState {
         self.detached(async move {
             let committed = tx.commit().await;
             gate.pass().await;
-            revoking.await;
+            let outcome = if committed.is_ok() {
+                Committed::Yes
+            } else {
+                Committed::Uncertain
+            };
+            revoking(outcome).await;
             match committed {
                 Ok(()) => Ok(announcing.await),
                 Err(e) => Err(ApiError::Internal(e)),

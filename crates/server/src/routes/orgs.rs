@@ -156,7 +156,7 @@ async fn create_org(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -181,7 +181,7 @@ async fn rename_org(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok(Json(json!({"id": org_id, "name": name})))
 }
@@ -250,7 +250,7 @@ async fn set_member_role(
     state
         .commit_then(
             tx,
-            async move {
+            |_| async move {
                 revoker
                     .hub
                     .drop_user(revoker.store.as_ref(), &member, &org_id)
@@ -299,7 +299,7 @@ async fn remove_member(
     state
         .commit_then(
             tx,
-            async move {
+            |_| async move {
                 revoker
                     .hub
                     .drop_user(revoker.store.as_ref(), &member, &org)
@@ -490,7 +490,7 @@ async fn create_invite(
     };
     let after = state.clone();
     let emailed = state
-        .commit_then(tx, async {}, async move {
+        .commit_then(tx, |_| async {}, async move {
             let mut emailed = false;
             if let Some((to, (subject, text))) = mail {
                 emailed =
@@ -543,7 +543,7 @@ async fn revoke_invite(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -778,7 +778,7 @@ async fn accept(
         "role": accepted.role.as_str(),
     });
     state
-        .commit_then(tx, async {}, accepted.announce(state.ext.clone()))
+        .commit_then(tx, |_| async {}, accepted.announce(state.ext.clone()))
         .await?;
     Ok(Json(answer))
 }
