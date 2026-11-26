@@ -547,6 +547,8 @@ pub struct FlakyStore {
     preloads: AtomicUsize,
     preload_delay: Mutex<Duration>,
     commit_delay: Arc<Mutex<Duration>>,
+    /// Shut: every top-level `commit` parks here (before it commits) until opened.
+    pub commit_gate: Arc<oswx_server::room::Gate>,
 }
 
 impl FlakyStore {
@@ -571,6 +573,7 @@ impl FlakyStore {
             preloads: AtomicUsize::new(0),
             preload_delay: Mutex::new(Duration::ZERO),
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
+            commit_gate: Arc::default(),
         }
     }
 
@@ -739,6 +742,7 @@ impl Store for FlakyStore {
             refuse_server_change: self.refuse_server_change.clone(),
             duplicate_inserts: self.duplicate_inserts.clone(),
             commit_delay: self.commit_delay.clone(),
+            commit_gate: self.commit_gate.clone(),
         }))
     }
 
@@ -1019,6 +1023,7 @@ pub struct FlakyTx<'a> {
     refuse_server_change: Arc<AtomicBool>,
     duplicate_inserts: Arc<AtomicUsize>,
     commit_delay: Arc<Mutex<Duration>>,
+    commit_gate: Arc<oswx_server::room::Gate>,
 }
 
 #[async_trait]
@@ -1027,6 +1032,7 @@ impl Tx for FlakyTx<'_> {
         if self.savepoint {
             return self.inner.commit().await;
         }
+        self.commit_gate.pass().await;
         if self.hang_commit.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -1072,6 +1078,7 @@ impl Tx for FlakyTx<'_> {
             refuse_server_change: self.refuse_server_change.clone(),
             duplicate_inserts,
             commit_delay,
+            commit_gate: self.commit_gate.clone(),
         }))
     }
 
