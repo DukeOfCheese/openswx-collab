@@ -183,6 +183,27 @@ fn event(seq: u64) -> ChangeEvent {
         ops: all_ops(),
         command: Arc::from("extrude"),
         undo_of: Some(Arc::from("c0")),
+        reverts: Some(seq - 1),
+    }
+}
+
+/// A change event as a revert from history has it: no change id, no `undo_of`, `reverts` set.
+fn revert_event(seq: u64) -> ChangeEvent {
+    ChangeEvent {
+        client_id: Arc::from("~server"),
+        change_id: Arc::from(""),
+        undo_of: None,
+        reverts: Some(2),
+        ..event(seq)
+    }
+}
+
+/// A plain change event: neither an undo nor a revert.
+fn plain_event(seq: u64) -> ChangeEvent {
+    ChangeEvent {
+        undo_of: None,
+        reverts: None,
+        ..event(seq)
     }
 }
 
@@ -211,8 +232,10 @@ fn broken() -> BTreeMap<String, Broken> {
             Broken {
                 error: "no solution".into(),
                 by_seq: Some(3),
+                by_user: Some("u2".into()),
                 by_name: Some("Bob".into()),
                 command: Some("edit".into()),
+                since_seq: Some(2),
             },
         ),
         (
@@ -220,8 +243,10 @@ fn broken() -> BTreeMap<String, Broken> {
             Broken {
                 error: "x".into(),
                 by_seq: None,
+                by_user: None,
                 by_name: None,
                 command: None,
+                since_seq: None,
             },
         ),
     ])
@@ -306,12 +331,15 @@ fn server_samples() -> Vec<ServerMsg> {
             }],
         },
         ServerMsg::Change(event(9)),
+        ServerMsg::Change(revert_event(9)),
+        ServerMsg::Change(plain_event(9)),
         ServerMsg::RevertResult {
             request_id: "r1".into(),
             ok: true,
             seq: Some(10),
             ops: all_ops(),
             code: None,
+            message: None,
         },
         ServerMsg::RevertResult {
             request_id: "r1".into(),
@@ -319,6 +347,7 @@ fn server_samples() -> Vec<ServerMsg> {
             seq: None,
             ops: vec![],
             code: Some("stale".into()),
+            message: Some("someone changed it since".into()),
         },
         ServerMsg::LockResult {
             request_id: "r1".into(),
@@ -365,7 +394,14 @@ fn server_samples() -> Vec<ServerMsg> {
             client_id: Arc::from("u1.client-03"),
             data: None,
         },
-        ServerMsg::RebuildStatus { broken: broken() },
+        ServerMsg::RebuildStatus {
+            seq: 4,
+            broken: broken(),
+        },
+        ServerMsg::RebuildStatus {
+            seq: 0,
+            broken: BTreeMap::new(),
+        },
         ServerMsg::VersionCreated {
             id: "v1".into(),
             name: "Release".into(),
@@ -1121,6 +1157,54 @@ fn decode_server_is_strict_about_types() {
     let mut trailing = encode_server(&ServerMsg::Pong { seq: 1 }).to_vec();
     trailing.push(0);
     assert!(decode_server(&trailing).is_err());
+}
+
+#[test]
+fn decode_server_is_strict_about_undo_reverts_and_rebuilds() {
+    let change = || {
+        json!({"t": "change", "seq": 3, "client_id": "u.c", "author": "u", "author_name": "A",
+               "change_id": "c", "ops": [], "command": ""})
+    };
+    let got = decode_server(&with_server(change(), "reverts", json!(2))).unwrap();
+    assert!(matches!(
+        got,
+        ServerMsg::Change(ChangeEvent {
+            reverts: Some(2),
+            ..
+        })
+    ));
+    assert!(matches!(
+        decode_server(&with_server(change(), "reverts", Json::Null)).unwrap(),
+        ServerMsg::Change(ChangeEvent { reverts: None, .. })
+    ));
+    for v in [json!("2"), json!(-1), json!(1.5), json!([2])] {
+        assert!(
+            decode_server(&with_server(change(), "reverts", v.clone())).is_err(),
+            "{v}"
+        );
+    }
+
+    let result = || json!({"t": "change.revert.result", "request_id": "r", "ok": false, "ops": []});
+    assert!(decode_server(&with_server(result(), "message", json!("no"))).is_ok());
+    assert!(decode_server(&with_server(result(), "message", json!(1))).is_err());
+
+    let status = |seq: Json, entry: Json| {
+        frame(&json!({"t": "rebuild.status", "seq": seq, "broken": {"f1": entry}}))
+    };
+    let full = json!({"error": "e", "by_seq": 2, "by_user": "u", "by_name": "A", "command": "c",
+                      "since_seq": 1});
+    assert!(decode_server(&status(json!(2), full.clone())).is_ok());
+    assert!(decode_server(&frame(&json!({"t": "rebuild.status", "broken": {}}))).is_err());
+    assert!(decode_server(&status(json!("2"), full.clone())).is_err());
+    for (key, v) in [
+        ("by_user", json!(1)),
+        ("since_seq", json!("1")),
+        ("since_seq", json!(-1)),
+    ] {
+        let mut entry = full.clone();
+        entry[key] = v;
+        assert!(decode_server(&status(json!(2), entry)).is_err(), "{key}");
+    }
 }
 
 #[test]

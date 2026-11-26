@@ -266,13 +266,20 @@ impl DenyReason {
     }
 }
 
-/// A feature that does not rebuild, and the change that broke it if known.
+/// A feature that does not rebuild, and the change that broke it if known. The blame fields are
+/// all present (a feature that broke after a baseline report) or all absent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Broken {
     pub error: String,
+    /// The change blamed for it.
     pub by_seq: Option<Seq>,
+    /// Its author's user id.
+    pub by_user: Option<String>,
     pub by_name: Option<String>,
     pub command: Option<String>,
+    /// The first seq after the last good report: the break came in somewhere in
+    /// `since_seq..=by_seq`.
+    pub since_seq: Option<Seq>,
 }
 
 /// An accepted change as the server tells everyone about it.
@@ -286,7 +293,10 @@ pub struct ChangeEvent {
     pub change_id: Arc<str>,
     pub ops: Vec<Op>,
     pub command: Arc<str>,
+    /// For a client's undo: the change id (of the same client) it undoes.
     pub undo_of: Option<Arc<str>>,
+    /// The seq of the change it takes back (a client's undo, or a revert from history).
+    pub reverts: Option<Seq>,
 }
 
 // A welcome is sent once per connection; boxing its fields would only complicate every caller.
@@ -322,12 +332,15 @@ pub enum ServerMsg {
         conflicts: Vec<Conflict>,
     },
     Change(ChangeEvent),
+    /// The answer to a `change.revert`: `seq` and the applied `ops` when `ok`, otherwise `code` and
+    /// `message`.
     RevertResult {
         request_id: String,
         ok: bool,
         seq: Option<Seq>,
         ops: Vec<Op>,
         code: Option<String>,
+        message: Option<String>,
     },
     /// The answer to a `lock.acquire`.
     LockResult {
@@ -353,7 +366,9 @@ pub enum ServerMsg {
         client_id: ClientId,
         data: Option<Plain>,
     },
+    /// What does not rebuild, after the report about state `seq` changed it.
     RebuildStatus {
+        seq: Seq,
         broken: BTreeMap<String, Broken>,
     },
     VersionCreated {
@@ -1074,11 +1089,17 @@ fn broken_to_wire(b: &Broken) -> Plain {
     if let Some(v) = b.by_seq {
         pairs.push(("by_seq", Plain::from(v)));
     }
+    if let Some(v) = &b.by_user {
+        pairs.push(("by_user", s(v)));
+    }
     if let Some(v) = &b.by_name {
         pairs.push(("by_name", s(v)));
     }
     if let Some(v) = &b.command {
         pairs.push(("command", s(v)));
+    }
+    if let Some(v) = b.since_seq {
+        pairs.push(("since_seq", Plain::from(v)));
     }
     map_of(pairs)
 }
@@ -1088,6 +1109,10 @@ fn broken_from_wire(p: &Plain) -> Result<Broken, WireError> {
     Ok(Broken {
         error: string(f.req("error")?, "error")?,
         by_seq: f.opt("by_seq")?.map(|p| uint(p, "by_seq")).transpose()?,
+        by_user: f
+            .opt("by_user")?
+            .map(|p| string(p, "by_user"))
+            .transpose()?,
         by_name: f
             .opt("by_name")?
             .map(|p| string(p, "by_name"))
@@ -1095,6 +1120,10 @@ fn broken_from_wire(p: &Plain) -> Result<Broken, WireError> {
         command: f
             .opt("command")?
             .map(|p| string(p, "command"))
+            .transpose()?,
+        since_seq: f
+            .opt("since_seq")?
+            .map(|p| uint(p, "since_seq"))
             .transpose()?,
     })
 }
@@ -1130,6 +1159,9 @@ fn event_pairs(e: &ChangeEvent) -> Vec<(&'static str, Plain)> {
     if let Some(u) = &e.undo_of {
         pairs.push(("undo_of", s(u)));
     }
+    if let Some(r) = e.reverts {
+        pairs.push(("reverts", Plain::from(r)));
+    }
     pairs
 }
 
@@ -1146,6 +1178,7 @@ fn event_from_fields(f: &Fields) -> Result<ChangeEvent, WireError> {
             .opt("undo_of")?
             .map(|p| shared(p, "undo_of", 0, usize::MAX))
             .transpose()?,
+        reverts: f.opt("reverts")?.map(|p| uint(p, "reverts")).transpose()?,
     })
 }
 
@@ -1248,12 +1281,14 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
             seq,
             ops,
             code,
+            message,
         } => Out::new("change.revert.result")
             .put("request_id", s(request_id))
             .put("ok", *ok)
             .put_opt("seq", seq.map(Plain::from))
             .put("ops", op_list(ops))
             .put_opt("code", opt_s(code))
+            .put_opt("message", opt_s(message))
             .bytes(),
         ServerMsg::LockResult {
             request_id,
@@ -1280,7 +1315,8 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
             .put("client_id", s(client_id))
             .put("data", data.clone().unwrap_or(Plain::Nil))
             .bytes(),
-        ServerMsg::RebuildStatus { broken } => Out::new("rebuild.status")
+        ServerMsg::RebuildStatus { seq, broken } => Out::new("rebuild.status")
+            .put("seq", *seq)
             .put("broken", broken_map_to_wire(broken))
             .bytes(),
         ServerMsg::VersionCreated { id, name, seq } => Out::new("version.created")
@@ -1374,6 +1410,10 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
             seq: f.opt("seq")?.map(|p| uint(p, "seq")).transpose()?,
             ops: ops(f.req("ops")?, "ops", 0, usize::MAX)?,
             code: f.opt("code")?.map(|p| string(p, "code")).transpose()?,
+            message: f
+                .opt("message")?
+                .map(|p| string(p, "message"))
+                .transpose()?,
         }),
         "lock.result" => Ok(ServerMsg::LockResult {
             request_id: string(f.req("request_id")?, "request_id")?,
@@ -1403,6 +1443,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 .transpose()?,
         }),
         "rebuild.status" => Ok(ServerMsg::RebuildStatus {
+            seq: uint(f.req("seq")?, "seq")?,
             broken: broken_map_from_wire(f.req("broken")?)?,
         }),
         "version.created" => Ok(ServerMsg::VersionCreated {

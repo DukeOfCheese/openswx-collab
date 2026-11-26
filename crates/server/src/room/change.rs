@@ -509,6 +509,7 @@ fn judge(
         command: change.command.clone(),
         // TASK 11: undo (the room resolves `undo_of` and hands `decide` the kept inverse).
         undo_of: None,
+        reverts: None,
     }));
     Ok(Decision {
         blobs,

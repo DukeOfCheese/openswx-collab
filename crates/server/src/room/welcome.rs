@@ -103,6 +103,7 @@ async fn change_events(
                     command: Arc::from(row.command.as_str()),
                     // TASK 11: undo.
                     undo_of: None,
+                    reverts: None,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()
