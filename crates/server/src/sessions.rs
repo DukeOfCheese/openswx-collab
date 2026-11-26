@@ -7,7 +7,8 @@
 //! neither disabled nor deleted) and the entry renewed.
 //!
 //! Whatever ends sessions on this node calls [`Sessions::forget_token`] or [`Sessions::forget_user`]
-//! after its database commit, so a revoked session stops working at once here; another node (none
+//! after its database commit (and then closes the document connections of those sessions through
+//! the hub), so a revoked session stops working at once here; another node (none
 //! yet: the server is one process) would notice within [`TRUST_SECS`]. An expired session stops at
 //! its expiry whatever the cache holds.
 //!
@@ -25,6 +26,14 @@ pub const TRUST_SECS: f64 = 30.0;
 
 /// The most sessions remembered; past it the oldest are forgotten.
 pub const MAX_ENTRIES: usize = 100_000;
+
+/// A live session, as [`Sessions::session`] answers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSession {
+    pub user_id: Id,
+    /// When it expires, in the clock's epoch seconds.
+    pub expires_at: f64,
+}
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -74,6 +83,19 @@ impl Sessions {
         token_hash: &str,
         now: f64,
     ) -> anyhow::Result<Option<Id>> {
+        Ok(self
+            .session(store, token_hash, now)
+            .await?
+            .map(|s| s.user_id))
+    }
+
+    /// [`Sessions::get`], with when the session expires (a document connection is closed then).
+    pub async fn session(
+        &self,
+        store: &dyn Store,
+        token_hash: &str,
+        now: f64,
+    ) -> anyhow::Result<Option<LiveSession>> {
         let generation = {
             let mut inner = self.lock();
             if let Some(e) = inner.entries.get(token_hash) {
@@ -82,7 +104,10 @@ impl Sessions {
                     return Ok(None);
                 }
                 if now - e.checked_at < TRUST_SECS {
-                    return Ok(Some(e.user_id.clone()));
+                    return Ok(Some(LiveSession {
+                        user_id: e.user_id.clone(),
+                        expires_at: e.expires_at,
+                    }));
                 }
             }
             inner.generation
@@ -103,11 +128,14 @@ impl Sessions {
             inner.entries.remove(token_hash);
             return Ok(None);
         };
-        let user_id = entry.user_id.clone();
+        let live = LiveSession {
+            user_id: entry.user_id.clone(),
+            expires_at: entry.expires_at,
+        };
         if inner.generation == generation {
             self.remember(&mut inner, token_hash, entry);
         }
-        Ok(Some(user_id))
+        Ok(Some(live))
     }
 
     fn remember(&self, inner: &mut Inner, token_hash: &str, entry: Entry) {

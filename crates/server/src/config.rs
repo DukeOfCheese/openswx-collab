@@ -96,6 +96,9 @@ pub struct Settings {
     pub max_blob_bytes: usize,
     /// Presence and draft messages per second per client before they are dropped.
     pub presence_rate: u32,
+    /// The most document connections (WebSockets) one account may have open at once, across the
+    /// whole server; one more is refused (close 4429).
+    pub max_connections_per_user: usize,
     /// Email is sent only when this and `smtp_from` are set.
     pub smtp_host: String,
     pub smtp_port: u16,
@@ -133,6 +136,7 @@ impl Default for Settings {
             max_change_bytes: 8 * MIB,
             max_blob_bytes: 256 * MIB,
             presence_rate: 60,
+            max_connections_per_user: 64,
             smtp_host: String::new(),
             smtp_port: 587,
             smtp_security: SmtpSecurity::StartTls,
@@ -172,6 +176,7 @@ impl Settings {
         e.positive_whole("MAX_CHANGE_BYTES", &mut s.max_change_bytes)?;
         e.positive_whole("MAX_BLOB_BYTES", &mut s.max_blob_bytes)?;
         e.positive_whole("PRESENCE_RATE", &mut s.presence_rate)?;
+        e.positive_whole("MAX_CONNECTIONS_PER_USER", &mut s.max_connections_per_user)?;
         e.string("SMTP_HOST", &mut s.smtp_host);
         e.whole("SMTP_PORT", &mut s.smtp_port)?;
         if let Some(raw) = e.get("SMTP_SECURITY") {
@@ -315,6 +320,7 @@ impl fmt::Debug for Settings {
             .field("max_change_bytes", &self.max_change_bytes)
             .field("max_blob_bytes", &self.max_blob_bytes)
             .field("presence_rate", &self.presence_rate)
+            .field("max_connections_per_user", &self.max_connections_per_user)
             .field("smtp_host", &self.smtp_host)
             .field("smtp_port", &self.smtp_port)
             .field("smtp_security", &self.smtp_security)
@@ -471,6 +477,7 @@ mod tests {
             (60, 587, 60)
         );
         assert_eq!(s.smtp_security, SmtpSecurity::StartTls);
+        assert_eq!(s.max_connections_per_user, 64);
         assert_eq!(s.smtp_from_name, "openswx collaboration");
         assert_eq!(
             s.database().ok(),
@@ -493,6 +500,7 @@ mod tests {
             ("MAX_BLOB_BYTES", "1048576"),
             ("LOCK_TTL", "2.5"),
             ("ROOM_IDLE", "10"),
+            ("MAX_CONNECTIONS_PER_USER", "3"),
             ("SMTP_PORT", "465"),
             ("SMTP_SECURITY", "SSL"),
             ("SMTP_PASSWORD", "pw"),
@@ -503,6 +511,7 @@ mod tests {
         assert_eq!(s.session_days, 7);
         assert_eq!(s.max_blob_bytes, 1 << 20);
         assert_eq!((s.lock_ttl, s.room_idle), (2.5, 10.0));
+        assert_eq!(s.max_connections_per_user, 3);
         assert_eq!(s.smtp_port, 465);
         assert_eq!(s.smtp_security, SmtpSecurity::Ssl);
         assert_eq!(s.smtp_password, "pw");
@@ -555,6 +564,7 @@ mod tests {
             "RESET_MINUTES",
             "MAX_CHANGE_BYTES",
             "MAX_BLOB_BYTES",
+            "MAX_CONNECTIONS_PER_USER",
         ] {
             for bad in ["0", "0.0", "-1", "-0.5", "", "x"] {
                 assert_eq!(

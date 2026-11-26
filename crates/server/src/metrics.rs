@@ -1,7 +1,8 @@
 //! Counters the live-editing path keeps about itself, for `/metrics` (Task 18 exports them).
 //!
 //! Plain process-wide atomics, so that counting costs one relaxed add and the room's logic only calls
-//! the functions below. No counter is keyed by a user, document or organisation.
+//! the functions below. No counter is keyed by a user, document or organisation. The gauges (open
+//! rooms, open connections) are read from the hub ([`crate::hub::Hub::gauges`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -37,6 +38,27 @@ static LOCKS_GRANTED: AtomicU64 = AtomicU64::new(0);
 static LOCKS_DENIED: AtomicU64 = AtomicU64::new(0);
 static PRESENCE_RELAYED: AtomicU64 = AtomicU64::new(0);
 static PRESENCE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static DROPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static ROOMS_LOADED: AtomicU64 = AtomicU64::new(0);
+static ROOMS_UNLOADED: AtomicU64 = AtomicU64::new(0);
+static CONNECTIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Why the server closed a document connection on its own (not counting slow consumers, takeovers
+/// and shutdown), in the order [`Counters::drops`] counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropCause {
+    /// Every session of the account ended (password changed or reset, account disabled or
+    /// deleted): 4401.
+    Account = 0,
+    /// The session the connection joined with ended (signed out): 4401.
+    Session = 1,
+    /// The session expired while connected: 4401.
+    Expired = 2,
+    /// The account's role in the project changed or went: 4403.
+    Access = 3,
+    /// The document (or its project) was deleted: 4404.
+    Document = 4,
+}
 
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -99,6 +121,26 @@ pub fn presence_dropped() {
     PRESENCE_DROPPED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The server closed `n` connections for `cause`.
+pub fn dropped(cause: DropCause, n: usize) {
+    DROPS[cause as usize].fetch_add(n as u64, Ordering::Relaxed);
+}
+
+/// A room was loaded.
+pub fn room_loaded() {
+    ROOMS_LOADED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A room was unloaded (idle, closed, lost or stopped).
+pub fn room_unloaded() {
+    ROOMS_UNLOADED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A connection was refused because its account had as many open as it may.
+pub fn connection_refused() {
+    CONNECTIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The counters as they are now.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Counters {
@@ -119,6 +161,13 @@ pub struct Counters {
     pub locks_denied: u64,
     pub presence_relayed: u64,
     pub presence_dropped: u64,
+    /// Connections the server closed, by [`DropCause`] (account, session, expired, access,
+    /// document).
+    pub drops: [u64; 5],
+    pub rooms_loaded: u64,
+    pub rooms_unloaded: u64,
+    /// Connections refused at the handshake for the per-account limit.
+    pub connections_refused: u64,
 }
 
 /// Reads every counter.
@@ -140,5 +189,9 @@ pub fn counters() -> Counters {
         locks_denied: get(&LOCKS_DENIED),
         presence_relayed: get(&PRESENCE_RELAYED),
         presence_dropped: get(&PRESENCE_DROPPED),
+        drops: std::array::from_fn(|i| get(&DROPS[i])),
+        rooms_loaded: get(&ROOMS_LOADED),
+        rooms_unloaded: get(&ROOMS_UNLOADED),
+        connections_refused: get(&CONNECTIONS_REFUSED),
     }
 }
