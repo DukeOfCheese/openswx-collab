@@ -200,6 +200,11 @@ impl SqliteStore {
         })
     }
 
+    /// [`Store::begin_journal`]: SQLite has one writer for everyone.
+    pub async fn begin_journal_tx(&self) -> Result<SqliteTx<'static>> {
+        self.begin_tx().await
+    }
+
     /// Fails when the calling task holds the write transaction (it would wait for itself).
     fn refuse_nested(&self) -> Result<()> {
         if holder_get(&self.holder) == Some(Caller::current()) {

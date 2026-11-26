@@ -46,4 +46,6 @@ jobs:
       - name: Test (PostgreSQL 16)
         env:
           OSWX_TEST_DATABASE_URL: postgres://collab:collab@127.0.0.1:5432/collab
-        run: cargo test -p oswx-server
+        # Four tests at a time: each test server holds up to six connections (and a test may start
+        # two servers), well inside the service's default max_connections of 100.
+        run: cargo test -p oswx-server -- --test-threads=4

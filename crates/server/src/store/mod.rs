@@ -103,6 +103,7 @@
 //!
 //! | checked, then written | protected by |
 //! |---|---|
+//! | an account that is being deleted gains no membership, and one link resets a password | [`Tx::lock_user`] before a membership is made (`create_org`, `accept_invite`) or a reset link replaced |
 //! | no account yet → the first is the server admin (password and provider registration) | [`Tx::user_count`] takes the accounts lock when it counts none, and counts again |
 //! | the last active admin stays; an organisation keeps an owner (account deletion) | [`Tx::lock_accounts`], [`Tx::lock_user`], then [`Tx::lock_org`] on each of its organisations |
 //! | an address has one account | the unique index; the route answers its 409 on [`is_unique_violation`] |
@@ -138,9 +139,12 @@
 //! journal row, a lease) can be inserted meanwhile, which keeps those inserts out of the order.
 //!
 //! Should two transactions wait for each other all the same, PostgreSQL ends one of them after a
-//! second (`40P01`). Nothing is retried inside the server: a REST request is answered 409
-//! [`crate::error::TRY_AGAIN`] ([`is_conflict`]) and can be sent again; a journal batch answers
-//! every record `Unknown` and its rooms reload from the store.
+//! second (`40P01`). And a request's transaction that waits more than a few seconds for a lock
+//! (the organisation is busy with a long deletion, say) is ended too (`55P03`), so that waiting
+//! requests cannot hold every connection. Nothing is retried inside the server: a REST request is
+//! answered 409 [`crate::error::TRY_AGAIN`] ([`is_conflict`]) and can be sent again; a journal
+//! batch (which has connections of its own, [`Store::begin_journal`], and no lock timeout)
+//! answers every record `Unknown` and its rooms reload from the store.
 
 pub mod postgres;
 mod shared;
@@ -178,14 +182,26 @@ pub fn is_zero_character(err: &anyhow::Error) -> bool {
     database_error(err).is_some_and(|e| e.code().as_deref() == Some("22021"))
 }
 
-/// Whether `err` is the database ending a transaction because of another one: a unique key taken
-/// at the same moment ([`is_unique_violation`]), a deadlock (`40P01`) or a serialization failure
-/// (`40001`). Nothing was written; the same request can be made again. Routes answer it with 409
-/// ([`crate::error::TRY_AGAIN`]) unless they have an answer of their own for the case.
+/// Whether `err` is the database ending a transaction because of another one: a deadlock
+/// (`40P01`), a serialization failure (`40001`), or a row lock it waited too long for (`55P03`,
+/// the lock timeout of requests' transactions on PostgreSQL). Nothing was written; the same request
+/// can be made again, and routes answer it with 409 ([`crate::error::TRY_AGAIN`]).
+///
+/// A taken key ([`is_unique_violation`]) is not one of these: a route that expects one answers it
+/// itself, and one nobody expected is a fault of the server (500), not something to try again.
 pub fn is_conflict(err: &anyhow::Error) -> bool {
-    database_error(err).is_some_and(|e| {
-        e.is_unique_violation() || matches!(e.code().as_deref(), Some("40P01" | "40001"))
-    })
+    database_error(err)
+        .is_some_and(|e| matches!(e.code().as_deref(), Some("40P01" | "40001" | "55P03")))
+}
+
+/// Whether `err` is the database not getting to the work in time: no connection was free within
+/// the pool's wait (30 s), or a statement ran into PostgreSQL's statement timeout (`57014`).
+/// Routes answer it with 503 ([`crate::error::BUSY`]).
+pub fn is_busy(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .any(|e| matches!(e, sqlx::Error::PoolTimedOut))
+        || database_error(err).is_some_and(|e| e.code().as_deref() == Some("57014"))
 }
 
 /// A new random id: 32 lower-case hex characters (a v4 UUID without dashes, as the Python server's
@@ -705,6 +721,12 @@ pub trait Store: Send + Sync + 'static {
     /// Opens a write transaction (on SQLite it waits while another one is open); see the module
     /// documentation.
     async fn begin(&self) -> anyhow::Result<Box<dyn Tx>>;
+
+    /// Opens a write transaction for the server's own writes: the journal writer's batches, lease
+    /// acquisitions and snapshot rows. On PostgreSQL these have connections of their own, which
+    /// requests' transactions ([`Store::begin`]) cannot use up, and wait for a lock as long as it
+    /// takes (a request's transaction gives up after a few seconds). Never for a request.
+    async fn begin_journal(&self) -> anyhow::Result<Box<dyn Tx>>;
 
     /// How many accounts exist, deleted and disabled ones included (the registration mode).
     async fn user_count(&self) -> anyhow::Result<u64>;

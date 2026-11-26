@@ -18,6 +18,7 @@ use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
 use crate::sessions::Sessions;
+use crate::store::postgres::PgConfig;
 use crate::store::{PgStore, SqliteStore, Store, Tx, new_id};
 
 /// The server's shared state. Cloning is cheap: every field is shared.
@@ -263,7 +264,7 @@ impl AppState {
                 PgStore::open(
                     &settings.database_url,
                     settings.auto_migrate,
-                    settings.database_pool,
+                    PgConfig::from_settings(&settings),
                 )
                 .await?,
             ),

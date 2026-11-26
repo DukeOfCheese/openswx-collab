@@ -587,3 +587,47 @@ async fn the_production_state_opens_the_database_and_mails_through_smtp() {
     .await;
     assert!(postgres.is_err());
 }
+
+// ------------------------------------------------------------------ Task 16, fix round 1
+
+/// Two requests for a reset link at the same moment, both past the removal of older links before
+/// either commits (on SQLite the second waits for the first's transaction instead): only the
+/// newest link works, so one is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_reset_requests_at_once_leave_one_link() {
+    let mailer = Arc::new(MemoryMailer::new(true));
+    let kept = mailer.clone();
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| {
+            s.smtp_host = "127.0.0.1".into();
+            s.smtp_from = "collab@example.org".into();
+        },
+        common::new_journal,
+        |s| s.mailer = kept,
+    )
+    .await;
+    server.register("ada@example.com").await;
+    flaky.commit_gate.shut();
+    let server = Arc::new(server);
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let server = server.clone();
+        tasks.push(tokio::spawn(async move {
+            server
+                .post(
+                    "/api/auth/password-reset",
+                    None,
+                    json!({"email": "ada@example.com"}),
+                )
+                .await
+        }));
+    }
+    flaky.commit_gate.until_waiting(1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    flaky.commit_gate.open();
+    for task in tasks {
+        assert_eq!(task.await.unwrap().0, StatusCode::ACCEPTED);
+    }
+    let links: i64 = server.scalar("SELECT COUNT(*) FROM password_resets").await;
+    assert_eq!(links, 1);
+}

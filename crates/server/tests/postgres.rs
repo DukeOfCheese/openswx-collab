@@ -13,6 +13,7 @@ use std::time::Duration;
 use common::{PgSchema, on_postgres};
 use oswx_server::AppState;
 use oswx_server::Settings;
+use oswx_server::store::postgres::PgConfig;
 use oswx_server::store::{
     Document, NewChange, Org, PgStore, Project, RoomLease, SchemaError, SchemaStatus, Store, User,
     is_conflict, is_unique_violation, new_id,
@@ -37,10 +38,18 @@ const CURRENT: SchemaStatus = SchemaStatus {
     unknown: vec![],
 };
 
+/// `pool` connections for requests (half for transactions, half for reads); the journal's two.
+fn pools(pool: u32) -> PgConfig {
+    PgConfig {
+        pool,
+        ..PgConfig::default()
+    }
+}
+
 /// An empty schema and the store opened in it.
 async fn open() -> (PgSchema, PgStore) {
     let schema = PgSchema::create().await;
-    let store = PgStore::open(&schema.url, true, 4)
+    let store = PgStore::open(&schema.url, true, pools(4))
         .await
         .expect("the store opens");
     (schema, store)
@@ -170,7 +179,9 @@ async fn an_empty_schema_is_built_and_opens_again_as_it_is() {
     store.close().await;
     assert!(store.health().await.is_err());
     for auto_migrate in [true, false] {
-        let store = PgStore::open(&schema.url, auto_migrate, 2).await.unwrap();
+        let store = PgStore::open(&schema.url, auto_migrate, pools(2))
+            .await
+            .unwrap();
         assert_eq!(store.schema_status().await.unwrap(), CURRENT);
         assert_eq!(store.user_count().await.unwrap(), 1);
         store.close().await;
@@ -181,7 +192,7 @@ async fn an_empty_schema_is_built_and_opens_again_as_it_is() {
 async fn connect_then_migrate_builds_the_schema() {
     needs_postgres!();
     let schema = PgSchema::create().await;
-    let store = PgStore::connect(&schema.url, 2).await.unwrap();
+    let store = PgStore::connect(&schema.url, pools(2)).await.unwrap();
     assert_eq!(
         store.schema_status().await.unwrap(),
         SchemaStatus {
@@ -200,8 +211,8 @@ async fn two_servers_starting_on_an_empty_database_build_it_once() {
     needs_postgres!();
     let schema = PgSchema::create().await;
     let (a, b) = tokio::join!(
-        PgStore::open(&schema.url, true, 2),
-        PgStore::open(&schema.url, true, 2)
+        PgStore::open(&schema.url, true, pools(2)),
+        PgStore::open(&schema.url, true, pools(2))
     );
     for store in [a.unwrap(), b.unwrap()] {
         assert_eq!(store.schema_status().await.unwrap(), CURRENT);
@@ -230,7 +241,7 @@ async fn an_older_schema_is_upgraded_only_when_auto_migrate_is_on() {
     store.close().await;
     let newer = newer_migrator(&dir).await;
 
-    let refused = PgStore::open_with_migrations(&schema.url, false, 2, newer).await;
+    let refused = PgStore::open_with_migrations(&schema.url, false, pools(2), newer).await;
     assert_eq!(
         schema_error(refused),
         SchemaError::Outdated {
@@ -238,7 +249,7 @@ async fn an_older_schema_is_upgraded_only_when_auto_migrate_is_on() {
             latest: 2
         }
     );
-    let store = PgStore::open_with_migrations(&schema.url, true, 2, newer)
+    let store = PgStore::open_with_migrations(&schema.url, true, pools(2), newer)
         .await
         .unwrap();
     assert_eq!(store.schema_status().await.unwrap().current, Some(2));
@@ -247,7 +258,7 @@ async fn an_older_schema_is_upgraded_only_when_auto_migrate_is_on() {
 
     // Now this binary (which knows only 0001) meets a database written by the newer one.
     assert_eq!(
-        schema_error(PgStore::open(&schema.url, true, 2).await),
+        schema_error(PgStore::open(&schema.url, true, pools(2)).await),
         SchemaError::Newer {
             unknown: vec![2],
             latest: 1
@@ -269,8 +280,9 @@ async fn an_applied_migration_that_was_edited_is_refused_at_open() {
     std::fs::write(to.join("0001_init.sql"), text).unwrap();
     let edited: &'static Migrator = Box::leak(Box::new(Migrator::new(to).await.unwrap()));
     for auto_migrate in [true, false] {
-        let err =
-            schema_error(PgStore::open_with_migrations(&schema.url, auto_migrate, 2, edited).await);
+        let err = schema_error(
+            PgStore::open_with_migrations(&schema.url, auto_migrate, pools(2), edited).await,
+        );
         assert_eq!(err, SchemaError::Changed { version: 1 });
     }
 }
@@ -280,7 +292,7 @@ async fn a_schema_with_tables_but_no_migration_record_is_refused() {
     needs_postgres!();
     let schema = PgSchema::create().await;
     // A Python server's database: its own tables and `alembic_version`, no `_sqlx_migrations`.
-    let raw = PgStore::connect(&schema.url, 2).await.unwrap();
+    let raw = PgStore::connect(&schema.url, pools(2)).await.unwrap();
     exec(
         &raw,
         "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)",
@@ -289,13 +301,187 @@ async fn a_schema_with_tables_but_no_migration_record_is_refused() {
     .unwrap();
     raw.close().await;
     assert_eq!(
-        schema_error(PgStore::open(&schema.url, true, 2).await),
+        schema_error(PgStore::open(&schema.url, true, pools(2)).await),
         SchemaError::Foreign
     );
 }
 
+/// A column type as SQLite's migration spells it, for PostgreSQL's name of the same type: the
+/// mapping `crate::store`'s module documentation gives (`BLOB` is `bytea`).
+fn sqlite_spelling(data_type: &str, length: Option<i64>) -> String {
+    match (data_type, length) {
+        ("character varying", Some(n)) => format!("VARCHAR({n})"),
+        ("text", None) => "TEXT".into(),
+        ("bigint", None) => "BIGINT".into(),
+        ("double precision", None) => "DOUBLE PRECISION".into(),
+        ("boolean", None) => "BOOLEAN".into(),
+        ("bytea", None) => "BLOB".into(),
+        (other, length) => format!("{other}?{length:?}"),
+    }
+}
+
+/// A column default without PostgreSQL's cast (`''::character varying`) and in one case.
+fn plain_default(default: Option<String>) -> String {
+    match default {
+        None => String::new(),
+        Some(d) => {
+            let d = d.split("::").next().unwrap_or_default().to_lowercase();
+            format!(" ={d}")
+        }
+    }
+}
+
+/// Everything the PostgreSQL schema declares, one line each: columns (type, NOT NULL, default),
+/// indexes and keys (uniqueness, columns, the name of those the migration names), foreign keys
+/// (with what a deletion does).
+async fn postgres_schema(pg: &PgStore) -> Vec<String> {
+    let mut c = pg.reader().await.unwrap();
+    let mut out = Vec::new();
+    /// A column: its table, name, type, length, whether it is NOT NULL, and its default.
+    type Column = (String, String, String, Option<i64>, bool, Option<String>);
+    let columns: Vec<Column> = sqlx::query_as(
+        "SELECT CAST(table_name AS TEXT), CAST(column_name AS TEXT), CAST(data_type AS TEXT), \
+         CAST(character_maximum_length AS BIGINT), is_nullable = 'NO', \
+         CAST(column_default AS TEXT) FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name <> '_sqlx_migrations'",
+    )
+    .fetch_all(&mut *c)
+    .await
+    .unwrap();
+    for (table, column, data_type, length, not_null, default) in columns {
+        out.push(format!(
+            "column {table}.{column} {}{}{}",
+            sqlite_spelling(&data_type, length),
+            if not_null { " NN" } else { "" },
+            plain_default(default)
+        ));
+    }
+    let indexes: Vec<(String, String, bool, String)> = sqlx::query_as(
+        "SELECT CAST(t.relname AS TEXT), CAST(i.relname AS TEXT), x.indisunique, \
+         (SELECT string_agg(CAST(a.attname AS TEXT), ', ' ORDER BY k.ord) \
+          FROM unnest(CAST(x.indkey AS int2[])) WITH ORDINALITY AS k(attnum, ord) \
+          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum) \
+         FROM pg_index x JOIN pg_class t ON t.oid = x.indrelid \
+         JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = current_schema() AND t.relname <> '_sqlx_migrations'",
+    )
+    .fetch_all(&mut *c)
+    .await
+    .unwrap();
+    for (table, name, unique, columns) in indexes {
+        out.push(index_line(&table, &name, unique, &columns));
+    }
+    let keys: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(t.relname AS TEXT), CAST(a.attname AS TEXT), CAST(rt.relname AS TEXT), \
+         CAST(ra.attname AS TEXT), CAST(c.confdeltype AS TEXT) \
+         FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid \
+         JOIN pg_class rt ON rt.oid = c.confrelid JOIN pg_namespace n ON n.oid = t.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = c.conkey[1] \
+         JOIN pg_attribute ra ON ra.attrelid = rt.oid AND ra.attnum = c.confkey[1] \
+         WHERE c.contype = 'f' AND n.nspname = current_schema() \
+         AND cardinality(c.conkey) = 1",
+    )
+    .fetch_all(&mut *c)
+    .await
+    .unwrap();
+    for (table, column, to_table, to, on_delete) in keys {
+        let on_delete = match on_delete.as_str() {
+            "a" => "NO ACTION",
+            "c" => "CASCADE",
+            "n" => "SET NULL",
+            "r" => "RESTRICT",
+            "d" => "SET DEFAULT",
+            other => panic!("an unknown deletion rule {other}"),
+        };
+        out.push(format!(
+            "key {table}.{column} -> {to_table}.{to} {on_delete}"
+        ));
+    }
+    let many: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace \
+         WHERE c.contype = 'f' AND n.nspname = current_schema() AND cardinality(c.conkey) <> 1",
+    )
+    .fetch_one(&mut *c)
+    .await
+    .unwrap();
+    assert_eq!(
+        many, 0,
+        "this comparison reads one-column foreign keys only"
+    );
+    out.sort();
+    out
+}
+
+/// An index or key: its table, uniqueness and columns; and its name if the migration gave it one
+/// (each database names the indexes of its keys itself).
+fn index_line(table: &str, name: &str, unique: bool, columns: &str) -> String {
+    let name = if name.starts_with("ix_") { name } else { "" };
+    let unique = if unique { "unique " } else { "" };
+    format!("index {table} {unique}({columns}) {name}")
+}
+
+/// [`postgres_schema`], of the SQLite schema.
+async fn sqlite_schema(lite: &oswx_server::store::SqliteStore) -> Vec<String> {
+    let mut c = lite.reader().await.unwrap();
+    let mut out = Vec::new();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         AND name <> '_sqlx_migrations'",
+    )
+    .fetch_all(&mut *c)
+    .await
+    .unwrap();
+    for table in tables {
+        let columns: Vec<(String, String, bool, Option<String>)> =
+            sqlx::query_as("SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info($1)")
+                .bind(&table)
+                .fetch_all(&mut *c)
+                .await
+                .unwrap();
+        for (column, declared, not_null, default) in columns {
+            out.push(format!(
+                "column {table}.{column} {declared}{}{}",
+                if not_null { " NN" } else { "" },
+                plain_default(default)
+            ));
+        }
+        let indexes: Vec<(String, bool)> =
+            sqlx::query_as("SELECT name, \"unique\" FROM pragma_index_list($1)")
+                .bind(&table)
+                .fetch_all(&mut *c)
+                .await
+                .unwrap();
+        for (name, unique) in indexes {
+            let columns: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM pragma_index_info($1) ORDER BY seqno")
+                    .bind(&name)
+                    .fetch_all(&mut *c)
+                    .await
+                    .unwrap();
+            out.push(index_line(&table, &name, unique, &columns.join(", ")));
+        }
+        let keys: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT \"from\", \"table\", \"to\", on_delete FROM pragma_foreign_key_list($1)",
+        )
+        .bind(&table)
+        .fetch_all(&mut *c)
+        .await
+        .unwrap();
+        for (column, to_table, to, on_delete) in keys {
+            out.push(format!(
+                "key {table}.{column} -> {to_table}.{to} {on_delete}"
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The two migration files cannot drift apart: every column (type, NOT NULL, default), every
+/// index and key (columns, uniqueness, the names the migrations give) and every foreign key (with
+/// its deletion rule) of one is in the other.
 #[tokio::test]
-async fn the_two_migrations_make_the_same_tables_columns_and_indexes() {
+async fn the_two_migrations_declare_the_same_schema() {
     needs_postgres!();
     let (_schema, pg) = open().await;
     let dir = TempDir::new().unwrap();
@@ -308,46 +494,27 @@ async fn the_two_migrations_make_the_same_tables_columns_and_indexes() {
     )
     .await
     .unwrap();
-
-    // table.column, in the order the tables declare them.
-    let mut pg_columns: Vec<(String, String)> = sqlx::query_as(
-        "SELECT CAST(table_name AS TEXT), CAST(column_name AS TEXT) \
-         FROM information_schema.columns \
-         WHERE table_schema = current_schema() AND table_name <> '_sqlx_migrations' \
-         ORDER BY table_name, ordinal_position",
-    )
-    .fetch_all(&mut *pg.reader().await.unwrap())
-    .await
-    .unwrap();
-    let mut lite_columns: Vec<(String, String)> = sqlx::query_as(
-        "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
-         WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND m.name <> '_sqlx_migrations' \
-         ORDER BY m.name, p.cid",
-    )
-    .fetch_all(&mut *lite.reader().await.unwrap())
-    .await
-    .unwrap();
-    pg_columns.sort();
-    lite_columns.sort();
-    assert_eq!(pg_columns, lite_columns);
-
-    // The indexes the migrations name (keys make their own, named by each database).
-    let pg_indexes: Vec<String> = sqlx::query_scalar(
-        "SELECT CAST(indexname AS TEXT) FROM pg_indexes \
-         WHERE schemaname = current_schema() AND indexname LIKE 'ix\\_%' ORDER BY 1",
-    )
-    .fetch_all(&mut *pg.reader().await.unwrap())
-    .await
-    .unwrap();
-    let lite_indexes: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix\\_%' ESCAPE '\\' \
-         ORDER BY 1",
-    )
-    .fetch_all(&mut *lite.reader().await.unwrap())
-    .await
-    .unwrap();
-    assert_eq!(pg_indexes, lite_indexes);
-    assert!(pg_indexes.contains(&"ix_changes_author".to_owned()));
+    let (of_postgres, of_sqlite) = (postgres_schema(&pg).await, sqlite_schema(&lite).await);
+    assert_eq!(
+        of_postgres.join("\n"),
+        of_sqlite.join("\n"),
+        "PostgreSQL's schema (left) and SQLite's (right) differ"
+    );
+    // (That the comparison sees what it should.)
+    for line in [
+        "column changes.ops BLOB NN",
+        "column users.is_server_admin BOOLEAN NN =false",
+        "column invites.projects TEXT NN ='[]'",
+        "column documents.format_version BIGINT",
+        "index changes (author_id, document_id, seq) ix_changes_author",
+        "index changes unique (document_id, client_id, change_id) ",
+        "index users unique (email) ix_users_email",
+        "key documents.folder_id -> folders.id SET NULL",
+        "key changes.document_id -> documents.id CASCADE",
+    ] {
+        assert!(of_postgres.contains(&line.to_owned()), "no line {line:?}");
+    }
+    assert!(of_postgres.len() > 150, "{}", of_postgres.len());
 
     // Every text column compares by bytes, as SQLite does.
     let other: i64 = scalar(
@@ -376,7 +543,7 @@ async fn an_unknown_scheme_is_refused_without_repeating_the_url() {
     assert!(shown.contains("OSWX_COLLAB_DATABASE_URL"), "{shown}");
     assert!(shown.contains("postgres://"), "it says what is accepted");
     assert!(!shown.contains("hunter2"), "{shown}");
-    let err = PgStore::connect("sqlite://data/collab.db", 2)
+    let err = PgStore::connect("sqlite://data/collab.db", pools(2))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not a PostgreSQL"), "{err}");
@@ -389,21 +556,147 @@ async fn a_database_that_cannot_be_reached_is_named_without_its_password() {
         "postgres://collab:hunter2@127.0.0.1:1/collab",
         "postgresql+asyncpg://collab:hunter2@127.0.0.1:1/collab",
     ] {
-        let err = tokio::time::timeout(Duration::from_secs(60), PgStore::open(url, true, 2))
+        let err = tokio::time::timeout(Duration::from_secs(60), PgStore::open(url, true, pools(2)))
             .await
             .expect("it gives up")
             .unwrap_err();
         let shown = format!("{err:#} {err:?}");
         assert!(shown.contains("collab on 127.0.0.1:1"), "{shown}");
+        assert!(
+            shown.contains("the database server cannot be reached"),
+            "{shown}"
+        );
         assert!(!shown.contains("hunter2"), "{shown}");
     }
     // A URL that cannot be read at all.
-    let err = PgStore::connect("postgres://collab:hunter2@127.0.0.1:port/collab", 2)
+    let err = PgStore::connect("postgres://collab:hunter2@127.0.0.1:port/collab", pools(2))
         .await
         .unwrap_err();
     let shown = format!("{err:#} {err:?}");
     assert!(shown.contains("cannot be read"), "{shown}");
     assert!(!shown.contains("hunter2"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_refused_user_is_not_named_in_the_error() {
+    needs_postgres!();
+    let schema = PgSchema::create().await;
+    let mut url = url::Url::parse(&schema.url).unwrap();
+    url.set_username("nobody_of_that_name").unwrap();
+    url.set_password(Some("hunter2")).unwrap();
+    let err = PgStore::open(url.as_str(), true, pools(2))
+        .await
+        .unwrap_err();
+    let shown = format!("{err:#} {err:?}");
+    assert!(
+        shown.contains("the user or password was refused"),
+        "{shown}"
+    );
+    assert!(shown.contains("cannot open the database"), "{shown}");
+    assert!(!shown.contains("nobody_of_that_name"), "{shown}");
+    assert!(!shown.contains("hunter2"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_statement_out_of_time_or_no_free_connection_is_503_and_a_taken_key_500() {
+    use axum::http::StatusCode;
+    use oswx_server::ApiError;
+    // (This much needs no database.)
+    let waited = ApiError::from(sqlx::Error::PoolTimedOut);
+    assert_eq!(
+        (waited.status(), waited.detail()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is busy; try again"
+        )
+    );
+    needs_postgres!();
+    let (_schema, store) = open().await;
+    let rows = fill(&store).await;
+    let mut tx = store.begin_tx().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = 50")
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    let slow: anyhow::Error = sqlx::query("SELECT pg_sleep(2)")
+        .execute(tx.conn())
+        .await
+        .unwrap_err()
+        .into();
+    assert!(oswx_server::store::is_busy(&slow), "{slow:#}");
+    assert_eq!(
+        ApiError::from(slow).status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(tx);
+    // A key nobody expected to be taken is a fault of the server, not something to try again.
+    let mut tx = store.begin().await.unwrap();
+    let taken = tx
+        .insert_org(&Org {
+            id: rows.org.clone(),
+            name: "Again".into(),
+            created_at: 0.0,
+        })
+        .await
+        .unwrap_err();
+    assert!(is_unique_violation(&taken) && !is_conflict(&taken));
+    assert_eq!(
+        ApiError::from(taken).status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_gives_up_on_a_lock_and_the_journal_does_not() {
+    use axum::http::StatusCode;
+    needs_postgres!();
+    let schema = PgSchema::create().await;
+    let config = PgConfig {
+        pool: 4,
+        journal_pool: 2,
+        lock_timeout: Duration::from_millis(300),
+    };
+    let store = PgStore::open(&schema.url, true, config).await.unwrap();
+    let rows = fill(&store).await;
+    let mut holder = store.begin().await.unwrap();
+    assert!(holder.lock_org(&rows.org).await.unwrap());
+    holder
+        .lock_documents(std::slice::from_ref(&rows.doc))
+        .await
+        .unwrap();
+    // A request's transaction gives up after the lock timeout: 409, try again.
+    let mut request = store.begin().await.unwrap();
+    let started = std::time::Instant::now();
+    let err = request.lock_org(&rows.org).await.unwrap_err();
+    assert!(is_conflict(&err), "{err:#}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let answer = oswx_server::ApiError::from(err);
+    assert_eq!(answer.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        answer.detail(),
+        "another request changed the same thing at the same moment; try again"
+    );
+    drop(request);
+    // The journal's transaction waits for as long as the lock is held.
+    let mut journal = {
+        let (store, doc) = (store.clone(), rows.doc.clone());
+        tokio::spawn(async move {
+            let mut tx = store.begin_journal().await.unwrap();
+            tx.lock_documents(&[doc]).await.unwrap();
+            tx.commit().await.unwrap();
+        })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), &mut journal)
+            .await
+            .is_err(),
+        "the journal's transaction gave up or did not wait"
+    );
+    holder.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), journal)
+        .await
+        .expect("it goes on once the lock is free")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -429,6 +722,20 @@ async fn every_connection_runs_read_committed_with_timeouts() {
         .await
         .unwrap();
     assert_eq!(idle, "1min");
+    // A request's transaction waits five seconds for a lock; the journal's and a read, for ever.
+    let lock: String = sqlx::query_scalar("SHOW lock_timeout")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(lock, "5s");
+    drop(tx);
+    let mut tx = store.begin_journal_tx().await.unwrap();
+    let lock: String = sqlx::query_scalar("SHOW lock_timeout")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(lock, "0");
+    assert_eq!(scalar::<String>(&store, "SHOW lock_timeout").await, "0");
 }
 
 #[tokio::test]
@@ -444,7 +751,10 @@ async fn a_taken_key_is_told_apart_from_other_errors() {
     let mut tx = store.begin().await.unwrap();
     let err = tx.insert_org(&again).await.unwrap_err();
     assert!(is_unique_violation(&err), "{err:#}");
-    assert!(is_conflict(&err));
+    assert!(
+        !is_conflict(&err),
+        "a taken key is not something to try again"
+    );
     // The transaction is over: PostgreSQL refuses what follows, and that is not a conflict.
     let after = tx.org_by_id(&rows.org).await.unwrap_err();
     assert!(

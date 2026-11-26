@@ -25,7 +25,7 @@ pub async fn acquire(
     ttl: f64,
 ) -> anyhow::Result<u64> {
     let expires_at = now + ttl;
-    let mut tx = store.begin().await?;
+    let mut tx = store.begin_journal().await?;
     let epoch = match tx.take_room_lease(doc, node_id, expires_at).await? {
         Some(epoch) => epoch,
         None => {

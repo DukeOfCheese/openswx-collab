@@ -460,7 +460,7 @@ async fn write_transaction(
     let mut results: Vec<Result<(), JournalError>> =
         vec![Err(JournalError::Unknown); records.len()];
 
-    let mut tx = store.begin().await?;
+    let mut tx = store.begin_journal().await?;
     // Every document row this transaction will lock, in ascending id order before anything else.
     let mut rows: Vec<String> = of_doc.keys().map(|doc| (*doc).to_owned()).collect();
     for extra in records.iter().flat_map(|r| &r.extra) {

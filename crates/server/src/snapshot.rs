@@ -379,7 +379,7 @@ pub async fn write_snapshot(
         created_at: now,
     };
     blobs.put(&key, bytes).await?;
-    let mut tx = store.begin().await?;
+    let mut tx = store.begin_journal().await?;
     let head_seq = tx
         .document_by_id(doc)
         .await?

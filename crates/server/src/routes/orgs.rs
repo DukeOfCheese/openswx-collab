@@ -94,6 +94,17 @@ pub(crate) fn clean_name(name: &str) -> Result<String, ApiError> {
     }
 }
 
+/// Locks the account's row until the transaction ends, and answers 401 unless it is still an
+/// account that may sign in: one deleted (or disabled) while the request was on its way gains
+/// nothing.
+async fn still_there(tx: &mut dyn Tx, user: &str) -> Result<(), ApiError> {
+    tx.lock_user(user).await?;
+    match tx.user_by_id(user).await? {
+        Some(account) if account.active() => Ok(()),
+        _ => Err(ApiError::Unauthorized),
+    }
+}
+
 /// The signed-in account's row (401 if it vanished since the session was checked).
 pub(crate) async fn load_user(state: &AppState, user: &CurrentUser) -> Result<User, ApiError> {
     state
@@ -145,6 +156,9 @@ async fn create_org(
         created_at: now,
     };
     let mut tx = state.store.begin().await?;
+    // The account's row is locked while it gains a membership, so that its own deletion (which
+    // locks it first) either sees the membership or is seen here.
+    still_there(&mut *tx, &user.id).await?;
     tx.insert_org(&org).await?;
     tx.insert_org_member(&OrgMember {
         org_id: org.id.clone(),
@@ -711,6 +725,10 @@ pub(crate) async fn accept_invite(
     user: &str,
     now: f64,
 ) -> Result<Accepted, ApiError> {
+    // The account's row is locked while it gains a membership (before the organisation's: the
+    // lock order of `crate::store`), so that its own deletion either sees the membership or is
+    // seen here.
+    still_there(tx, user).await?;
     let org = &invite.org_id;
     // The organisation's row is locked before its members are counted: of two people joining at
     // once the second counts the first, and cannot take a seat the hook did not approve.

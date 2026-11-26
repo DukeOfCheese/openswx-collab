@@ -1433,3 +1433,131 @@ async fn a_record_with_the_zero_character_is_refused_alone() {
     assert_eq!(s.undo_target(&doc, "u.\0", "c1").await.unwrap(), None);
     assert_eq!(s.recent_change_ids(&doc, "u.\0", 10).await.unwrap(), []);
 }
+
+// ------------------------------------------------------------------ Task 16, fix round 1
+
+/// The lease row is locked by the batch that checked its epoch, until that batch commits: an
+/// acquisition cannot move the epoch on between the check and the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acquisition_waits_for_the_batch_that_checked_the_lease() {
+    let (server, flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "D").await;
+    let epoch = lease(&server, &doc).await;
+    let writer = new_journal(&server.state.store);
+    // The batch has checked the lease and inserted its row; it is held before it commits.
+    flaky.head_gate.shut();
+    let receipt = writer.submit(simple(&doc, 1, epoch)).await;
+    flaky.head_gate.until_waiting(1).await;
+    let mut taking = {
+        let (store, doc) = (server.state.store.clone(), doc.clone());
+        tokio::spawn(async move { acquire(store.as_ref(), &doc, "other", 1000.0, 60.0).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(600), &mut taking)
+            .await
+            .is_err(),
+        "the lease was taken from under a batch that had checked it"
+    );
+    flaky.head_gate.open();
+    // The record was written under the epoch it was checked against; the acquisition follows.
+    assert_eq!(receipt.outcome().await, Ok(()));
+    assert_eq!(taking.await.unwrap().unwrap(), epoch + 1);
+    let rows = store(&server)
+        .changes_between(&doc, 0, i64::MAX, 10)
+        .await
+        .unwrap();
+    assert_eq!((rows.len(), rows[0].epoch), (1, epoch as i64));
+}
+
+/// One organisation whose row lock is held for a long time, and requests queued on it, must not
+/// take the connections the journal and other organisations need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_organisation_holds_up_neither_the_journal_nor_other_organisations() {
+    if !common::on_postgres() {
+        eprintln!("skipped on SQLite: it has one writer, and no row lock to wait for");
+        return;
+    }
+    // Four connections for requests (two of them for transactions), a lock timeout of a second.
+    let (server, flaky) = TestServer::start_flaky(|s| s.database_lock_timeout = 1.0).await;
+    let world = World::new(&server).await.unwrap();
+    let (status, other) = server
+        .post(
+            "/api/orgs",
+            Some(&world.admin),
+            serde_json::json!({"name": "Other"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let other = other["id"].as_str().unwrap().to_owned();
+    let doc = new_doc(&server, &world, "D").await;
+    let epoch = lease(&server, &doc).await;
+    let server = Arc::new(server);
+
+    // A request holds the organisation's row lock (it is parked in the middle of renaming it) ...
+    flaky.org_gate.shut();
+    let holder = {
+        let (server, w) = (server.clone(), (world.org.clone(), world.admin.clone()));
+        tokio::spawn(async move {
+            server
+                .patch(
+                    &format!("/api/orgs/{}", w.0),
+                    Some(&w.1),
+                    serde_json::json!({"name": "Held"}),
+                )
+                .await
+        })
+    };
+    flaky.org_gate.until_waiting(1).await;
+    // ... and three more writes to that organisation queue up behind it.
+    let mut queued = Vec::new();
+    for n in 0..3 {
+        let (server, w) = (server.clone(), (world.org.clone(), world.admin.clone()));
+        queued.push(tokio::spawn(async move {
+            server
+                .post(
+                    &format!("/api/orgs/{}/projects", w.0),
+                    Some(&w.1),
+                    serde_json::json!({"name": format!("Queued {n}")}),
+                )
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The journal writes at once: its connections are its own.
+    let written = tokio::time::timeout(
+        Duration::from_secs(3),
+        server.state.journal.append(simple(&doc, 1, epoch)),
+    )
+    .await
+    .expect("the journal is not held up by requests waiting for a lock");
+    assert_eq!(written, Ok(()));
+    // Another organisation's write goes through as soon as the waiters have given up.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(12),
+        server.post(
+            &format!("/api/orgs/{other}/projects"),
+            Some(&world.admin),
+            serde_json::json!({"name": "Elsewhere"}),
+        ),
+    )
+    .await
+    .expect("another organisation is not held up");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // Each queued write gave up on the lock: 409, try again. Nothing of them was written.
+    for task in queued {
+        assert_eq!(
+            task.await.unwrap(),
+            (
+                StatusCode::CONFLICT,
+                serde_json::json!({"detail":
+                    "another request changed the same thing at the same moment; try again"})
+            )
+        );
+    }
+    assert!(!holder.is_finished());
+    flaky.org_gate.open();
+    assert_eq!(holder.await.unwrap().0, StatusCode::OK);
+    let projects = store(&server).projects_in_org(&world.org).await.unwrap();
+    assert!(projects.iter().all(|p| !p.name.starts_with("Queued")));
+}

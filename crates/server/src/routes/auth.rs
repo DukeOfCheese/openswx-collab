@@ -522,7 +522,8 @@ async fn request_reset(
     let settings = &state.settings;
     let token = new_token();
     let mut tx = state.store.begin().await?;
-    // Only the newest link works.
+    // Only the newest link works: one request at a time per account replaces it.
+    tx.lock_user(&user.id).await?;
     tx.delete_user_password_resets(&user.id).await?;
     tx.delete_expired_password_resets(now).await?;
     tx.insert_password_reset(&PasswordReset {

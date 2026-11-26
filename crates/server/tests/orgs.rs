@@ -2031,3 +2031,70 @@ async fn two_owners_demoting_each_other_at_once_leave_an_owner() {
         .count();
     assert_eq!(owners, 1);
 }
+
+// ------------------------------------------------------------------ Task 16, fix round 1
+
+/// An account that is being deleted gains no membership meanwhile: its deletion holds its row,
+/// and joining or founding an organisation takes that row first and looks at the account again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_being_deleted_joins_and_founds_nothing() {
+    let (server, flaky) = TestServer::start_flaky(|s| s.open_registration = true).await;
+    let w = World::new(&server).await.unwrap();
+    let (_, inv) = invite(&server, &w, json!({})).await;
+    let invite_token = inv["token"].as_str().unwrap().to_owned();
+    let (bob, bob_id) = server.register("bob@example.com").await;
+    let server = Arc::new(server);
+    // The deletion has emptied the account and is held before its commit ...
+    flaky.commit_gate.shut();
+    let deleting = {
+        let (server, bob) = (server.clone(), bob.clone());
+        tokio::spawn(async move {
+            server
+                .call(
+                    reqwest::Method::DELETE,
+                    "/api/me",
+                    Some(&bob),
+                    Some(json!({"current_password": PASSWORD})),
+                )
+                .await
+        })
+    };
+    flaky.commit_gate.until_waiting(1).await;
+    // ... while the same account accepts an invite and founds an organisation.
+    let joining = {
+        let (server, bob) = (server.clone(), bob.clone());
+        tokio::spawn(async move { accept(&server, &bob, &invite_token).await })
+    };
+    let founding = {
+        let (server, bob) = (server.clone(), bob.clone());
+        tokio::spawn(async move {
+            server
+                .post("/api/orgs", Some(&bob), json!({"name": "Mine"}))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    flaky.commit_gate.open();
+    assert_eq!(deleting.await.unwrap().0, StatusCode::NO_CONTENT);
+    let (joined, founded) = (joining.await.unwrap(), founding.await.unwrap());
+    assert_eq!(joined.0, StatusCode::UNAUTHORIZED, "{joined:?}");
+    assert_eq!(founded.0, StatusCode::UNAUTHORIZED, "{founded:?}");
+    let memberships: i64 = server
+        .scalar(&format!(
+            "SELECT COUNT(*) FROM org_members WHERE user_id = '{bob_id}'"
+        ))
+        .await;
+    assert_eq!(memberships, 0);
+    assert_eq!(
+        server.state.store.org_member_count(&w.org).await.unwrap(),
+        1
+    );
+    let orgs: i64 = server.scalar("SELECT COUNT(*) FROM orgs").await;
+    assert_eq!(orgs, 1);
+    // The invite was not used up by the refused acceptance.
+    let (cy, _) = server.register("cy@example.com").await;
+    assert_eq!(
+        accept(&server, &cy, inv["token"].as_str().unwrap()).await.0,
+        StatusCode::OK
+    );
+}

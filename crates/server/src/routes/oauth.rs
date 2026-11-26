@@ -682,10 +682,10 @@ async fn sign_in_code(
             Ok(Attempt::Done(back)) => return Ok(back),
             Ok(Attempt::Again) => {}
             // Another sign-in made the same account, or attached the same identity, at the same
-            // moment (the database refused this one's row, which `?` turned into 409 "try
-            // again"): the next try finds what the other made.
-            Err(ApiError::Conflict(why))
-                if attempt < SEAT_ATTEMPTS && why == crate::error::TRY_AGAIN => {}
+            // moment (the database refused this one's row): the next try finds what the other
+            // made.
+            Err(ApiError::Internal(e))
+                if attempt < SEAT_ATTEMPTS && crate::store::is_unique_violation(&e) => {}
             Err(e) => return Err(e),
         }
     }

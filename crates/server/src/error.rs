@@ -46,6 +46,8 @@ pub enum ApiError {
     Busy(&'static str),
     /// 501 with the message.
     NotImplemented(String),
+    /// 503 with the message: the server could not get to the request in time; nothing was done.
+    Unavailable(&'static str),
     /// 500 `server error`; the error itself goes to the log only.
     Internal(anyhow::Error),
 }
@@ -64,6 +66,7 @@ impl ApiError {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RateLimited | Self::Busy(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -73,7 +76,7 @@ impl ApiError {
         match self {
             Self::Unauthorized => "sign in first",
             Self::WrongCredentials => "wrong email address or password",
-            Self::NotFound(m) | Self::Forbidden(m) | Self::Busy(m) => m,
+            Self::NotFound(m) | Self::Forbidden(m) | Self::Busy(m) | Self::Unavailable(m) => m,
             Self::Conflict(m)
             | Self::NotFoundDetail(m)
             | Self::BadRequest(m)
@@ -98,12 +101,19 @@ pub const ZERO_CHARACTER: &str = "text must not contain the zero character";
 /// What a request is told when the database ended its transaction in favour of another one.
 pub const TRY_AGAIN: &str = "another request changed the same thing at the same moment; try again";
 
+/// What a request is told when the database could not get to it in time.
+pub const BUSY: &str = "the server is busy; try again";
+
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
-    /// 500, except for an error by which the database says that two transactions got in each
-    /// other's way ([`crate::store::is_conflict`]): nothing was written, and the client may send the
-    /// request again, so that is 409 [`TRY_AGAIN`]; and for PostgreSQL refusing the zero character
-    /// in a value no route checked for it (an id in a path, say), which is the request's fault:
-    /// 422 [`ZERO_CHARACTER`].
+    /// 500, except for what the database says about itself rather than about a fault:
+    ///
+    /// - two transactions got in each other's way, or one waited too long for the other's lock
+    ///   ([`crate::store::is_conflict`]): nothing was written and the request can be sent again,
+    ///   409 [`TRY_AGAIN`];
+    /// - no connection came free in time, or a statement ran out of time
+    ///   ([`crate::store::is_busy`]): 503 [`BUSY`];
+    /// - PostgreSQL refused the zero character in a value no route checked for it (an id in a
+    ///   path, say), which is the request's fault: 422 [`ZERO_CHARACTER`].
     fn from(err: E) -> Self {
         let err = err.into();
         if crate::store::is_zero_character(&err) {
@@ -112,6 +122,10 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
         if crate::store::is_conflict(&err) {
             tracing::warn!("a request lost to a concurrent one: {err:#}");
             return Self::Conflict(TRY_AGAIN.into());
+        }
+        if crate::store::is_busy(&err) {
+            tracing::warn!("the database did not get to a request in time: {err:#}");
+            return Self::Unavailable(BUSY);
         }
         Self::Internal(err)
     }

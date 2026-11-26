@@ -1,13 +1,29 @@
 //! The PostgreSQL store.
 //!
-//! The connections ([`PgStore::open`]'s `pool_size` of them at most) are in two pools, one for
-//! transactions and one for reads, half each: a request that holds a transaction and then reads
-//! through [`Store`] can never wait for a connection that only other transactions could give back
-//! (as on SQLite, where the writer and the readers are apart). A caller waits up to 30 s for a
-//! free connection. Every connection is opened with:
+//! The connections are in three pools ([`PgConfig`]), so that no kind of work can take the
+//! connections another kind needs:
+//!
+//! - **transactions** of requests ([`Store::begin`]): half of `pool`. These wait for row locks
+//!   (every write in an organisation locks its row first), and a waiting transaction holds its
+//!   connection; so each of these connections has `lock_timeout` set (5 s unless configured), and
+//!   a transaction that waits longer for a lock fails with `55P03`, which a request answers with
+//!   409 "try again" ([`super::is_conflict`]);
+//! - **reads** ([`PgStore::reader`]): the other half of `pool`. A request that holds a
+//!   transaction and then reads through [`Store`] never waits for a connection that only other
+//!   transactions could give back (as on SQLite, where the writer and the readers are apart);
+//! - **the journal** ([`Store::begin_journal`]): `journal_pool` connections (2 unless
+//!   configured) for the journal writer, lease acquisitions and snapshot rows, which no request
+//!   can use up. These have **no** `lock_timeout`: what the journal waits for are document rows a
+//!   request's transaction changed or is deleting, which that transaction's own timeouts bound,
+//!   and failing a batch instead would answer every record in it `Unknown` and make every room in
+//!   it reload.
+//!
+//! With the defaults the server holds at most **12** connections (5 + 5 + 2), opened as they are
+//! needed. A caller waits up to 30 s for a free one ([`super::is_busy`]: 503). Every connection is
+//! opened with:
 //!
 //! - `default_transaction_isolation = read committed`, whatever the database or role is set to:
-//!   the server's transactions are written for it (see "Locks" in [`crate::store`]);
+//!   the server's transactions are written for it (see "Isolation and locks" in [`crate::store`]);
 //! - `statement_timeout = 30s`: a statement stuck behind a lock, or runaway, fails instead of
 //!   holding its connection for ever;
 //! - `idle_in_transaction_session_timeout = 60s`: a transaction nobody is driving any more is
@@ -24,8 +40,9 @@
 //! second transaction gets one (on another connection), and the two can then wait for each other's
 //! locks. Use a savepoint, as the rules in [`crate::store`] say.
 //!
-//! The URL is never logged or put in an error: connection errors name the host, port and database
-//! only.
+//! The URL is never logged or put in an error, and neither is what the database says about a
+//! failed connection (it names the user): connection errors are a fixed phrase and the host,
+//! port and database.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -50,9 +67,15 @@ use crate::config::{Database, parse_database_url};
 /// The migrations in `migrations/postgres/`, embedded in the binary.
 pub static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-/// How many connections the pool holds at most, unless the settings say otherwise
-/// (`OSWX_COLLAB_DATABASE_POOL`).
+/// How many connections requests share (half for transactions, half for reads), unless the
+/// settings say otherwise (`OSWX_COLLAB_DATABASE_POOL`).
 pub const DEFAULT_POOL: u32 = 10;
+/// How many connections the journal has to itself, unless the settings say otherwise
+/// (`OSWX_COLLAB_DATABASE_JOURNAL_POOL`).
+pub const DEFAULT_JOURNAL_POOL: u32 = 2;
+/// How many seconds a request's transaction waits for a row lock, unless the settings say
+/// otherwise (`OSWX_COLLAB_DATABASE_LOCK_TIMEOUT`).
+pub const DEFAULT_LOCK_TIMEOUT: f64 = 5.0;
 /// How long a caller waits for a connection.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest one statement may run (waiting for a lock included), in milliseconds.
@@ -63,13 +86,47 @@ const IDLE_IN_TRANSACTION_MS: u32 = 60_000;
 /// Prepared statements kept per connection: every fixed statement of [`super::sql`] fits.
 const STATEMENT_CACHE: usize = 256;
 
+/// How many connections a [`PgStore`] holds, and how long its requests wait for a lock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PgConfig {
+    /// Connections for requests: half for their transactions, half for reads (at least one each).
+    pub pool: u32,
+    /// Connections for the journal writer, leases and snapshot rows (at least one).
+    pub journal_pool: u32,
+    /// How long a request's transaction waits for a row lock before it fails (`55P03`).
+    pub lock_timeout: Duration,
+}
+
+impl Default for PgConfig {
+    fn default() -> Self {
+        Self {
+            pool: DEFAULT_POOL,
+            journal_pool: DEFAULT_JOURNAL_POOL,
+            lock_timeout: Duration::from_secs_f64(DEFAULT_LOCK_TIMEOUT),
+        }
+    }
+}
+
+impl PgConfig {
+    /// As the settings say (`OSWX_COLLAB_DATABASE_POOL`, `_JOURNAL_POOL`, `_LOCK_TIMEOUT`).
+    pub fn from_settings(settings: &crate::Settings) -> Self {
+        Self {
+            pool: settings.database_pool,
+            journal_pool: settings.database_journal_pool,
+            lock_timeout: Duration::from_secs_f64(settings.database_lock_timeout),
+        }
+    }
+}
+
 /// A PostgreSQL database. Cloning is cheap: clones share the pools.
 #[derive(Clone)]
 pub struct PgStore {
-    /// Connections for transactions ([`PgStore::begin_tx`]).
+    /// Connections for requests' transactions ([`PgStore::begin_tx`]).
     transactions: PgPool,
     /// Connections for reads ([`PgStore::reader`]).
     reads: PgPool,
+    /// Connections for the journal's transactions ([`PgStore::begin_journal_tx`]).
+    journal: PgPool,
     /// How every connection is opened (for the migrations' own connection).
     options: Arc<PgConnectOptions>,
     migrator: &'static Migrator,
@@ -83,21 +140,21 @@ impl std::fmt::Debug for PgStore {
             .field("database", &self.options.get_database())
             .field(
                 "connections",
-                &(self.transactions.size() + self.reads.size()),
+                &(self.transactions.size() + self.reads.size() + self.journal.size()),
             )
             .finish_non_exhaustive()
     }
 }
 
 impl PgStore {
-    /// Opens the database at `url` with at most `pool_size` connections (at least 2: one for
-    /// transactions, one for reads) and brings its schema up to date: an empty database is always built; an older one is upgraded only when
-    /// `auto_migrate` is true, and is otherwise an error telling the operator to run `migrate`; a
-    /// newer one, or one this server did not write, is always an error ([`SchemaError`]).
+    /// Opens the database at `url` with the pools `config` describes and brings its schema up to
+    /// date: an empty database is always built; an older one is upgraded only when `auto_migrate`
+    /// is true, and is otherwise an error telling the operator to run `migrate`; a newer one, or
+    /// one this server did not write, is always an error ([`SchemaError`]).
     ///
     /// `url` is any PostgreSQL form [`parse_database_url`] accepts.
-    pub async fn open(url: &str, auto_migrate: bool, pool_size: u32) -> Result<Self> {
-        Self::open_with_migrations(url, auto_migrate, pool_size, &MIGRATOR).await
+    pub async fn open(url: &str, auto_migrate: bool, config: PgConfig) -> Result<Self> {
+        Self::open_with_migrations(url, auto_migrate, config, &MIGRATOR).await
     }
 
     /// [`PgStore::open`] with other migrations than the embedded ones (tests of the upgrade path,
@@ -106,17 +163,17 @@ impl PgStore {
     pub async fn open_with_migrations(
         url: &str,
         auto_migrate: bool,
-        pool_size: u32,
+        config: PgConfig,
         migrator: &'static Migrator,
     ) -> Result<Self> {
-        let mut store = Self::connect(url, pool_size).await?;
+        let mut store = Self::connect(url, config).await?;
         store.migrator = migrator;
         store.bring_up_to_date(auto_migrate).await?;
         Ok(store)
     }
 
     /// Opens the database at `url` without looking at its schema (for `migrate` and tools).
-    pub async fn connect(url: &str, pool_size: u32) -> Result<Self> {
+    pub async fn connect(url: &str, config: PgConfig) -> Result<Self> {
         let url = match parse_database_url(url)? {
             Database::Postgres(url) => url,
             Database::Sqlite(_) => bail!("not a PostgreSQL database URL"),
@@ -134,22 +191,30 @@ impl PgStore {
                     IDLE_IN_TRANSACTION_MS,
                 ),
             ]);
-        let for_transactions = (pool_size / 2).max(1);
-        let for_reads = pool_size.saturating_sub(for_transactions).max(1);
-        let transactions = PgPoolOptions::new()
-            .max_connections(for_transactions)
-            .acquire_timeout(ACQUIRE_TIMEOUT)
-            .connect_with(options.clone())
+        let for_transactions = (config.pool / 2).max(1);
+        let for_reads = config.pool.saturating_sub(for_transactions).max(1);
+        let pool = |connections: u32| {
+            PgPoolOptions::new()
+                .max_connections(connections.max(1))
+                .acquire_timeout(ACQUIRE_TIMEOUT)
+        };
+        let lock_timeout_ms = config.lock_timeout.as_millis().max(1);
+        // One connection made here and now shows whether the database answers, and says why not
+        // at once (a pool would try again until its wait ran out). The pools open theirs as they
+        // are needed.
+        let probe = options
+            .connect()
             .await
-            .with_context(|| format!("cannot open the database {}", place(&options)))?;
-        // (Opened when first needed: the first pool has shown that the database answers.)
-        let reads = PgPoolOptions::new()
-            .max_connections(for_reads)
-            .acquire_timeout(ACQUIRE_TIMEOUT)
-            .connect_lazy_with(options.clone());
+            .map_err(|e| cannot_connect(&options, &e))?;
+        let _ = probe.close().await;
+        let transactions = pool(for_transactions)
+            .connect_lazy_with(options.clone().options([("lock_timeout", lock_timeout_ms)]));
+        let reads = pool(for_reads).connect_lazy_with(options.clone());
+        let journal = pool(config.journal_pool).connect_lazy_with(options.clone());
         Ok(Self {
             transactions,
             reads,
+            journal,
             options: Arc::new(options),
             migrator: &MIGRATOR,
         })
@@ -166,7 +231,7 @@ impl PgStore {
         let mut conn = unhurried
             .connect()
             .await
-            .with_context(|| format!("cannot open the database {}", place(&self.options)))?;
+            .map_err(|e| cannot_connect(&self.options, &e))?;
         let ran = self.migrator.run(&mut conn).await;
         let _ = conn.close().await;
         Ok(ran?)
@@ -187,6 +252,13 @@ impl PgStore {
         })
     }
 
+    /// [`Store::begin_journal`]: a transaction on the journal's own connections.
+    pub async fn begin_journal_tx(&self) -> Result<PgTx<'static>> {
+        Ok(PgTx {
+            tx: self.journal.begin().await?,
+        })
+    }
+
     /// A connection for reads (each statement sees what was committed when it started).
     pub async fn reader(&self) -> Result<PoolConnection<Postgres>> {
         Ok(self.reads.acquire().await?)
@@ -195,6 +267,7 @@ impl PgStore {
     /// Closes every connection.
     pub async fn close(&self) {
         self.reads.close().await;
+        self.journal.close().await;
         self.transactions.close().await;
     }
 }
@@ -207,6 +280,25 @@ fn place(options: &PgConnectOptions) -> String {
         options.get_host(),
         options.get_port()
     )
+}
+
+/// The error for a connection that could not be made: a fixed phrase for the kind of failure and
+/// where the database is. What the database or the driver said is left out: it names the user
+/// (`password authentication failed for user "…"`).
+fn cannot_connect(options: &PgConnectOptions, err: &sqlx::Error) -> anyhow::Error {
+    let code = err
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()));
+    let why = match (err, code.as_deref()) {
+        (_, Some(code)) if code.starts_with("28") => "the user or password was refused",
+        (_, Some("3D000")) => "there is no such database",
+        (_, Some("53300")) => "the database has no connection to spare",
+        (sqlx::Error::Io(_), _) => "the database server cannot be reached",
+        (sqlx::Error::Tls(_), _) => "a secure connection could not be made",
+        (sqlx::Error::PoolTimedOut, _) => "the database server did not answer in time",
+        _ => "the connection failed",
+    };
+    anyhow!("cannot open the database {}: {why}", place(options))
 }
 
 /// A transaction, or a savepoint within one.

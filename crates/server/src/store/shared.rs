@@ -106,6 +106,10 @@ macro_rules! store_impl {
                 Ok(Box::new(self.begin_tx().await?))
             }
 
+            async fn begin_journal(&self) -> Result<Box<dyn Tx>> {
+                Ok(Box::new(self.begin_journal_tx().await?))
+            }
+
             async fn user_count(&self) -> Result<u64> {
                 q::user_count(&mut *self.reader().await?).await
             }

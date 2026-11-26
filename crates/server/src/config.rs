@@ -71,6 +71,12 @@ pub struct Settings {
     /// The most connections the server holds to a PostgreSQL database (SQLite has its own fixed
     /// few).
     pub database_pool: u32,
+    /// The connections to a PostgreSQL database the journal writer has to itself, on top of
+    /// `database_pool`.
+    pub database_journal_pool: u32,
+    /// Seconds a request's transaction waits for another's row lock on PostgreSQL before it is
+    /// answered 409 "try again".
+    pub database_lock_timeout: f64,
     pub storage_url: String,
     /// For S3-compatible stores (MinIO), e.g. `http://minio:9000`.
     pub s3_endpoint: String,
@@ -124,6 +130,8 @@ impl Default for Settings {
         Self {
             database_url: "sqlite+aiosqlite:///./data/collab.db".into(),
             database_pool: crate::store::postgres::DEFAULT_POOL,
+            database_journal_pool: crate::store::postgres::DEFAULT_JOURNAL_POOL,
+            database_lock_timeout: crate::store::postgres::DEFAULT_LOCK_TIMEOUT,
             storage_url: "./data/storage".into(),
             s3_endpoint: String::new(),
             public_url: "http://localhost:8787".into(),
@@ -165,6 +173,8 @@ impl Settings {
         let mut s = Self::default();
         e.string("DATABASE_URL", &mut s.database_url);
         e.positive_whole("DATABASE_POOL", &mut s.database_pool)?;
+        e.positive_whole("DATABASE_JOURNAL_POOL", &mut s.database_journal_pool)?;
+        e.positive_seconds("DATABASE_LOCK_TIMEOUT", &mut s.database_lock_timeout)?;
         e.string("STORAGE_URL", &mut s.storage_url);
         e.string("S3_ENDPOINT", &mut s.s3_endpoint);
         e.string("PUBLIC_URL", &mut s.public_url);
@@ -310,6 +320,8 @@ impl fmt::Debug for Settings {
         f.debug_struct("Settings")
             .field("database_url", &redact_url_password(&self.database_url))
             .field("database_pool", &self.database_pool)
+            .field("database_journal_pool", &self.database_journal_pool)
+            .field("database_lock_timeout", &self.database_lock_timeout)
             .field("storage_url", &self.storage_url)
             .field("s3_endpoint", &self.s3_endpoint)
             .field("public_url", &self.public_url)
@@ -720,15 +732,29 @@ mod tests {
     }
 
     #[test]
-    fn the_database_pool_is_ten_connections_unless_set() {
-        assert_eq!(read(&[]).database_pool, 10);
-        assert_eq!(read(&[("DATABASE_POOL", " 32 ")]).database_pool, 32);
-        for bad in ["0", "-1", "many", ""] {
-            assert_eq!(
-                refused(&[("DATABASE_POOL", bad)]).var,
-                "OSWX_COLLAB_DATABASE_POOL",
-                "{bad}"
-            );
+    fn the_database_pools_are_ten_and_two_connections_unless_set() {
+        let s = read(&[]);
+        assert_eq!((s.database_pool, s.database_journal_pool), (10, 2));
+        assert_eq!(s.database_lock_timeout, 5.0);
+        let s = read(&[
+            ("DATABASE_POOL", " 32 "),
+            ("DATABASE_JOURNAL_POOL", "4"),
+            ("DATABASE_LOCK_TIMEOUT", "1.5"),
+        ]);
+        assert_eq!((s.database_pool, s.database_journal_pool), (32, 4));
+        assert_eq!(s.database_lock_timeout, 1.5);
+        for name in [
+            "DATABASE_POOL",
+            "DATABASE_JOURNAL_POOL",
+            "DATABASE_LOCK_TIMEOUT",
+        ] {
+            for bad in ["0", "-1", "many", ""] {
+                assert_eq!(
+                    refused(&[(name, bad)]).var,
+                    format!("OSWX_COLLAB_{name}"),
+                    "{bad}"
+                );
+            }
         }
     }
 

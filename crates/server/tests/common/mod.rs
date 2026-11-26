@@ -25,6 +25,7 @@ use oswx_server::hub::Hub;
 use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
+use oswx_server::store::postgres::PgConfig;
 use oswx_server::store::{
     AssemblyRefRow, AssemblyUse, AuthoredChange, ChangeEventRow, ChangeRow, ChangeSize, Document,
     Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange, OAuthIdentity,
@@ -86,7 +87,8 @@ fn test_settings(dir: &Path) -> Settings {
 
 /// The environment variable that names the PostgreSQL database the tests run against.
 const PG_ENV: &str = "OSWX_TEST_DATABASE_URL";
-/// How many connections one test server's PostgreSQL pool holds at most: a few hundred tests,
+/// How many connections one test server's PostgreSQL pool for requests holds at most (two for
+/// transactions, two for reads; the journal has its default two besides): a few hundred tests,
 /// many at once, share one database server's `max_connections`.
 const PG_POOL: u32 = 4;
 
@@ -253,7 +255,7 @@ async fn open_store(settings: &Settings) -> TestDb {
             PgStore::open(
                 &settings.database_url,
                 settings.auto_migrate,
-                settings.database_pool,
+                PgConfig::from_settings(settings),
             )
             .await
             .expect("the test database opens"),
@@ -763,6 +765,8 @@ pub struct FlakyStore {
     commit_delay: Arc<Mutex<Duration>>,
     /// Shut: every top-level `commit` parks here (before it commits) until opened.
     pub commit_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every `set_org_name` parks here (a request then holds its organisation's row lock).
+    pub org_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `insert_user` parks here (a registration has then counted the accounts).
     pub user_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `set_document_head` parks here (the journal has then locked and written what a
@@ -808,6 +812,7 @@ impl FlakyStore {
             commit_gate: Arc::default(),
             head_gate: Arc::default(),
             user_gate: Arc::default(),
+            org_gate: Arc::default(),
             commit_patience: Arc::default(),
             parts_gate: Arc::default(),
             history_gate: Arc::default(),
@@ -932,7 +937,37 @@ impl FlakyStore {
             .unwrap_or_else(PoisonError::into_inner) = patience;
     }
 
-    /// How many transactions [`Store::begin`] has opened so far.
+    /// What every `begin` (a request's or the journal's) does first.
+    fn before_begin(&self) {
+        if self.panic_on_begin.load(Ordering::SeqCst) {
+            panic!("the flaky store was told to panic in begin");
+        }
+        self.begins.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A real transaction wrapped so that it fails, waits and counts as this store was told.
+    fn flaky(&self, inner: Box<dyn Tx>) -> Box<dyn Tx> {
+        Box::new(FlakyTx {
+            inner,
+            savepoint: false,
+            fail_commit: self.fail_commit.clone(),
+            fail_reverted_by: self.fail_reverted_by.clone(),
+            commit_then_fail: self.commit_then_fail.clone(),
+            hang_commit: self.hang_commit.clone(),
+            refuse_change: self.refuse_change.clone(),
+            refuse_server_change: self.refuse_server_change.clone(),
+            duplicate_inserts: self.duplicate_inserts.clone(),
+            commit_delay: self.commit_delay.clone(),
+            commit_gate: self.commit_gate.clone(),
+            head_gate: self.head_gate.clone(),
+            user_gate: self.user_gate.clone(),
+            org_gate: self.org_gate.clone(),
+            commit_patience: self.commit_patience.clone(),
+            ref_writes: self.ref_writes.clone(),
+        })
+    }
+
+    /// How many transactions [`Store::begin`] and [`Store::begin_journal`] have opened so far.
     pub fn begins(&self) -> usize {
         self.begins.load(Ordering::SeqCst)
     }
@@ -998,27 +1033,13 @@ impl Store for FlakyStore {
     }
 
     async fn begin(&self) -> anyhow::Result<Box<dyn Tx>> {
-        if self.panic_on_begin.load(Ordering::SeqCst) {
-            panic!("the flaky store was told to panic in begin");
-        }
-        self.begins.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(FlakyTx {
-            inner: self.inner().begin().await?,
-            savepoint: false,
-            fail_commit: self.fail_commit.clone(),
-            fail_reverted_by: self.fail_reverted_by.clone(),
-            commit_then_fail: self.commit_then_fail.clone(),
-            hang_commit: self.hang_commit.clone(),
-            refuse_change: self.refuse_change.clone(),
-            refuse_server_change: self.refuse_server_change.clone(),
-            duplicate_inserts: self.duplicate_inserts.clone(),
-            commit_delay: self.commit_delay.clone(),
-            commit_gate: self.commit_gate.clone(),
-            head_gate: self.head_gate.clone(),
-            user_gate: self.user_gate.clone(),
-            commit_patience: self.commit_patience.clone(),
-            ref_writes: self.ref_writes.clone(),
-        }))
+        self.before_begin();
+        Ok(self.flaky(self.inner().begin().await?))
+    }
+
+    async fn begin_journal(&self) -> anyhow::Result<Box<dyn Tx>> {
+        self.before_begin();
+        Ok(self.flaky(self.inner().begin_journal().await?))
     }
 
     async fn user_count(&self) -> anyhow::Result<u64> {
@@ -1388,6 +1409,7 @@ pub struct FlakyTx<'a> {
     commit_gate: Arc<oswx_server::room::Gate>,
     head_gate: Arc<oswx_server::room::Gate>,
     user_gate: Arc<oswx_server::room::Gate>,
+    org_gate: Arc<oswx_server::room::Gate>,
     commit_patience: Arc<Mutex<Option<Duration>>>,
     ref_writes: Arc<AtomicUsize>,
 }
@@ -1456,6 +1478,7 @@ impl Tx for FlakyTx<'_> {
             commit_gate: self.commit_gate.clone(),
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
+            org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
         }))
@@ -1598,6 +1621,7 @@ impl Tx for FlakyTx<'_> {
     }
 
     async fn set_org_name(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.org_gate.pass().await;
         self.inner.set_org_name(id, name).await
     }
 
