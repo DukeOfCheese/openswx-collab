@@ -263,8 +263,8 @@ impl Room {
         }
         // Releases it made that still wait to be announced go now.
         self.flush_lock_news(conn);
-        // For this task the refused ids are forgotten when the connection goes (TASK 12: after a
-        // grace period instead).
+        // The refused ids of its client are forgotten when the connection goes (a client that
+        // reconnects resends only what it has no answer for).
         self.refused.remove(&c.client);
         let (code, reason) = close.unwrap_or((1000, ""));
         c.outbox.close(code, reason);

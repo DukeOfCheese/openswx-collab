@@ -90,6 +90,18 @@ pub enum RegisterError {
     ShuttingDown,
 }
 
+/// A connection asking to register ([`Hub::register`]).
+pub struct Connecting<'a> {
+    pub conn: ConnId,
+    pub user: &'a Id,
+    pub doc: &'a Id,
+    /// `<user id>.<client id of the hello>`.
+    pub client: &'a Arc<str>,
+    /// The hash of its session's token (never the token).
+    pub token_hash: &'a str,
+    pub outbox: Arc<Outbox>,
+}
+
 /// What the hub holds now (for `/metrics`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Gauges {
@@ -100,16 +112,53 @@ pub struct Gauges {
 }
 
 /// A registered connection.
-#[derive(Debug)]
 struct Entry {
     user: Id,
     doc: Id,
+    /// `<user id>.<client id of the hello>`.
+    client: Arc<str>,
     token_hash: String,
     outbox: Arc<Outbox>,
     /// The project and role it joined with, once its handshake settled them.
     settled: Option<(Id, ProjectRole)>,
     /// A drop concerned it before it settled: its handshake works its role out again.
     recheck: bool,
+    /// The room that took it, once one did.
+    room: Option<RoomHandle>,
+    /// How a drop closed it, if one did (told to its room when the room takes it later).
+    revoked: Option<(u16, String)>,
+}
+
+/// Everything but the token hash, which is never printed.
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("user", &self.user)
+            .field("doc", &self.doc)
+            .field("client", &self.client)
+            .field("settled", &self.settled)
+            .field("recheck", &self.recheck)
+            .field("room", &self.room.as_ref().map(RoomHandle::id))
+            .field("revoked", &self.revoked)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Entry {
+    /// Closes the connection for a drop: its outbox at once, and its room (if it has one) is told
+    /// to remove it and release its locks.
+    fn revoke(&mut self, conn: ConnId, code: u16, reason: &str) -> Option<(RoomHandle, ConnId)> {
+        self.outbox.close_now(code, reason);
+        self.revoked = Some((code, reason.to_owned()));
+        self.room.clone().map(|room| (room, conn))
+    }
+}
+
+/// Tells the rooms of revoked connections (never under the registry lock).
+fn tell_rooms(revoked: Vec<(RoomHandle, ConnId)>, code: u16, reason: &str) {
+    for (room, conn) in revoked {
+        room.revoke(conn, code, reason);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -170,6 +219,22 @@ impl Registration {
         }
         entry.settled = Some((project.clone(), role));
         true
+    }
+
+    /// Records the room that took the connection. If a drop closed the connection before, the
+    /// room is told now (so that it removes it and releases its locks at once).
+    pub fn joined(&self, room: &RoomHandle) {
+        let revoked = {
+            let mut registry = lock(&self.hub.inner.registry);
+            let Some(entry) = registry.entries.get_mut(&self.conn) else {
+                return;
+            };
+            entry.room = Some(room.clone());
+            entry.revoked.clone()
+        };
+        if let Some((code, reason)) = revoked {
+            room.revoke(self.conn, code, &reason);
+        }
     }
 }
 
@@ -294,38 +359,51 @@ impl Hub {
 
     // ------------------------------------------------------------------ connections
 
-    /// Registers a document connection whose session is known (see the module documentation).
-    /// Refused when the account has `max` connections already, or the server is shutting down.
+    /// Registers a document connection whose session is known (see the module documentation);
+    /// `client` is `<user id>.<client id of the hello>`. Refused when the account has `max`
+    /// connections already, unless this one takes over a connection of the same client to the same
+    /// document (which its room then replaces: no more connections than before); and refused when
+    /// the server is shutting down.
     pub fn register(
         &self,
-        conn: ConnId,
-        user: &Id,
-        doc: &Id,
-        token_hash: &str,
-        outbox: Arc<Outbox>,
+        connecting: Connecting<'_>,
         max: usize,
     ) -> Result<Registration, RegisterError> {
+        let Connecting {
+            conn,
+            user,
+            doc,
+            client,
+            token_hash,
+            outbox,
+        } = connecting;
         if self.inner.closing.load(Ordering::SeqCst) {
             return Err(RegisterError::ShuttingDown);
         }
         let mut registry = lock(&self.inner.registry);
-        let n = registry.per_user.entry(user.clone()).or_default();
-        if *n >= max {
-            if *n == 0 {
-                registry.per_user.remove(user);
-            }
+        let n = registry.per_user.get(user).copied().unwrap_or(0);
+        let takeover = || {
+            registry
+                .entries
+                .values()
+                .any(|e| e.user == *user && e.doc == *doc && e.client == *client)
+        };
+        if n >= max && !takeover() {
             return Err(RegisterError::TooMany);
         }
-        *n += 1;
+        *registry.per_user.entry(user.clone()).or_default() += 1;
         registry.entries.insert(
             conn,
             Entry {
                 user: user.clone(),
                 doc: doc.clone(),
+                client: client.clone(),
                 token_hash: token_hash.to_owned(),
                 outbox,
                 settled: None,
                 recheck: false,
+                room: None,
+                revoked: None,
             },
         );
         Ok(Registration {
@@ -351,19 +429,24 @@ impl Hub {
         }
     }
 
-    /// Closes the settled connections `pick` chooses with `code` and `reason`, and marks the
-    /// unsettled ones it chooses for a recheck. Answers how many were closed.
+    /// Closes the settled connections `pick` chooses with `code` and `reason` (and tells their
+    /// rooms), and marks the unsettled ones it chooses for a recheck. Answers how many were closed.
     fn close_where(&self, code: u16, reason: &str, pick: impl Fn(&Entry) -> bool) -> usize {
-        let mut registry = lock(&self.inner.registry);
-        let mut closed = 0;
-        for entry in registry.entries.values_mut().filter(|e| pick(e)) {
-            if entry.settled.is_some() {
-                entry.outbox.close_now(code, reason);
-                closed += 1;
-            } else {
-                entry.recheck = true;
+        let (closed, revoked) = {
+            let mut registry = lock(&self.inner.registry);
+            let mut revoked = Vec::new();
+            let mut closed = 0;
+            for (conn, entry) in registry.entries.iter_mut().filter(|(_, e)| pick(e)) {
+                if entry.settled.is_some() {
+                    revoked.extend(entry.revoke(*conn, code, reason));
+                    closed += 1;
+                } else {
+                    entry.recheck = true;
+                }
             }
-        }
+            (closed, revoked)
+        };
+        tell_rooms(revoked, code, reason);
         closed
     }
 
@@ -430,19 +513,20 @@ impl Hub {
             })
             .map(|(conn, _, _)| conn)
             .collect();
-        let n = {
-            let registry = lock(&self.inner.registry);
+        let reason = "your access changed";
+        let (n, revoked) = {
+            let mut registry = lock(&self.inner.registry);
+            let mut revoked = Vec::new();
             let mut n = 0;
             for conn in &changed {
-                if let Some(entry) = registry.entries.get(conn) {
-                    entry
-                        .outbox
-                        .close_now(close::ACCESS_CHANGED, "your access changed");
+                if let Some(entry) = registry.entries.get_mut(conn) {
+                    revoked.extend(entry.revoke(*conn, close::ACCESS_CHANGED, reason));
                     n += 1;
                 }
             }
-            n
+            (n, revoked)
         };
+        tell_rooms(revoked, close::ACCESS_CHANGED, reason);
         metrics::dropped(DropCause::Access, n);
     }
 
@@ -582,4 +666,27 @@ async fn load(state: &AppState, doc: &str) -> Result<RoomInit, OpenError> {
         epoch,
         snapshot_seq,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_registry_entry_never_prints_its_token_hash() {
+        let entry = Entry {
+            user: "u".into(),
+            doc: "d".into(),
+            client: Arc::from("u.c"),
+            token_hash: "5ecre7hash".into(),
+            outbox: Outbox::new(1024),
+            settled: None,
+            recheck: false,
+            room: None,
+            revoked: None,
+        };
+        let printed = format!("{entry:?}");
+        assert!(printed.contains("u.c"), "{printed}");
+        assert!(!printed.contains("5ecre7hash"), "{printed}");
+    }
 }

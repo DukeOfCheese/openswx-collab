@@ -6,7 +6,7 @@ use oswx_core::Seq;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::{CLOSE_WAIT, Closing, FINAL_SNAPSHOT_WAIT, Internal, Room, close};
+use super::{CLOSE_WAIT, Closing, Internal, Room, close};
 use crate::snapshot::write_snapshot;
 
 impl Room {
@@ -39,6 +39,11 @@ impl Room {
     /// the server's waiting, nothing being judged or looked up, no snapshot being written, and not
     /// closing already.
     pub(super) fn may_unload(&self) -> bool {
+        self.idle_enough() && self.snapshot_task.is_none()
+    }
+
+    /// [`Room::may_unload`] but for a snapshot being written: the room would unload but for that.
+    pub(super) fn idle_enough(&self) -> bool {
         let idle_long = self
             .idle_since
             .is_some_and(|t| self.state.clock.now() - t >= self.state.settings.room_idle);
@@ -48,10 +53,10 @@ impl Room {
             && self.locks.is_empty()
             && self.pending.is_empty()
             && self.server_queue.is_empty()
+            && self.held_unchanged.is_empty()
             && self.paused == 0
             && self.checking.is_empty()
             && self.undo_waiting.is_empty()
-            && self.snapshot_task.is_none()
     }
 
     /// Unloads the room because it is idle: it stops being offered to joiners at once, writes a
@@ -116,13 +121,13 @@ impl Room {
         }
         if c.snapshot {
             if let Some(task) = self.snapshot_task.take() {
-                let _ = tokio::time::timeout(FINAL_SNAPSHOT_WAIT, task).await;
+                let _ = tokio::time::timeout(self.state.room_hooks.snapshot_wait, task).await;
             }
             if self.durable.seq > self.snapshot_seq {
                 self.prune_index();
                 let head = self.durable.clone();
                 let written = tokio::time::timeout(
-                    FINAL_SNAPSHOT_WAIT,
+                    self.state.room_hooks.snapshot_wait,
                     write_snapshot(
                         self.state.store.as_ref(),
                         self.state.blobs.as_ref(),
@@ -202,9 +207,10 @@ impl Room {
         let now = self.state.clock.now();
         let internal = self.internal.clone();
         let failing = self.snapshot_failing;
+        let wait = self.state.room_hooks.snapshot_wait;
         self.snapshot_task = Some(tokio::spawn(async move {
             let written = tokio::time::timeout(
-                FINAL_SNAPSHOT_WAIT,
+                wait,
                 write_snapshot(store.as_ref(), blobs.as_ref(), &doc, epoch, &head, now),
             )
             .await;

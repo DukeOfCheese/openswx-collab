@@ -133,8 +133,12 @@ pub const MAX_REPLIES: usize = 2000;
 const DUPLICATE_USERS: usize = 1024;
 /// How long closing waits for the journal's answers to changes in flight.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
-/// How long a final snapshot may take when a room closes.
-const FINAL_SNAPSHOT_WAIT: Duration = Duration::from_secs(30);
+/// How long a snapshot may take (a final one when a room closes, or one in the background) before
+/// it is given up ([`Hooks::snapshot_wait`] by default).
+pub const SNAPSHOT_WAIT: Duration = Duration::from_secs(30);
+/// How long a handshake waits for a room to take its join before telling the client to reconnect
+/// ([`Hooks::join_wait`] by default).
+pub const JOIN_WAIT: Duration = Duration::from_secs(10);
 /// A snapshot's index keeps this many changes of history to judge late changes against; older
 /// marks are pruned just before the snapshot is written ([`Hooks::index_keep`] by default).
 pub const INDEX_KEEP: Seq = 100_000;
@@ -158,6 +162,10 @@ pub struct Hooks {
     /// Shut: the steps after a REST commit ([`crate::state::AppState::after_commit`]) wait here
     /// before they start (so that a test can drop the request meanwhile).
     pub after_commit: Arc<Gate>,
+    /// How long a handshake waits for a room to take its join ([`JOIN_WAIT`]).
+    pub join_wait: Duration,
+    /// How long a snapshot may take ([`SNAPSHOT_WAIT`]).
+    pub snapshot_wait: Duration,
 }
 
 /// A gate tests shut to hold work at a point and open to let it go on.
@@ -285,6 +293,8 @@ impl Default for Hooks {
             page_bytes: PAGE_BYTES,
             stall: Arc::default(),
             after_commit: Arc::default(),
+            join_wait: JOIN_WAIT,
+            snapshot_wait: SNAPSHOT_WAIT,
         }
     }
 }
@@ -463,6 +473,13 @@ pub enum RoomCmd {
     /// The hub's sweeper: a tick, then the room unloads itself if it may (see the module
     /// documentation).
     Sweep,
+    /// The hub revoked a connection's access (it has closed its outbox with `code` already): the
+    /// room removes it at once and releases its locks.
+    Revoked {
+        conn: ConnId,
+        code: u16,
+        reason: String,
+    },
     /// Stop: wait (briefly) for the journal's answers to changes in flight, close every connection
     /// with `code`, write a final snapshot if `snapshot` and there is anything new, then answer
     /// `done`.
@@ -558,6 +575,24 @@ impl RoomHandle {
             Ok(JoinAnswer::Taken) => Ok(()),
             Ok(JoinAnswer::Bounced(req)) => Err(JoinError::Gone(req)),
             Err(_) => Err(JoinError::Lost),
+        }
+    }
+
+    /// Tells the room, without waiting, that the hub revoked a connection's access (and closed
+    /// its outbox with `code`): the room removes it at once and releases its locks. Taken even
+    /// while the room judges a big change or waits for the journal; if the room's queue is full it
+    /// is sent from a task of its own.
+    pub fn revoke(&self, conn: ConnId, code: u16, reason: &str) {
+        let cmd = RoomCmd::Revoked {
+            conn,
+            code,
+            reason: reason.to_owned(),
+        };
+        if let Err(mpsc::error::TrySendError::Full(cmd)) = self.control.try_send(cmd) {
+            let control = self.control.clone();
+            tokio::spawn(async move {
+                let _ = control.send(cmd).await;
+            });
         }
     }
 
@@ -1046,12 +1081,17 @@ impl Room {
         }
     }
 
-    /// The room's periodic work: locks expire, and a snapshot that failed (with no change since to
-    /// try it again) is tried again, so a room never sits on a snapshot it owes.
+    /// The room's periodic work: locks expire, connections whose session expired close, and a
+    /// snapshot that failed (with no change since to try it again) is tried again, so a room never
+    /// sits on a snapshot it owes. Not when the room could unload (idle, nothing else keeping it):
+    /// the sweeper's unload writes the final snapshot then, and a retry started here (which with
+    /// storage hanging lasts until its timeout) would keep the room loaded.
     fn on_tick(&mut self) {
         self.sweep();
-        self.maybe_snapshot();
         self.close_expired_sessions();
+        if !self.idle_enough() {
+            self.maybe_snapshot();
+        }
     }
 
     /// The hub's sweep: a tick, or an unload if the room may (whose final snapshot then stands
@@ -1067,16 +1107,18 @@ impl Room {
         }
     }
 
-    /// Closes (4401) the connections whose session has expired.
+    /// Closes (4401) the connections whose session has expired. The boundary is REST's
+    /// ([`crate::sessions::Sessions`]): a session is expired once `expires_at < now`; at its
+    /// expiry second it still works.
     fn close_expired_sessions(&mut self) {
         let now = self.state.clock.now();
-        if now < self.next_expiry {
+        if now <= self.next_expiry {
             return;
         }
         let expired: Vec<ConnId> = self
             .conns
             .iter()
-            .filter(|(_, c)| c.expires <= now)
+            .filter(|(_, c)| c.expires < now)
             .map(|(id, _)| *id)
             .collect();
         for conn in &expired {
@@ -1133,6 +1175,7 @@ impl Room {
             }
             RoomCmd::Tick => self.on_tick(),
             RoomCmd::Sweep => self.on_sweep(),
+            RoomCmd::Revoked { conn, code, reason } => self.revoke(conn, code, &reason),
             RoomCmd::Close {
                 code,
                 reason,
@@ -1203,9 +1246,40 @@ impl Room {
 
     // ------------------------------------------------------------------ frames
 
+    /// The connection, if the room still works for it: present, and its outbox not closed. A
+    /// closed outbox means its access ended (the hub closes it at once, before the room hears) or
+    /// it broke a limit: nothing more of it is processed. Every path that resumes work for a
+    /// connection (a judge, a lookup, a blob check coming back; a re-judge after a journal refusal;
+    /// the hand-over to the journal itself) asks this first.
+    ///
+    /// The rule for a revoked connection's changes: those already handed to the journal before the
+    /// drop were accepted while it had access, and complete (they are durable, or about to be,
+    /// and broadcast to the others); nothing more is sent to the revoked connection, whose outbox
+    /// is closed. Everything not yet handed to the journal is discarded.
+    pub(super) fn live_conn(&self, conn: ConnId) -> Option<&Conn> {
+        self.conns.get(&conn).filter(|c| !c.outbox.is_closed())
+    }
+
+    /// The hub revoked a connection's access (`code`: 4401, 4403 or 4404): it is removed at once,
+    /// whatever the room is busy with (its parked messages and work not yet handed to the journal
+    /// are discarded; see [`Room::live_conn`]), the others hear `peer.left` once, and its locks are
+    /// released now rather than kept for the grace period: a revoked user must not go on blocking
+    /// others. (An ordinary disconnect keeps its locks for the grace period.)
+    fn revoke(&mut self, conn: ConnId, code: u16, reason: &str) {
+        let Some(c) = self.conns.get(&conn) else {
+            return;
+        };
+        c.outbox.close_now(code, reason);
+        let client = c.client.clone();
+        if self.by_client.get(&client) == Some(&conn) {
+            self.locks_at_revoke(&client);
+        }
+        self.remove_conn(conn, None, true);
+    }
+
     fn on_frame(&mut self, conn: ConnId, incoming: change::Incoming) {
-        if self.conns.get(&conn).is_some_and(|c| c.outbox.is_closed()) {
-            return; // (closed: see `dispatch`)
+        if self.live_conn(conn).is_none() {
+            return; // (see `live_conn`)
         }
         // Presence and drafts are not answered and wait for nothing: relayed now, whatever the
         // connection's other messages wait for.
@@ -1287,9 +1361,8 @@ impl Room {
 
     /// What every message a client sends leads to. Later tasks add their messages here.
     fn dispatch(&mut self, conn: ConnId, incoming: change::Incoming) {
-        if self.conns.get(&conn).is_some_and(|c| c.outbox.is_closed()) {
-            // Closed (its access ended, or it broke a limit): nothing more of it is processed. Its
-            // reader reports it gone, and the room then removes it.
+        if self.conns.contains_key(&conn) && self.live_conn(conn).is_none() {
+            // Closed (its access ended, or it broke a limit): nothing more of it is processed.
             return;
         }
         let (msg, size) = match incoming {

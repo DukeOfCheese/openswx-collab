@@ -124,7 +124,7 @@ impl Room {
             result,
         } = lookup;
         self.unpark(conn);
-        if self.closing.is_some() || !self.conns.contains_key(&conn) {
+        if self.closing.is_some() || self.live_conn(conn).is_none() {
             return;
         }
         let info = result.unwrap_or_else(|e| {

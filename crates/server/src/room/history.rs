@@ -82,7 +82,7 @@ impl Room {
     /// Resolves the `undo_of` of a client's change, then judges it (now, or when the journal
     /// answers).
     pub(super) fn resolve_undo(&mut self, conn: ConnId, change: Arc<Change>, size: usize) {
-        let Some(c) = self.conns.get(&conn) else {
+        let Some(c) = self.live_conn(conn) else {
             return;
         };
         let Some(of) = change.undo_of.clone() else {
@@ -155,7 +155,7 @@ impl Room {
             result,
         } = lookup;
         self.unpark(conn);
-        if self.closing.is_some() || !self.conns.contains_key(&conn) {
+        if self.closing.is_some() || self.live_conn(conn).is_none() {
             return;
         }
         let id = change.change_id.clone();
@@ -201,6 +201,9 @@ impl Room {
     /// resolved again, each before anything its connection sent after it.
     pub(super) fn checked(&mut self, ticket: super::change::Ticket) {
         for (conn, change, size) in self.undo_waiting.remove(&ticket).unwrap_or_default() {
+            if self.live_conn(conn).is_none() {
+                continue;
+            }
             if let Some(c) = self.conns.get_mut(&conn) {
                 c.busy = false;
                 self.park_first(conn, Incoming::Judge(change, size, None));
@@ -256,7 +259,7 @@ impl Room {
         if self.closing.is_some() {
             return;
         }
-        let Some(c) = self.conns.get(&conn) else {
+        let Some(c) = self.live_conn(conn) else {
             return;
         };
         let (client, user, name) = (c.client.clone(), c.user.clone(), c.name.clone());

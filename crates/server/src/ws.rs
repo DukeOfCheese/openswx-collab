@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use crate::access::project_role;
 use crate::error::ApiPath;
-use crate::hub::{OpenError, RegisterError};
+use crate::hub::{Connecting, OpenError, RegisterError};
 use crate::room::conn::{self, Outbox, error_frame};
 use crate::room::{JoinError, JoinRequest, close};
 use crate::security::{ProjectRole, token_hash};
@@ -167,14 +167,19 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     let mut session_expires = session.expires_at;
     let outbox = Outbox::new(4 * state.settings.max_change_bytes);
     let conn = conn::next_id();
-    let registration = match state.hub.register(
+    let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
+    let connecting = Connecting {
         conn,
-        &user_id,
-        &document_id,
-        &hash,
-        outbox.clone(),
-        state.settings.max_connections_per_user,
-    ) {
+        user: &user_id,
+        doc: &document_id,
+        client: &client,
+        token_hash: &hash,
+        outbox: outbox.clone(),
+    };
+    let registration = match state
+        .hub
+        .register(connecting, state.settings.max_connections_per_user)
+    {
         Ok(registration) => registration,
         Err(RegisterError::TooMany) => {
             crate::metrics::connection_refused();
@@ -252,7 +257,6 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         return refuse(socket, "busy", "try again", close::TOO_SLOW).await;
     };
 
-    let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
     let (sink, stream) = socket.split();
     tokio::spawn(conn::write(sink, outbox.clone()));
     let heard = conn::Heard::new(state.clock.clone());
@@ -319,14 +323,17 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
             }
         }
         request.room = room.id();
-        match room.join(request).await {
-            Ok(()) => {
+        // Bounded: a room that does not take the join (stuck) cannot hold the handshake forever.
+        // (If it takes the join later, the connection is closed by then and never registers.)
+        match tokio::time::timeout(state.room_hooks.join_wait, room.join(request)).await {
+            Ok(Ok(())) => {
+                registration.joined(&room);
                 joined = Some(room);
                 break;
             }
             // The room was ending at that moment: open it again.
-            Err(JoinError::Gone(back)) => request = *back,
-            Err(JoinError::Lost) => {
+            Ok(Err(JoinError::Gone(back))) => request = *back,
+            Ok(Err(JoinError::Lost)) | Err(_) => {
                 outbox.close(close::MOVED, "reconnect");
                 drop(registration);
                 return drain(stream).await;

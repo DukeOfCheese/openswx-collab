@@ -469,6 +469,12 @@ impl Room {
         self.announce_locks(detached, Vec::new());
     }
 
+    /// At a revocation: the client's locks are released now, and announced.
+    pub(super) fn locks_at_revoke(&mut self, client: &ClientId) {
+        let released = self.locks.release_client(client);
+        self.announce_locks(Vec::new(), released);
+    }
+
     /// Announces the changes [`Room::locks_at_join`] made.
     pub(super) fn announce_join_locks(&mut self, back: Vec<Lock>, released: Vec<Path>) {
         self.announce_locks(back, released);

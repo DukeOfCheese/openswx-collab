@@ -350,7 +350,7 @@ pub async fn read(
             Some(Ok(Message::Binary(frame))) => frame,
             Some(Ok(Message::Text(_))) => {
                 let message = "frames must be binary MessagePack".to_owned();
-                if malformed(&room, conn, &outbox, "bad_message", message).await {
+                if malformed(&room, conn, &outbox, &mut life, "bad_message", message).await {
                     continue;
                 }
                 break;
@@ -358,7 +358,7 @@ pub async fn read(
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
             Some(Err(_)) => {
                 // The WebSocket layer could not read a frame: malformed, or longer than the one
-                // byte over the limit it lets through (see [ead_limit]).
+                // byte over the limit it lets through (see [`read_limit`]).
                 outbox.close(close::PROTOCOL_ERROR, "unreadable frame");
                 break;
             }
@@ -386,19 +386,25 @@ pub async fn read(
             Err((WireError::Invalid(_), true)) => crate::metrics::presence_dropped(),
             Err((WireError::TooLarge, _)) => {
                 let message = "send large data as blobs".to_owned();
-                if !malformed(&room, conn, &outbox, "too_large", message).await {
+                if !malformed(&room, conn, &outbox, &mut life, "too_large", message).await {
                     break;
                 }
             }
             Err((WireError::Invalid(why), false)) => {
-                if !malformed(&room, conn, &outbox, "bad_message", why).await {
+                if !malformed(&room, conn, &outbox, &mut life, "bad_message", why).await {
                     break;
                 }
             }
             // A second hello is read and ignored.
             Ok(ClientMsg::Hello { .. }) => {}
             Ok(msg) => {
-                if room.frame(conn, msg, size).await.is_err() {
+                // Raced against the connection's life: a reader waiting on a full room queue
+                // still stops at once when the connection is closed (its access ended).
+                let handed = tokio::select! {
+                    handed = room.frame(conn, msg, size) => handed,
+                    _ = life.wait_for(|l| *l != Life::Open) => break,
+                };
+                if handed.is_err() {
                     outbox.close(close::MOVED, "reconnect");
                     break;
                 }
@@ -428,16 +434,22 @@ pub fn read_limit(max: usize) -> usize {
 }
 
 /// Hands an unreadable frame to the room, to be answered `error` in its turn (after the answers
-/// to the connection's earlier messages); alse if the room is gone.
+/// to the connection's earlier messages); `false` if the room is gone.
 async fn malformed(
     room: &RoomHandle,
     conn: ConnId,
     outbox: &Outbox,
+    life: &mut watch::Receiver<Life>,
     code: &'static str,
     message: String,
 ) -> bool {
     let message: String = message.chars().take(MAX_ERROR_MESSAGE).collect();
-    if room.malformed(conn, code, message).await.is_err() {
+    // (Raced against the connection's life, as a frame is.)
+    let handed = tokio::select! {
+        handed = room.malformed(conn, code, message) => handed,
+        _ = life.wait_for(|l| *l != Life::Open) => return false,
+    };
+    if handed.is_err() {
         outbox.close(close::MOVED, "reconnect");
         return false;
     }

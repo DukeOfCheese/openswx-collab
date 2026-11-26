@@ -728,7 +728,7 @@ impl Room {
             result,
         } = lookup;
         self.unpark(conn);
-        if self.closing.is_some() || !self.conns.contains_key(&conn) {
+        if self.closing.is_some() || self.live_conn(conn).is_none() {
             return;
         }
         match result {
@@ -838,7 +838,7 @@ impl Room {
         if change.undo_of.is_some() && reverts.is_none() {
             return self.resolve_undo(conn, change, size);
         }
-        let Some(c) = self.conns.get(&conn) else {
+        let Some(c) = self.live_conn(conn) else {
             return;
         };
         let item = Item {
@@ -990,7 +990,7 @@ impl Room {
         } = decided;
         if let Some(conn) = item.conn() {
             self.unpark(conn);
-            if !self.conns.contains_key(&conn) {
+            if self.live_conn(conn).is_none() {
                 return;
             }
         }
@@ -1084,7 +1084,7 @@ impl Room {
         } = check;
         if let Some(conn) = item.conn() {
             self.unpark(conn);
-            if !self.conns.contains_key(&conn) {
+            if self.live_conn(conn).is_none() {
                 return;
             }
         }
@@ -1136,6 +1136,14 @@ impl Room {
 
     /// Makes an accepted change tentative and hands its record to the journal.
     fn adopt(&mut self, mut item: Item, d: Decision) {
+        // The last gate before the journal: nothing is written for a connection whose access
+        // ended (see `Room::live_conn`).
+        if item
+            .conn()
+            .is_some_and(|conn| self.live_conn(conn).is_none())
+        {
+            return;
+        }
         let seq = d.accepted.seq;
         debug_assert_eq!(seq, self.tentative.seq + 1, "decided on the tentative head");
         let ticket = match item.ticket {
@@ -1578,6 +1586,14 @@ impl Room {
         }
         for p in rest {
             let mut item = p.item;
+            // A change of a connection whose access ended since is not written again (it was not
+            // durable: see `Room::live_conn`); its sender hears nothing more.
+            if item
+                .conn()
+                .is_some_and(|conn| self.live_conn(conn).is_none())
+            {
+                continue;
+            }
             // A duplicate refusal is the other record's fault (and should not happen at all: see
             // the module documentation); only systematic causes count toward the cap.
             if !duplicate {
@@ -1648,6 +1664,8 @@ impl Room {
             item.waiters
                 .extend(self.checking.remove(&ticket).unwrap_or_default());
         }
+        // (Its answer goes to the connections the room still works for.)
+        item.waiters.retain(|w| self.live_conn(*w).is_some());
         self.settle_duplicate(item, result);
         if let Some(ticket) = ticket {
             self.checked(ticket);
