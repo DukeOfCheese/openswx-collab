@@ -2,8 +2,11 @@
 //! batches, before anyone is told it was accepted.
 //!
 //! One background task per store collects [`Record`]s from all rooms. It takes the first record
-//! that arrives, keeps collecting until it has `max_batch` records or `max_wait` has passed since
-//! the first, and writes the batch in **one transaction**:
+//! that arrives and every record already queued behind it, up to `max_batch` (the server's writer
+//! waits for nothing more, [`MAX_WAIT`]: an idle writer writes a record at once, and under load a
+//! batch is what arrived while the previous one was being written; a writer started with a
+//! `max_wait` also keeps collecting until that has passed since the first), and writes the batch
+//! in **one transaction**:
 //!
 //! - first the rows of every document the batch will touch (the records' documents and the parts
 //!   their assembly changes chose) are locked, in ascending id order: the lock order of
@@ -64,7 +67,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -79,8 +82,11 @@ use crate::store::{AssemblyRefRow, NewChange, RoomLease, Store, Tx};
 
 /// The most records written in one transaction, unless [`JournalWriter::start`] is told otherwise.
 pub const MAX_BATCH: usize = 256;
-/// How long the writer waits for more records after the first of a batch.
-pub const MAX_WAIT: Duration = Duration::from_millis(2);
+/// How long the server's writer waits for more records after the first of a batch: not at all. A
+/// batch is the first record and whatever is queued behind it, which under load is what arrived
+/// while the previous batch was being written (group commit without a timer). Tests start writers
+/// with a wait, to make the records they submit together share a batch.
+pub const MAX_WAIT: Duration = Duration::ZERO;
 /// How many records may wait for the writer; [`JournalWriter::submit`] waits while it is full.
 pub const QUEUE: usize = 4096;
 /// A batch that has not committed by then is abandoned with every record `Unknown` (unless
@@ -163,6 +169,26 @@ pub struct JournalWriter {
     queue: mpsc::Sender<Msg>,
     alive: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    stats: Arc<Counts>,
+}
+
+/// What one writer has done, as [`JournalWriter::stats`] reports it.
+#[derive(Debug, Default)]
+struct Counts {
+    batches: AtomicU64,
+    records: AtomicU64,
+    timed_waits: AtomicU64,
+}
+
+/// What a writer has done since it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterStats {
+    /// Batches (transactions) written.
+    pub batches: u64,
+    /// Records in them.
+    pub records: u64,
+    /// Batches that waited on a timer for more records before they were written.
+    pub timed_waits: u64,
 }
 
 /// How the writer task batches.
@@ -227,11 +253,23 @@ impl JournalWriter {
             max_wait,
             timeout,
         };
-        tokio::spawn(run(store, rx, batching, guard));
+        let stats = Arc::new(Counts::default());
+        tokio::spawn(run(store, rx, batching, guard, stats.clone()));
         Self {
             queue,
             alive,
             closed: Arc::new(AtomicBool::new(false)),
+            stats,
+        }
+    }
+
+    /// What this writer has done since it started.
+    pub fn stats(&self) -> WriterStats {
+        let get = |a: &AtomicU64| a.load(Ordering::SeqCst);
+        WriterStats {
+            batches: get(&self.stats.batches),
+            records: get(&self.stats.records),
+            timed_waits: get(&self.stats.timed_waits),
         }
     }
 
@@ -350,7 +388,13 @@ fn int(n: u64) -> i64 {
 }
 
 /// The writer task.
-async fn run(store: Arc<dyn Store>, mut rx: mpsc::Receiver<Msg>, batching: Batching, alive: Alive) {
+async fn run(
+    store: Arc<dyn Store>,
+    mut rx: mpsc::Receiver<Msg>,
+    batching: Batching,
+    alive: Alive,
+    stats: Arc<Counts>,
+) {
     let mut closing = None;
     loop {
         let first = match rx.recv().await {
@@ -361,10 +405,29 @@ async fn run(store: Arc<dyn Store>, mut rx: mpsc::Receiver<Msg>, batching: Batch
             }
             None => break,
         };
-        let deadline = Instant::now() + batching.max_wait;
         let mut batch = vec![first];
         let mut stop = false;
+        // What else is queued (it arrived while the previous batch was being written) joins this
+        // one, without waiting: an idle writer writes the first record at once.
         while batch.len() < batching.max_batch {
+            match rx.try_recv() {
+                Ok(Msg::Record(p)) => batch.push(*p),
+                Ok(Msg::Close(done)) => {
+                    closing = Some(done);
+                    stop = true;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    stop = true;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+        // A test's writer may linger for more (zero for the server's: no timer at all; a timer
+        // fires on the next tick of the clock, 15.6 ms on Windows, however short it is).
+        let deadline = Instant::now() + batching.max_wait;
+        while !stop && !batching.max_wait.is_zero() && batch.len() < batching.max_batch {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(Msg::Record(p))) => batch.push(*p),
                 Ok(Some(Msg::Close(done))) => {
@@ -376,9 +439,16 @@ async fn run(store: Arc<dyn Store>, mut rx: mpsc::Receiver<Msg>, batching: Batch
                     stop = true;
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    stats.timed_waits.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
             }
         }
+        stats.batches.fetch_add(1, Ordering::SeqCst);
+        stats
+            .records
+            .fetch_add(batch.len() as u64, Ordering::SeqCst);
         write(store.as_ref(), batch, batching.timeout).await;
         if stop {
             break;

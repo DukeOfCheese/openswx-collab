@@ -172,6 +172,65 @@ async fn a_thousand_appends_from_fifty_tasks_land_in_order_in_few_transactions()
     }
 }
 
+/// The server's writer (`journal::MAX_WAIT`) writes a record that finds it idle at once: no batch
+/// waits on a timer for more records to come.
+#[tokio::test]
+async fn an_idle_writer_writes_a_record_at_once() {
+    let (server, flaky, world) = setup().await;
+    let a = new_doc(&server, &world, "A").await;
+    let ea = lease(&server, &a).await;
+    let writer = new_journal(&server.state.store);
+    let begins = flaky.begins();
+    for seq in 1..=5 {
+        assert_eq!(writer.append(simple(&a, seq, ea)).await, Ok(()));
+    }
+    assert_eq!(flaky.begins() - begins, 5, "one transaction per append");
+    let stats = writer.stats();
+    assert_eq!((stats.batches, stats.records), (5, 5));
+    assert_eq!(stats.timed_waits, 0, "no batch waited on a timer");
+    assert_eq!(head_seq(&server, &a).await, 5);
+}
+
+/// Under load, a batch is what arrived while the previous one was being written (up to
+/// `MAX_BATCH`), with no timer involved: 1 record finds the writer idle and is written alone; the
+/// 310 submitted while its commit is held go in as 256 and 54.
+#[tokio::test]
+async fn records_that_arrive_during_a_write_share_the_next_batches() {
+    let (server, flaky, world) = setup().await;
+    let (a, b) = (
+        new_doc(&server, &world, "A").await,
+        new_doc(&server, &world, "B").await,
+    );
+    let (ea, eb) = (lease(&server, &a).await, lease(&server, &b).await);
+    let writer = new_journal(&server.state.store);
+    flaky.commit_gate.shut();
+    let first = writer.submit(simple(&a, 1, ea)).await;
+    flaky.commit_gate.until_waiting(1).await;
+    let begins = flaky.begins();
+    let mut receipts = Vec::new();
+    for seq in 2..=301 {
+        receipts.push(writer.submit(simple(&a, seq, ea)).await);
+    }
+    for seq in 1..=10 {
+        receipts.push(writer.submit(simple(&b, seq, eb)).await);
+    }
+    flaky.commit_gate.open();
+    assert_eq!(first.outcome().await, Ok(()));
+    for r in receipts {
+        assert_eq!(r.outcome().await, Ok(()));
+    }
+    assert_eq!(
+        flaky.begins() - begins,
+        2,
+        "310 waiting records: one full batch and the rest"
+    );
+    let stats = writer.stats();
+    assert_eq!((stats.batches, stats.records), (3, 311));
+    assert_eq!(stats.timed_waits, 0);
+    assert_eq!(head_seq(&server, &a).await, 301);
+    assert_eq!(head_seq(&server, &b).await, 10);
+}
+
 #[tokio::test]
 async fn every_acquisition_bumps_the_epoch_and_the_old_epoch_is_refused() {
     let (server, _flaky, world) = setup().await;
