@@ -122,7 +122,7 @@ impl Room {
     }
 
     /// Writes a snapshot in the background once enough durable changes have built up since the last
-    /// one (a failed one is tried again after the next change).
+    /// one (a failed one is tried again after the next change, or at the next tick).
     pub(super) fn maybe_snapshot(&mut self) {
         let every = Seq::from(self.state.settings.snapshot_every.max(1));
         if self.snapshot_task.is_some()

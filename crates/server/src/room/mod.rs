@@ -272,8 +272,8 @@ pub enum RoomCmd {
     },
     /// A change the server makes itself.
     ServerChange(Box<ServerChange>),
-    /// A sweep, as the room's own timer makes every `sweep_interval` seconds: locks expire (TASK
-    /// 12: idle checks hang off it too).
+    /// A sweep, as the room's own timer makes every `sweep_interval` seconds: locks expire, and a
+    /// snapshot still owed (one that failed) is tried again (TASK 12: idle checks hang off it too).
     Tick,
     /// Stop: wait (briefly) for the journal's answers to changes in flight, close every connection
     /// with `code`, write a final snapshot if `snapshot` and there is anything new, then answer
@@ -686,7 +686,7 @@ impl Room {
             tokio::select! {
                 biased;
                 Some(event) = internal.recv() => self.on_internal(event),
-                _ = sweep.tick() => self.sweep(),
+                _ = sweep.tick() => self.on_tick(),
                 cmd = control.recv(), if control_open => match cmd {
                     Some(cmd) => self.on_command(cmd),
                     // Nobody can reach the room any more (the hub is gone).
@@ -716,6 +716,13 @@ impl Room {
         }
     }
 
+    /// The room's periodic work: locks expire, and a snapshot that failed (with no change since to
+    /// try it again) is tried again, so a room never sits on a snapshot it owes.
+    fn on_tick(&mut self) {
+        self.sweep();
+        self.maybe_snapshot();
+    }
+
     /// Whether the room takes the next frame now.
     fn takes_frames(&self) -> bool {
         self.closing.is_none() && self.paused == 0 && self.pending.len() < MAX_TENTATIVE
@@ -739,7 +746,7 @@ impl Room {
                 message,
             } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
             RoomCmd::ServerChange(sc) => self.on_server_change(*sc),
-            RoomCmd::Tick => self.sweep(),
+            RoomCmd::Tick => self.on_tick(),
             RoomCmd::Close {
                 code,
                 reason,

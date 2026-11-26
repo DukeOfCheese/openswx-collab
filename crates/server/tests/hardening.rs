@@ -768,6 +768,16 @@ async fn storage_trouble_never_drops_the_connection_or_half_applies() {
     assert_eq!(a.change_on(0, vec![set_depth(1)]).await.seq(), 1);
     // A snapshot was due and failed: the change still stands.
     assert_eq!(a.change_on(1, vec![set_depth(2)]).await.seq(), 2);
+    // (Wait until that attempt has really failed: one still on its way to storage when storage
+    // comes back would simply succeed, and the next snapshot would then be due at 4.)
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while blobs.put_failures() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the snapshot at 2 was not tried"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let heard: Vec<u64> = b
         .drain()
         .await
@@ -919,4 +929,37 @@ async fn presence_and_drafts_the_codec_refuses_are_dropped_and_the_connection_ke
         .unwrap();
     assert_eq!(ada.draft, Some(plain(json!({"x": 1}))));
     assert_eq!(ada.presence, Some(plain(json!({"pointer": [1, 2, 3]}))));
+}
+
+#[tokio::test]
+async fn a_failed_snapshot_is_tried_again_without_waiting_for_another_change() {
+    let (server, blobs) = TestServer::start_blobs(|s| {
+        s.snapshot_every = 2;
+        s.sweep_interval = 0.1;
+    })
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    blobs.fail_put(true);
+    assert_eq!(a.change_on(0, vec![set_depth(1)]).await.seq(), 1);
+    assert_eq!(a.change_on(1, vec![set_depth(2)]).await.seq(), 2);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while blobs.put_failures() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the snapshot at 2 was not tried"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Storage comes back, and nobody changes anything: the room still writes what it owes.
+    blobs.fail_put(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.room_status(&doc).await.snapshot_seq != 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the owed snapshot was never written"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
