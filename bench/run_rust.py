@@ -4,6 +4,7 @@
     .venv/Scripts/python bench/run_rust.py run --database sqlite   --out bench/results/rust-<version>-sqlite
     .venv/Scripts/python bench/run_rust.py run --database postgres --out bench/results/rust-<version>-postgres
     .venv/Scripts/python bench/run_rust.py table bench/results/rust-<version>-sqlite
+    .venv/Scripts/python bench/run_rust.py compare bench/results/python-0.1.2-sqlite         bench/results/rust-<version>-sqlite bench/results/rust-<version>-postgres
 
 Needs psutil, and for `--database postgres` pixeltable-pgserver (a throwaway PostgreSQL 16, as
 tools/test_postgres_rust.py uses; it is stopped and removed at the end).
@@ -16,7 +17,9 @@ starts, the highest of the once-a-second samples, and at the end), its CPU time,
 and the warnings and errors in the server's log. A run in which loadgen failed has no report; its entry
 says what happened.
 
-`table` prints the Markdown tables of bench/results/README.md from those files.
+`table` prints the Markdown tables of bench/results/README.md from those files; `compare` prints the
+baseline's single run next to the median run of each folder. The median run of a scenario is the middle one
+by service p99 (by the server's peak memory when nothing is timed, as in `idle`).
 """
 from __future__ import annotations
 
@@ -61,17 +64,14 @@ COMPARISON = [
     ("idle-2000", ["idle", "--connections", "2000"]),
 ]
 
-# Not in the baseline: sizes the design proposes as targets. Kept apart from the comparison.
+# Not in the baseline: the size the design proposes as a target (10,000 connections on 2,000 open
+# documents), and half of it. Kept apart from the comparison. The target names no edit rate: here each
+# connection edits once every 10 s, 1,000 edits a second in all (500 for the half).
 TARGETS = [
-    # 10,000 connections on 2,000 open documents; each connection edits once every 10 s (1,000 edits/s).
     ("target-manydocs-2000x5",
      ["many-docs", "--docs", "2000", "--editors-per-doc", "5", "--rate", "0.1"]),
-    # The same connections with nobody editing: do 10,000 sockets hold at all?
-    ("target-idle-10000", ["idle", "--connections", "10000"]),
-    # Steps below it, to see where it stops if it does.
     ("target-manydocs-1000x5",
      ["many-docs", "--docs", "1000", "--editors-per-doc", "5", "--rate", "0.1"]),
-    ("target-idle-5000", ["idle", "--connections", "5000"]),
 ]
 
 SETS = {"comparison": COMPARISON, "targets": TARGETS}
@@ -276,7 +276,7 @@ def cmd_run(a: argparse.Namespace) -> int:
                                  "synchronous_commit", "wal_sync_method", "listen_addresses")}
             print("PostgreSQL:", meta["postgres"], flush=True)
         for name, args in scenarios:
-            for n in range(1, a.runs + 1):
+            for n in range(a.first_run, a.first_run + a.runs):
                 print(f"{time.strftime('%H:%M:%S')} {name} run {n} ...", flush=True)
                 record = one_run(name, args, n, a.database, pg, a.out, a.duration,
                                  f"rust server {version.split()[-1]}")
@@ -391,13 +391,15 @@ def failed(record: dict, report: dict | None) -> str | None:
     return ", ".join(why) or None
 
 
-def row(name: str, record: dict, report: dict | None) -> str:
+def row(name: str, record: dict, report: dict | None, others_failed: str = "") -> str:
     if report is None:
         return f"| {name} (FAILED: {failed(record, report)}) | {connections(record)} " + "| - " * 10 + "|"
     kind = record["args"][0]
     title = label(name, report, record)
     if failed(record, report):
         title += " (FAILED)"
+    elif others_failed:
+        title += f" ({others_failed})"
     rejected = sum(report["rejected"].values())
     changes = "n/a" if kind == "open" else (
         f"{report['changes_sent']} / {report['accepted']} / {rejected} / {report['timeouts']} / "
@@ -420,45 +422,106 @@ HEADER = ("| Run | connections | changes (sent / accepted / rejected / timeouts 
 
 def cmd_table(a: argparse.Namespace) -> int:
     for directory in a.dirs:
-        meta, by_scenario = load(directory)
-        print(f"\n### {directory}: the median run of each scenario\n")
-        print(HEADER)
-        for name, pairs in by_scenario.items():
+        _, everything = load(directory)
+        # The target scenarios are tables of their own, never rows among the comparison's.
+        for what, wanted in (("comparison", False), ("targets", True)):
+            by_scenario = {name: pairs for name, pairs in everything.items()
+                           if name.startswith("target-") == wanted}
+            if by_scenario:
+                print_tables(f"{directory} ({what})", by_scenario)
+    return 0
+
+
+def print_tables(directory: str, by_scenario: dict[str, list[tuple[dict, dict | None]]]) -> None:
+    print(f"\n### {directory}: the median run of each scenario\n")
+    print(HEADER)
+    for name, pairs in by_scenario.items():
+        record, report = median_run(pairs)
+        bad = sum(1 for r, j in pairs if failed(r, j))
+        print(row(name, record, report, f"{bad} of {len(pairs)} runs FAILED" if bad else ""))
+    print(f"\n### {directory}: every run\n")
+    print("| Scenario | run | changes (sent / accepted / rejected / timeouts / errors / dropped) | "
+          "refused connections | service p50 / p99 / max | schedule p50 / p99 / max | "
+          "accepted per s | run s | first open | RSS MB | server CPU s | busiest second, % of a core "
+          "| machine CPU % before / mean / max | server log warnings / errors | median |")
+    print("|---" * 15 + "|")
+    for name, pairs in by_scenario.items():
+        chosen = median_run(pairs)[0]["run"]
+        for record, report in pairs:
+            log = record.get("server_log", {})
+            m = record.get("machine_cpu_percent", {})
+            machine = (f"{record.get('machine_cpu_percent_before', '?')} / {m.get('mean', '?')} / "
+                       f"{m.get('max', '?')}")
+            if report is None:
+                print(f"| {name} | {record['run']} | FAILED: {failed(record, report)} " + "| - " * 8
+                      + f"| - | {machine} | {log.get('warnings')} / {log.get('errors')} | |")
+                continue
+            kind = record["args"][0]
+            rejected = sum(report["rejected"].values())
+            changes = "n/a" if kind == "open" else (
+                f"{report['changes_sent']} / {report['accepted']} / {rejected} / "
+                f"{report['timeouts']} / {report['errors']} / {report['dropped_connections']}")
+            first = (f"{report['first_open_ms']:.1f}"
+                     if report.get("first_open_ms") is not None else "-")
+            why = failed(record, report)
+            print(f"| {name}{' (FAILED: ' + why + ')' if why else ''} | {record['run']} | {changes} | "
+                  f"{report['connect_failed']} | {lat(report['latency_ms'])} | "
+                  f"{lat(report['latency_from_schedule_ms'])} | "
+                  f"{'n/a' if kind == 'open' else format(report['accepted_per_s'], '.1f')} | "
+                  f"{report['duration_s']:.1f} | {first} | {mb(record)} | "
+                  f"{record.get('server_cpu_s', '?')} | {record.get('server_cpu_peak_percent', '?')} | "
+                  f"{machine} | {log.get('warnings')} / {log.get('errors')} | "
+                  f"{'x' if record['run'] == chosen else ''} |")
+
+
+def baseline_rss(directory: str, name: str) -> str:
+    """The peak working set the baseline's run script wrote down (UTF-16 text), in MB."""
+    try:
+        with open(os.path.join(directory, f"{name}.server-rss.txt"), encoding="utf-16") as f:
+            return f"{int(re.search(r'peak=(\d+)', f.read()).group(1)) / 1e6:.0f}"
+    except (OSError, AttributeError):
+        return "?"
+
+
+def cmd_compare(a: argparse.Namespace) -> int:
+    """The baseline's single run next to the median run of each Rust folder."""
+    loaded = [load(d) for d in a.dirs]
+    names = [os.path.basename(os.path.normpath(d)).rsplit("-", 1)[-1] for d in a.dirs]
+    head = ["Scenario", "Python accepted / rejected", "Python service p50 / p99 / max",
+            "Python accepted per s (run s)", "Python peak RSS MB"]
+    for n in names:
+        head += [f"Rust {n} accepted / rejected", f"Rust {n} service p50 / p99 / max",
+                 f"Rust {n} accepted per s (run s)", f"Rust {n} peak RSS MB"]
+    print("| " + " | ".join(head) + " |")
+    print("|---" * len(head) + "|")
+
+    def cells(report: dict, peak: str, note: str) -> list[str]:
+        if report["scenario"] == "open":
+            counts, per_s = "n/a", f"n/a ({report['duration_s']:.1f})"
+        else:
+            counts = f"{report['accepted']} / {sum(report['rejected'].values())}"
+            per_s = f"{report['accepted_per_s']:.1f} ({report['duration_s']:.0f})"
+        return [counts + note, lat(report["latency_ms"]), per_s, peak]
+
+    for name, _ in COMPARISON:
+        with open(os.path.join(a.baseline, f"{name}.json"), encoding="utf-8") as f:
+            base = json.load(f)
+        note = f" (FAILED: {base['dropped_connections']} dropped)" if base["dropped_connections"] else ""
+        line = [name, *cells(base, baseline_rss(a.baseline, name), note)]
+        for _, by_scenario in loaded:
+            pairs = by_scenario.get(name)
+            if not pairs:
+                line += ["not run"] * 4
+                continue
             record, report = median_run(pairs)
-            print(row(name, record, report))
-        print(f"\n### {directory}: every run\n")
-        print("| Scenario | run | changes (sent / accepted / rejected / timeouts / errors / dropped) | "
-              "refused connections | service p50 / p99 / max | schedule p50 / p99 / max | "
-              "accepted per s | run s | first open | RSS MB | server CPU s | busiest second, % of a core "
-              "| machine CPU % before / mean / max | server log warnings / errors | median |")
-        print("|---" * 15 + "|")
-        for name, pairs in by_scenario.items():
-            chosen = median_run(pairs)[0]["run"]
-            for record, report in pairs:
-                log = record.get("server_log", {})
-                m = record.get("machine_cpu_percent", {})
-                machine = (f"{record.get('machine_cpu_percent_before', '?')} / {m.get('mean', '?')} / "
-                           f"{m.get('max', '?')}")
-                if report is None:
-                    print(f"| {name} | {record['run']} | FAILED: {failed(record, report)} " + "| - " * 8
-                          + f"| - | {machine} | {log.get('warnings')} / {log.get('errors')} | |")
-                    continue
-                kind = record["args"][0]
-                rejected = sum(report["rejected"].values())
-                changes = "n/a" if kind == "open" else (
-                    f"{report['changes_sent']} / {report['accepted']} / {rejected} / "
-                    f"{report['timeouts']} / {report['errors']} / {report['dropped_connections']}")
-                first = (f"{report['first_open_ms']:.1f}"
-                         if report.get("first_open_ms") is not None else "-")
-                why = failed(record, report)
-                print(f"| {name}{' (FAILED: ' + why + ')' if why else ''} | {record['run']} | {changes} | "
-                      f"{report['connect_failed']} | {lat(report['latency_ms'])} | "
-                      f"{lat(report['latency_from_schedule_ms'])} | "
-                      f"{'n/a' if kind == 'open' else format(report['accepted_per_s'], '.1f')} | "
-                      f"{report['duration_s']:.1f} | {first} | {mb(record)} | "
-                      f"{record.get('server_cpu_s', '?')} | {record.get('server_cpu_peak_percent', '?')} | "
-                      f"{machine} | {log.get('warnings')} / {log.get('errors')} | "
-                      f"{'x' if record['run'] == chosen else ''} |")
+            bad = sum(1 for r, j in pairs if failed(r, j))
+            note = f" ({bad} of {len(pairs)} runs FAILED)" if bad else ""
+            if report is None:
+                line += [f"FAILED: {failed(record, report)}", "-", "-", "-"]
+            else:
+                peak = f"{record['server_rss_bytes']['peak'] / 1e6:.0f}"
+                line += cells(report, peak, note)
+        print("| " + " | ".join(line) + " |")
     return 0
 
 
@@ -471,12 +534,18 @@ def main() -> int:
     run.add_argument("--set", choices=sorted(SETS), default="comparison")
     run.add_argument("--only", help="scenario names, separated by commas")
     run.add_argument("--runs", type=int, default=3)
+    run.add_argument("--first-run", type=int, default=1,
+                     help="the number of the first run (to add runs to a folder without replacing any)")
     run.add_argument("--duration", default="60s")
     run.add_argument("--pause", type=float, default=5.0, help="seconds between runs")
     run.set_defaults(func=cmd_run)
     table = sub.add_parser("table", help="print the Markdown tables of a results folder")
     table.add_argument("dirs", nargs="+")
     table.set_defaults(func=cmd_table)
+    compare = sub.add_parser("compare", help="print the baseline next to the Rust folders' median runs")
+    compare.add_argument("baseline", help="bench/results/python-0.1.2-sqlite")
+    compare.add_argument("dirs", nargs="+")
+    compare.set_defaults(func=cmd_compare)
     a = parser.parse_args()
     return a.func(a)
 
