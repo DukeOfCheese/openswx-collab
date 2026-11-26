@@ -13,6 +13,9 @@
 //! [`with_body_limit`]; nothing outside the `standard` group gets the default, so every router merged
 //! into `large` must set one. A path may have its methods split between the groups (e.g. `GET` in
 //! `standard`, `POST` in `large`).
+//!
+//! **Time limits.** Every route but the blob upload is answered within `request_timeout`
+//! ([`crate::serve::within_time`]); extension routes too.
 
 pub mod assemblies;
 pub mod auth;
@@ -46,15 +49,19 @@ pub const DEFAULT_BODY_LIMIT: usize = 1 << 20;
 
 /// A body declared over its route's limit is still read (and thrown away) up to this size, so the
 /// client sees the 413; a bigger one is answered at once and the connection closed.
-const DRAIN_AT_MOST: u64 = 32 << 20;
+pub(crate) const DRAIN_AT_MOST: u64 = 32 << 20;
 /// How long reading such a body may take.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The app's routes over `state`.
 pub(crate) fn router(state: AppState) -> Router {
     // Routes whose bodies are at most DEFAULT_BODY_LIMIT. Merge new routers here.
     let standard = Router::new()
         .merge(meta::router())
+        .route(
+            crate::metrics::PATH,
+            axum::routing::get(crate::metrics::metrics),
+        )
         .merge(auth::router())
         .merge(oauth::router())
         .merge(orgs::router())
@@ -67,24 +74,25 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(assemblies::router())
         .merge(crate::ws::router());
 
-    // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document
-    // creation).
-    let large: Router<AppState> = Router::new()
-        .merge(with_body_limit(
-            blobs::upload_router(),
-            state.settings.max_blob_bytes,
-        ))
-        .merge(with_body_limit(
-            documents::create_router(),
-            documents::MAX_DOCUMENT_BODY,
-        ));
+    // Routes with their own body limit, each wrapped in `with_body_limit`: document creation
+    // (merged below, beside the standard ones) and the blob upload, which alone has no time limit.
+    let large: Router<AppState> =
+        with_body_limit(blobs::upload_router(), state.settings.max_blob_bytes);
 
     let extensions = with_body_limit(state.ext.routes(state.clone()), DEFAULT_BODY_LIMIT);
 
+    // Everything but the blob upload must be answered within `request_timeout`; an upload takes
+    // as long as its bytes keep coming (see `crate::serve`).
+    let in_time = || middleware::from_fn_with_state(state.clone(), crate::serve::within_time);
     with_body_limit(standard, DEFAULT_BODY_LIMIT)
+        .merge(with_body_limit(
+            documents::create_router(),
+            documents::MAX_DOCUMENT_BODY,
+        ))
+        .layer(in_time())
         .merge(large)
-        .with_state(state)
-        .merge(extensions)
+        .with_state(state.clone())
+        .merge(extensions.layer(in_time()))
         .fallback(not_found)
         // After every merge: it applies to the routes registered so far.
         .method_not_allowed_fallback(method_not_allowed)
@@ -128,8 +136,9 @@ async fn json_errors(req: Request, next: Next) -> Response {
 }
 
 /// What a handler that panicked answers: 500 `server error`. The log gets only the kind of payload:
-/// a panic message can embed request or document content. (Rust's panic hook still prints the
-/// message and location to stderr; nothing here sends them anywhere else.)
+/// a panic message can embed request or document content. (Where the panic was is logged by the
+/// program's panic hook, which withholds the message too; Rust's own hook, in a process that has
+/// not replaced it, prints both to stderr.)
 fn panicked(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
     let kind = if panic.is::<&str>() || panic.is::<String>() {
         "message"

@@ -8,7 +8,9 @@
 //!   (nothing is stored). Over `max_blob_bytes` is 413: before reading anything when
 //!   `Content-Length` says so, and as soon as the streamed size passes it otherwise. 204 when stored.
 //!   A blob that is already stored is not written again: the body is still read and checked, and the
-//!   answer is the same 204. A path that is not a SHA-256 is 400.
+//!   answer is the same 204. A path that is not a SHA-256 is 400. The server takes only so many
+//!   uploads at once, and so many from one account ([`crate::uploads`]): one more is refused
+//!   before any of it is stored, with 429 (the account's own limit) or 503 (the server's).
 //! - `GET /api/projects/{project}/blobs/{sha256}` (viewer): the raw bytes, streamed, as
 //!   `application/octet-stream` with their `Content-Length`, `Cache-Control: private,
 //!   max-age=31536000, immutable` and `ETag: "<sha256>"`. `If-None-Match` with that tag answers 304.
@@ -42,6 +44,7 @@ use crate::blobs::{
     ByteStream, PutError, blob_key, drop_when_stalled, fail_when_stalled, is_sha256,
 };
 use crate::error::{ApiError, ApiJson, ApiPath};
+use crate::routes::{DRAIN_AT_MOST, DRAIN_TIMEOUT};
 use crate::security::ProjectRole;
 use crate::state::AppState;
 
@@ -126,6 +129,7 @@ async fn upload(
     State(state): State<AppState>,
     user: CurrentUser,
     ApiPath((project_id, sha)): ApiPath<(String, String)>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let (project, _) = require_project(
@@ -140,6 +144,14 @@ async fn upload(
             "the blob name must be its sha256 in lower-case hex".into(),
         ));
     }
+    // Held until this request ends, however it ends.
+    let _place = match state.uploads.place(&user.id) {
+        Ok(place) => place,
+        Err(refusal) => {
+            unread(&headers, body).await;
+            return Err(refusal);
+        }
+    };
     let limit = state.settings.max_blob_bytes as u64;
     let key = blob_key(&project.org_id, &sha);
     let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);
@@ -156,6 +168,21 @@ async fn upload(
         .await
         .map_err(upload_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Before an upload is refused unread: a body of modest declared size is read and thrown away
+/// (for a few seconds at most), so that a client still sending it reads the refusal rather than a
+/// connection reset, as a body over the size limit is treated.
+async fn unread(headers: &HeaderMap, body: Body) {
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n <= DRAIN_AT_MOST) {
+        let mut chunks = body.into_data_stream();
+        let reading = async { while let Some(Ok(_)) = chunks.next().await {} };
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, reading).await;
+    }
 }
 
 /// Reads `body` to its end, holding one chunk at a time, refusing it past `limit` bytes.

@@ -111,6 +111,15 @@ impl OrgQueue {
         self.orgs().len()
     }
 
+    /// How many requests wait for a turn, over every organisation (not counting those that have
+    /// one).
+    pub fn waiters(&self) -> usize {
+        self.orgs()
+            .values()
+            .map(|(_, users)| users.saturating_sub(1))
+            .sum()
+    }
+
     /// How many requests wait for the turn of `org` (not counting the one that has it).
     pub fn waiting(&self, org: &str) -> usize {
         self.orgs()
@@ -128,6 +137,7 @@ impl OrgQueue {
                 .or_insert_with(|| (Arc::new(Semaphore::new(1)), 0));
             // (One has the turn; the rest wait.)
             if *users > self.inner.waiters {
+                crate::metrics::org_queue_refused();
                 return Err(ApiError::Unavailable(BUSY));
             }
             *users += 1;
@@ -143,7 +153,10 @@ impl OrgQueue {
                 _place: place,
             }),
             // (The semaphore is never closed; a wait that ran out gives its place up.)
-            _ => Err(ApiError::Unavailable(BUSY)),
+            _ => {
+                crate::metrics::org_queue_refused();
+                Err(ApiError::Unavailable(BUSY))
+            }
         }
     }
 }

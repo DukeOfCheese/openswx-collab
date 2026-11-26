@@ -20,12 +20,16 @@ chrono.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 lettre.workspace = true
 object_store.workspace = true
 oswx-core = { path = "../core" }
 rand.workspace = true
 reqwest.workspace = true
 rmpv.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 scrypt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,16 +40,19 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "fs", "io-util"] }
 tokio-util = { workspace = true, features = ["compat"] }
 tower-http.workspace = true
+tower-service.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 s3s.workspace = true
 s3s-fs.workspace = true
 tempfile.workspace = true
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 zip.workspace = true

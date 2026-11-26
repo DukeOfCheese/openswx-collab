@@ -270,6 +270,57 @@ impl SchemaStatus {
     }
 }
 
+/// Which of an extension's migrations ([`crate::ext::Extensions::migrations`]) a database has
+/// had. They are applied in the extension's order, after the server's own, and recorded in
+/// `extension_migrations` under their place in that order, counted from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExtensionSchema {
+    /// How many the database has had.
+    pub applied: usize,
+    /// How many this binary's extension carries.
+    pub known: usize,
+}
+
+impl ExtensionSchema {
+    /// How many this binary carries that the database has not had.
+    pub fn pending(&self) -> usize {
+        self.known.saturating_sub(self.applied)
+    }
+
+    /// How many the database has had that this binary does not carry.
+    pub fn unknown(&self) -> usize {
+        self.applied.saturating_sub(self.known)
+    }
+
+    /// The SHA-256 of a migration's text, as it is recorded.
+    pub fn checksum(migration: &str) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(migration.as_bytes()))
+    }
+
+    /// The status of a database whose record holds `applied` (version and checksum, by
+    /// version), for an extension that carries `migrations`. An error when the record is not
+    /// the versions 1, 2, … without a gap, or when a migration the database has had is not the
+    /// one the extension carries in that place ([`SchemaError::ExtensionChanged`]).
+    pub fn compare(applied: &[(i64, String)], migrations: &[&str]) -> Result<Self, SchemaError> {
+        for (place, (version, checksum)) in applied.iter().enumerate() {
+            if usize::try_from(*version).ok() != Some(place + 1) {
+                return Err(SchemaError::ExtensionRecord);
+            }
+            if migrations
+                .get(place)
+                .is_some_and(|m| Self::checksum(m) != *checksum)
+            {
+                return Err(SchemaError::ExtensionChanged { version: *version });
+            }
+        }
+        Ok(Self {
+            applied: applied.len(),
+            known: migrations.len(),
+        })
+    }
+}
+
 /// Why a database cannot be used as it is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SchemaError {
@@ -298,6 +349,30 @@ pub enum SchemaError {
          database of the Python server must be imported, not opened"
     )]
     Foreign,
+    /// The extension has migrations the database has not had and upgrading on start is turned
+    /// off.
+    #[error(
+        "the database has had {applied} of this server's {known} extension migrations; run \
+         `openswx-collab-server migrate` (or set OSWX_COLLAB_AUTO_MIGRATE=1) to apply the rest"
+    )]
+    ExtensionOutdated { applied: usize, known: usize },
+    /// The database has had more extension migrations than this binary's extension carries.
+    #[error(
+        "the database was written by a newer version of the server's extension (it has had \
+         {applied} extension migrations, this server knows {known}); run that version or a later \
+         one"
+    )]
+    ExtensionNewer { applied: usize, known: usize },
+    /// An extension migration the database has had is not the one this binary carries in that
+    /// place.
+    #[error(
+        "extension migration {version} has changed since it was applied to this database; \
+         released migrations must never be edited (add a new one instead)"
+    )]
+    ExtensionChanged { version: i64 },
+    /// The record of the extension's migrations is not the versions 1, 2, … in order.
+    #[error("the database's record of extension migrations is damaged (not 1, 2, ... in order)")]
+    ExtensionRecord,
 }
 
 /// An account (`users`).
@@ -1050,6 +1125,9 @@ pub trait Tx: Send {
     async fn set_user_email_verified(&mut self, id: &str, verified: bool) -> anyhow::Result<()>;
 
     async fn set_user_disabled(&mut self, id: &str, disabled: bool) -> anyhow::Result<()>;
+
+    /// Makes an account a server admin, or an ordinary one.
+    async fn set_user_admin(&mut self, id: &str, admin: bool) -> anyhow::Result<()>;
 
     async fn insert_session(&mut self, session: &Session) -> anyhow::Result<()>;
 

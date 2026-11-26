@@ -299,6 +299,7 @@ impl Purger {
             }
             Err(e) if e.is::<Stopped>() => Err(Stopped),
             Err(e) => {
+                crate::metrics::purge_failed();
                 let failures = failed_before.map_or(0, |w| w.failures) + 1;
                 let wait = self
                     .inner
@@ -357,6 +358,7 @@ impl Purger {
                     tx.commit().await?;
                     anyhow::ensure!(gone || held_up, "it still has projects");
                     if gone {
+                        crate::metrics::purge_removed();
                         tracing::info!(org = %org, "a deleted organisation was removed");
                     }
                     Ok(())
@@ -377,6 +379,7 @@ impl Purger {
         match page {
             Ok(page) => Some(page),
             Err(e) => {
+                crate::metrics::purge_failed();
                 tracing::warn!("what was deleted could not be listed: {e:#}");
                 // (So that the task looks again: as a thing that failed.)
                 let _ = self
@@ -441,6 +444,7 @@ impl Purger {
             let gone = tx.purge_project(project).await?;
             tx.commit().await?;
             anyhow::ensure!(gone, "it still has documents");
+            crate::metrics::purge_removed();
             tracing::info!(project = %project, "a deleted project was removed");
             Ok(())
         })
@@ -480,6 +484,7 @@ impl Purger {
             gone,
             "its row was not removed (its project is not marked deleted)"
         );
+        crate::metrics::purge_removed();
         Ok(())
     }
 }

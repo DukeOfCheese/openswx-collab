@@ -20,9 +20,16 @@ macro_rules! store_impl {
             /// an older one is upgraded only when `auto_migrate` is true, and is otherwise an error
             /// telling the operator to run `migrate`; a newer one, or one this server did not
             /// write, is always an error ([`SchemaError`]).
-            async fn bring_up_to_date(&self, auto_migrate: bool) -> Result<()> {
+            ///
+            /// Then the same for the `extension` migrations
+            /// ([`crate::ext::Extensions::migrations`]), which come after the server's own: all
+            /// of them are applied to a database that was empty; the ones an older database has
+            /// not had, only when `auto_migrate` is true
+            /// ([`SchemaError::ExtensionOutdated`] otherwise).
+            async fn bring_up_to_date(&self, auto_migrate: bool, extension: &[&str]) -> Result<()> {
                 self.check_unchanged().await?;
                 let status = self.schema_status().await?;
+                let was_empty = status.current.is_none();
                 let upgrade = status.current.is_some()
                     && status.unknown.is_empty()
                     && !status.pending.is_empty();
@@ -36,7 +43,46 @@ macro_rules! store_impl {
                     // Builds an empty database; refuses a newer or foreign one.
                     self.migrate().await?;
                 }
+                let ours = self.extension_schema(extension).await?;
+                if ours.pending() > 0 && !(auto_migrate || was_empty) {
+                    bail!(SchemaError::ExtensionOutdated {
+                        applied: ours.applied,
+                        known: ours.known,
+                    });
+                }
+                self.migrate_extension(extension).await?;
                 Ok(())
+            }
+
+            /// Which of the `extension` migrations the database has had (its own schema must
+            /// be in place). Refuses a database whose applied ones differ from these
+            /// ([`SchemaError::ExtensionChanged`]), or that has had more of them than a
+            /// non-empty `extension` carries ([`SchemaError::ExtensionNewer`]). A binary with
+            /// no extension (the open-source server) takes a database that has had some: their
+            /// tables are none of its business.
+            pub async fn extension_schema(&self, extension: &[&str]) -> Result<ExtensionSchema> {
+                let applied = q::extension_migrations(&mut *self.reader().await?).await?;
+                let schema = ExtensionSchema::compare(&applied, extension)?;
+                if schema.unknown() > 0 && !extension.is_empty() {
+                    bail!(SchemaError::ExtensionNewer {
+                        applied: schema.applied,
+                        known: schema.known,
+                    });
+                }
+                Ok(schema)
+            }
+
+            /// Applies the `extension` migrations the database has not had, in order and in one
+            /// transaction (all of them or none), after [`Self::migrate`] has put the server's
+            /// own schema in place; answers the status afterwards.
+            pub async fn migrate_extension(&self, extension: &[&str]) -> Result<ExtensionSchema> {
+                if self.extension_schema(extension).await?.pending() > 0 {
+                    self.refuse_nested()?;
+                    self.run_extension_migrations(extension)
+                        .await
+                        .context("applying the extension's migrations")?;
+                }
+                self.extension_schema(extension).await
             }
 
             /// Applies the migrations this binary carries that the database has not had, and
@@ -509,6 +555,10 @@ macro_rules! store_impl {
 
             async fn set_user_disabled(&mut self, id: &str, disabled: bool) -> Result<()> {
                 q::set_user_disabled(self.conn(), id, disabled).await
+            }
+
+            async fn set_user_admin(&mut self, id: &str, admin: bool) -> Result<()> {
+                q::set_user_admin(self.conn(), id, admin).await
             }
 
             async fn insert_session(&mut self, session: &Session) -> Result<()> {
@@ -1088,6 +1138,51 @@ macro_rules! store_impl {
                     .bind(disabled)
                     .execute(c)
                     .await?;
+                Ok(())
+            }
+
+            pub async fn set_user_admin(c: &mut $Conn, id: &str, admin: bool) -> Result<()> {
+                sqlx::query(sql::SET_USER_ADMIN)
+                    .bind(id)
+                    .bind(admin)
+                    .execute(c)
+                    .await?;
+                Ok(())
+            }
+
+            /// The extension migrations the database has had: version and checksum, by version.
+            pub async fn extension_migrations(c: &mut $Conn) -> Result<Vec<(i64, String)>> {
+                Ok(sqlx::query_as(sql::EXTENSION_MIGRATIONS)
+                    .fetch_all(c)
+                    .await?)
+            }
+
+            /// Inside a transaction that nobody else can be running beside: applies the
+            /// `extension` migrations the database has not had (read again here: another
+            /// server may have applied them meanwhile) and records each.
+            pub async fn apply_extension_migrations(
+                c: &mut $Conn,
+                extension: &[&str],
+            ) -> Result<()> {
+                let applied = extension_migrations(&mut *c).await?;
+                let had = ExtensionSchema::compare(&applied, extension)?.applied;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64());
+                for (place, migration) in extension.iter().enumerate().skip(had) {
+                    let version = i64::try_from(place + 1)?;
+                    // (Its text is never put in the error: only which one it was.)
+                    sqlx::raw_sql(migration)
+                        .execute(&mut *c)
+                        .await
+                        .with_context(|| format!("extension migration {version} failed"))?;
+                    sqlx::query(sql::INSERT_EXTENSION_MIGRATION)
+                        .bind(version)
+                        .bind(ExtensionSchema::checksum(migration))
+                        .bind(now)
+                        .execute(&mut *c)
+                        .await?;
+                }
                 Ok(())
             }
 

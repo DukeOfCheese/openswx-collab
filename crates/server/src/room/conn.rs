@@ -293,6 +293,7 @@ pub async fn write(mut sink: SplitSink<WebSocket, Message>, outbox: Arc<Outbox>)
     loop {
         match outbox.next().await {
             Next::Frame(frame) => {
+                crate::metrics::frame_out(frame.len());
                 // A close that drops the queue also abandons a frame stuck on a socket nobody reads.
                 let sent = tokio::select! {
                     sent = sink.send(Message::Binary(frame)) => sent.is_ok(),
@@ -357,7 +358,10 @@ pub async fn read(
             heard.touch();
         }
         let frame = match next {
-            Some(Ok(Message::Binary(frame))) => frame,
+            Some(Ok(Message::Binary(frame))) => {
+                crate::metrics::frame_in(frame.len());
+                frame
+            }
             Some(Ok(Message::Text(_))) => {
                 let message = "frames must be binary MessagePack".to_owned();
                 if malformed(&room, conn, &outbox, &mut life, "bad_message", message).await {

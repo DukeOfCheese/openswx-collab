@@ -5,6 +5,13 @@
 //! As in the Python server, a handler awaits the send and then answers the same whatever happened: a
 //! failure is logged for the operator, never shown to the person (someone asking for a reset link is
 //! told the same thing whether or not one was sent).
+//!
+//! **Whose certificates are trusted.** The mail server's certificate must lead to one of Mozilla's
+//! roots (built into the binary, so a container without a certificate bundle can still reach a
+//! public mail service) or to a root in the machine's own trust store (so a self-hosted relay with
+//! a certificate from a private authority works once that authority is installed there; on Linux
+//! `SSL_CERT_FILE` and `SSL_CERT_DIR` say where the store is). The certificate must be for the
+//! name in `OSWX_COLLAB_SMTP_HOST`. There is no setting that turns the check off.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -14,6 +21,7 @@ use async_trait::async_trait;
 use lettre::message::header::ContentType;
 use lettre::message::{Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Certificate, CertificateStore, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::config::{Settings, SmtpSecurity};
@@ -83,6 +91,43 @@ pub fn reset_text(url: &str, minutes: u32) -> (String, String) {
     )
 }
 
+/// How a mail server called `host` is verified: its certificate must be for that name and lead
+/// to one of Mozilla's roots or to a root of the machine's trust store (see the module
+/// documentation).
+fn tls_parameters(host: &str) -> anyhow::Result<TlsParameters> {
+    let mut parameters =
+        TlsParameters::builder(host.to_owned()).certificate_store(CertificateStore::WebpkiRoots);
+    for root in machine_roots() {
+        parameters = parameters.add_root_certificate(Certificate::from_der(root)?);
+    }
+    parameters
+        .build_rustls()
+        .context("the TLS settings for the mail server could not be made")
+}
+
+/// The roots of the machine's trust store that can be used, in DER. One that cannot be read is
+/// left out (a store often holds a few), and a store that cannot be read at all gives none:
+/// Mozilla's roots are still there, so neither stops the server.
+fn machine_roots() -> Vec<Vec<u8>> {
+    let found = rustls_native_certs::load_native_certs();
+    let mut usable = rustls::RootCertStore::empty();
+    let roots: Vec<Vec<u8>> = found
+        .certs
+        .into_iter()
+        .filter(|root| usable.add(root.clone()).is_ok())
+        .map(|root| root.to_vec())
+        .collect();
+    if !found.errors.is_empty() {
+        tracing::warn!(
+            "part of the machine's trust store could not be read ({} errors); {} of its roots \
+             are trusted for the mail server",
+            found.errors.len(),
+            roots.len()
+        );
+    }
+    roots
+}
+
 /// How long a connection to the mail server may take, per step (the Python server's 20 s).
 const SMTP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -111,14 +156,12 @@ impl SmtpMailer {
     pub fn new(settings: &Settings) -> anyhow::Result<Self> {
         let transport = if settings.email_configured() {
             let host = settings.smtp_host.as_str();
+            // (`builder_dangerous` only means "no TLS unless one is set", which is done here.)
+            let builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host);
             let builder = match settings.smtp_security {
-                SmtpSecurity::Ssl => AsyncSmtpTransport::<Tokio1Executor>::relay(host)?,
-                SmtpSecurity::StartTls => {
-                    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?
-                }
-                SmtpSecurity::Plain => {
-                    AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
-                }
+                SmtpSecurity::Ssl => builder.tls(Tls::Wrapper(tls_parameters(host)?)),
+                SmtpSecurity::StartTls => builder.tls(Tls::Required(tls_parameters(host)?)),
+                SmtpSecurity::Plain => builder,
             };
             let mut builder = builder.port(settings.smtp_port).timeout(Some(SMTP_TIMEOUT));
             if !settings.smtp_user.is_empty() {

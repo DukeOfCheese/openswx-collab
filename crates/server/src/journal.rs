@@ -431,6 +431,7 @@ async fn write_batch(
         Err(e) if of_doc.len() > 1 && crate::store::is_conflict(&e) => e,
         outcome => return outcome,
     };
+    crate::metrics::journal_fallback();
     tracing::warn!(
         "a journal batch of {} documents waited too long for a lock; writing them one at a time: \
          {blocked:#}",
@@ -446,10 +447,13 @@ async fn write_batch(
                     results[i].clone_from(&written[i]);
                 }
             }
-            Err(e) => tracing::error!(
-                "the {} journal records of document {doc} could not be written: {e:#}",
-                indices.len()
-            ),
+            Err(e) => {
+                crate::metrics::journal_fallback_document_failed();
+                tracing::error!(
+                    "the {} journal records of document {doc} could not be written: {e:#}",
+                    indices.len()
+                );
+            }
         }
     }
     Ok(results)

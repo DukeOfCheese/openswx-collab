@@ -1040,6 +1040,7 @@ async fn the_schema_is_exactly_as_expected() {
         "assembly_refs",
         "changes",
         "documents",
+        "extension_migrations",
         "folders",
         "invites",
         "login_codes",
@@ -1092,6 +1093,9 @@ documents.created_by VARCHAR(32) NN
 documents.created_at DOUBLE PRECISION NN
 documents.updated_at DOUBLE PRECISION NN
 documents.deleted_at DOUBLE PRECISION
+extension_migrations.version BIGINT NN pk1
+extension_migrations.checksum VARCHAR(64) NN
+extension_migrations.applied_at DOUBLE PRECISION NN
 folders.id VARCHAR(32) NN pk1
 folders.project_id VARCHAR(32) NN
 folders.parent_id VARCHAR(32)
@@ -1186,6 +1190,7 @@ versions.created_at DOUBLE PRECISION NN";
         "documents (folder_id) ix_documents_folder_id",
         "documents (project_id) ix_documents_project_id",
         "documents unique (id) pk",
+        "extension_migrations unique (version) pk",
         "folders (parent_id) ix_folders_parent_id",
         "folders (project_id) ix_folders_project_id",
         "folders unique (id) pk",

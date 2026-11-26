@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -13,6 +14,9 @@ const MIB: usize = 1 << 20;
 
 /// The region an S3 client names when none is set.
 pub const DEFAULT_S3_REGION: &str = "us-east-1";
+
+/// How long a metrics token may be, in characters.
+const METRICS_TOKEN_LEN: std::ops::RangeInclusive<usize> = 16..=256;
 
 /// The longest interval a setting in seconds may be: a year.
 const MAX_SECONDS: f64 = 365.0 * 86400.0;
@@ -67,6 +71,81 @@ pub enum Storage {
     S3 { bucket: String, prefix: String },
 }
 
+/// A range of addresses, written as one address (`10.0.0.7`, `::1`) or in CIDR form
+/// (`172.16.0.0/12`, `fd00::/8`): an entry of `OSWX_COLLAB_TRUSTED_PROXIES`.
+///
+/// An IPv4 address written as IPv6 (`::ffff:10.0.0.7`) is the IPv4 address, in a range and in an
+/// address asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpNet {
+    /// An address of the range.
+    addr: IpAddr,
+    /// How many leading bits an address shares with `addr` to be in the range.
+    prefix: u8,
+}
+
+impl IpNet {
+    /// The range of one address.
+    pub fn one(addr: IpAddr) -> Self {
+        let addr = addr.to_canonical();
+        let prefix = if addr.is_ipv4() { 32 } else { 128 };
+        Self { addr, prefix }
+    }
+
+    /// Whether `ip` is in the range.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                leading(u128::from(net.to_bits()), self.prefix, 32)
+                    == leading(u128::from(ip.to_bits()), self.prefix, 32)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                leading(net.to_bits(), self.prefix, 128) == leading(ip.to_bits(), self.prefix, 128)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The first `prefix` bits of an address of `width` bits.
+fn leading(bits: u128, prefix: u8, width: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        bits >> (width - prefix.min(width))
+    }
+}
+
+/// (The error says nothing: [`Settings::from_env`] names the variable.)
+impl FromStr for IpNet {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let (addr, prefix) = match s.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (s, None),
+        };
+        let addr: IpAddr = addr.parse().map_err(|_| ())?;
+        let width: u8 = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            // (Digits only: `parse` alone would take `+8`.)
+            Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                p.parse::<u8>().ok().filter(|p| *p <= width).ok_or(())?
+            }
+            Some(_) => return Err(()),
+            None => width,
+        };
+        // `::ffff:a.b.c.d/n` is the IPv4 range `a.b.c.d/(n - 96)`.
+        match (addr, addr.to_canonical()) {
+            (IpAddr::V6(_), v4 @ IpAddr::V4(_)) if prefix >= 96 => Ok(Self {
+                addr: v4,
+                prefix: prefix - 96,
+            }),
+            _ => Ok(Self { addr, prefix }),
+        }
+    }
+}
+
 /// The server's settings. `Default` gives the Python server's defaults.
 #[derive(Clone, PartialEq)]
 pub struct Settings {
@@ -100,6 +179,29 @@ pub struct Settings {
     pub s3_path_style: Option<bool>,
     /// Seconds: a blob upload or download in which no bytes move for this long is given up on.
     pub blob_idle_timeout: f64,
+    /// The most blob uploads the server takes at once; one more is answered 503. (An upload to S3
+    /// holds up to about 40 MiB in memory.)
+    pub max_blob_uploads: usize,
+    /// The most blob uploads one account may have running at once; one more is answered 429.
+    pub max_blob_uploads_per_user: usize,
+    /// Seconds a request may take until its answer begins (its headers and body read, its handler
+    /// run); a longer one is answered 503. Blob uploads are not under it (they are given up on
+    /// when no bytes move, `blob_idle_timeout`), and neither is the sending of an answer (a
+    /// download, an export) nor an open document connection.
+    pub request_timeout: f64,
+    /// Seconds: a connection whose client takes nothing of what the server is sending it for this
+    /// long is closed (a stalled download or export, a document connection that stopped reading).
+    pub write_timeout: f64,
+    /// Seconds an orderly stop (Ctrl-C, SIGTERM) may take before the process ends anyway. Below
+    /// the ten seconds `docker stop` waits before it kills.
+    pub shutdown_timeout: f64,
+    /// The proxies whose `X-Forwarded-For` is believed, as addresses and CIDR ranges
+    /// (`OSWX_COLLAB_TRUSTED_PROXIES`, separated by commas or spaces). The sign-in limits are kept
+    /// per client address: behind a proxy that is not listed here, every client shares one.
+    pub trusted_proxies: Vec<IpNet>,
+    /// `GET /metrics` answers only requests that carry this as a bearer token; empty (the
+    /// default): there is no `/metrics` (404).
+    pub metrics_token: String,
     /// How clients and browsers reach this server (OAuth callbacks, invite and reset links).
     pub public_url: String,
     /// False: the first account is the server admin and everyone else needs an invite.
@@ -161,6 +263,14 @@ impl Default for Settings {
             s3_session_token: String::new(),
             s3_path_style: None,
             blob_idle_timeout: 60.0,
+            max_blob_uploads: 16,
+            max_blob_uploads_per_user: 4,
+            request_timeout: 60.0,
+            write_timeout: 60.0,
+            shutdown_timeout: 8.0,
+            // (What uvicorn believes by default, and so what the Python server did.)
+            trusted_proxies: vec![IpNet::one(IpAddr::from([127, 0, 0, 1]))],
+            metrics_token: String::new(),
             public_url: "http://localhost:8787".into(),
             open_registration: false,
             session_days: 30,
@@ -229,6 +339,41 @@ impl Settings {
             s.s3_path_style = Some(path_style);
         }
         e.positive_seconds("BLOB_IDLE_TIMEOUT", &mut s.blob_idle_timeout)?;
+        e.positive_whole("MAX_BLOB_UPLOADS", &mut s.max_blob_uploads)?;
+        e.positive_whole(
+            "MAX_BLOB_UPLOADS_PER_USER",
+            &mut s.max_blob_uploads_per_user,
+        )?;
+        e.positive_seconds("REQUEST_TIMEOUT", &mut s.request_timeout)?;
+        e.positive_seconds("WRITE_TIMEOUT", &mut s.write_timeout)?;
+        e.positive_seconds("SHUTDOWN_TIMEOUT", &mut s.shutdown_timeout)?;
+        if let Some(raw) = e.get("TRUSTED_PROXIES") {
+            s.trusted_proxies = raw
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|entry| !entry.is_empty())
+                .map(str::parse)
+                .collect::<Result<_, ()>>()
+                .map_err(|()| {
+                    ConfigError::new(
+                        "TRUSTED_PROXIES",
+                        "a list of addresses and CIDR ranges (e.g. `127.0.0.1, 172.16.0.0/12`)",
+                    )
+                })?;
+        }
+        if let Some(raw) = e.get("METRICS_TOKEN") {
+            let token = raw.trim();
+            // (It travels in a header; and a short one could be guessed.)
+            let fits = token.is_empty()
+                || (METRICS_TOKEN_LEN.contains(&token.len())
+                    && token.bytes().all(|b| b.is_ascii_graphic()));
+            if !fits {
+                return Err(ConfigError::new(
+                    "METRICS_TOKEN",
+                    "16 to 256 printable ASCII characters without spaces (or empty: no /metrics)",
+                ));
+            }
+            token.clone_into(&mut s.metrics_token);
+        }
         // The S3 credentials and region have the names every S3 tool reads (and the Python
         // server's client read), without this server's prefix.
         let aws = |name: &str| env.get(name).map(|v| v.trim()).filter(|v| !v.is_empty());
@@ -281,8 +426,55 @@ impl Settings {
         e.string("GITHUB_CLIENT_ID", &mut s.github_client_id);
         e.string("GITHUB_CLIENT_SECRET", &mut s.github_client_secret);
         s.database()?;
-        s.storage()?;
+        if let Storage::S3 { .. } = s.storage()? {
+            s.check_s3()?;
+        }
         Ok(s)
+    }
+
+    /// What can be told of the S3 settings without asking the store (the rest is found out when
+    /// the server starts and tries the bucket): an endpoint is an `http://` or `https://`
+    /// address without credentials in it, and the access key and its secret come together.
+    fn check_s3(&self) -> Result<(), ConfigError> {
+        let endpoint = self.s3_endpoint.trim();
+        if !endpoint.is_empty() {
+            let usable = url::Url::parse(endpoint).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+            });
+            if !usable {
+                return Err(ConfigError::new(
+                    "S3_ENDPOINT",
+                    "the store's address, as http://host[:port] or https://host[:port]",
+                ));
+            }
+        }
+        let other = |var: &str, expected: &'static str| ConfigError {
+            var: var.to_owned(),
+            expected,
+        };
+        match (
+            self.s3_access_key_id.is_empty(),
+            self.s3_secret_access_key.is_empty(),
+        ) {
+            (false, true) => Err(other(
+                "AWS_SECRET_ACCESS_KEY",
+                "set when AWS_ACCESS_KEY_ID is (both, or neither to use the machine's own AWS role)",
+            )),
+            (true, false) => Err(other(
+                "AWS_ACCESS_KEY_ID",
+                "set when AWS_SECRET_ACCESS_KEY is (both, or neither to use the machine's own AWS \
+                 role)",
+            )),
+            (true, true) if !self.s3_session_token.is_empty() => Err(other(
+                "AWS_SESSION_TOKEN",
+                "left unset unless AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// [`Settings::from_env`] over this process's environment.
@@ -401,6 +593,13 @@ impl fmt::Debug for Settings {
             .field("s3_session_token", &secret(&self.s3_session_token))
             .field("s3_path_style", &self.s3_path_style)
             .field("blob_idle_timeout", &self.blob_idle_timeout)
+            .field("max_blob_uploads", &self.max_blob_uploads)
+            .field("max_blob_uploads_per_user", &self.max_blob_uploads_per_user)
+            .field("request_timeout", &self.request_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("metrics_token", &secret(&self.metrics_token))
             .field("public_url", &self.public_url)
             .field("open_registration", &self.open_registration)
             .field("session_days", &self.session_days)
@@ -685,6 +884,189 @@ mod tests {
                 );
             }
             read(&[(var, "31536000")]);
+        }
+    }
+
+    #[test]
+    fn the_s3_settings_are_checked_when_the_storage_is_a_bucket() {
+        let with = |extra: &[(&str, &str)]| {
+            let mut vars = env(&[("STORAGE_URL", "s3://bucket/prefix")]);
+            for (name, value) in extra {
+                vars.insert((*name).to_owned(), (*value).to_owned());
+            }
+            Settings::from_env(&vars)
+        };
+        assert!(with(&[]).is_ok());
+        assert!(
+            with(&[
+                ("OSWX_COLLAB_S3_ENDPOINT", " https://s3.example.com:9000/ "),
+                ("AWS_ACCESS_KEY_ID", "key"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+                ("AWS_SESSION_TOKEN", "token"),
+            ])
+            .is_ok()
+        );
+        assert!(with(&[("OSWX_COLLAB_S3_ENDPOINT", "http://garage:3900")]).is_ok());
+        for bad in [
+            "garage:3900",
+            "s3.example.com",
+            "ftp://s3.example.com",
+            "https://",
+            "https://key:topsecret-in-the-address@s3.example.com",
+            "https://s3.example.com/?X-Amz-Signature=topsecret",
+            "not an address at all",
+        ] {
+            let e = with(&[("OSWX_COLLAB_S3_ENDPOINT", bad)]).unwrap_err();
+            assert_eq!(e.var, "OSWX_COLLAB_S3_ENDPOINT", "{bad}");
+            assert!(!e.to_string().contains("topsecret"), "{e}");
+        }
+        // Half a pair of credentials is a mistake, not a wish for the machine's own role.
+        let e = with(&[("AWS_ACCESS_KEY_ID", "AKIA-the-key-id")]).unwrap_err();
+        assert_eq!(e.var, "AWS_SECRET_ACCESS_KEY");
+        assert!(!e.to_string().contains("AKIA-the-key-id"), "{e}");
+        let e = with(&[("AWS_SECRET_ACCESS_KEY", "topsecret-value")]).unwrap_err();
+        assert_eq!(e.var, "AWS_ACCESS_KEY_ID");
+        assert!(!e.to_string().contains("topsecret"), "{e}");
+        let e = with(&[("AWS_SESSION_TOKEN", "topsecret-token")]).unwrap_err();
+        assert_eq!(e.var, "AWS_SESSION_TOKEN");
+        assert!(!e.to_string().contains("topsecret"), "{e}");
+        // None of that is looked at for a folder: the variables may be there for something else.
+        let mut vars = env(&[("S3_ENDPOINT", "nonsense")]);
+        vars.insert("AWS_ACCESS_KEY_ID".into(), "key".into());
+        assert!(Settings::from_env(&vars).is_ok());
+    }
+
+    #[test]
+    fn the_serving_limits_have_defaults_and_are_read() {
+        let s = read(&[]);
+        assert_eq!((s.max_blob_uploads, s.max_blob_uploads_per_user), (16, 4));
+        assert_eq!(
+            (s.request_timeout, s.write_timeout, s.shutdown_timeout),
+            (60.0, 60.0, 8.0)
+        );
+        assert!(s.metrics_token.is_empty());
+        let s = read(&[
+            ("MAX_BLOB_UPLOADS", "3"),
+            ("MAX_BLOB_UPLOADS_PER_USER", "1"),
+            ("REQUEST_TIMEOUT", "2.5"),
+            ("WRITE_TIMEOUT", "7"),
+            ("SHUTDOWN_TIMEOUT", "20"),
+            ("METRICS_TOKEN", " 0123456789abcdef-token "),
+        ]);
+        assert_eq!((s.max_blob_uploads, s.max_blob_uploads_per_user), (3, 1));
+        assert_eq!(
+            (s.request_timeout, s.write_timeout, s.shutdown_timeout),
+            (2.5, 7.0, 20.0)
+        );
+        assert_eq!(s.metrics_token, "0123456789abcdef-token");
+        for var in [
+            "MAX_BLOB_UPLOADS",
+            "MAX_BLOB_UPLOADS_PER_USER",
+            "REQUEST_TIMEOUT",
+            "WRITE_TIMEOUT",
+            "SHUTDOWN_TIMEOUT",
+        ] {
+            for bad in ["0", "-1", "", "x"] {
+                assert_eq!(refused(&[(var, bad)]).var, format!("{PREFIX}{var}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_metrics_token_is_long_enough_printable_and_never_repeated() {
+        assert!(read(&[("METRICS_TOKEN", "")]).metrics_token.is_empty());
+        let long = "x".repeat(257);
+        for bad in [
+            "short",
+            "has a space in the middle",
+            "tab\there-and-more",
+            &long,
+        ] {
+            let e = refused(&[("METRICS_TOKEN", bad)]);
+            assert_eq!(e.var, "OSWX_COLLAB_METRICS_TOKEN");
+            assert!(!e.to_string().contains(bad), "{e}");
+        }
+        assert!(
+            refused(&[("METRICS_TOKEN", "caf\u{e9}-0123456789abcdef")])
+                .var
+                .contains("METRICS")
+        );
+        let s = read(&[("METRICS_TOKEN", "0123456789abcdef")]);
+        assert!(!format!("{s:?}").contains("0123456789abcdef"));
+    }
+
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap_or_else(|()| panic!("{s} is a range"))
+    }
+
+    #[test]
+    fn an_address_range_holds_its_addresses_and_no_others() {
+        let has = |range: &str, ip: &str| net(range).contains(ip.parse().unwrap());
+        assert!(has("127.0.0.1", "127.0.0.1"));
+        assert!(!has("127.0.0.1", "127.0.0.2"));
+        assert!(has("172.16.0.0/12", "172.16.0.1"));
+        assert!(has("172.16.0.0/12", "172.31.255.255"));
+        assert!(!has("172.16.0.0/12", "172.32.0.0"));
+        assert!(!has("172.16.0.0/12", "171.255.255.255"));
+        // (An address with bits after the prefix names the range it is in.)
+        assert!(has("10.1.2.3/8", "10.200.0.1"));
+        assert!(has("0.0.0.0/0", "8.8.8.8"));
+        assert!(
+            !has("0.0.0.0/0", "::1"),
+            "an IPv4 range holds no IPv6 address"
+        );
+        assert!(has("::/0", "2001:db8::1"));
+        assert!(!has("::/0", "8.8.8.8"));
+        assert!(has("::1", "::1"));
+        assert!(!has("::1", "::2"));
+        assert!(has("fd00::/8", "fd12:3456::1"));
+        assert!(!has("fd00::/8", "fe80::1"));
+        assert!(has("2001:db8::/33", "2001:db8:7fff::1"));
+        assert!(!has("2001:db8::/33", "2001:db8:8000::1"));
+        // An IPv4 address that arrives written as IPv6 is the IPv4 address.
+        assert!(has("127.0.0.1", "::ffff:127.0.0.1"));
+        assert!(has("::ffff:10.0.0.0/104", "10.9.9.9"));
+        assert!(has("::ffff:10.0.0.7", "10.0.0.7"));
+        assert!(!has("::ffff:10.0.0.0/104", "11.0.0.1"));
+        assert_eq!(
+            IpNet::one("::ffff:10.0.0.7".parse().unwrap()),
+            net("10.0.0.7")
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_are_a_list_of_addresses_and_ranges() {
+        assert_eq!(read(&[]).trusted_proxies, vec![net("127.0.0.1")]);
+        assert_eq!(read(&[("TRUSTED_PROXIES", "")]).trusted_proxies, vec![]);
+        assert_eq!(read(&[("TRUSTED_PROXIES", " , ")]).trusted_proxies, vec![]);
+        assert_eq!(
+            read(&[("TRUSTED_PROXIES", "127.0.0.1, 172.16.0.0/12 ::1,fd00::/8")]).trusted_proxies,
+            vec![
+                net("127.0.0.1"),
+                net("172.16.0.0/12"),
+                net("::1"),
+                net("fd00::/8")
+            ]
+        );
+        for bad in [
+            "localhost",
+            "10.0.0.0/33",
+            "::1/129",
+            "10.0.0.0/",
+            "10.0.0.0/+8",
+            "10.0.0.0/-1",
+            "10.0.0/8",
+            "10.0.0.0/8/8",
+            "/8",
+            "127.0.0.1;10.0.0.1",
+            "127.0.0.1, nonsense-that-must-not-be-echoed",
+            "[::1]",
+            "127.0.0.1:8080",
+            "*",
+        ] {
+            let e = refused(&[("TRUSTED_PROXIES", bad)]);
+            assert_eq!(e.var, "OSWX_COLLAB_TRUSTED_PROXIES", "{bad}");
+            assert!(!e.to_string().contains("nonsense"), "{e}");
         }
     }
 

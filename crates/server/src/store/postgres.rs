@@ -66,12 +66,13 @@ use sqlx::{Acquire, ConnectOptions, Connection, Postgres, Transaction};
 
 use super::{
     AssemblyRefRow, AssemblyUse, AuthoredChange, ChangeEventRow, ChangeRow, ChangeSize, Document,
-    Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange, OAuthIdentity,
-    OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project,
-    ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow,
-    Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
+    ExtensionSchema, Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange,
+    OAuthIdentity, OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent,
+    Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session,
+    SnapshotRow, Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
+use crate::metrics::{self, DbPool};
 
 /// The migrations in `migrations/postgres/`, embedded in the binary.
 pub static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
@@ -181,6 +182,20 @@ impl PgStore {
         Self::open_with_migrations(url, auto_migrate, config, &MIGRATOR).await
     }
 
+    /// [`PgStore::open`], and then the same for an extension's migrations
+    /// ([`crate::ext::Extensions::migrations`]): applied to a database that was empty, and to an
+    /// older one only when `auto_migrate` is true.
+    pub async fn open_with_extension(
+        url: &str,
+        auto_migrate: bool,
+        config: PgConfig,
+        extension: &[&str],
+    ) -> Result<Self> {
+        let store = Self::connect(url, config).await?;
+        store.bring_up_to_date(auto_migrate, extension).await?;
+        Ok(store)
+    }
+
     /// [`PgStore::open`] with other migrations than the embedded ones (tests of the upgrade path,
     /// which need a "newer binary").
     #[doc(hidden)]
@@ -192,7 +207,7 @@ impl PgStore {
     ) -> Result<Self> {
         let mut store = Self::connect(url, config).await?;
         store.migrator = migrator;
-        store.bring_up_to_date(auto_migrate).await?;
+        store.bring_up_to_date(auto_migrate, &[]).await?;
         Ok(store)
     }
 
@@ -267,21 +282,44 @@ impl PgStore {
         })
     }
 
-    /// Applies the pending migrations on a connection of their own, without the statement timeout
-    /// (building an index on a large table takes as long as it takes).
-    async fn run_migrations(&self) -> Result<()> {
+    /// A connection of its own for migrations, without the statement timeout (building an index
+    /// on a large table takes as long as it takes).
+    async fn unhurried(&self) -> Result<PgConnection> {
         // (The later of two settings of one option wins.)
         let unhurried = PgConnectOptions::clone(&self.options).options([
             ("statement_timeout", 0),
             ("idle_in_transaction_session_timeout", 0),
         ]);
-        let mut conn = unhurried
+        unhurried
             .connect()
             .await
-            .map_err(|e| cannot_connect(&self.options, &e))?;
+            .map_err(|e| cannot_connect(&self.options, &e))
+    }
+
+    /// Applies the pending migrations on a connection of their own.
+    async fn run_migrations(&self) -> Result<()> {
+        let mut conn = self.unhurried().await?;
         let ran = self.migrator.run(&mut conn).await;
         let _ = conn.close().await;
         Ok(ran?)
+    }
+
+    /// Applies the extension migrations the database has not had, in one transaction on a
+    /// connection of its own. The record is locked for the transaction, so that two servers
+    /// started at once apply them once: the second waits, and then finds them applied.
+    async fn run_extension_migrations(&self, extension: &[&str]) -> Result<()> {
+        let mut conn = self.unhurried().await?;
+        let ran = async {
+            let mut tx = sqlx::Connection::begin(&mut conn).await?;
+            sqlx::query("LOCK TABLE extension_migrations IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+            q::apply_extension_migrations(&mut tx, extension).await?;
+            Ok(tx.commit().await?)
+        }
+        .await;
+        let _ = conn.close().await;
+        ran
     }
 
     /// Nothing to refuse: a second transaction of one task runs on another connection (see the
@@ -295,20 +333,20 @@ impl PgStore {
     /// [`Store::begin`]).
     pub async fn begin_tx(&self) -> Result<PgTx<'static>> {
         Ok(PgTx {
-            tx: self.transactions.begin().await?,
+            tx: metrics::acquiring(DbPool::Transactions, self.transactions.begin()).await?,
         })
     }
 
     /// [`Store::begin_journal`]: a transaction on the journal's own connections.
     pub async fn begin_journal_tx(&self) -> Result<PgTx<'static>> {
         Ok(PgTx {
-            tx: self.journal.begin().await?,
+            tx: metrics::acquiring(DbPool::Journal, self.journal.begin()).await?,
         })
     }
 
     /// A connection for reads (each statement sees what was committed when it started).
     pub async fn reader(&self) -> Result<PoolConnection<Postgres>> {
-        Ok(self.reads.acquire().await?)
+        Ok(metrics::acquiring(DbPool::Reads, self.reads.acquire()).await?)
     }
 
     /// Closes every connection.

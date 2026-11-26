@@ -50,6 +50,17 @@ pub const SET_USER_EMAIL_VERIFIED: &str = "UPDATE users SET email_verified = $2 
 /// [`super::Tx::set_user_disabled`].
 pub const SET_USER_DISABLED: &str = "UPDATE users SET disabled = $2 WHERE id = $1";
 
+/// [`super::Tx::set_user_admin`].
+pub const SET_USER_ADMIN: &str = "UPDATE users SET is_server_admin = $2 WHERE id = $1";
+
+/// The extension's migrations a database has had, in order.
+pub const EXTENSION_MIGRATIONS: &str =
+    "SELECT version, checksum FROM extension_migrations ORDER BY version";
+
+/// Records one extension migration as applied.
+pub const INSERT_EXTENSION_MIGRATION: &str =
+    "INSERT INTO extension_migrations (version, checksum, applied_at) VALUES ($1, $2, $3)";
+
 /// [`super::Tx::insert_session`].
 pub const INSERT_SESSION: &str = "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, label) \
      VALUES ($1, $2, $3, $4, $5)";

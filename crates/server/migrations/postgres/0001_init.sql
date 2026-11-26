@@ -220,3 +220,11 @@ CREATE TABLE room_leases (
     epoch BIGINT NOT NULL,
     expires_at DOUBLE PRECISION NOT NULL
 );
+
+-- The migrations an extension (`Extensions::migrations`) has added, in its order: the server's
+-- own are in sqlx's record. `version` counts from 1; `checksum` is the SHA-256 of the text.
+CREATE TABLE extension_migrations (
+    version BIGINT NOT NULL PRIMARY KEY,
+    checksum VARCHAR(64) COLLATE "C" NOT NULL,
+    applied_at DOUBLE PRECISION NOT NULL
+);

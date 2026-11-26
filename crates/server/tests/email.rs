@@ -631,3 +631,195 @@ async fn two_reset_requests_at_once_leave_one_link() {
     let links: i64 = server.scalar("SELECT COUNT(*) FROM password_resets").await;
     assert_eq!(links, 1);
 }
+
+// ------------------------------------------------------------------ the mail server's certificate
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+/// A certificate authority nobody knows but this test.
+struct Authority {
+    cert: rcgen::Certificate,
+    key: rcgen::KeyPair,
+}
+
+impl Authority {
+    fn new(name: &str) -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        Self {
+            cert: params.self_signed(&key).unwrap(),
+            key,
+        }
+    }
+
+    /// A certificate for a server called `host`, and its key.
+    fn issue(&self, host: &str) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let params = rcgen::CertificateParams::new(vec![host.to_owned()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
+        (
+            cert.der().clone(),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+    }
+}
+
+type MailStream = BufStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
+
+async fn say(stream: &mut MailStream, line: &str) -> std::io::Result<()> {
+    stream.write_all(line.as_bytes()).await?;
+    stream.write_all(b"\r\n").await?;
+    stream.flush().await
+}
+
+/// One SMTP conversation: every message is taken, and who it was for is added to `taken`.
+async fn take_mail(mut stream: MailStream, taken: Arc<std::sync::Mutex<Vec<String>>>) {
+    if say(&mut stream, "220 localhost ESMTP").await.is_err() {
+        return;
+    }
+    let mut in_data = false;
+    loop {
+        let mut line = String::new();
+        match stream.read_line(&mut line).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let command = line.trim_end().to_ascii_uppercase();
+        let answer = if in_data {
+            if command != "." {
+                continue;
+            }
+            in_data = false;
+            "250 taken"
+        } else if command.starts_with("RCPT TO:") {
+            taken.lock().unwrap().push(line.trim_end()[8..].to_owned());
+            "250 ok"
+        } else if command == "DATA" {
+            in_data = true;
+            "354 go on"
+        } else if command == "QUIT" {
+            let _ = say(&mut stream, "221 bye").await;
+            return;
+        } else {
+            "250 ok"
+        };
+        if say(&mut stream, answer).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// A mail server on this machine that speaks TLS from the first byte with a certificate `ca`
+/// issued for `localhost`, and takes every message. Answers its port and who it took mail for.
+async fn tls_mail_server(ca: &Authority) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio_rustls::rustls;
+    let (cert, key) = ca.issue("localhost");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let recipients = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let taken = recipients.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let (acceptor, taken) = (acceptor.clone(), taken.clone());
+            tokio::spawn(async move {
+                // (A client that does not trust the certificate ends the handshake.)
+                if let Ok(tls) = acceptor.accept(socket).await {
+                    take_mail(BufStream::new(tls), taken).await;
+                }
+            });
+        }
+    });
+    (port, recipients)
+}
+
+const SMTP_PORT_ENV: &str = "OSWX_TEST_SMTP_PORT";
+const SMTP_HOST_ENV: &str = "OSWX_TEST_SMTP_HOST";
+
+/// Run by the test below in a process of its own (the machine's trust store is read from the
+/// process's environment): sends one message through the real mailer to the mail server the
+/// environment names, and prints how that went.
+#[tokio::test]
+#[ignore = "run by a_mail_server_is_trusted_by_the_machines_trust_store, in a process of its own"]
+async fn send_one_message_to_the_mail_server_in_the_environment() {
+    let (Ok(port), Ok(host)) = (std::env::var(SMTP_PORT_ENV), std::env::var(SMTP_HOST_ENV)) else {
+        return;
+    };
+    let settings = Settings {
+        smtp_host: host,
+        smtp_port: port.parse().unwrap(),
+        smtp_security: SmtpSecurity::Ssl,
+        smtp_user: String::new(),
+        ..smtp_settings()
+    };
+    let mailer = SmtpMailer::new(&settings).unwrap();
+    match mailer
+        .send("bob@example.com", "Hello", "A message.\n", None)
+        .await
+    {
+        Ok(()) => println!("MAIL-WAS-SENT"),
+        Err(e) => println!("MAIL-WAS-REFUSED: {e:#}"),
+    }
+}
+
+/// Sends one message in a process whose trust store is the PEM file `trusted`; answers what the
+/// process printed.
+async fn send_trusting(trusted: &std::path::Path, host: &str, port: u16) -> String {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "send_one_message_to_the_mail_server_in_the_environment",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SSL_CERT_FILE", trusted)
+        .env_remove("SSL_CERT_DIR")
+        .env(SMTP_PORT_ENV, port.to_string())
+        .env(SMTP_HOST_ENV, host);
+    let output = tokio::task::spawn_blocking(move || command.output())
+        .await
+        .unwrap()
+        .expect("the test binary runs again");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[tokio::test]
+async fn a_mail_server_is_trusted_by_the_machines_trust_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (ours, theirs) = (Authority::new("Our own CA"), Authority::new("Another CA"));
+    let (our_pem, their_pem) = (dir.path().join("ours.pem"), dir.path().join("theirs.pem"));
+    std::fs::write(&our_pem, ours.cert.pem()).unwrap();
+    std::fs::write(&their_pem, theirs.cert.pem()).unwrap();
+    let (port, recipients) = tls_mail_server(&ours).await;
+
+    // The relay's certificate comes from a CA in the machine's trust store: mail goes out.
+    let said = send_trusting(&our_pem, "localhost", port).await;
+    assert!(said.contains("MAIL-WAS-SENT"), "{said}");
+    assert_eq!(*recipients.lock().unwrap(), ["<bob@example.com>"]);
+
+    // From a CA the machine does not trust: refused, and nothing is sent.
+    let said = send_trusting(&their_pem, "localhost", port).await;
+    assert!(said.contains("MAIL-WAS-REFUSED"), "{said}");
+    // A trusted CA, but the certificate is for another name than the one connected to.
+    let said = send_trusting(&our_pem, "127.0.0.1", port).await;
+    assert!(said.contains("MAIL-WAS-REFUSED"), "{said}");
+    assert_eq!(recipients.lock().unwrap().len(), 1, "{said}");
+}

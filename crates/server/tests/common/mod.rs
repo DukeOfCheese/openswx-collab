@@ -547,15 +547,13 @@ impl TestServer {
             .expect("a free port");
         let base = format!("http://{}", listener.local_addr().expect("an address"));
         let (stop, stopped) = oneshot::channel::<()>();
-        let app = oswx_server::app(state.clone())
-            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let serving = state.clone();
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await
-                .expect("the server runs");
+            // As the binary serves: the same loop, limits and orderly stop.
+            oswx_server::serve::serve(listener, serving, async {
+                let _ = stopped.await;
+            })
+            .await;
         });
         Self {
             base,
@@ -571,15 +569,16 @@ impl TestServer {
         }
     }
 
-    /// Stops accepting, gives open requests a moment to finish, then shuts the state down (the hub,
-    /// then the journal, which writes what it has queued).
+    /// Stops the server as a signal stops the binary: it stops accepting and shuts the state down
+    /// (the hub, then the journal, which writes what it has queued), within the settings'
+    /// `shutdown_timeout`. Whatever that left undone is then waited for without a limit.
     async fn shutdown(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
             let abort = task.abort_handle();
-            if tokio::time::timeout(Duration::from_secs(5), task)
+            if tokio::time::timeout(Duration::from_secs(30), task)
                 .await
                 .is_err()
             {
@@ -1678,6 +1677,10 @@ impl Tx for FlakyTx<'_> {
 
     async fn set_user_disabled(&mut self, id: &str, disabled: bool) -> anyhow::Result<()> {
         self.inner.set_user_disabled(id, disabled).await
+    }
+
+    async fn set_user_admin(&mut self, id: &str, admin: bool) -> anyhow::Result<()> {
+        self.inner.set_user_admin(id, admin).await
     }
 
     async fn insert_session(&mut self, session: &Session) -> anyhow::Result<()> {

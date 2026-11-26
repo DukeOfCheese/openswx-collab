@@ -10,10 +10,11 @@
 //!
 //! Sign-in failures are limited per email address and client address (10 in 10 minutes); reset
 //! requests per address and client and per address alone (5 an hour). The client address is the
-//! connection's peer, except that a peer of `127.0.0.1` (a proxy on this machine) is taken at its word
-//! in `X-Forwarded-For`, as uvicorn does by default for the Python server.
+//! connection's peer, except that a peer listed in `OSWX_COLLAB_TRUSTED_PROXIES` (by default
+//! `127.0.0.1`, a proxy on this machine, as uvicorn believes by default for the Python server) is
+//! taken at its word in `X-Forwarded-For` (see [`client_ip`]).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, FromRequestParts, State};
@@ -25,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::access::CurrentUser;
-use crate::config::Settings;
+use crate::config::{IpNet, Settings};
 use crate::error::{ApiError, ApiJson};
 use crate::ext::{Event, emit};
 use crate::mail::{reset_text, send_logged};
@@ -128,50 +129,60 @@ pub(crate) async fn start_session(
 /// The client's address, for the limits (see the module documentation).
 pub(crate) struct ClientAddr(pub(crate) String);
 
-/// The peer that may speak for the client in `X-Forwarded-For`: uvicorn's default
-/// `forwarded_allow_ips`.
-const TRUSTED_PROXY: &str = "127.0.0.1";
-
-/// The client's address as uvicorn's proxy-headers middleware works it out with its defaults: the
-/// peer's, unless the peer is [`TRUSTED_PROXY`] and sent `X-Forwarded-For`; then the rightmost
-/// address there that is not the trusted proxy (or the leftmost if all are). `""` without a peer.
-fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+/// The client's address: the connection's peer, unless the peer is one of the `trusted` proxies
+/// and sent `X-Forwarded-For`. Then the header's addresses are read from the right (the last one
+/// was added by the peer itself, the one before by the proxy before it, and so on; several
+/// headers count as one list), and the client is the first that is not a trusted proxy: what the
+/// outermost proxy of ours saw, whatever the client itself wrote to the left of it. If every
+/// address is a trusted proxy, it is the left-most one.
+///
+/// An entry that is not an address (a host name, an address with a port, anything a client might
+/// forge) ends the reading: the client is then the last address read before it, or the peer. So
+/// the answer is always the peer's address or one a trusted proxy vouched for, in its canonical
+/// spelling; never text from the header. `""` without a peer (the app was served without
+/// connection info).
+fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &[IpNet]) -> String {
     let Some(peer) = peer else {
         return String::new();
     };
-    let ip = peer.ip().to_canonical().to_string();
-    if ip != TRUSTED_PROXY {
-        return ip;
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|range| range.contains(ip));
+    let mut client = peer.ip().to_canonical();
+    if !is_trusted(client) {
+        return client.to_string();
     }
-    let Some(forwarded) = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .next_back()
-        .and_then(|v| v.to_str().ok())
-    else {
-        return ip;
-    };
-    let hosts: Vec<&str> = forwarded.split(',').map(str::trim).collect();
-    let host = hosts
-        .iter()
-        .rev()
-        .find(|h| **h != TRUSTED_PROXY)
-        .or(hosts.first())
-        .copied()
-        .unwrap_or_default();
-    // A limiter key; an address is at most 45 characters.
-    host.chars().take(64).collect()
+    'headers: for value in headers.get_all("x-forwarded-for").iter().rev() {
+        let Ok(value) = value.to_str() else {
+            break;
+        };
+        for entry in value.rsplit(',') {
+            let Ok(ip) = entry.trim().parse::<IpAddr>() else {
+                break 'headers;
+            };
+            client = ip.to_canonical();
+            if !is_trusted(client) {
+                break 'headers;
+            }
+        }
+    }
+    client.to_string()
 }
 
-impl<S: Send + Sync> FromRequestParts<S> for ClientAddr {
+impl FromRequestParts<AppState> for ClientAddr {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
-        Ok(Self(client_ip(peer, &parts.headers)))
+        Ok(Self(client_ip(
+            peer,
+            &parts.headers,
+            &state.settings.trusted_proxies,
+        )))
     }
 }
 
@@ -645,33 +656,130 @@ mod tests {
         Some(SocketAddr::new(ip.parse().unwrap(), 5000))
     }
 
+    fn ranges(list: &[&str]) -> Vec<IpNet> {
+        list.iter().map(|r| r.parse().unwrap()).collect()
+    }
+
     #[test]
-    fn the_client_address_is_the_peer_unless_a_local_proxy_forwarded_it() {
-        assert_eq!(client_ip(None, &HeaderMap::new()), "");
-        assert_eq!(client_ip(peer("10.0.0.7"), &HeaderMap::new()), "10.0.0.7");
-        // Only a proxy on 127.0.0.1 is believed.
-        assert_eq!(client_ip(peer("10.0.0.7"), &xff("1.2.3.4")), "10.0.0.7");
-        assert_eq!(client_ip(peer("::1"), &xff("1.2.3.4")), "::1");
-        assert_eq!(client_ip(peer("127.0.0.1"), &xff("1.2.3.4")), "1.2.3.4");
-        assert_eq!(
-            client_ip(peer("::ffff:127.0.0.1"), &xff("1.2.3.4")),
-            "1.2.3.4"
-        );
+    fn the_client_address_is_the_peer_unless_a_trusted_proxy_forwarded_it() {
+        let local = ranges(&["127.0.0.1"]);
+        let ip = |peer_ip: &str, headers: &HeaderMap| client_ip(peer(peer_ip), headers, &local);
+        assert_eq!(client_ip(None, &xff("1.2.3.4"), &local), "");
+        assert_eq!(ip("10.0.0.7", &HeaderMap::new()), "10.0.0.7");
+        // A peer that is not listed is not believed: a forged header changes nothing.
+        assert_eq!(ip("10.0.0.7", &xff("1.2.3.4")), "10.0.0.7");
+        assert_eq!(ip("10.0.0.7", &xff("127.0.0.1")), "10.0.0.7");
+        assert_eq!(ip("::1", &xff("1.2.3.4")), "::1");
+        assert_eq!(ip("127.0.0.1", &xff("1.2.3.4")), "1.2.3.4");
+        assert_eq!(ip("::ffff:127.0.0.1", &xff("1.2.3.4")), "1.2.3.4");
         // The rightmost address that is not the proxy: what the proxy saw, not what the client wrote.
+        assert_eq!(ip("127.0.0.1", &xff("6.6.6.6, 1.2.3.4")), "1.2.3.4");
+        assert_eq!(ip("127.0.0.1", &xff("1.2.3.4, 127.0.0.1")), "1.2.3.4");
+        assert_eq!(ip("127.0.0.1", &xff("127.0.0.1, 127.0.0.1")), "127.0.0.1");
+        assert_eq!(ip("127.0.0.1", &HeaderMap::new()), "127.0.0.1");
+        // Nobody is trusted: the header is never read.
         assert_eq!(
-            client_ip(peer("127.0.0.1"), &xff("6.6.6.6, 1.2.3.4")),
-            "1.2.3.4"
-        );
-        assert_eq!(
-            client_ip(peer("127.0.0.1"), &xff("1.2.3.4, 127.0.0.1")),
-            "1.2.3.4"
-        );
-        assert_eq!(
-            client_ip(peer("127.0.0.1"), &xff("127.0.0.1, 127.0.0.1")),
+            client_ip(peer("127.0.0.1"), &xff("1.2.3.4"), &[]),
             "127.0.0.1"
         );
-        assert_eq!(client_ip(peer("127.0.0.1"), &HeaderMap::new()), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_chain_of_proxies_is_read_from_the_right_up_to_the_first_stranger() {
+        // The Docker bridge, and a load balancer in front of it.
+        let ours = ranges(&["172.16.0.0/12", "10.0.0.5", "fd00::/8"]);
+        let ip = |peer_ip: &str, headers: &HeaderMap| client_ip(peer(peer_ip), headers, &ours);
+        assert_eq!(ip("172.18.0.1", &xff("203.0.113.9")), "203.0.113.9");
+        assert_eq!(
+            ip("172.18.0.1", &xff("203.0.113.9, 10.0.0.5")),
+            "203.0.113.9"
+        );
+        // What the client wrote itself is to the left of what our proxies added, and is never
+        // reached: neither an address of its choice, nor one of our own proxies' addresses.
+        assert_eq!(
+            ip("172.18.0.1", &xff("6.6.6.6, 203.0.113.9, 10.0.0.5")),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            ip("172.18.0.1", &xff("172.18.0.1, 10.0.0.5, 203.0.113.9")),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            ip("172.18.0.1", &xff("127.0.0.1, 203.0.113.9")),
+            "203.0.113.9"
+        );
+        // Every hop is ours: the first of them.
+        assert_eq!(ip("172.18.0.1", &xff("10.0.0.5, 172.20.1.1")), "10.0.0.5");
+        // IPv6, and an IPv4 address written as IPv6.
+        assert_eq!(ip("fd00::2", &xff("2001:db8::7")), "2001:db8::7");
+        assert_eq!(ip("fd00::2", &xff("::ffff:203.0.113.9")), "203.0.113.9");
+        assert_eq!(
+            ip("172.18.0.1", &xff("203.0.113.9, ::ffff:10.0.0.5")),
+            "203.0.113.9"
+        );
+        // Several headers are one list, in order.
+        let mut two = HeaderMap::new();
+        two.append("x-forwarded-for", HeaderValue::from_static("6.6.6.6"));
+        two.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.5"),
+        );
+        assert_eq!(ip("172.18.0.1", &two), "203.0.113.9");
+        let mut two = HeaderMap::new();
+        two.append("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        two.append("x-forwarded-for", HeaderValue::from_static("10.0.0.5"));
+        assert_eq!(ip("172.18.0.1", &two), "203.0.113.9");
+    }
+
+    #[test]
+    fn a_malformed_forwarded_header_never_becomes_the_client_address() {
+        let ours = ranges(&["172.16.0.0/12", "10.0.0.5"]);
+        let ip = |headers: &HeaderMap| client_ip(peer("172.18.0.1"), headers, &ours);
         let long = "x".repeat(10_000);
-        assert_eq!(client_ip(peer("127.0.0.1"), &xff(&long)).len(), 64);
+        for junk in [
+            "",
+            " ",
+            ",",
+            "unknown",
+            "localhost",
+            "1.2.3.4:5678",
+            "[2001:db8::7]",
+            "[2001:db8::7]:443",
+            "1.2.3",
+            "1.2.3.4.5",
+            "999.1.1.1",
+            "1.2.3.4 5.6.7.8",
+            "1.2.3.4;5.6.7.8",
+            "0x7f.0.0.1",
+            "1.2.3.4/32",
+            "_hidden",
+            &long,
+        ] {
+            // Alone: the peer (the proxy) it is.
+            assert_eq!(ip(&xff(junk)), "172.18.0.1", "{junk:?}");
+            // To the left of a real client: never reached.
+            assert_eq!(
+                ip(&xff(&format!("{junk}, 203.0.113.9"))),
+                "203.0.113.9",
+                "{junk:?}"
+            );
+            // To the right of our own proxy's entry: the last address read before it.
+            assert_eq!(
+                ip(&xff(&format!("203.0.113.9, {junk}, 10.0.0.5"))),
+                "10.0.0.5",
+                "{junk:?}"
+            );
+        }
+        // Bytes that are not text.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"203.0.113.9, \xff\xfe").unwrap(),
+        );
+        assert_eq!(ip(&h), "172.18.0.1");
+        // Thousands of entries are read without harm.
+        let many = vec!["10.0.0.5"; 5000].join(",");
+        assert_eq!(ip(&xff(&many)), "10.0.0.5");
+        assert_eq!(ip(&xff(&format!("203.0.113.9,{many}"))), "203.0.113.9");
     }
 }

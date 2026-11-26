@@ -5,6 +5,7 @@
 //! shape `{"detail": "..."}`.
 
 pub mod access;
+pub mod admin;
 pub mod assemblies;
 pub mod blobs;
 pub mod clock;
@@ -25,10 +26,12 @@ pub mod record;
 pub mod room;
 pub mod routes;
 pub mod security;
+pub mod serve;
 pub mod sessions;
 pub mod snapshot;
 pub mod state;
 pub mod store;
+pub mod uploads;
 pub mod ws;
 
 pub use clock::Clock;

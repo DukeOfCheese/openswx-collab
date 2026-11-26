@@ -50,12 +50,13 @@ use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
     AssemblyRefRow, AssemblyUse, AuthoredChange, ChangeEventRow, ChangeRow, ChangeSize, Document,
-    Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange, OAuthIdentity,
-    OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project,
-    ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow,
-    Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
+    ExtensionSchema, Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange,
+    OAuthIdentity, OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent,
+    Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session,
+    SnapshotRow, Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
+use crate::metrics::{self, DbPool};
 
 /// The migrations in `migrations/sqlite/`, embedded in the binary.
 pub static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
@@ -126,6 +127,19 @@ impl SqliteStore {
         Self::open_with_migrations(url, auto_migrate, &MIGRATOR).await
     }
 
+    /// [`SqliteStore::open`], and then the same for an extension's migrations
+    /// ([`crate::ext::Extensions::migrations`]): applied to a database that was empty, and to an
+    /// older one only when `auto_migrate` is true.
+    pub async fn open_with_extension(
+        url: &str,
+        auto_migrate: bool,
+        extension: &[&str],
+    ) -> Result<Self> {
+        let store = Self::connect(url).await?;
+        store.bring_up_to_date(auto_migrate, extension).await?;
+        Ok(store)
+    }
+
     /// [`SqliteStore::open`] with other migrations than the embedded ones (tests of the upgrade
     /// path, which need a "newer binary").
     #[doc(hidden)]
@@ -136,7 +150,7 @@ impl SqliteStore {
     ) -> Result<Self> {
         let mut store = Self::connect(url).await?;
         store.migrator = migrator;
-        store.bring_up_to_date(auto_migrate).await?;
+        store.bring_up_to_date(auto_migrate, &[]).await?;
         Ok(store)
     }
 
@@ -188,11 +202,19 @@ impl SqliteStore {
         Ok(self.migrator.run(&self.writer).await?)
     }
 
+    /// Applies the extension migrations the database has not had, in one write transaction.
+    async fn run_extension_migrations(&self, extension: &[&str]) -> Result<()> {
+        let mut tx = self.begin_tx().await?;
+        q::apply_extension_migrations(tx.conn(), extension).await?;
+        tx.commit_tx().await
+    }
+
     /// A write transaction with direct access to its connection (for tests and tools; handlers use
     /// [`Store::begin`]). It waits while another write transaction is open.
     pub async fn begin_tx(&self) -> Result<SqliteTx<'static>> {
         self.refuse_nested()?;
-        let tx = self.writer.begin_with("BEGIN IMMEDIATE").await?;
+        let begun = self.writer.begin_with("BEGIN IMMEDIATE");
+        let tx = metrics::acquiring(DbPool::Transactions, begun).await?;
         holder_set(&self.holder, Some(Caller::current()));
         Ok(SqliteTx {
             claim: Some(Claim(self.holder.clone())),
@@ -215,7 +237,7 @@ impl SqliteStore {
 
     /// A read-only connection (`query_only`), for reads.
     pub async fn reader(&self) -> Result<PoolConnection<Sqlite>> {
-        Ok(self.readers.acquire().await?)
+        Ok(metrics::acquiring(DbPool::Reads, self.readers.acquire()).await?)
     }
 
     /// Closes every connection.

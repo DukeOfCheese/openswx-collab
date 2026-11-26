@@ -7,19 +7,20 @@ use std::time::Duration;
 
 use crate::blobs::{self, Blobs, LocalBlobs, S3Blobs, S3Config};
 use crate::clock::Clock;
-use crate::config::{Database, Settings, Storage};
+use crate::config::{Settings, Storage};
 use crate::error::ApiError;
 use crate::export::Exports;
 use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
 use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
+use crate::metrics::HttpStats;
 use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
 use crate::org_queue::{OrgQueue, OrgTurn};
 use crate::purge::Purger;
 use crate::sessions::Sessions;
-use crate::store::postgres::PgConfig;
-use crate::store::{PgStore, SqliteStore, Store, Tx, new_id};
+use crate::store::{Store, Tx, new_id};
+use crate::uploads::Uploads;
 
 /// The server's shared state. Cloning is cheap: every field is shared.
 #[derive(Clone)]
@@ -49,6 +50,10 @@ pub struct AppState {
     pub purger: Purger,
     /// Whose turn it is to change each organisation ([`crate::org_queue`]).
     pub org_queue: OrgQueue,
+    /// How many blob uploads run at once ([`Uploads`]).
+    pub uploads: Arc<Uploads>,
+    /// What the serving loop counts ([`crate::serve`]).
+    pub http: Arc<HttpStats>,
 }
 
 /// What the revoking steps of [`AppState::commit_then`] know of the commit.
@@ -161,7 +166,13 @@ impl AppState {
     pub fn new(settings: Settings, store: Arc<dyn Store>, blobs: Arc<dyn Blobs>) -> Self {
         let mailer = Arc::new(MemoryMailer::new(settings.email_configured()));
         let journal = JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT);
+        let uploads = Uploads::new(
+            settings.max_blob_uploads,
+            settings.max_blob_uploads_per_user,
+        );
         Self {
+            uploads: Arc::new(uploads),
+            http: Arc::default(),
             journal,
             node_id: new_id(),
             store,
@@ -319,19 +330,19 @@ impl AppState {
     /// removal before the server starts), mail through the operator's SMTP server ([`SmtpMailer`]) and the real Google and GitHub
     /// ([`HttpProviders`]).
     pub async fn from_settings(settings: Settings) -> anyhow::Result<Self> {
-        let store: Arc<dyn Store> = match settings.database()? {
-            Database::Sqlite(_) => {
-                Arc::new(SqliteStore::open(&settings.database_url, settings.auto_migrate).await?)
-            }
-            Database::Postgres(_) => Arc::new(
-                PgStore::open(
-                    &settings.database_url,
-                    settings.auto_migrate,
-                    PgConfig::from_settings(&settings),
-                )
-                .await?,
-            ),
-        };
+        Self::from_settings_with(settings, Arc::new(NoExtensions)).await
+    }
+
+    /// [`AppState::from_settings`] for a server with the extension `ext`: its migrations are
+    /// applied after the server's own (as `auto_migrate` allows; [`crate::admin::Db::open`]), and
+    /// it is the state's `ext`.
+    pub async fn from_settings_with(
+        settings: Settings,
+        ext: Arc<dyn Extensions>,
+    ) -> anyhow::Result<Self> {
+        let store = crate::admin::Db::open(&settings, ext.as_ref())
+            .await?
+            .store();
         let blobs: Arc<dyn Blobs> = match settings.storage()? {
             Storage::Local(folder) => {
                 let local = Arc::new(LocalBlobs::new(folder)?);
@@ -350,6 +361,7 @@ impl AppState {
         let mut state = Self::new(settings, store, blobs);
         state.mailer = mailer;
         state.oauth = oauth;
+        state.ext = ext;
         Ok(state)
     }
 
@@ -362,9 +374,26 @@ impl AppState {
     /// ended (what it has not removed stays marked, for the next start). Calling it again does
     /// no harm.
     pub async fn shutdown(&self) {
+        self.shutdown_with(AFTER_COMMIT_WAIT, PURGER_WAIT).await;
+    }
+
+    /// [`AppState::shutdown`] for a server that has `bound` to stop in ([`crate::serve`]): the
+    /// same steps in the same order, with the waits for others' work cut to fit, so that the
+    /// journal is still written out and stopped inside `bound`: the steps after REST commits get
+    /// at most half of it, the purger at most a tenth. (Closing the rooms is not cut short here;
+    /// the caller's own clock runs beside this.)
+    pub async fn shutdown_within(&self, bound: Duration) {
+        self.shutdown_with(
+            AFTER_COMMIT_WAIT.min(bound / 2),
+            PURGER_WAIT.min(bound / 10),
+        )
+        .await;
+    }
+
+    async fn shutdown_with(&self, after_commit_wait: Duration, purger_wait: Duration) {
         self.purger.signal_stop();
         self.hub.shutdown().await;
-        if tokio::time::timeout(AFTER_COMMIT_WAIT, self.after_commits.idle())
+        if tokio::time::timeout(after_commit_wait, self.after_commits.idle())
             .await
             .is_err()
         {
@@ -374,14 +403,15 @@ impl AppState {
             );
         }
         self.journal.close().await;
-        self.purger.stop(PURGER_WAIT).await;
+        self.purger.stop(purger_wait).await;
     }
 }
 
 /// The whole HTTP application for this state.
 ///
-/// Serve it with connection info (`into_make_service_with_connect_info::<SocketAddr>()`): sign-in
-/// and password reset limits are kept per client address, and without it every client shares one.
+/// Serve it with [`crate::serve::serve`], which gives every request its peer's address (sign-in
+/// and password reset limits are kept per client address, and without it every client shares
+/// one), cuts off clients that stop sending or reading, and stops in order.
 ///
 /// Building it also wakes the purger ([`crate::purge`]), which goes on with whatever an earlier
 /// run of the server marked deleted and did not finish removing; so it must be called inside a
