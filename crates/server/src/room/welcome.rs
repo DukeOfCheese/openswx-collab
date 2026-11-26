@@ -22,6 +22,8 @@ pub(super) struct Welcome {
     pub head: Head,
     pub last_seq: Option<Seq>,
     pub catchup_limit: Seq,
+    /// The most stored operation bytes the catch-up may carry ([`super::PAGE_BYTES`]).
+    pub page_bytes: u64,
     pub project: Id,
     pub role: ProjectRole,
     pub read_only: Option<String>,
@@ -43,8 +45,15 @@ impl Welcome {
         let head_seq = self.head.seq;
         let changes = match self.last_seq {
             Some(last) if last <= head_seq && head_seq - last <= self.catchup_limit => {
-                match change_events(self.store.as_ref(), &self.doc, last, head_seq).await {
-                    Ok(events) => Some(events),
+                let events = change_events(
+                    self.store.as_ref(),
+                    &self.doc,
+                    last,
+                    head_seq,
+                    self.page_bytes,
+                );
+                match events.await {
+                    Ok(events) => events,
                     Err(e) => {
                         tracing::warn!(
                             "catching a client of document {} up failed; it gets the document: \
@@ -77,14 +86,25 @@ impl Welcome {
 }
 
 /// The change events `after < seq <= upto`, read from the journal: the same events the live
-/// broadcast carried.
+/// broadcast carried. `None` when their stored operations come to more than `budget` bytes (the
+/// sizes are read first, without the operations): the client gets the document instead.
 async fn change_events(
     store: &dyn Store,
     doc: &str,
     after: Seq,
     upto: Seq,
-) -> anyhow::Result<Vec<ChangeEvent>> {
+    budget: u64,
+) -> anyhow::Result<Option<Vec<ChangeEvent>>> {
     let (after_i, upto_i) = (i64::try_from(after)?, i64::try_from(upto)?);
+    let sizes = store
+        .change_sizes(doc, upto_i + 1, after_i, upto_i - after_i)
+        .await?;
+    let total = sizes.iter().fold(0u64, |t, s| {
+        t.saturating_add(u64::try_from(s.size).unwrap_or(u64::MAX))
+    });
+    if total > budget {
+        return Ok(None);
+    }
     let rows = store
         .change_events_between(doc, after_i, upto_i, upto_i - after_i)
         .await?;
@@ -108,6 +128,7 @@ async fn change_events(
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()
+            .map(Some)
     })
     .await?
 }

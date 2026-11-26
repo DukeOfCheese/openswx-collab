@@ -133,7 +133,15 @@ pub struct Hooks {
     pub index_keep: Seq,
     /// The most change ids a room remembers ([`MAX_REMEMBERED`]).
     pub max_remembered: usize,
+    /// The most stored operation bytes one page of history, or one catch-up in a welcome, carries
+    /// ([`PAGE_BYTES`]).
+    pub page_bytes: u64,
 }
+
+/// The most stored operation bytes (the journal's `ops` column) one history page or one welcome's
+/// catch-up carries: a page stops before the row that would pass it (but always holds one row),
+/// and a catch-up that would pass it sends the document instead.
+pub const PAGE_BYTES: u64 = 16 << 20;
 
 /// The most change ids a room remembers, whatever its snapshots; past it the oldest are forgotten
 /// (and their clients' later unknown ids are looked up in the journal).
@@ -148,6 +156,7 @@ impl Default for Hooks {
             judge_delay: Duration::ZERO,
             index_keep: INDEX_KEEP,
             max_remembered: MAX_REMEMBERED,
+            page_bytes: PAGE_BYTES,
         }
     }
 }

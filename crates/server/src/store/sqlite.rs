@@ -49,10 +49,10 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, HistoryRow, Id, Invite, Member,
-    NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole,
-    RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx, UndoTarget, User,
-    Version, VersionWithAuthor, sql,
+    AssemblyRefRow, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder, HistoryRow, Id,
+    Invite, Member, NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
+    ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx,
+    UndoTarget, User, Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -447,6 +447,23 @@ impl Store for SqliteStore {
             document_id,
             client_id,
             change_id,
+        )
+        .await
+    }
+
+    async fn change_sizes(
+        &self,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeSize>> {
+        q::change_sizes(
+            &mut *self.reader().await?,
+            document_id,
+            before,
+            after,
+            limit,
         )
         .await
     }
@@ -1740,6 +1757,22 @@ mod q {
             .bind(client_id)
             .bind(change_id)
             .fetch_optional(c)
+            .await?)
+    }
+
+    pub async fn change_sizes(
+        c: &mut SqliteConnection,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeSize>> {
+        Ok(sqlx::query_as(sql::CHANGE_SIZES)
+            .bind(document_id)
+            .bind(before)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(c)
             .await?)
     }
 

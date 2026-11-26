@@ -2,7 +2,10 @@
 //!
 //! - `GET /api/documents/{document}/history?before=&after=&limit=` (viewer): the changes with
 //!   `after < seq < before` (both optional), newest first, at most `limit` (default
-//!   [`HISTORY_LIMIT`], clamped to `1..=`[`HISTORY_MAX`]; a value that is not an integer is 422).
+//!   [`HISTORY_LIMIT`], clamped to `1..=`[`HISTORY_MAX`]; a value that is not an integer is 422)
+//!   and at most [`crate::room::PAGE_BYTES`] of stored operations (always one row at least). The
+//!   answer is a plain list, as in the Python server: a client pages on with `before=<the last
+//!   seq it got>` until it gets an empty page.
 //!   Each: `{seq, author, author_name, client_id, change_id, time, ops, command, reverts,
 //!   reverted_by, broke}` — `author` the user id, `client_id` and `change_id` `null` for a change
 //!   the server made (a restore, a revert from history), `ops` as [`crate::content::ops_json`]
@@ -33,8 +36,11 @@
 //! 404 `no such document`, as everywhere.
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use oswx_core::{Conflict, ConflictKind, Refusal, Value};
 use serde::Deserialize;
@@ -51,7 +57,7 @@ use crate::routes::orgs::clean_name;
 use crate::security::ProjectRole;
 use crate::snapshot::{LoadError, state_at};
 use crate::state::AppState;
-use crate::store::{Document, HistoryRow, Version, new_id};
+use crate::store::{ChangeSize, Document, HistoryRow, Version, new_id};
 
 /// How many changes a history page has unless `limit` says otherwise.
 pub const HISTORY_LIMIT: i64 = 100;
@@ -149,11 +155,11 @@ struct HistoryQuery {
 }
 
 /// One history entry.
-fn history_entry(row: HistoryRow) -> serde_json::Value {
+fn history_entry(doc: &str, row: HistoryRow) -> serde_json::Value {
     let ops = match decode_ops(&row.ops) {
         Ok(ops) => ops_json(&ops),
         Err(e) => {
-            tracing::error!("change {} of a document is damaged: {e}", row.seq);
+            tracing::error!("change {} of document {doc} is damaged: {e}", row.seq);
             serde_json::Value::Null
         }
     };
@@ -174,7 +180,7 @@ async fn history(
     user: CurrentUser,
     ApiPath(document_id): ApiPath<String>,
     ApiQuery(query): ApiQuery<HistoryQuery>,
-) -> Result<ApiJson<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let before = int_param("before", query.before.as_deref())?;
     let after = int_param("after", query.after.as_deref())?;
     let limit = int_param("limit", query.limit.as_deref())?
@@ -187,20 +193,58 @@ async fn history(
         ProjectRole::Viewer,
     )
     .await?;
-    let rows = state
+    // The page stops before the row that would pass the byte budget (one row at least); the sizes
+    // are read first, without the operations, so no more than the budget is ever loaded.
+    let sizes = state
         .store
-        .history(
+        .change_sizes(
             &doc.id,
             before.unwrap_or(i64::MAX),
             after.unwrap_or(i64::MIN),
             limit,
         )
         .await?;
-    let out = tokio::task::spawn_blocking(move || {
-        serde_json::Value::Array(rows.into_iter().map(history_entry).collect())
+    let n = rows_within(&sizes, state.room_hooks.page_bytes);
+    let rows = match (sizes.first(), n.checked_sub(1).map(|i| &sizes[i])) {
+        (Some(top), Some(bottom)) => {
+            state
+                .store
+                .history(&doc.id, top.seq + 1, bottom.seq - 1, i64::try_from(n)?)
+                .await?
+        }
+        _ => Vec::new(),
+    };
+    // Built and written on the blocking pool.
+    let doc_id = doc.id;
+    let body = tokio::task::spawn_blocking(move || {
+        let page: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| history_entry(&doc_id, r))
+            .collect();
+        serde_json::to_vec(&page)
     })
-    .await?;
-    Ok(ApiJson(out))
+    .await??;
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(body),
+    )
+        .into_response())
+}
+
+/// How many of `sizes` (newest first) one page takes: rows while their stored operations stay
+/// within `budget` bytes, and always the first.
+pub(crate) fn rows_within(sizes: &[ChangeSize], budget: u64) -> usize {
+    let mut total = 0u64;
+    let mut n = 0;
+    for s in sizes {
+        let size = u64::try_from(s.size).unwrap_or(u64::MAX);
+        if n > 0 && total.saturating_add(size) > budget {
+            break;
+        }
+        total = total.saturating_add(size);
+        n += 1;
+    }
+    n
 }
 
 // ------------------------------------------------------------------ versions

@@ -186,6 +186,7 @@ impl Room {
             head: self.durable.clone(),
             last_seq: req.last_seq,
             catchup_limit: self.state.settings.catchup_limit as Seq,
+            page_bytes: self.state.room_hooks.page_bytes,
             project: self.project.clone(),
             role: req.role,
             read_only: conn.read_only.clone(),

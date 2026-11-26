@@ -18,10 +18,10 @@ use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    AssemblyRefRow, ChangeEventRow, ChangeRow, Document, Folder, HistoryRow, Id, Invite, Member,
-    NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember, ProjectWithRole,
-    RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx, UndoTarget, User,
-    Version, VersionWithAuthor,
+    AssemblyRefRow, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder, HistoryRow, Id,
+    Invite, Member, NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
+    ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx,
+    UndoTarget, User, Version, VersionWithAuthor,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -882,6 +882,18 @@ impl Store for FlakyStore {
         pause(delay).await;
         self.inner()
             .undo_target(document_id, client_id, change_id)
+            .await
+    }
+
+    async fn change_sizes(
+        &self,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeSize>> {
+        self.inner()
+            .change_sizes(document_id, before, after, limit)
             .await
     }
 

@@ -418,6 +418,14 @@ pub struct HistoryRow {
     pub broke: Option<String>,
 }
 
+/// How many bytes a journal row's stored operations take ([`Store::change_sizes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct ChangeSize {
+    pub seq: i64,
+    /// The length of its `ops` column, in bytes.
+    pub size: i64,
+}
+
 /// A named version of a document (`versions`): a label on a seq.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Version {
@@ -623,6 +631,16 @@ pub trait Store: Send + Sync + 'static {
         client_id: &str,
         change_id: &str,
     ) -> anyhow::Result<Option<UndoTarget>>;
+
+    /// The seq and stored operation size of a document's journal rows with `after < seq < before`,
+    /// newest first, at most `limit` (without reading the operations).
+    async fn change_sizes(
+        &self,
+        document_id: &str,
+        before: i64,
+        after: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeSize>>;
 
     /// A document's journal rows with `after < seq < before`, newest first, at most `limit`, with
     /// their authors' names.

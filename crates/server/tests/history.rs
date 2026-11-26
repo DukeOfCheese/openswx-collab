@@ -962,6 +962,87 @@ async fn a_history_page_holds_at_most_500_changes() {
     );
 }
 
+/// A server whose history pages and catch-ups carry at most `bytes` of stored operations.
+async fn with_page_bytes(bytes: u64) -> (TestServer, World) {
+    let hooks = oswx_server::room::Hooks {
+        page_bytes: bytes,
+        ..oswx_server::room::Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    (server, world)
+}
+
+/// Six changes of about 730 stored bytes each.
+async fn six_big_changes(live: &mut Live) {
+    for n in 1..=6u64 {
+        let value = format!("{n}{}", "x".repeat(700));
+        let out = live.change(vec![set(&["variables", "v"], json!(value))], vec![], vec![]);
+        assert_eq!(out.await.seq(), n);
+    }
+}
+
+#[tokio::test]
+async fn a_history_page_is_bounded_in_bytes_too() {
+    let (server, world) = with_page_bytes(2000).await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    six_big_changes(&mut a).await;
+    let admin = world.admin.as_str();
+    // Two rows fit in 2000 bytes; the client pages on with `before` until a page is empty.
+    let mut pages = Vec::new();
+    let mut q = "?limit=500".to_owned();
+    loop {
+        let page = seqs(&history(&server, &doc, admin, &q).await.1);
+        if page.is_empty() {
+            break;
+        }
+        q = format!("?limit=500&before={}", page.last().unwrap());
+        pages.push(page);
+    }
+    assert_eq!(pages, [vec![6, 5], vec![4, 3], vec![2, 1]]);
+    // A row bigger than the whole budget still comes, alone.
+    let huge = json!("y".repeat(3000));
+    assert_eq!(
+        a.change(vec![set(&["variables", "w"], huge)], vec![], vec![])
+            .await
+            .seq(),
+        7
+    );
+    assert_eq!(seqs(&history(&server, &doc, admin, "").await.1), [7]);
+    assert_eq!(
+        seqs(&history(&server, &doc, admin, "?before=7").await.1),
+        [6, 5]
+    );
+}
+
+#[tokio::test]
+async fn a_catch_up_over_the_byte_budget_sends_the_document() {
+    let (server, world) = with_page_bytes(2000).await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    six_big_changes(&mut a).await;
+    let near = Live::connect_with(&server, &doc, &world.admin, Hello::default().last_seq(4)).await;
+    let seqs: Vec<Seq> = near
+        .welcome
+        .changes
+        .expect("a catch-up")
+        .iter()
+        .map(|c| c.seq)
+        .collect();
+    assert_eq!((seqs, near.welcome.content.is_none()), (vec![5, 6], true));
+    let far = Live::connect_with(&server, &doc, &world.admin, Hello::default().last_seq(2)).await;
+    assert!(far.welcome.changes.is_none());
+    let content = far.welcome.content.expect("the document");
+    assert_eq!(
+        content.at(&["variables", "v"]).and_then(|v| match v {
+            Value::Str(s) => s.chars().next(),
+            _ => None,
+        }),
+        Some('6')
+    );
+}
+
 #[tokio::test]
 async fn the_content_at_every_seq_is_what_clients_held_then() {
     // Snapshots every 7 changes, and a restart: every state is still reproduced.
