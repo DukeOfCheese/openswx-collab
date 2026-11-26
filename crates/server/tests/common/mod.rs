@@ -898,6 +898,9 @@ pub struct FlakyStore {
     pub user_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `erase_user` parks here (an account's deletion then holds its locks).
     pub erase_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every `mark_org_deleted` parks here once it has marked (a deletion then holds the
+    /// rows of the organisation's documents).
+    pub mark_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `set_document_head` parks here (the journal has then locked and written what a
     /// batch writes, and not yet committed).
     pub head_gate: Arc<oswx_server::room::Gate>,
@@ -942,6 +945,7 @@ impl FlakyStore {
             head_gate: Arc::default(),
             user_gate: Arc::default(),
             erase_gate: Arc::default(),
+            mark_gate: Arc::default(),
             org_gate: Arc::default(),
             commit_patience: Arc::default(),
             parts_gate: Arc::default(),
@@ -1092,6 +1096,7 @@ impl FlakyStore {
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
             erase_gate: self.erase_gate.clone(),
+            mark_gate: self.mark_gate.clone(),
             org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
@@ -1173,26 +1178,23 @@ impl Store for FlakyStore {
         Ok(self.flaky(self.inner().begin_journal().await?))
     }
 
-    async fn deleted_projects(&self, limit: i64) -> anyhow::Result<Vec<Id>> {
-        self.inner().deleted_projects(limit).await
+    async fn deleted_projects(&self, after: &str, limit: i64) -> anyhow::Result<Vec<Id>> {
+        self.inner().deleted_projects(after, limit).await
     }
 
-    async fn deleted_orgs(&self, limit: i64) -> anyhow::Result<Vec<Id>> {
-        self.inner().deleted_orgs(limit).await
+    async fn deleted_orgs(&self, after: &str, limit: i64) -> anyhow::Result<Vec<Id>> {
+        self.inner().deleted_orgs(after, limit).await
     }
 
     async fn documents_of_deleted_project(
         &self,
         project_id: &str,
+        after: &str,
         limit: i64,
     ) -> anyhow::Result<Vec<Id>> {
         self.inner()
-            .documents_of_deleted_project(project_id, limit)
+            .documents_of_deleted_project(project_id, after, limit)
             .await
-    }
-
-    async fn projects_left_in_org(&self, org_id: &str) -> anyhow::Result<u64> {
-        self.inner().projects_left_in_org(org_id).await
     }
 
     async fn user_count(&self) -> anyhow::Result<u64> {
@@ -1563,6 +1565,7 @@ pub struct FlakyTx<'a> {
     head_gate: Arc<oswx_server::room::Gate>,
     user_gate: Arc<oswx_server::room::Gate>,
     erase_gate: Arc<oswx_server::room::Gate>,
+    mark_gate: Arc<oswx_server::room::Gate>,
     org_gate: Arc<oswx_server::room::Gate>,
     commit_patience: Arc<Mutex<Option<Duration>>>,
     ref_writes: Arc<AtomicUsize>,
@@ -1633,6 +1636,7 @@ impl Tx for FlakyTx<'_> {
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
             erase_gate: self.erase_gate.clone(),
+            mark_gate: self.mark_gate.clone(),
             org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
@@ -1851,10 +1855,6 @@ impl Tx for FlakyTx<'_> {
         self.inner.set_project_name(id, name).await
     }
 
-    async fn delete_project(&mut self, id: &str) -> anyhow::Result<()> {
-        self.inner.delete_project(id).await
-    }
-
     async fn project_by_id(&mut self, id: &str) -> anyhow::Result<Option<Project>> {
         self.inner.project_by_id(id).await
     }
@@ -1909,14 +1909,16 @@ impl Tx for FlakyTx<'_> {
     }
 
     async fn mark_org_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool> {
-        self.inner.mark_org_deleted(id, now).await
+        let marked = self.inner.mark_org_deleted(id, now).await?;
+        self.mark_gate.pass().await;
+        Ok(marked)
     }
 
     async fn purge_document_rows(&mut self, document_id: &str, limit: i64) -> anyhow::Result<u64> {
         self.inner.purge_document_rows(document_id, limit).await
     }
 
-    async fn purge_document(&mut self, id: &str) -> anyhow::Result<()> {
+    async fn purge_document(&mut self, id: &str) -> anyhow::Result<bool> {
         self.inner.purge_document(id).await
     }
 
@@ -2190,10 +2192,6 @@ impl Tx for FlakyTx<'_> {
     async fn org_member_ids(&mut self, org_id: &str) -> anyhow::Result<Vec<Id>> {
         self.inner.org_member_ids(org_id).await
     }
-
-    async fn delete_org(&mut self, id: &str) -> anyhow::Result<()> {
-        self.inner.delete_org(id).await
-    }
 }
 
 /// A server admin (Ada, `ada@example.com`, the first account) who owns an organisation, "Robotics",
@@ -2330,6 +2328,12 @@ pub struct TestBlobs {
     fail_exists: AtomicBool,
     fail_put: AtomicBool,
     fail_delete: AtomicBool,
+    /// The one prefix whose removal fails, whatever `fail_delete` says.
+    fail_delete_of: Mutex<Option<String>>,
+    /// How many removals of a prefix were asked for.
+    deletes: AtomicUsize,
+    /// Shut: every removal of a prefix parks here, inside the storage call.
+    pub delete_gate: oswx_server::room::Gate,
     exists_calls: AtomicUsize,
     exists_now: AtomicUsize,
     exists_most: AtomicUsize,
@@ -2346,6 +2350,9 @@ impl TestBlobs {
             fail_exists: AtomicBool::new(false),
             fail_put: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
+            fail_delete_of: Mutex::new(None),
+            deletes: AtomicUsize::new(0),
+            delete_gate: oswx_server::room::Gate::default(),
             exists_calls: AtomicUsize::new(0),
             exists_now: AtomicUsize::new(0),
             exists_most: AtomicUsize::new(0),
@@ -2379,6 +2386,19 @@ impl TestBlobs {
     /// Makes every removal of a prefix fail (`true`), as a storage that is away; or work again.
     pub fn fail_delete(&self, fail: bool) {
         self.fail_delete.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes the removal of this one prefix fail for good (`None`: of none).
+    pub fn fail_delete_of(&self, prefix: Option<&str>) {
+        *self
+            .fail_delete_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = prefix.map(str::to_owned);
+    }
+
+    /// How many removals of a prefix were asked for so far.
+    pub fn deletes(&self) -> usize {
+        self.deletes.load(Ordering::SeqCst)
     }
 
     pub fn fail_put(&self, fail: bool) {
@@ -2459,7 +2479,15 @@ impl Blobs for TestBlobs {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
-        if self.fail_delete.load(Ordering::SeqCst) {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        self.delete_gate.pass().await;
+        let this_one = self
+            .fail_delete_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            == Some(prefix);
+        if this_one || self.fail_delete.load(Ordering::SeqCst) {
             anyhow::bail!("the test storage was told to fail removals");
         }
         self.inner.delete_prefix(prefix).await

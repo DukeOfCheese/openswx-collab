@@ -371,7 +371,7 @@ async fn delete_org(
     // Asked before the transaction (never while it holds the writer).
     check_org_delete(&state.ext, &org.id).await?;
 
-    let _turn = state.org_turn(&org.id).await?;
+    let turn = state.org_turn(&org.id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org.id, OrgRole::Owner).await?;
     let renamed = tx.org_by_id(&org.id).await?.is_none_or(|now| !named(&now));
@@ -389,7 +389,7 @@ async fn delete_org(
     let (after, org_id, by) = (state.clone(), org.id, user.id);
     let committed = state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 for document in &open {
                     revoker.hub.close_document(document, ORG_DELETED).await;

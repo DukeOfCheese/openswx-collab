@@ -213,7 +213,7 @@ async fn register(
     let approval = approve_invite(&state, body.invite.as_deref(), &email, None, now).await?;
 
     // (Joining an organisation changes it: this request takes its turn, as any other does.)
-    let _turn = match &approval {
+    let turn = match &approval {
         Some(approval) => Some(state.org_turn(approval.org()).await?),
         None => None,
     };
@@ -264,7 +264,7 @@ async fn register(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move {
+        .commit_then((tx, turn), |_| async {}, async move {
             emit(&ext, registered).await;
             if let Some(accepted) = accepted {
                 accepted.announce(ext).await;

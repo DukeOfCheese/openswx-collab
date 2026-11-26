@@ -724,22 +724,22 @@ async fn a_request_gives_up_on_a_lock_and_the_journal_a_little_later() {
 async fn a_lock_timeout_as_long_as_a_statement_may_run_is_refused() {
     needs_postgres!();
     let schema = PgSchema::create().await;
-    for config in [
-        PgConfig {
-            lock_timeout: Duration::from_secs(21),
-            ..PgConfig::default()
-        },
-        PgConfig {
-            journal_lock_timeout: Duration::from_secs(30),
-            ..PgConfig::default()
-        },
-    ] {
-        let err = PgStore::connect(&schema.url, config).await.unwrap_err();
-        assert!(err.to_string().contains("at most 20 s"), "{err:#}");
-    }
+    let request = PgConfig {
+        lock_timeout: Duration::from_secs(21),
+        ..PgConfig::default()
+    };
+    let err = PgStore::connect(&schema.url, request).await.unwrap_err();
+    assert!(err.to_string().contains("at most 20 s"), "{err:#}");
+    // The journal's: a quarter of the time a batch may take.
+    let journal = PgConfig {
+        journal_lock_timeout: Duration::from_secs(8),
+        ..PgConfig::default()
+    };
+    let err = PgStore::connect(&schema.url, journal).await.unwrap_err();
+    assert!(err.to_string().contains("at most 7.5 s"), "{err:#}");
     let longest = PgConfig {
         lock_timeout: Duration::from_secs(20),
-        journal_lock_timeout: Duration::from_secs(20),
+        journal_lock_timeout: Duration::from_millis(7500),
         ..PgConfig::default()
     };
     PgStore::connect(&schema.url, longest).await.unwrap();

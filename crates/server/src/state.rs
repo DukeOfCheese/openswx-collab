@@ -72,6 +72,37 @@ impl Committed {
     }
 }
 
+/// What [`AppState::commit_then`] commits: a transaction, and the turn of the organisation it
+/// changes if the request took one. Made from `tx`, `(tx, turn)` or `(tx, Option<turn>)`.
+pub struct Commit {
+    tx: Box<dyn Tx>,
+    turn: Option<OrgTurn>,
+}
+
+impl From<Box<dyn Tx>> for Commit {
+    fn from(tx: Box<dyn Tx>) -> Self {
+        Self { tx, turn: None }
+    }
+}
+
+impl From<(Box<dyn Tx>, OrgTurn)> for Commit {
+    fn from((tx, turn): (Box<dyn Tx>, OrgTurn)) -> Self {
+        Self {
+            tx,
+            turn: Some(turn),
+        }
+    }
+}
+
+impl From<(Box<dyn Tx>, Option<OrgTurn>)> for Commit {
+    fn from((tx, turn): (Box<dyn Tx>, Option<OrgTurn>)) -> Self {
+        Self { tx, turn }
+    }
+}
+
+/// How long shutdown waits for the purger to end by itself before it is aborted.
+const PURGER_WAIT: Duration = Duration::from_secs(2);
+
 /// How long shutdown waits for the steps after REST commits that are still running.
 const AFTER_COMMIT_WAIT: Duration = Duration::from_secs(10);
 
@@ -151,9 +182,15 @@ impl AppState {
     }
 
     /// The turn to change something in the organisation `org`, taken before the request opens
-    /// its transaction and kept until it has committed: requests that change one organisation
-    /// run one at a time, and those that wait hold no database connection
-    /// ([`crate::org_queue`]). 503 when too many already wait, or the turn does not come in time.
+    /// its transaction: requests that change one organisation run their transactions one at a
+    /// time, and those that wait hold no database connection ([`crate::org_queue`]). 503 when too
+    /// many already wait, or the turn does not come in time.
+    ///
+    /// Hand it to [`AppState::commit_then`] with the transaction (`(tx, turn)`): it is given up as
+    /// soon as the commit has been made, **before** the steps that follow it (closing
+    /// connections, mail, extension hooks, which may take seconds), so the next request's
+    /// transaction does not wait for them. A request that ends before it commits gives the turn
+    /// up by dropping it.
     pub async fn org_turn(&self, org: &str) -> Result<OrgTurn, ApiError> {
         self.org_queue.turn(org).await
     }
@@ -181,6 +218,9 @@ impl AppState {
     ///
     /// A commit error is answered as the error (500) after the revoking steps.
     ///
+    /// `tx` is the transaction, or the transaction and the organisation's turn the request holds
+    /// ([`AppState::org_turn`]), which is given up between the commit and the steps.
+    ///
     /// # Which hub call a route makes
     ///
     /// Every route whose commit takes away access calls one of these among its revoking steps
@@ -202,7 +242,7 @@ impl AppState {
     /// If the steps panic (the panic is passed on to the request).
     pub async fn commit_then<T, F, R, A>(
         &self,
-        tx: Box<dyn Tx>,
+        tx: impl Into<Commit>,
         revoking: F,
         announcing: A,
     ) -> Result<T, ApiError>
@@ -213,8 +253,11 @@ impl AppState {
         A: Future<Output = T> + Send + 'static,
     {
         let gate = self.room_hooks.after_commit.clone();
+        let Commit { tx, turn } = tx.into();
         self.detached(async move {
             let committed = tx.commit().await;
+            // The organisation's next request may begin: what follows holds no transaction.
+            drop(turn);
             gate.pass().await;
             let outcome = if committed.is_ok() {
                 Committed::Yes
@@ -310,14 +353,16 @@ impl AppState {
         Ok(state)
     }
 
-    /// The orderly end of a server, once it has stopped accepting requests: stops the
-    /// purger at its next chunk (what it has not removed stays marked, for the next start), the
-    /// rooms and connections (each room waits briefly for the journal's answers to its changes in flight,
+    /// The orderly end of a server, once it has stopped accepting requests: tells the purger to
+    /// stop (without waiting for it: it may be inside a slow storage call), closes the rooms and
+    /// connections (each room waits briefly for the journal's answers to its changes in flight,
     /// closes its sockets with 1001 and writes a final snapshot of its durable head), waits (a
-    /// while) for the steps after REST commits still running, then writes what the journal still
-    /// has queued and stops it. Calling it again does no harm.
+    /// while) for the steps after REST commits still running, writes what the journal still has
+    /// queued and stops it, and last waits a moment for the purger and aborts it if it has not
+    /// ended (what it has not removed stays marked, for the next start). Calling it again does
+    /// no harm.
     pub async fn shutdown(&self) {
-        self.purger.stop().await;
+        self.purger.signal_stop();
         self.hub.shutdown().await;
         if tokio::time::timeout(AFTER_COMMIT_WAIT, self.after_commits.idle())
             .await
@@ -329,6 +374,7 @@ impl AppState {
             );
         }
         self.journal.close().await;
+        self.purger.stop(PURGER_WAIT).await;
     }
 }
 

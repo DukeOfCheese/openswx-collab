@@ -20,9 +20,10 @@
 //!   ([`crate::journal`]): only the records of the blocked document come back `Unknown` (its
 //!   room reloads); every other document's are stored.
 //!
-//! Both lock timeouts are at most 20 s ([`MAX_LOCK_TIMEOUT`]), well below the statement timeout,
-//! so that a lock wait ends as a lock wait (409, or the journal's fallback) and not as a statement
-//! that ran out of time (503, or a failed batch). [`PgStore::connect`] refuses longer ones, and
+//! A request's lock timeout is at most 20 s ([`MAX_LOCK_TIMEOUT`]), well below the statement
+//! timeout, and the journal's at most 7.5 s ([`MAX_JOURNAL_LOCK_TIMEOUT`], a quarter of the time
+//! a journal batch may take), so that a lock wait ends as a lock wait (409, or the journal's
+//! fallback) and not as a statement that ran out of time (503) or a batch given up as a whole. [`PgStore::connect`] refuses longer ones, and
 //! sets both on the connection it makes first, so that a database that will not take them says
 //! so when the server starts.
 //!
@@ -90,6 +91,11 @@ pub const DEFAULT_JOURNAL_LOCK_TIMEOUT: f64 = 2.0;
 /// The longest lock timeout, in seconds: well below the statement timeout (30 s), so that a wait
 /// for a lock ends as one.
 pub const MAX_LOCK_TIMEOUT: f64 = 20.0;
+/// The longest lock timeout of the journal's transactions, in seconds: a quarter of the time a
+/// journal batch may take ([`crate::journal::BATCH_TIMEOUT`]), so that a batch that waited for a
+/// lock, and then once more for the blocked document when it is written again one document at a
+/// time, still ends well inside it.
+pub const MAX_JOURNAL_LOCK_TIMEOUT: f64 = 7.5;
 /// How long a caller waits for a connection.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest one statement may run (waiting for a lock included), in milliseconds.
@@ -218,9 +224,14 @@ impl PgStore {
         };
         let longest = Duration::from_secs_f64(MAX_LOCK_TIMEOUT);
         anyhow::ensure!(
-            config.lock_timeout <= longest && config.journal_lock_timeout <= longest,
+            config.lock_timeout <= longest,
             "a lock timeout is at most {MAX_LOCK_TIMEOUT} s (statements end after {} s)",
             STATEMENT_TIMEOUT_MS / 1000
+        );
+        anyhow::ensure!(
+            config.journal_lock_timeout <= Duration::from_secs_f64(MAX_JOURNAL_LOCK_TIMEOUT),
+            "the journal's lock timeout is at most {MAX_JOURNAL_LOCK_TIMEOUT} s (a quarter of \
+             the time a journal batch may take)"
         );
         let lock_timeout_ms = config.lock_timeout.as_millis().max(1);
         let journal_lock_timeout_ms = config.journal_lock_timeout.as_millis().max(1);

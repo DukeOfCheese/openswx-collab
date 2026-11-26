@@ -358,6 +358,7 @@ pub async fn write_snapshot(
     let document = store
         .document_by_id(doc)
         .await?
+        .filter(|d| d.deleted_at.is_none())
         .ok_or(WriteSnapshotError::NoDocument)?;
     if seq_i > document.head_seq {
         return Err(ahead(document.head_seq));
@@ -380,6 +381,16 @@ pub async fn write_snapshot(
     };
     blobs.put(&key, bytes).await?;
     let mut tx = store.begin_journal().await?;
+    // The document's row is locked while its snapshot row is written: a deletion either came
+    // first (nothing is recorded, and the file just stored is taken away again: the purger may
+    // already have emptied `docs/<document>/`) or waits, and then removes this one with the rest.
+    if !tx.lock_live_document(doc).await? {
+        drop(tx);
+        if let Err(e) = blobs.delete(&key).await {
+            tracing::warn!("could not remove the snapshot {key} of a deleted document: {e:#}");
+        }
+        return Err(WriteSnapshotError::NoDocument);
+    }
     let head_seq = tx
         .document_by_id(doc)
         .await?

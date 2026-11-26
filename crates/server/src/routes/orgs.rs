@@ -189,7 +189,7 @@ async fn rename_org(
 ) -> Result<Json<Value>, ApiError> {
     let name = clean_name(&body.name)?;
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Owner).await?;
-    let _turn = state.org_turn(&org_id).await?;
+    let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Owner).await?;
     tx.set_org_name(&org_id, &name).await?;
@@ -199,7 +199,11 @@ async fn rename_org(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            async move { emit(&ext, event).await },
+        )
         .await?;
     Ok(Json(json!({"id": org_id, "name": name})))
 }
@@ -241,7 +245,7 @@ async fn set_member_role(
         .parse()
         .map_err(|_| ApiError::Unprocessable("role must be one of owner, admin, member".into()))?;
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
-    let _turn = state.org_turn(&org_id).await?;
+    let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     let mine = recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     let Some(member) = tx.org_member(&org_id, &user_id).await? else {
@@ -268,7 +272,7 @@ async fn set_member_role(
     let ext = state.ext.clone();
     state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 revoker
                     .hub
@@ -289,7 +293,7 @@ async fn remove_member(
     ApiPath((org_id, user_id)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Member).await?;
-    let _turn = state.org_turn(&org_id).await?;
+    let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     let mine = recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Member).await?;
     let Some(member) = tx.org_member(&org_id, &user_id).await? else {
@@ -318,7 +322,7 @@ async fn remove_member(
     // Access goes first: their open documents close before any extension hears of it.
     state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 revoker
                     .hub
@@ -491,7 +495,7 @@ async fn create_invite(
         expires_at: now + body.days as f64 * 86400.0,
         accepted_by: None,
     };
-    let _turn = state.org_turn(&org_id).await?;
+    let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     tx.insert_invite(&invite).await?;
@@ -511,7 +515,7 @@ async fn create_invite(
     };
     let after = state.clone();
     let emailed = state
-        .commit_then(tx, |_| async {}, async move {
+        .commit_then((tx, turn), |_| async {}, async move {
             let mut emailed = false;
             if let Some((to, (subject, text))) = mail {
                 emailed =
@@ -552,7 +556,7 @@ async fn revoke_invite(
     ApiPath((org_id, invite_id)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
-    let _turn = state.org_turn(&org_id).await?;
+    let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     if !tx.delete_invite(&org_id, &invite_id).await? {
@@ -565,7 +569,11 @@ async fn revoke_invite(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            async move { emit(&ext, event).await },
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -826,7 +834,7 @@ async fn accept(
     else {
         return Err(ApiError::NotFound(INVITE_INVALID));
     };
-    let _turn = state.org_turn(approval.org()).await?;
+    let turn = state.org_turn(approval.org()).await?;
     let mut tx = state.store.begin().await?;
     let Some(invite) = find_invite(&mut *tx, Some(&body.token), &me.email, now).await? else {
         return Err(ApiError::NotFound(INVITE_INVALID));
@@ -837,7 +845,11 @@ async fn accept(
         "role": accepted.role.as_str(),
     });
     state
-        .commit_then(tx, |_| async {}, accepted.announce(state.ext.clone()))
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            accepted.announce(state.ext.clone()),
+        )
         .await?;
     Ok(Json(answer))
 }

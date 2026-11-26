@@ -151,7 +151,7 @@ async fn create_folder(
         name,
         created_at: state.clock.now(),
     };
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Editor).await?;
     if let Some(parent) = &folder.parent_id {
@@ -173,7 +173,11 @@ async fn create_folder(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            async move { emit(&ext, event).await },
+        )
         .await?;
     Ok((StatusCode::CREATED, ApiJson(folder_out(&folder))))
 }
@@ -248,7 +252,7 @@ async fn patch_folder(
     if let Some(Some(parent)) = &body.parent_id {
         folder_in(state.store.folder_by_id(parent).await?, &project.id)?;
     }
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     let mut folder = recheck_folder(&mut *tx, &user.id, &folder.id, ProjectRole::Editor).await?;
     if let Some(parent) = &body.parent_id {
@@ -294,7 +298,7 @@ async fn patch_folder(
     }
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move {
+        .commit_then((tx, turn), |_| async {}, async move {
             for event in events {
                 emit(&ext, event).await;
             }
@@ -311,7 +315,7 @@ async fn delete_folder(
 ) -> Result<StatusCode, ApiError> {
     let (folder, project) =
         require_folder(&state, &user.id, &folder_id, ProjectRole::Editor).await?;
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     let folder = recheck_folder(&mut *tx, &user.id, &folder.id, ProjectRole::Editor).await?;
     let parent = folder.parent_id.as_deref();
@@ -326,7 +330,11 @@ async fn delete_folder(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            async move { emit(&ext, event).await },
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

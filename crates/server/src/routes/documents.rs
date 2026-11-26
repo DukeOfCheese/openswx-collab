@@ -523,6 +523,7 @@ async fn insert_document(
     references: &References,
     org_id: &str,
 ) -> Result<ProjectRole, InsertError> {
+    // (Given up when this returns: right after its commit.)
     let _turn = state.org_turn(org_id).await?;
     let mut tx = state.store.begin().await?;
     let (_, role) = recheck_project(
@@ -617,7 +618,7 @@ async fn patch_document(
     if let Some(Some(folder)) = &body.folder_id {
         folder_in(state.store.folder_by_id(folder).await?, &project.id)?;
     }
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     let (mut doc, _, role) =
         recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Editor).await?;
@@ -652,7 +653,7 @@ async fn patch_document(
     }
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move {
+        .commit_then((tx, turn), |_| async {}, async move {
             for event in events {
                 emit(&ext, event).await;
             }
@@ -675,7 +676,7 @@ async fn delete_document(
         ProjectRole::Owner,
     )
     .await?;
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Owner).await?;
     if !tx.mark_document_deleted(&doc.id, state.clock.now()).await? {
@@ -705,7 +706,7 @@ async fn delete_document(
     let (revoker, ext) = (state.clone(), state.ext.clone());
     state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 revoker
                     .hub

@@ -730,7 +730,7 @@ async fn sign_in_once(
         _ => None,
     };
 
-    let _turn = match &approval {
+    let turn = match &approval {
         Some(approval) => Some(state.org_turn(approval.org()).await?),
         None => None,
     };
@@ -798,7 +798,7 @@ async fn sign_in_once(
     let first = created.as_ref().is_some_and(|(first, _)| *first);
     let made = created.is_some();
     state
-        .commit_then(tx, |_| async {}, async move {
+        .commit_then((tx, turn), |_| async {}, async move {
             if let Some((_, accepted)) = created {
                 let registered = Event::RegisteredWithProvider {
                     user: user_id.clone(),

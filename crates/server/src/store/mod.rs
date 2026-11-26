@@ -743,23 +743,22 @@ pub trait Store: Send + Sync + 'static {
     /// takes (a request's transaction gives up after a few seconds). Never for a request.
     async fn begin_journal(&self) -> anyhow::Result<Box<dyn Tx>>;
 
-    /// The projects marked deleted whose rows are still there, by id, at most `limit`: what the
-    /// purger ([`crate::purge`]) has left to remove.
-    async fn deleted_projects(&self, limit: i64) -> anyhow::Result<Vec<Id>>;
+    /// The projects marked deleted whose rows are still there, by id, after the id `after` (`""`
+    /// for the first), at most `limit`: what the purger ([`crate::purge`]) has left to remove.
+    async fn deleted_projects(&self, after: &str, limit: i64) -> anyhow::Result<Vec<Id>>;
 
-    /// The organisations marked deleted whose rows are still there, by id, at most `limit`.
-    async fn deleted_orgs(&self, limit: i64) -> anyhow::Result<Vec<Id>>;
+    /// The organisations marked deleted whose rows are still there, by id, after `after`, at most
+    /// `limit`.
+    async fn deleted_orgs(&self, after: &str, limit: i64) -> anyhow::Result<Vec<Id>>;
 
-    /// The documents a project marked deleted still has, by id, at most `limit` (none for a
-    /// project that is not marked).
+    /// The documents a project marked deleted still has, by id, after `after`, at most `limit`
+    /// (none for a project that is not marked).
     async fn documents_of_deleted_project(
         &self,
         project_id: &str,
+        after: &str,
         limit: i64,
     ) -> anyhow::Result<Vec<Id>>;
-
-    /// How many project rows an organisation still has, the marked ones included.
-    async fn projects_left_in_org(&self, org_id: &str) -> anyhow::Result<u64>;
 
     /// How many accounts exist, deleted and disabled ones included (the registration mode).
     async fn user_count(&self) -> anyhow::Result<u64>;
@@ -1168,10 +1167,6 @@ pub trait Tx: Send {
 
     async fn set_project_name(&mut self, id: &str, name: &str) -> anyhow::Result<()>;
 
-    /// Deletes a project; the database removes its documents, their journals, snapshot rows,
-    /// versions and references, and its role rows with it.
-    async fn delete_project(&mut self, id: &str) -> anyhow::Result<()>;
-
     /// [`Store::project_by_id`], seeing this transaction's writes.
     async fn project_by_id(&mut self, id: &str) -> anyhow::Result<Option<Project>>;
 
@@ -1229,9 +1224,10 @@ pub trait Tx: Send {
     /// none is left. For the purger: a document of a deleted project, a chunk a transaction.
     async fn purge_document_rows(&mut self, document_id: &str, limit: i64) -> anyhow::Result<u64>;
 
-    /// Removes the row of a document whose project is marked deleted (nothing otherwise). Purge
-    /// its rows first ([`Tx::purge_document_rows`]): the database removes what is left with it.
-    async fn purge_document(&mut self, id: &str) -> anyhow::Result<()>;
+    /// Removes the row of a document whose project is marked deleted; `false` (nothing removed)
+    /// for any other document. Purge its rows first ([`Tx::purge_document_rows`]): the database
+    /// removes what is left with it.
+    async fn purge_document(&mut self, id: &str) -> anyhow::Result<bool>;
 
     /// Removes up to `limit` folders of a project (each with the folders inside it) and answers
     /// how many went; 0 when none is left. For the purger.
@@ -1447,8 +1443,4 @@ pub trait Tx: Send {
 
     /// The accounts that are members of an organisation, by id.
     async fn org_member_ids(&mut self, org_id: &str) -> anyhow::Result<Vec<Id>>;
-
-    /// Deletes an organisation; the database removes its members, invites and projects with it
-    /// (and with those what [`Tx::delete_project`] removes).
-    async fn delete_org(&mut self, id: &str) -> anyhow::Result<()>;
 }

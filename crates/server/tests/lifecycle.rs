@@ -1825,7 +1825,7 @@ async fn files_that_cannot_be_removed_do_not_fail_the_deletion() {
     );
     server.state.purger.gate().open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while !logs.text().contains("removing what was deleted failed") {
+    while !logs.text().contains("could not be removed") {
         assert!(tokio::time::Instant::now() < deadline, "{}", logs.text());
         pause(Duration::from_millis(20)).await;
     }
@@ -1833,7 +1833,8 @@ async fn files_that_cannot_be_removed_do_not_fail_the_deletion() {
     assert!(has_files(&server, "docs", &doc).await, "left behind");
     assert!(server.state.purger.busy());
     let text = logs.text();
-    assert!(text.contains("will be tried again"), "{text}");
+    assert!(text.contains("it is tried again"), "{text}");
+    assert!(server.state.purger.waiting() >= 1);
     logs.assert_never_logged(&["Robotics", "ada@example.com", "Ada", "Bracket", PASSWORD]);
 }
 

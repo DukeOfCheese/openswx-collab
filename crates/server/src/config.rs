@@ -206,20 +206,20 @@ impl Settings {
             "DATABASE_JOURNAL_LOCK_TIMEOUT",
             &mut s.database_journal_lock_timeout,
         )?;
-        // A lock wait as long as the statement timeout would never be the one to end.
-        for (name, seconds) in [
-            ("DATABASE_LOCK_TIMEOUT", s.database_lock_timeout),
-            (
+        // A lock wait as long as the statement timeout would never be the one to end; and the
+        // journal's must leave a batch time to be written again.
+        if s.database_lock_timeout > crate::store::postgres::MAX_LOCK_TIMEOUT {
+            return Err(ConfigError::new(
+                "DATABASE_LOCK_TIMEOUT",
+                "a number of seconds above zero and at most 20 (statements end after 30)",
+            ));
+        }
+        if s.database_journal_lock_timeout > crate::store::postgres::MAX_JOURNAL_LOCK_TIMEOUT {
+            return Err(ConfigError::new(
                 "DATABASE_JOURNAL_LOCK_TIMEOUT",
-                s.database_journal_lock_timeout,
-            ),
-        ] {
-            if seconds > crate::store::postgres::MAX_LOCK_TIMEOUT {
-                return Err(ConfigError::new(
-                    name,
-                    "a number of seconds above zero and at most 20 (statements end after 30)",
-                ));
-            }
+                "a number of seconds above zero and at most 7.5 (a quarter of a journal batch's \
+                 time)",
+            ));
         }
         e.string("STORAGE_URL", &mut s.storage_url);
         e.string("S3_ENDPOINT", &mut s.s3_endpoint);
@@ -862,15 +862,37 @@ mod tests {
         assert_eq!((s.database_pool, s.database_journal_pool), (10, 2));
         assert_eq!(s.database_lock_timeout, 5.0);
         assert_eq!(s.database_journal_lock_timeout, 2.0);
-        // A lock timeout must end before the statement timeout (30 s) does.
-        for name in ["DATABASE_LOCK_TIMEOUT", "DATABASE_JOURNAL_LOCK_TIMEOUT"] {
-            assert_eq!(read(&[(name, "20")]).database_pool, 10, "20 s is allowed");
-            for bad in ["20.5", "30", "31", "86400"] {
+        // A lock timeout must end before the statement timeout (30 s) does, and the journal's
+        // within a quarter of a batch's time.
+        for (name, most, over, says) in [
+            (
+                "DATABASE_LOCK_TIMEOUT",
+                "20",
+                ["20.5", "30", "86400"],
+                "at most 20",
+            ),
+            (
+                "DATABASE_JOURNAL_LOCK_TIMEOUT",
+                "7.5",
+                ["7.6", "20", "86400"],
+                "at most 7.5",
+            ),
+        ] {
+            assert_eq!(
+                read(&[(name, most)]).database_pool,
+                10,
+                "{most} s is allowed"
+            );
+            for bad in over {
                 let err = refused(&[(name, bad)]);
                 assert_eq!(err.var, format!("OSWX_COLLAB_{name}"), "{bad}");
-                assert!(err.expected.contains("at most 20"), "{err}");
+                assert!(err.expected.contains(says), "{err}");
             }
         }
+        assert_eq!(
+            crate::store::postgres::MAX_JOURNAL_LOCK_TIMEOUT,
+            crate::journal::BATCH_TIMEOUT.as_secs_f64() / 4.0
+        );
         let s = read(&[
             ("DATABASE_POOL", " 32 "),
             ("DATABASE_JOURNAL_POOL", "4"),

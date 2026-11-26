@@ -110,24 +110,22 @@ macro_rules! store_impl {
                 Ok(Box::new(self.begin_journal_tx().await?))
             }
 
-            async fn deleted_projects(&self, limit: i64) -> Result<Vec<Id>> {
-                q::deleted_projects(&mut *self.reader().await?, limit).await
+            async fn deleted_projects(&self, after: &str, limit: i64) -> Result<Vec<Id>> {
+                q::deleted_projects(&mut *self.reader().await?, after, limit).await
             }
 
-            async fn deleted_orgs(&self, limit: i64) -> Result<Vec<Id>> {
-                q::deleted_orgs(&mut *self.reader().await?, limit).await
+            async fn deleted_orgs(&self, after: &str, limit: i64) -> Result<Vec<Id>> {
+                q::deleted_orgs(&mut *self.reader().await?, after, limit).await
             }
 
             async fn documents_of_deleted_project(
                 &self,
                 project_id: &str,
+                after: &str,
                 limit: i64,
             ) -> Result<Vec<Id>> {
-                q::documents_of_deleted_project(&mut *self.reader().await?, project_id, limit).await
-            }
-
-            async fn projects_left_in_org(&self, org_id: &str) -> Result<u64> {
-                q::projects_left_in_org(&mut *self.reader().await?, org_id).await
+                let mut c = self.reader().await?;
+                q::documents_of_deleted_project(&mut c, project_id, after, limit).await
             }
 
             async fn user_count(&self) -> Result<u64> {
@@ -685,10 +683,6 @@ macro_rules! store_impl {
                 q::set_project_name(self.conn(), id, name).await
             }
 
-            async fn delete_project(&mut self, id: &str) -> Result<()> {
-                q::delete_project(self.conn(), id).await
-            }
-
             async fn project_by_id(&mut self, id: &str) -> Result<Option<Project>> {
                 q::project_by_id(self.conn(), id).await
             }
@@ -746,7 +740,7 @@ macro_rules! store_impl {
                 q::purge_document_rows(self.conn(), document_id, limit).await
             }
 
-            async fn purge_document(&mut self, id: &str) -> Result<()> {
+            async fn purge_document(&mut self, id: &str) -> Result<bool> {
                 q::purge_document(self.conn(), id).await
             }
 
@@ -982,10 +976,6 @@ macro_rules! store_impl {
 
             async fn org_member_ids(&mut self, org_id: &str) -> Result<Vec<Id>> {
                 q::org_member_ids(self.conn(), org_id).await
-            }
-
-            async fn delete_org(&mut self, id: &str) -> Result<()> {
-                q::delete_org(self.conn(), id).await
             }
         }
 
@@ -1522,11 +1512,6 @@ macro_rules! store_impl {
                 Ok(())
             }
 
-            pub async fn delete_project(c: &mut $Conn, id: &str) -> Result<()> {
-                sqlx::query(sql::DELETE_PROJECT).bind(id).execute(c).await?;
-                Ok(())
-            }
-
             pub async fn project_by_id(c: &mut $Conn, id: &str) -> Result<Option<Project>> {
                 Ok(sqlx::query_as(sql::PROJECT_BY_ID)
                     .bind(id)
@@ -1679,15 +1664,21 @@ macro_rules! store_impl {
                 Ok(true)
             }
 
-            pub async fn deleted_projects(c: &mut $Conn, limit: i64) -> Result<Vec<Id>> {
+            pub async fn deleted_projects(
+                c: &mut $Conn,
+                after: &str,
+                limit: i64,
+            ) -> Result<Vec<Id>> {
                 Ok(sqlx::query_scalar(sql::DELETED_PROJECTS)
+                    .bind(after)
                     .bind(limit)
                     .fetch_all(c)
                     .await?)
             }
 
-            pub async fn deleted_orgs(c: &mut $Conn, limit: i64) -> Result<Vec<Id>> {
+            pub async fn deleted_orgs(c: &mut $Conn, after: &str, limit: i64) -> Result<Vec<Id>> {
                 Ok(sqlx::query_scalar(sql::DELETED_ORGS)
+                    .bind(after)
                     .bind(limit)
                     .fetch_all(c)
                     .await?)
@@ -1696,21 +1687,15 @@ macro_rules! store_impl {
             pub async fn documents_of_deleted_project(
                 c: &mut $Conn,
                 project_id: &str,
+                after: &str,
                 limit: i64,
             ) -> Result<Vec<Id>> {
                 Ok(sqlx::query_scalar(sql::DOCUMENTS_OF_DELETED_PROJECT)
                     .bind(project_id)
+                    .bind(after)
                     .bind(limit)
                     .fetch_all(c)
                     .await?)
-            }
-
-            pub async fn projects_left_in_org(c: &mut $Conn, org_id: &str) -> Result<u64> {
-                let n: i64 = sqlx::query_scalar(sql::PROJECTS_LEFT_IN_ORG)
-                    .bind(org_id)
-                    .fetch_one(c)
-                    .await?;
-                Ok(u64::try_from(n)?)
             }
 
             pub async fn purge_document_rows(
@@ -1739,9 +1724,9 @@ macro_rules! store_impl {
                 Ok(gone)
             }
 
-            pub async fn purge_document(c: &mut $Conn, id: &str) -> Result<()> {
-                sqlx::query(sql::PURGE_DOCUMENT).bind(id).execute(c).await?;
-                Ok(())
+            pub async fn purge_document(c: &mut $Conn, id: &str) -> Result<bool> {
+                let done = sqlx::query(sql::PURGE_DOCUMENT).bind(id).execute(c).await?;
+                Ok(done.rows_affected() == 1)
             }
 
             pub async fn purge_project_rows(
@@ -2549,11 +2534,6 @@ macro_rules! store_impl {
                     .bind(org_id)
                     .fetch_all(c)
                     .await?)
-            }
-
-            pub async fn delete_org(c: &mut $Conn, id: &str) -> Result<()> {
-                sqlx::query(sql::DELETE_ORG).bind(id).execute(c).await?;
-                Ok(())
             }
 
             pub async fn user_memberships(c: &mut $Conn, user_id: &str) -> Result<Vec<Membership>> {

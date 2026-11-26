@@ -778,7 +778,12 @@ async fn load(state: &AppState, doc: &str) -> Result<RoomInit, OpenError> {
         state.clock.now(),
         LEASE_TTL,
     )
-    .await?;
+    .await
+    // (Deleted between the read above and the lease: as if it had been found deleted.)
+    .map_err(|e| match e.downcast::<lease::NoDocument>() {
+        Ok(_) => OpenError::NoDocument,
+        Err(other) => OpenError::Failed(other),
+    })?;
     let (head, _) = load_head(state.store.as_ref(), state.blobs.as_ref(), doc)
         .await
         .map_err(|e| match e {

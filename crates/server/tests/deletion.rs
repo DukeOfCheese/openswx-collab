@@ -137,7 +137,7 @@ async fn count(server: &TestServer, query: &str) -> i64 {
 /// as fast as ever: no append waits for more than a chunk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_big_deletion_delays_nobody_elses_journal() {
-    let (server, _flaky) = server_purging(250).await;
+    let (server, _flaky) = server_purging(50).await;
     let w = World::new(&server).await.unwrap();
     let store = server.state.store.clone();
     let mut doomed = Vec::new();
@@ -184,6 +184,8 @@ async fn a_big_deletion_delays_nobody_elses_journal() {
     server.state.purger.gate().open();
     let mut slowest = Duration::ZERO;
     let mut seq = 0;
+    // (At how many chunks the purger was when each append was written.)
+    let mut between = std::collections::BTreeSet::new();
     while server.state.purger.busy() || seq < 20 {
         seq += 1;
         let started = Instant::now();
@@ -193,14 +195,24 @@ async fn a_big_deletion_delays_nobody_elses_journal() {
             .append(record(&kept, &w.admin_id, seq, epoch))
             .await;
         assert_eq!(written, Ok(()), "append {seq}");
+        if server.state.purger.busy() {
+            between.insert(server.state.purger.chunks());
+        }
         slowest = slowest.max(started.elapsed());
         assert!(seq < 100_000, "the purger never finished");
     }
     server.purged().await;
     assert!(
-        server.state.purger.chunks() >= 24,
-        "6,000 rows went in {} chunks of 250",
+        server.state.purger.chunks() >= 120,
+        "6,000 rows went in {} chunks of 50",
         server.state.purger.chunks()
+    );
+    // The appends were written in between the chunks, not before or after one long removal: they
+    // saw the purger at many different points of its way.
+    assert!(
+        between.len() >= 5,
+        "appends landed at only {} points of the removal: {between:?}",
+        between.len()
     );
     assert!(
         slowest < Duration::from_secs(1),
@@ -704,7 +716,12 @@ async fn rows_wait_for_their_files_when_storage_fails() {
         delete_org(&server, &w.admin, &w.org, "Robotics").await,
         StatusCode::NO_CONTENT
     );
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // The purger has tried, been refused by the storage, and waits for its next try.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while blobs.deletes() == 0 || server.state.purger.waiting() == 0 {
+        assert!(Instant::now() < deadline, "the purger never tried");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Gone for everyone; its rows and files wait.
     assert!(server.state.purger.busy());
     assert_eq!(count(&server, "SELECT COUNT(*) FROM documents").await, 1);
@@ -891,4 +908,249 @@ async fn a_turn_that_does_not_come_is_answered_busy() {
             .is_empty()
     );
     assert_eq!(server.state.org_queue.organisations(), 0);
+}
+
+/// A server whose storage the test can hold or break, and whose purger tries again quickly.
+async fn server_with_blobs(retry: Duration) -> (TestServer, Arc<common::TestBlobs>) {
+    let mut handle = None;
+    let server = TestServer::start_custom(
+        |s| s.open_registration = true,
+        |s| {
+            let blobs = Arc::new(common::TestBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+            s.purger = Purger::new(100, retry);
+        },
+    )
+    .await;
+    (server, handle.unwrap())
+}
+
+/// One document whose files the storage will never remove holds up only itself (and its project
+/// and organisation, which go after it): everything else that was deleted is removed, whichever
+/// comes first in the purger's order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_thing_that_cannot_be_removed_does_not_hold_up_the_rest() {
+    let (server, blobs) = server_with_blobs(Duration::from_millis(100)).await;
+    let w = World::new(&server).await.unwrap();
+    // Three organisations, a project and a document each; the one whose project comes first in
+    // id order (the purger's order) is the one that cannot be removed.
+    let mut all = Vec::new();
+    for n in 0..3 {
+        let name = format!("Org {n}");
+        let o = org(&server, &w.admin, &name).await;
+        let p = project(&server, &w.admin, &o, "P").await;
+        let d = document(&server, &w.admin, &p, "D").await;
+        fill_journal(server.state.store.as_ref(), &d, &w.admin_id, 30).await;
+        all.push((p, o, d, name));
+    }
+    all.sort();
+    let (_, stuck_org, stuck_doc, _) = all[0].clone();
+    blobs.fail_delete_of(Some(&format!("docs/{stuck_doc}/")));
+    server.state.purger.gate().shut();
+    for (_, o, _, name) in &all {
+        assert_eq!(
+            delete_org(&server, &w.admin, o, name).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    server.state.purger.gate().open();
+    // The other two go entirely, while the first is tried again and again.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let orgs = count(
+            &server,
+            "SELECT COUNT(*) FROM orgs WHERE deleted_at IS NOT NULL",
+        )
+        .await;
+        if orgs == 1 && server.state.purger.waiting() >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{orgs} deleted organisations are left: the stuck one held up the rest"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for (_, _, doc, _) in &all[1..] {
+        assert!(
+            server
+                .stored_under(&format!("docs/{doc}/"))
+                .await
+                .is_empty()
+        );
+        assert!(
+            server
+                .state
+                .store
+                .document_by_id(doc)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    // What cannot be removed is still marked, with its rows and files, and is still tried.
+    assert!(server.state.purger.busy());
+    assert_eq!(
+        server.state.store.deleted_orgs("", 10).await.unwrap(),
+        std::slice::from_ref(&stuck_org)
+    );
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM changes").await, 30);
+    assert_eq!(
+        server
+            .stored_under(&format!("docs/{stuck_doc}/"))
+            .await
+            .len(),
+        1
+    );
+    let tries = blobs.deletes();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(blobs.deletes() > tries, "it is tried again");
+    // Once the storage takes the removal, it goes too.
+    blobs.fail_delete_of(None);
+    server.purged().await;
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 1);
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM changes").await, 0);
+    assert_eq!(server.state.purger.waiting(), 0);
+}
+
+/// The server is told to stop while the purger is inside a storage call that does not return.
+/// The rooms are closed all the same, at once: their clients are told (1001) and their final
+/// snapshots written. The purger is given up on; what it had not removed is still marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_purger_stuck_in_storage_does_not_hold_up_shutdown() {
+    let (mut server, blobs) = server_with_blobs(RETRY).await;
+    let w = World::new(&server).await.unwrap();
+    let doomed = org(&server, &w.admin, "Doomed").await;
+    let p = project(&server, &w.admin, &doomed, "P").await;
+    let _ = document(&server, &w.admin, &p, "D").await;
+    // Someone is editing a document of another organisation.
+    let kept = w.document(&server, None, None, None).await;
+    let mut live = Live::connect(&server, &kept, &w.admin).await;
+    assert_eq!(
+        live.change(vec![common::set_depth(7)], vec![], vec![])
+            .await
+            .seq(),
+        1
+    );
+    // The purger is inside the removal of the deleted document's files, which does not return.
+    blobs.delete_gate.shut();
+    assert_eq!(
+        delete_org(&server, &w.admin, &doomed, "Doomed").await,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(Duration::from_secs(20), blobs.delete_gate.until_waiting(1))
+        .await
+        .expect("the purger reached the storage");
+
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), server.stop())
+        .await
+        .expect("shutdown does not wait for the purger");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(live.closed().await.0, 1001);
+    let snapshot = server
+        .state
+        .store
+        .latest_snapshot(&kept)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.seq, 1, "the room's final snapshot was written");
+    // The purger is gone, and its work is still marked for the next start.
+    assert!(!server.state.purger.busy());
+    assert_eq!(
+        server.state.store.deleted_orgs("", 10).await.unwrap(),
+        [doomed]
+    );
+    blobs.delete_gate.open();
+}
+
+/// A request that gives up while it waits for its organisation's turn (its client went away)
+/// leaves the queue: its place is free for another, and it never opens a transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_leaves_the_queue_frees_its_place() {
+    let (server, flaky) = TestServer::start_flaky_full(
+        |_| {},
+        new_journal,
+        |s| s.org_queue = OrgQueue::new(1, Duration::from_secs(30)),
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let server = Arc::new(server);
+    flaky.org_gate.shut();
+    let holder = {
+        let (server, w) = (server.clone(), (w.org.clone(), w.admin.clone()));
+        tokio::spawn(async move {
+            server
+                .patch(
+                    &format!("/api/orgs/{}", w.0),
+                    Some(&w.1),
+                    json!({"name": "Held"}),
+                )
+                .await
+        })
+    };
+    flaky.org_gate.until_waiting(1).await;
+    let begins = flaky.begins();
+    // The one place in the queue is taken by a client that hangs up after 300 ms.
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let url = server.url(&format!("/api/orgs/{}/projects", w.org));
+    let gave_up = impatient
+        .post(&url)
+        .bearer_auth(&w.admin)
+        .json(&json!({"name": "Never"}))
+        .send()
+        .await;
+    assert!(gave_up.is_err_and(|e| e.is_timeout()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.state.org_queue.waiting(&w.org) > 0 {
+        assert!(Instant::now() < deadline, "its place was never freed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The place is free: the next request queues (it is not told the queue is full) ...
+    let next = {
+        let (server, w) = (server.clone(), (w.org.clone(), w.admin.clone()));
+        tokio::spawn(async move {
+            server
+                .post(
+                    &format!("/api/orgs/{}/projects", w.0),
+                    Some(&w.1),
+                    json!({"name": "Next"}),
+                )
+                .await
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.state.org_queue.waiting(&w.org) < 1 {
+        assert!(Instant::now() < deadline, "the next request did not queue");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        flaky.begins(),
+        begins,
+        "nobody in the queue opened a transaction"
+    );
+    flaky.org_gate.open();
+    assert_eq!(holder.await.unwrap().0, StatusCode::OK);
+    assert_eq!(next.await.unwrap().0, StatusCode::CREATED);
+    // ... and the one that left wrote nothing.
+    let names: Vec<String> = server
+        .state
+        .store
+        .projects_in_org(&w.org)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert!(!names.contains(&"Never".to_owned()), "{names:?}");
+    assert!(names.contains(&"Next".to_owned()), "{names:?}");
 }

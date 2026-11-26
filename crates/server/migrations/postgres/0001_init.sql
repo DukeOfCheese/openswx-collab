@@ -81,6 +81,7 @@ CREATE TABLE orgs (
     created_at DOUBLE PRECISION NOT NULL,
     deleted_at DOUBLE PRECISION NULL
 );
+CREATE INDEX ix_orgs_deleted ON orgs (id) WHERE deleted_at IS NOT NULL;
 
 CREATE TABLE org_members (
     org_id VARCHAR(32) COLLATE "C" NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
@@ -115,6 +116,8 @@ CREATE TABLE projects (
     deleted_at DOUBLE PRECISION NULL
 );
 CREATE INDEX ix_projects_org_id ON projects (org_id);
+-- What is still to be removed, found without reading every project.
+CREATE INDEX ix_projects_deleted ON projects (id) WHERE deleted_at IS NOT NULL;
 
 CREATE TABLE project_members (
     project_id VARCHAR(32) COLLATE "C" NOT NULL REFERENCES projects (id) ON DELETE CASCADE,

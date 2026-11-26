@@ -1634,3 +1634,296 @@ async fn a_locked_document_costs_only_its_own_changes() {
     assert_eq!(writer.append(simple(&a, 1, ea)).await, Ok(()));
     assert_eq!(head_seq(&server, &a).await, 1);
 }
+
+// ------------------------------------------------------------------ Task 16, fix round 3
+
+/// The scenario the two-step deletion and the journal's fallback were made for, through the real
+/// path: an organisation's deletion is held inside its transaction (it has marked, and holds the
+/// rows of the organisation's documents), and a journal batch mixes a change to one of those
+/// documents with changes to another organisation's. Only the blocked document's change is not
+/// written; the other organisation's are; and a writer of the other organisation that lost its
+/// lease is still refused for that, in the fallback as in any batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_held_in_its_transaction_costs_other_organisations_nothing() {
+    if !common::on_postgres() {
+        eprintln!("skipped on SQLite: a held transaction holds the one writer there");
+        return;
+    }
+    let (server, flaky) = TestServer::start_flaky(|s| {
+        s.open_registration = true;
+        s.database_journal_lock_timeout = 0.5;
+    })
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let theirs = new_doc(&server, &world, "Doomed").await;
+    let (status, other) = server
+        .post(
+            "/api/orgs",
+            Some(&world.admin),
+            serde_json::json!({"name": "Other"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, elsewhere) = server
+        .post(
+            &format!("/api/orgs/{}/projects", other["id"].as_str().unwrap()),
+            Some(&world.admin),
+            serde_json::json!({"name": "Elsewhere"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut ours = Vec::new();
+    for name in ["B", "C"] {
+        let (status, doc) = server
+            .post(
+                &format!(
+                    "/api/projects/{}/documents",
+                    elsewhere["id"].as_str().unwrap()
+                ),
+                Some(&world.admin),
+                serde_json::json!({"name": name, "content": common::part()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        ours.push(doc["id"].as_str().unwrap().to_owned());
+    }
+    let (b, c) = (ours[0].clone(), ours[1].clone());
+    let (ea, eb) = (lease(&server, &theirs).await, lease(&server, &b).await);
+    // (C's writer holds an epoch the lease has moved on from.)
+    let stale = lease(&server, &c).await;
+    let ec = lease(&server, &c).await;
+    assert!(ec > stale);
+    let writer = slow_writer(&server);
+    let server = Arc::new(server);
+
+    // The deletion has marked the organisation and is held before its commit.
+    flaky.mark_gate.shut();
+    let deletion = {
+        let (server, w) = (server.clone(), (world.org.clone(), world.admin.clone()));
+        tokio::spawn(async move {
+            server
+                .call(
+                    reqwest::Method::DELETE,
+                    &format!("/api/orgs/{}", w.0),
+                    Some(&w.1),
+                    Some(serde_json::json!({
+                        "confirm_name": "Robotics",
+                        "current_password": common::PASSWORD,
+                    })),
+                )
+                .await
+        })
+    };
+    flaky.mark_gate.until_waiting(1).await;
+
+    // One batch: the deleted organisation's document, and two of another organisation.
+    let receipts = [
+        writer.submit(simple(&b, 1, eb)).await,
+        writer.submit(simple(&theirs, 1, ea)).await,
+        writer.submit(simple(&c, 1, stale)).await,
+        writer.submit(simple(&b, 2, eb)).await,
+    ];
+    let mut outcomes = Vec::new();
+    for receipt in receipts {
+        outcomes.push(receipt.outcome().await);
+    }
+    assert_eq!(
+        outcomes,
+        [
+            Ok(()),
+            Err(JournalError::Unknown),
+            refused(RefusedWhy::Lease),
+            Ok(())
+        ]
+    );
+    assert!(!deletion.is_finished(), "the deletion is still held");
+    assert_eq!(head_seq(&server, &b).await, 2);
+    assert_eq!(head_seq(&server, &c).await, 0);
+    // The other organisation goes on writing while the deletion is held.
+    assert_eq!(writer.append(simple(&c, 1, ec)).await, Ok(()));
+
+    flaky.mark_gate.open();
+    assert_eq!(deletion.await.unwrap().0, StatusCode::NO_CONTENT);
+    // And once it has committed, the deleted document takes nothing more.
+    assert_eq!(
+        writer.append(simple(&theirs, 1, ea)).await,
+        refused(RefusedWhy::NoDocument)
+    );
+}
+
+/// A room that slipped in around a deletion can write nothing for the document any more: it
+/// gets no lease, and a snapshot of it is refused and its file not left behind (the purger may
+/// already have emptied the document's folder).
+#[tokio::test]
+async fn a_deleted_document_gets_no_lease_and_no_snapshot() {
+    let (server, _flaky, world) = setup().await;
+    let blobs = server.state.blobs.as_ref();
+    let doc = new_doc(&server, &world, "D").await;
+    let epoch = lease(&server, &doc).await;
+    let writer = new_journal(&server.state.store);
+    writer.append(simple(&doc, 1, epoch)).await.unwrap();
+    let (head, _) = load_head(store(&server), blobs, &doc).await.unwrap();
+    assert_eq!(head.seq, 1);
+
+    // The project is deleted; the purger is held, so every row is still there.
+    server.state.purger.gate().shut();
+    let (status, _) = server
+        .delete(
+            &format!("/api/projects/{}", world.project),
+            Some(&world.admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let files = server.stored_under(&format!("docs/{doc}/")).await;
+    assert_eq!(files.len(), 1, "{files:?}");
+
+    let refused_lease = acquire(store(&server), &doc, "node", 1000.0, 60.0)
+        .await
+        .unwrap_err();
+    assert!(
+        refused_lease.is::<oswx_server::lease::NoDocument>(),
+        "{refused_lease:#}"
+    );
+    assert_eq!(
+        store(&server)
+            .room_lease(&doc)
+            .await
+            .unwrap()
+            .unwrap()
+            .epoch,
+        epoch as i64,
+        "the lease did not move"
+    );
+    let refused_snapshot = write_snapshot(store(&server), blobs, &doc, epoch, &head, 9.0)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused_snapshot, WriteSnapshotError::NoDocument),
+        "{refused_snapshot:?}"
+    );
+    assert_eq!(server.stored_under(&format!("docs/{doc}/")).await, files);
+
+    // And once the purger has removed the document: nothing is put back.
+    server.state.purger.gate().open();
+    server.purged().await;
+    assert!(
+        server
+            .stored_under(&format!("docs/{doc}/"))
+            .await
+            .is_empty()
+    );
+    for _ in 0..2 {
+        assert!(
+            acquire(store(&server), &doc, "node", 1000.0, 60.0)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            write_snapshot(store(&server), blobs, &doc, epoch, &head, 9.0).await,
+            Err(WriteSnapshotError::NoDocument)
+        ));
+    }
+    assert!(
+        server
+            .stored_under(&format!("docs/{doc}/"))
+            .await
+            .is_empty()
+    );
+    assert!(store(&server).room_lease(&doc).await.unwrap().is_none());
+    // A document deleted on its own is refused the same way.
+    let alone = {
+        let (status, body) = server
+            .post(
+                "/api/orgs",
+                Some(&world.admin),
+                serde_json::json!({"name": "Other"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, p) = server
+            .post(
+                &format!("/api/orgs/{}/projects", body["id"].as_str().unwrap()),
+                Some(&world.admin),
+                serde_json::json!({"name": "P"}),
+            )
+            .await;
+        let (status, d) = server
+            .post(
+                &format!("/api/projects/{}/documents", p["id"].as_str().unwrap()),
+                Some(&world.admin),
+                serde_json::json!({"name": "Alone", "content": common::part()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        d["id"].as_str().unwrap().to_owned()
+    };
+    let (head, _) = load_head(store(&server), blobs, &alone).await.unwrap();
+    let (status, _) = server
+        .delete(&format!("/api/documents/{alone}"), Some(&world.admin))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        acquire(store(&server), &alone, "node", 1000.0, 60.0)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        write_snapshot(store(&server), blobs, &alone, 7, &head, 9.0).await,
+        Err(WriteSnapshotError::NoDocument)
+    ));
+}
+
+/// A snapshot being stored while its document is deleted and removed: when its row is about to
+/// be written the document is gone, so nothing is recorded, and the file that was just stored
+/// (after the purger emptied the document's folder) is taken away again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_stored_around_a_deletion_leaves_no_file() {
+    let (server, blobs) = TestServer::start_blobs(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = new_doc(&server, &world, "D").await;
+    let epoch = lease(&server, &doc).await;
+    let writer = new_journal(&server.state.store);
+    writer.append(simple(&doc, 1, epoch)).await.unwrap();
+    let (head, _) = load_head(store(&server), server.state.blobs.as_ref(), &doc)
+        .await
+        .unwrap();
+    // The snapshot's file takes a second to store ...
+    blobs.put_delay(Duration::from_secs(1));
+    let snapshot = {
+        let (store, storage, doc) = (
+            server.state.store.clone(),
+            server.state.blobs.clone(),
+            doc.clone(),
+        );
+        tokio::spawn(async move {
+            write_snapshot(store.as_ref(), storage.as_ref(), &doc, epoch, &head, 9.0).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // ... and meanwhile the project is deleted, and everything of it removed.
+    let (status, _) = server
+        .delete(
+            &format!("/api/projects/{}", world.project),
+            Some(&world.admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    server.purged().await;
+    assert!(
+        server
+            .stored_under(&format!("docs/{doc}/"))
+            .await
+            .is_empty()
+    );
+    assert!(
+        !snapshot.is_finished(),
+        "the snapshot is still being stored"
+    );
+    let refused = snapshot.await.unwrap().unwrap_err();
+    assert!(
+        matches!(refused, WriteSnapshotError::NoDocument),
+        "{refused:?}"
+    );
+    let left = server.stored_under(&format!("docs/{doc}/")).await;
+    assert!(left.is_empty(), "left behind for good: {left:?}");
+}

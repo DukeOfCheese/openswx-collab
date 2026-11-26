@@ -78,7 +78,7 @@ async fn create_project(
         name,
         created_at: state.clock.now(),
     };
-    let _turn = state.org_turn(&org_id).await?;
+    let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Member).await?;
     tx.insert_project(&project).await?;
@@ -95,7 +95,11 @@ async fn create_project(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            async move { emit(&ext, event).await },
+        )
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -117,7 +121,7 @@ async fn rename_project(
         ProjectRole::Owner,
     )
     .await?;
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     tx.set_project_name(&project.id, &name).await?;
@@ -128,7 +132,11 @@ async fn rename_project(
     };
     let ext = state.ext.clone();
     state
-        .commit_then(tx, |_| async {}, async move { emit(&ext, event).await })
+        .commit_then(
+            (tx, turn),
+            |_| async {},
+            async move { emit(&ext, event).await },
+        )
         .await?;
     Ok(Json(
         json!({"id": project.id, "name": name, "org_id": project.org_id}),
@@ -151,7 +159,7 @@ async fn delete_project(
         ProjectRole::Owner,
     )
     .await?;
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     let documents = tx.project_document_ids(&project.id).await?;
@@ -180,7 +188,7 @@ async fn delete_project(
     let (revoker, ext) = (state.clone(), state.ext.clone());
     let committed = state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 for document in &documents {
                     revoker
@@ -245,7 +253,7 @@ async fn set_member(
         ProjectRole::Owner,
     )
     .await?;
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     if tx.org_member(&project.org_id, &user_id).await?.is_none() {
@@ -275,7 +283,7 @@ async fn set_member(
     let ext = state.ext.clone();
     state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 revoker
                     .hub
@@ -301,7 +309,7 @@ async fn remove_member(
         ProjectRole::Owner,
     )
     .await?;
-    let _turn = state.org_turn(&project.org_id).await?;
+    let turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     if !tx.delete_project_member(&project.id, &user_id).await? {
@@ -317,7 +325,7 @@ async fn remove_member(
     let ext = state.ext.clone();
     state
         .commit_then(
-            tx,
+            (tx, turn),
             |_| async move {
                 revoker
                     .hub

@@ -1602,8 +1602,18 @@ async fn the_organisation_queries_read_back_what_they_wrote() {
     tx.commit().await.unwrap();
     let deleted_at: Option<f64> = server.scalar("SELECT deleted_at FROM documents").await;
     assert_eq!(deleted_at, Some(99.0));
+    // the project is marked, and from then on is nobody's; its rows go one chunk at a time
     let mut tx = store.begin().await.unwrap();
-    tx.delete_project(&"1".repeat(32)).await.unwrap();
+    assert!(
+        tx.mark_project_deleted(&"1".repeat(32), 99.0)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !tx.mark_project_deleted(&"1".repeat(32), 100.0)
+            .await
+            .unwrap()
+    );
     tx.commit().await.unwrap();
     assert!(
         store
@@ -1612,8 +1622,45 @@ async fn the_organisation_queries_read_back_what_they_wrote() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(
+        store.deleted_projects("", 10).await.unwrap(),
+        ["1".repeat(32)]
+    );
+    assert!(
+        store
+            .deleted_projects(&"1".repeat(32), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .documents_of_deleted_project(&"1".repeat(32), "", 10)
+            .await
+            .unwrap(),
+        ["d".repeat(32)]
+    );
+    let mut tx = store.begin().await.unwrap();
+    assert!(
+        !tx.purge_project(&"1".repeat(32)).await.unwrap(),
+        "it has a document"
+    );
+    // (a document of a project that is not marked is not removed)
+    assert!(!tx.purge_document(&"0".repeat(32)).await.unwrap());
+    assert_eq!(
+        tx.purge_document_rows(&"d".repeat(32), 10).await.unwrap(),
+        0
+    );
+    assert!(tx.purge_document(&"d".repeat(32)).await.unwrap());
+    assert!(tx.purge_project(&"1".repeat(32)).await.unwrap());
+    assert!(
+        !tx.purge_project(&"2".repeat(32)).await.unwrap(),
+        "not marked"
+    );
+    tx.commit().await.unwrap();
     let documents: i64 = server.scalar("SELECT COUNT(*) FROM documents").await;
     assert_eq!(documents, 0, "the documents went with the project");
+    assert!(store.deleted_projects("", 10).await.unwrap().is_empty());
     // (ending on a request gives the writer connection time to go back to its pool before the
     // server is dropped)
     server.get("/api/health", None).await;
@@ -2097,4 +2144,84 @@ async fn an_account_being_deleted_joins_and_founds_nothing() {
         accept(&server, &cy, inv["token"].as_str().unwrap()).await.0,
         StatusCode::OK
     );
+}
+
+// ------------------------------------------------------------------ Task 16, fix round 3
+
+/// A hook that, once told to, does not answer an event.
+struct SlowEvents(AtomicBool);
+
+#[async_trait]
+impl Extensions for SlowEvents {
+    fn hook_timeout(&self) -> Duration {
+        Duration::from_secs(4)
+    }
+
+    async fn on_event(&self, _event: &Event) {
+        if self.0.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// The organisation's turn ends with the commit, not with what follows it: while one request's
+/// extension hook hangs (after its commit), the next request to the organisation goes through
+/// its transaction at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_write_does_not_wait_for_the_hooks_of_the_one_before() {
+    let ext = Arc::new(SlowEvents(false.into()));
+    let kept = ext.clone();
+    let server = TestServer::start_custom(|_| {}, |s| s.ext = kept).await;
+    let w = World::new(&server).await.unwrap();
+    ext.0.store(true, Ordering::SeqCst);
+    let server = Arc::new(server);
+    let create = |name: &'static str| {
+        let (server, w) = (server.clone(), (w.org.clone(), w.admin.clone()));
+        tokio::spawn(async move {
+            server
+                .post(
+                    &format!("/api/orgs/{}/projects", w.0),
+                    Some(&w.1),
+                    json!({"name": name}),
+                )
+                .await
+        })
+    };
+    let committed = |name: &'static str| {
+        let (server, org) = (server.clone(), w.org.clone());
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let projects = server.state.store.projects_in_org(&org).await.unwrap();
+                if projects.iter().any(|p| p.name == name) {
+                    return true;
+                }
+                if Instant::now() > deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    // The first is committed, and its answer waits for the hook (four seconds).
+    let first = create("First");
+    assert!(committed("First").await);
+    assert!(!first.is_finished());
+    assert_eq!(
+        server.state.org_queue.organisations(),
+        0,
+        "its turn is over"
+    );
+    // The second commits meanwhile.
+    let started = Instant::now();
+    let second = create("Second");
+    assert!(
+        committed("Second").await,
+        "the second write waited for the first one's hook"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(!first.is_finished(), "the hook still hangs");
+    for request in [first, second] {
+        assert_eq!(request.await.unwrap().0, StatusCode::CREATED);
+    }
 }

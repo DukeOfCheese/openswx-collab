@@ -12,6 +12,11 @@
 
 use anyhow::Context;
 
+/// [`acquire`] was asked for a document that does not exist or is deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("there is no such document (or it is deleted)")]
+pub struct NoDocument;
+
 use crate::store::{RoomLease, Store};
 
 /// Takes the room lease of `doc` for `node_id` until `now + ttl`, in one transaction, and answers
@@ -26,6 +31,11 @@ pub async fn acquire(
 ) -> anyhow::Result<u64> {
     let expires_at = now + ttl;
     let mut tx = store.begin_journal().await?;
+    // The document's row first (the lock order of `crate::store`): nobody takes the lease of a
+    // document that is deleted, so no room opens on one that slipped in around its deletion.
+    if !tx.lock_live_document(doc).await? {
+        return Err(NoDocument.into());
+    }
     let epoch = match tx.take_room_lease(doc, node_id, expires_at).await? {
         Some(epoch) => epoch,
         None => {
