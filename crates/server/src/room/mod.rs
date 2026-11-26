@@ -170,6 +170,8 @@ pub enum ServerChangeError {
 /// A change the server makes itself, waiting for the room.
 pub struct ServerChange {
     pub ops: Vec<oswx_core::Op>,
+    /// For a restore: the state to reach (`ops` is then empty; see [`RoomHandle::restore`]).
+    pub target: Option<oswx_core::Value>,
     pub command: String,
     /// The user it is made for (history shows them as its author).
     pub author: Id,
@@ -400,9 +402,48 @@ impl RoomHandle {
         author_name: &str,
         options: ServerChangeOptions,
     ) -> Result<Seq, ServerChangeError> {
+        self.submit(ops, None, command, author, author_name, options)
+            .await
+    }
+
+    /// Puts the document back to `target` as one change the server makes (a restore). The
+    /// operations are `diff(head, target)` worked out when the room judges it, off its task,
+    /// against the very head they are applied to: the document at the answered seq is exactly
+    /// `target`. Every change that became tentative before the restore was judged is overwritten
+    /// by it; changes judged after it apply on top. When the head is `target` already, nothing is
+    /// written and the head's seq is answered. Locks are judged at the same moment.
+    pub async fn restore(
+        &self,
+        target: oswx_core::Value,
+        command: &str,
+        author: &str,
+        author_name: &str,
+        options: ServerChangeOptions,
+    ) -> Result<Seq, ServerChangeError> {
+        self.submit(
+            Vec::new(),
+            Some(target),
+            command,
+            author,
+            author_name,
+            options,
+        )
+        .await
+    }
+
+    async fn submit(
+        &self,
+        ops: Vec<oswx_core::Op>,
+        target: Option<oswx_core::Value>,
+        command: &str,
+        author: &str,
+        author_name: &str,
+        options: ServerChangeOptions,
+    ) -> Result<Seq, ServerChangeError> {
         let (reply, answer) = oneshot::channel();
         let change = ServerChange {
             ops,
+            target,
             command: command.to_owned(),
             author: author.to_owned(),
             author_name: author_name.to_owned(),

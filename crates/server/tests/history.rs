@@ -1433,6 +1433,114 @@ async fn restoring_a_python_shaped_document_after_edits() {
     );
 }
 
+/// Waits until the open room of `doc` has at least one change being written.
+async fn until_tentative(server: &TestServer, doc: &str) {
+    for _ in 0..500 {
+        if server.room_status(doc).await.tentative > 0 {
+            return;
+        }
+        pause(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no change became tentative");
+}
+
+#[tokio::test]
+async fn a_restore_overwrites_changes_that_were_tentative_when_it_was_judged() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let target = content(&server, &doc, &world.admin, "").await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(a.change(vec![set_depth(20)], vec![], vec![]).await.seq(), 1);
+    // Ada's insert is being written (its commit is reported late) when the restore comes.
+    flaky.commit_delay(std::time::Duration::from_millis(800));
+    let (op, _) = a.add_feature("Fillet1");
+    let insert = a.make_change(1, vec![op]);
+    a.send_change(&insert).await;
+    until_tentative(&server, &doc).await;
+    let (status, body) = restore(&server, &doc, &world.admin, json!({"seq": 0})).await;
+    flaky.commit_delay(std::time::Duration::ZERO);
+    assert_eq!((status, body.clone()), (200, json!({"seq": 3})), "{body}");
+    assert_eq!(a.outcome(&insert.change_id).await.seq(), 2);
+    // The document at the restore's seq is exactly the target: the insert did not survive.
+    assert_eq!(content(&server, &doc, &world.admin, "?seq=3").await, target);
+}
+
+#[tokio::test]
+async fn a_restore_puts_back_an_item_removed_while_it_waited() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let target = content(&server, &doc, &world.admin, "").await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let name = ["features", "f1", "name"];
+    assert_eq!(
+        a.change(vec![set(&name, json!("Base"))], vec![], vec![])
+            .await
+            .seq(),
+        1
+    );
+    flaky.commit_delay(std::time::Duration::from_millis(800));
+    let gone = a.make_change(1, vec![remove(&["features"], "f1")]);
+    a.send_change(&gone).await;
+    until_tentative(&server, &doc).await;
+    let (status, body) = restore(&server, &doc, &world.admin, json!({"seq": 0})).await;
+    flaky.commit_delay(std::time::Duration::ZERO);
+    assert_eq!((status, body.clone()), (200, json!({"seq": 3})), "{body}");
+    assert_eq!(a.outcome(&gone.change_id).await.seq(), 2);
+    assert_eq!(content(&server, &doc, &world.admin, "?seq=3").await, target);
+}
+
+#[tokio::test]
+async fn presence_goes_on_while_a_restore_is_judged() {
+    let hooks = oswx_server::room::Hooks {
+        judge_delay: std::time::Duration::from_millis(2500),
+        ..oswx_server::room::Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let ops = (0..300)
+        .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
+        .collect();
+    assert_eq!(a.change(ops, vec![], vec![]).await.seq(), 1);
+    let restoring = {
+        let (base, token, doc) = (server.base.clone(), world.admin.clone(), doc.clone());
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base}/api/documents/{doc}/restore"))
+                .bearer_auth(token)
+                .json(&json!({"seq": 0}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    pause(std::time::Duration::from_millis(300)).await;
+    a.presence(json!({"tool": "a"})).await;
+    let started = std::time::Instant::now();
+    let a_id = a.client_id.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let got: Relayed = b.expect().await;
+            if got.kind == "presence" && got.client_id == a_id {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the presence came at once");
+    assert!(
+        !restoring.is_finished(),
+        "the restore was still being judged"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(restoring.await.unwrap(), 200);
+}
+
 #[tokio::test]
 async fn a_restore_during_live_editing_and_without_an_open_room() {
     let (server, world) = world().await;

@@ -17,11 +17,14 @@
 //!   server: versions are what others pin to). 204; 404 `no such version`.
 //! - `POST /api/documents/{document}/restore` (editor): `{seq}` or `{version}` (a name; it wins
 //!   over `seq`; 422 when neither is given). The document becomes, as one new change, what it was
-//!   at that state: the operations are `oswx_core::diff(durable head, state)`, submitted as a change
-//!   the server makes for the caller (`restore to <seq or version name>`), with no staleness check,
-//!   and refused (409 `{code: "locked", message, conflicts}`) while anyone but the caller holds a
-//!   lock. `{seq}` once durable (the head itself when nothing differs). Works whether or not the
-//!   document is open (it opens the room), and alongside live editing.
+//!   at that state: the target goes to the room ([`crate::room::RoomHandle::restore`]), which works
+//!   out `oswx_core::diff(head, target)` against the head it applies it to, so the document at the
+//!   answered seq is exactly the target (changes tentative before the restore was judged are
+//!   overwritten; later ones apply on top). It is a change the server makes for the caller
+//!   (`restore to <seq or version name>`), with no staleness check, refused (409 `{code: "locked",
+//!   message, conflicts}`) while anyone but the caller holds a lock. `{seq}` once durable (the
+//!   head's seq when nothing differs). Works whether or not the document is open (it opens the
+//!   room), and alongside live editing.
 //! - `GET /api/documents/{document}/content?seq=N` or `?version=<name>` (viewer; in
 //!   `routes::documents`): the document at that state, read with [`crate::snapshot::state_at`].
 //!
@@ -413,6 +416,8 @@ async fn restore(
     ApiPath(document_id): ApiPath<String>,
     ApiJson(body): ApiJson<RestoreIn>,
 ) -> Result<ApiJson<serde_json::Value>, ApiError> {
+    // The role is checked once, here: the write happens in the room's journal, so there is no REST
+    // transaction to read it again in.
     let (doc, project, _) = require_document(
         state.store.as_ref(),
         &user.id,
@@ -449,21 +454,17 @@ async fn restore(
             return Err(no_state(seq));
         }
         let target = content_at(&state, &doc, seq).await?;
-        let ops =
-            tokio::task::spawn_blocking(move || oswx_core::diff(&head.doc, &target.to_plain()))
-                .await?
-                .map_err(|e| refused("invalid", &e.to_string(), &[]))?;
-        if ops.is_empty() {
-            return Ok(ApiJson(json!({"seq": head_seq})));
-        }
         let options = ServerChangeOptions {
             check_stale: false,
             locks: LockRule::AnyOfOtherUsers,
         };
+        // The room works out the operations against the head it applies them to.
         match room
-            .server_change(ops, &command, &user.id, &author_name, options)
+            .restore(target, &command, &user.id, &author_name, options)
             .await
         {
+            // Nothing differed: the head's seq, nothing written.
+            Ok(new_seq) if new_seq <= head.seq => return Ok(ApiJson(json!({"seq": new_seq}))),
             Ok(new_seq) => {
                 emit(
                     &state.ext,

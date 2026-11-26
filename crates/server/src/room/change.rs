@@ -67,8 +67,8 @@ use bytes::Bytes;
 use futures_util::FutureExt;
 use oswx_core::wire::{self, ChangeEvent, ClientMsg, ServerMsg};
 use oswx_core::{
-    Accepted, Change, ClientId, Conflict, Head, Known, Op, Refusal, RejectCode, Rules, Seq, decide,
-    decide_server,
+    Accepted, Change, ClientId, Conflict, Head, Known, Op, Refusal, RejectCode, Rules, Seq, Value,
+    decide, decide_server,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -340,6 +340,9 @@ pub(super) struct Item {
     blobs_checked: bool,
     /// What it takes back, if anything.
     reverts: Option<Reverts>,
+    /// For a restore: the state to reach. Its operations (`change.ops`, empty until then) are
+    /// worked out when it is judged, against the head it is applied to.
+    target: Option<Arc<Value>>,
 }
 
 impl Item {
@@ -378,6 +381,7 @@ impl Item {
                 ticket: None,
                 client_base: seq,
             }),
+            target: None,
         }
     }
 
@@ -472,7 +476,7 @@ pub(super) struct BlobCheck {
 pub(super) struct Offloaded {
     item: Item,
     version: u64,
-    result: Option<Result<Decision, Refusal>>,
+    result: Option<Result<Decision, NotTaken>>,
 }
 
 /// An accepted change with everything its record and broadcast need, made where it was judged.
@@ -546,7 +550,9 @@ fn blob_refs_of(ops: &[Op]) -> BTreeSet<String> {
 /// Judges a change against `head` and, if it is accepted, makes everything its record and broadcast
 /// need. `server_stale` is `Some(check_stale)` for a change the server makes itself
 /// ([`decide_server`]). `reverts` is what it takes back (for an undo, the kept inverse `decide`
-/// exempts ids by). Pure and `Send`, so it can run on the blocking pool.
+/// exempts ids by). For a restore, `target` is the state to reach: the operations are
+/// `diff(head, target)`, worked out here, against the very head they are applied to (none:
+/// [`NotTaken::Unchanged`]). Pure and `Send`, so it can run on the blocking pool.
 fn judge(
     head: &Head,
     author: &Author,
@@ -554,12 +560,30 @@ fn judge(
     known: &HashMap<Arc<str>, Known>,
     server_stale: Option<bool>,
     reverts: Option<&Reverts>,
-) -> Result<Decision, Refusal> {
+    target: Option<&Value>,
+) -> Result<Decision, NotTaken> {
+    let restore;
+    let change = match target {
+        None => change,
+        Some(target) => {
+            let ops = oswx_core::diff(&head.doc, &target.to_plain())
+                .map_err(|e| Refusal::Invalid(e.to_string()))?;
+            if ops.is_empty() {
+                return Err(NotTaken::Unchanged);
+            }
+            restore = Change {
+                ops,
+                ..change.clone()
+            };
+            &restore
+        }
+    };
     let blobs = blob_refs_of(&change.ops);
     if blobs.len() > MAX_BLOB_REFS {
         return Err(Refusal::Invalid(format!(
             "a change may refer to at most {MAX_BLOB_REFS} blobs"
-        )));
+        ))
+        .into());
     }
     let accepted = match server_stale {
         // The server's own change: no id prefix, staleness only when asked.
@@ -604,6 +628,19 @@ fn judge(
         event,
         accepted,
     })
+}
+
+/// Why a judged change was not taken.
+pub(super) enum NotTaken {
+    Refused(Refusal),
+    /// A restore whose target is the head already: nothing to do.
+    Unchanged,
+}
+
+impl From<Refusal> for NotTaken {
+    fn from(r: Refusal) -> NotTaken {
+        NotTaken::Refused(r)
+    }
 }
 
 /// What a refused sender is told.
@@ -757,6 +794,7 @@ impl Room {
             rejudged: 0,
             blobs_checked: true,
             reverts: None,
+            target: sc.target.map(Arc::new),
         });
     }
 
@@ -817,6 +855,7 @@ impl Room {
             rejudged: 0,
             blobs_checked: false,
             reverts,
+            target: None,
         };
         self.judge_item(item);
     }
@@ -881,7 +920,8 @@ impl Room {
         }
         let known = self.known(&item.author.client, &item.change.depends);
         let version = self.tentative_version;
-        if item.change.ops.len() > BIG_OPS || item.size > BIG_FRAME {
+        // A restore diffs a whole document: always judged off the task.
+        if item.change.ops.len() > BIG_OPS || item.size > BIG_FRAME || item.target.is_some() {
             // Judged off the task; no other frame is taken meanwhile, and the sender's later
             // messages wait; everything else goes on.
             self.paused += 1;
@@ -891,14 +931,22 @@ impl Room {
             let head = self.tentative.clone();
             let stale = item.origin.server_stale();
             let (author, change) = (item.author.clone(), item.change.clone());
-            let reverts = item.reverts.clone();
+            let (reverts, target) = (item.reverts.clone(), item.target.clone());
             let (internal, encodes) = (self.internal.clone(), self.encodes.clone());
             let delay = self.state.room_hooks.judge_delay;
             tokio::spawn(async move {
                 let judging = tokio::task::spawn_blocking(move || {
                     std::thread::sleep(delay);
                     let started = Instant::now();
-                    let result = judge(&head, &author, &change, &known, stale, reverts.as_ref());
+                    let result = judge(
+                        &head,
+                        &author,
+                        &change,
+                        &known,
+                        stale,
+                        reverts.as_ref(),
+                        target.as_deref(),
+                    );
                     metrics::decided(started.elapsed());
                     result
                 });
@@ -924,6 +972,7 @@ impl Room {
             &known,
             stale,
             item.reverts.as_ref(),
+            item.target.as_deref(),
         );
         metrics::decided(started.elapsed());
         if result.is_ok() {
@@ -979,10 +1028,11 @@ impl Room {
         }
     }
 
-    fn decided(&mut self, item: Item, version: u64, result: Result<Decision, Refusal>) {
+    fn decided(&mut self, item: Item, version: u64, result: Result<Decision, NotTaken>) {
         let decision = match result {
             Ok(decision) => decision,
-            Err(refusal) => return self.refuse_item(item, refusal),
+            Err(NotTaken::Refused(refusal)) => return self.refuse_item(item, refusal),
+            Err(NotTaken::Unchanged) => return self.unchanged(item),
         };
         if item.blobs_checked {
             return self.adopt(item, decision);
@@ -1318,6 +1368,13 @@ impl Room {
         self.encode(&msg)
     }
 
+    /// A restore whose target is the head it was judged against: answered with that head's seq.
+    fn unchanged(&mut self, item: Item) {
+        if let Origin::Server { reply, .. } = item.origin {
+            let _ = reply.send(Ok(self.tentative.seq));
+        }
+    }
+
     /// A change that will not be written because the room is closing: the server is told; clients
     /// resend after reconnecting.
     fn not_written(&mut self, item: Item) {
@@ -1504,7 +1561,7 @@ impl Room {
                 continue;
             }
             // Judged here and now, so that the order of the changes is kept (their blobs were
-            // checked already).
+            // checked already; a restore's diff runs here too, on this rare path).
             let known = self.known(&item.author.client, &item.change.depends);
             let started = Instant::now();
             let stale = item.origin.server_stale();
@@ -1515,6 +1572,7 @@ impl Room {
                 &known,
                 stale,
                 item.reverts.as_ref(),
+                item.target.as_deref(),
             );
             metrics::decided(started.elapsed());
             match result {
@@ -1522,7 +1580,8 @@ impl Room {
                     self.encodes.fetch_add(1, Ordering::Relaxed);
                     self.adopt(item, decision);
                 }
-                Err(refusal) => self.refuse_item(item, refusal),
+                Err(NotTaken::Refused(refusal)) => self.refuse_item(item, refusal),
+                Err(NotTaken::Unchanged) => self.unchanged(item),
             }
         }
         if let Some(user) = misbehaving {
