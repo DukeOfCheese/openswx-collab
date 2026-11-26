@@ -1661,3 +1661,49 @@ async fn a_change_a_rejudge_cannot_check_is_answered_server_error_and_can_be_sen
         vec![("c1".to_owned(), first.clone(), 1)]
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_demoted_client_reconnecting_inherits_nothing_whose_parts_are_checked() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let (bob, bob_id) = bob(&server, &world).await;
+    let part = world.document(&server, None, None, None).await;
+    let asm = make_ok(&server, &world, assembly(vec![], vec![]), "Rover").await;
+    let desk = Hello::client("demoted-parts");
+    let mut a = Live::connect_with(&server, &asm, &bob, desk.clone()).await;
+    flaky.parts_gate.shut();
+    let id = a.new_id();
+    let change = a.make_change(0, vec![add_component(component(&id, &part, 0, None))]);
+    a.send_change(&change).await;
+    flaky.parts_gate.until_waiting(1).await;
+    // Bob is made a viewer; his client reconnects before the hub has closed the old socket.
+    let gate = server.state.room_hooks.after_commit.clone();
+    gate.shut();
+    let demoting = {
+        let url = server.url(&format!("/api/projects/{}/members/{bob_id}", world.project));
+        let token = world.admin.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .put(url)
+                .bearer_auth(token)
+                .json(&json!({"role": "viewer"}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    gate.until_waiting(1).await;
+    let mut b = Live::connect_with(&server, &asm, &bob, desk).await;
+    gate.open();
+    assert_eq!(demoting.await.unwrap(), 200);
+    flaky.parts_gate.open();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (_, got) = server
+        .get(&format!("/api/documents/{asm}/content"), Some(&world.admin))
+        .await;
+    assert_eq!(got["seq"], 0, "nothing written after the demotion");
+    assert_eq!(got["content"]["components"], json!([]));
+    assert_eq!(b.resend(&change).await.code(), RejectCode::ReadOnly);
+    assert!(table(&server, &asm).await.is_empty());
+}

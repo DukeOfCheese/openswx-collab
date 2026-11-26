@@ -532,6 +532,7 @@ pub struct FlakyStore {
     fail_reverted_by: Arc<AtomicBool>,
     commit_then_fail: Arc<AtomicBool>,
     fail_document_reads: AtomicBool,
+    fail_project_reads: AtomicBool,
     panic_on_begin: AtomicBool,
     hang_commit: Arc<AtomicBool>,
     begins: AtomicUsize,
@@ -567,6 +568,7 @@ impl FlakyStore {
             fail_reverted_by: Arc::new(AtomicBool::new(false)),
             commit_then_fail: Arc::new(AtomicBool::new(false)),
             fail_document_reads: AtomicBool::new(false),
+            fail_project_reads: AtomicBool::new(false),
             panic_on_begin: AtomicBool::new(false),
             hang_commit: Arc::new(AtomicBool::new(false)),
             begins: AtomicUsize::new(0),
@@ -735,6 +737,11 @@ impl FlakyStore {
         self.fail_reverted_by.store(fail, Ordering::SeqCst);
     }
 
+    /// Makes [`Store::project_by_id`] fail (`true`) or delegate again (`false`).
+    pub fn fail_project_reads(&self, fail: bool) {
+        self.fail_project_reads.store(fail, Ordering::SeqCst);
+    }
+
     pub fn fail_document_reads(&self, fail: bool) {
         self.fail_document_reads.store(fail, Ordering::SeqCst);
     }
@@ -818,6 +825,9 @@ impl Store for FlakyStore {
     }
 
     async fn project_by_id(&self, id: &str) -> anyhow::Result<Option<Project>> {
+        if self.fail_project_reads.load(Ordering::SeqCst) {
+            anyhow::bail!("the flaky store was told to fail project reads");
+        }
         self.inner().project_by_id(id).await
     }
 
