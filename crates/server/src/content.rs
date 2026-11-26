@@ -77,6 +77,18 @@ pub fn json_from_plain(p: &Plain) -> serde_json::Value {
     }
 }
 
+/// Operations as REST shows them (history): each operation's wire map ([`oswx_core::Op::to_wire`])
+/// rendered as JSON, values in their wire form (a keyed list is `{"$list": [[pos, item], ...]}`), so
+/// that nothing is lost: `[{"op": "set", "path": [...], "value": ...}, {"op": "insert", "list":
+/// [...], "item": {...}, "pos": "..."}, ...]`. The same shape the WebSocket carries, in JSON.
+pub fn ops_json(ops: &[oswx_core::Op]) -> serde_json::Value {
+    serde_json::Value::Array(
+        ops.iter()
+            .map(|op| json_from_plain(&op.to_wire()))
+            .collect(),
+    )
+}
+
 fn float(f: f64) -> serde_json::Value {
     serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number)
 }

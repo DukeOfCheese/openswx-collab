@@ -18,6 +18,8 @@ use serde::de::DeserializeOwned;
 pub enum ApiError {
     /// 404 with the message (e.g. `no such project`; `Not Found` for an unknown route).
     NotFound(&'static str),
+    /// 404 with a message made for the request (e.g. `the document has no state 9`).
+    NotFoundDetail(String),
     /// 401 `sign in first`.
     Unauthorized,
     /// 401 `wrong email address or password` (a refused sign-in).
@@ -50,7 +52,7 @@ impl ApiError {
     /// The status code this error answers with.
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::NotFound(_) | Self::NotFoundDetail(_) => StatusCode::NOT_FOUND,
             Self::Unauthorized | Self::WrongCredentials => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) | Self::ConflictWith(_) => StatusCode::CONFLICT,
@@ -71,6 +73,7 @@ impl ApiError {
             Self::WrongCredentials => "wrong email address or password",
             Self::NotFound(m) | Self::Forbidden(m) => m,
             Self::Conflict(m)
+            | Self::NotFoundDetail(m)
             | Self::BadRequest(m)
             | Self::Unprocessable(m)
             | Self::PaymentRequired(m)

@@ -10,7 +10,9 @@
 //!   being the top of the project), `DELETE` (project owner, as in the Python server; 204, a soft
 //!   delete: the row stays, marked deleted, and open connections are closed).
 //! - `GET /api/documents/{document}/content` (viewer): `{"document", "seq", "content"}`, the
-//!   document as it is now.
+//!   document as it is now; `?seq=N` (an integer, else 422) or `?version=<name>` (which wins) for
+//!   an earlier state (see `routes::history`: 404 `the document has no state N` / `no version
+//!   named 'x'`).
 //!
 //! A document answers as `{id, project_id, folder_id, name, kind, format_version, seq, created_by,
 //! created_at, updated_at}` (`seq` is its head seq), with `role`, the caller's role, except inside
@@ -36,6 +38,7 @@ use crate::content::{
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, detail_response};
 use crate::ext::{Event, Quota, check_quota, emit};
+use crate::routes::history;
 use crate::routes::orgs::clean_name;
 use crate::security::ProjectRole;
 use crate::snapshot::{self, load_head_doc, snapshot_key};
@@ -606,8 +609,8 @@ struct ContentQuery {
     version: Option<String>,
 }
 
-/// The document as it is now: `{"document": <document, without role>, "seq": <head>, "content":
-/// <the content>}`. The JSON is written on the blocking pool.
+/// The document as it is now, or at `?seq=` / `?version=`: `{"document": <document, without
+/// role>, "seq": <its seq>, "content": <the content>}`. The JSON is written on the blocking pool.
 async fn get_content(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -621,22 +624,28 @@ async fn get_content(
         ProjectRole::Viewer,
     )
     .await?;
-    if query.seq.is_some() || query.version.is_some() {
-        // TASK 11: an earlier state (`seq`) or a named version (`version`, which wins), 404 `no
-        // version named ...` / `the document has no state N`; a seq equal to the head is the head.
-        return Err(ApiError::NotImplemented(
-            "reading an earlier state of a document arrives with history".into(),
-        ));
-    }
+    // An earlier state (`seq`) or a named version (`version`, which wins); a seq equal to the
+    // head is the head.
+    let asked =
+        history::requested_seq(&state, &doc, query.seq.as_deref(), query.version.as_deref())
+            .await?;
     // An open room has the durable head in memory; otherwise it is read from the store (without
     // opening a room for one request).
     let open = match state.hub.loaded(&doc.id) {
         Some(room) => room.durable_head().await,
         None => None,
     };
-    let (content, seq) = match open {
-        Some(head) => (head.doc, head.seq),
-        None => {
+    let head_seq = match &open {
+        Some(head) => i64::try_from(head.seq)?,
+        None => doc.head_seq,
+    };
+    let (content, seq) = match (asked, open) {
+        (Some(seq), _) if seq != head_seq => {
+            let content = history::content_at(&state, &doc, seq).await?;
+            (content, u64::try_from(seq)?)
+        }
+        (_, Some(head)) => (head.doc, head.seq),
+        (_, None) => {
             let (content, _, seq) =
                 load_head_doc(state.store.as_ref(), state.blobs.as_ref(), &doc.id).await?;
             (content, seq)

@@ -19,6 +19,8 @@
 //!    looked up in the journal. Then **locks** (the `locks` module): a change touching what another
 //!    client holds a lock on is refused (`locked`), against the lock table of the moment it is
 //!    judged (and again whenever it is judged again).
+//!    An **undo** (`undo_of`) has its target resolved before it is judged, from memory or the
+//!    journal (off the task, the sender's later messages waiting): see the `history` module.
 //! 3. **Judged** by [`oswx_core::decide`] against the tentative head, under the sender's client id,
 //!    with `Rules::openswx()`. `depends` are answered from what the room knows of the client's own
 //!    changes: accepted (tentatively or durably) if memory holds it, refused if the client's
@@ -46,7 +48,14 @@
 //! lease or an unknown outcome unloads the room (see the room module).
 //!
 //! The server's own changes ([`super::RoomHandle::server_change`]) go through the same pipeline
-//! under [`SERVER_CLIENT`], with no change id, and are broadcast to every connection.
+//! under [`SERVER_CLIENT`], with no change id, and are broadcast to every connection. So does a
+//! revert from history (`change.revert`), whose requester is answered `change.revert.result` in
+//! the order of its messages and gets no change event.
+//!
+//! A change that takes another back (an undo, a revert) is journaled with `reverts` (and, for an
+//! undo, `undo_of`) set to that change's seq, together with [`Extra::SetRevertedBy`]; the journal
+//! refuses it (`AlreadyReverted`) if something else took the change back first, and its sender is
+//! told so (`invalid`, or `already_reverted` for a revert).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -66,7 +75,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::{ConnId, Internal, Reply, Room, ServerChange, ServerChangeError, close};
 use crate::blobs::missing_blobs;
 use crate::content::blob_refs;
-use crate::journal::{JournalError, JournalWriter, Receipt, Record, RefusedWhy};
+use crate::journal::{Extra, JournalError, JournalWriter, Receipt, Record, RefusedWhy};
 use crate::metrics;
 use crate::record::{encode_ops, encode_paths, encode_reads};
 use crate::snapshot::SERVER_CLIENT;
@@ -102,7 +111,7 @@ pub(super) type Ticket = u64;
 // ------------------------------------------------------------------ memory
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Seen {
+pub(super) enum Seen {
     /// Decided, not yet durable.
     Tentative(Ticket),
     /// The journal refused it as a duplicate; the seq it holds is being looked up. Counts as
@@ -138,12 +147,12 @@ impl Recent {
         }
     }
 
-    fn get(&self, client: &ClientId, change_id: &Arc<str>) -> Option<Seen> {
+    pub(super) fn get(&self, client: &ClientId, change_id: &Arc<str>) -> Option<Seen> {
         self.map.get(&(client.clone(), change_id.clone())).copied()
     }
 
     /// Whether a change id of `client` that memory does not hold is new.
-    fn is_complete(&self, client: &ClientId) -> bool {
+    pub(super) fn is_complete(&self, client: &ClientId) -> bool {
         self.complete.contains(client)
     }
 
@@ -241,8 +250,9 @@ impl KnownBlobs {
 pub(super) enum Incoming {
     /// A decoded message and the size of its frame.
     Msg(ClientMsg, usize),
-    /// A change whose memory and journal checks are done: judge it.
-    Judge(Arc<Change>, usize),
+    /// A change whose memory and journal checks are done: judge it (with what it takes back, for
+    /// an undo whose `undo_of` was resolved; an undo without it is resolved first).
+    Judge(Arc<Change>, usize, Option<Reverts>),
     /// A frame that could not be read: answer `error` with this code and message.
     Malformed(&'static str, String),
 }
@@ -250,10 +260,28 @@ pub(super) enum Incoming {
 impl Incoming {
     pub(super) fn size(&self) -> usize {
         match self {
-            Incoming::Msg(_, size) | Incoming::Judge(_, size) => *size,
+            Incoming::Msg(_, size) | Incoming::Judge(_, size, _) => *size,
             Incoming::Malformed(..) => 0,
         }
     }
+}
+
+/// What a change takes back: the sender's own earlier change (an undo, `undo_of`) or any change
+/// (a revert from history).
+#[derive(Debug, Clone)]
+pub(super) struct Reverts {
+    /// The seq of the change it takes back.
+    pub(super) seq: Seq,
+    /// For an undo: the inverse the room kept of the undone change (the journal's, or the
+    /// tentative one's), handed to `decide`; it decides which ids the undo may bring back. Never
+    /// anything the client sent.
+    pub(super) inverse: Option<Arc<[Op]>>,
+    /// For an undo of a change that was not yet durable when the undo was resolved: that change's
+    /// ticket (its seq may move if it is judged again).
+    pub(super) ticket: Option<Ticket>,
+    /// For an undo: the base the client gave. The undo is judged from the older of that and the
+    /// undone change's seq, so that anyone else's write since the undone change makes it `stale`.
+    pub(super) client_base: Seq,
 }
 
 /// Where a change came from, and so who is answered.
@@ -266,13 +294,22 @@ pub(super) enum Origin {
         /// Which locks refuse it.
         locks: super::LockRule,
     },
+    /// A revert from history a connection asked for (`change.revert`): judged as a change the
+    /// server makes (stale since the reverted change), answered with `change.revert.result`.
+    Revert {
+        conn: ConnId,
+        request_id: String,
+        /// The requester's own locks do not stop it.
+        locks: super::LockRule,
+    },
 }
 
 impl Origin {
-    /// `Some(check_stale)` for the server's own change.
+    /// `Some(check_stale)` for a change judged as the server's own.
     fn server_stale(&self) -> Option<bool> {
         match self {
             Origin::Server { check_stale, .. } => Some(*check_stale),
+            Origin::Revert { .. } => Some(true),
             Origin::Conn(_) => None,
         }
     }
@@ -301,20 +338,64 @@ pub(super) struct Item {
     rejudged: u8,
     /// Its blob references were checked.
     blobs_checked: bool,
+    /// What it takes back, if anything.
+    reverts: Option<Reverts>,
 }
 
 impl Item {
+    /// A revert from history of change `seq` (whose stored inverse is `change.ops`), asked for by
+    /// the connection `conn` of `user`, whose client is `client`.
+    pub(super) fn revert(
+        conn: ConnId,
+        request_id: String,
+        client: ClientId,
+        user: String,
+        name: String,
+        change: Change,
+        seq: Seq,
+    ) -> Item {
+        Item {
+            origin: Origin::Revert {
+                conn,
+                request_id,
+                locks: super::LockRule::WritesExcept(client),
+            },
+            author: Author {
+                client: Arc::from(SERVER_CLIENT),
+                user,
+                name,
+            },
+            change: Arc::new(change),
+            size: 0,
+            ticket: None,
+            waiters: Vec::new(),
+            rejudged: 0,
+            // (Its operations put back what the journal held: blobs that were there then.)
+            blobs_checked: true,
+            reverts: Some(Reverts {
+                seq,
+                inverse: None,
+                ticket: None,
+                client_base: seq,
+            }),
+        }
+    }
+
+    /// The connection waiting for its answer: the sender of a client's change, or the requester
+    /// of a revert.
     fn conn(&self) -> Option<ConnId> {
         match self.origin {
-            Origin::Conn(conn) => Some(conn),
+            Origin::Conn(conn) | Origin::Revert { conn, .. } => Some(conn),
             Origin::Server { .. } => None,
         }
     }
 
     /// The key of its id in [`Recent`], for a client's change.
     fn key(&self) -> Option<Key> {
-        self.conn()
-            .map(|_| (self.author.client.clone(), self.change.change_id.clone()))
+        match self.origin {
+            Origin::Conn(_) => Some((self.author.client.clone(), self.change.change_id.clone())),
+            Origin::Server { .. } | Origin::Revert { .. } => None,
+        }
     }
 
     /// What the lock check needs to know of it.
@@ -325,7 +406,7 @@ impl Item {
             user: &self.author.user,
             rule: match &self.origin {
                 Origin::Conn(_) => None,
-                Origin::Server { locks, .. } => Some(locks),
+                Origin::Server { locks, .. } | Origin::Revert { locks, .. } => Some(locks),
             },
         }
     }
@@ -440,7 +521,7 @@ pub(super) fn pump(
 }
 
 /// Runs `work` and turns a panic in it into an error, so that whoever waits for its answer gets one.
-async fn caught<T>(
+pub(super) async fn caught<T>(
     work: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     match AssertUnwindSafe(work).catch_unwind().await {
@@ -464,13 +545,15 @@ fn blob_refs_of(ops: &[Op]) -> BTreeSet<String> {
 
 /// Judges a change against `head` and, if it is accepted, makes everything its record and broadcast
 /// need. `server_stale` is `Some(check_stale)` for a change the server makes itself
-/// ([`decide_server`]). Pure and `Send`, so it can run on the blocking pool.
+/// ([`decide_server`]). `reverts` is what it takes back (for an undo, the kept inverse `decide`
+/// exempts ids by). Pure and `Send`, so it can run on the blocking pool.
 fn judge(
     head: &Head,
     author: &Author,
     change: &Change,
     known: &HashMap<Arc<str>, Known>,
     server_stale: Option<bool>,
+    reverts: Option<&Reverts>,
 ) -> Result<Decision, Refusal> {
     let blobs = blob_refs_of(&change.ops);
     if blobs.len() > MAX_BLOB_REFS {
@@ -483,12 +566,13 @@ fn judge(
         Some(check_stale) => decide_server(head, change, &Rules::openswx(), check_stale)?,
         None => {
             let known = |id: &str| known.get(id).copied().unwrap_or(Known::Unknown);
+            let undo = reverts.and_then(|r| r.inverse.as_deref());
             decide(
                 head,
                 &author.client,
                 change,
                 &known,
-                None,
+                undo,
                 &Rules::openswx(),
             )?
         }
@@ -507,9 +591,9 @@ fn judge(
         },
         ops: change.ops.clone(),
         command: change.command.clone(),
-        // TASK 11: undo (the room resolves `undo_of` and hands `decide` the kept inverse).
-        undo_of: None,
-        reverts: None,
+        // (As catch-up reads them from the row: the undone change's id, and its seq.)
+        undo_of: if server { None } else { change.undo_of.clone() },
+        reverts: reverts.map(|r| r.seq),
     }));
     Ok(Decision {
         blobs,
@@ -596,7 +680,7 @@ impl Room {
             });
             return;
         }
-        self.judge_conn_change(conn, change, size);
+        self.judge_conn_change(conn, change, size, None);
     }
 
     pub(super) fn on_lookup(&mut self, lookup: Lookup) {
@@ -621,8 +705,10 @@ impl Room {
                 }
                 self.accept_again(conn, &change.change_id, seq);
             }
-            Ok(None) if self.paused > 0 => self.park_first(conn, Incoming::Judge(change, size)),
-            Ok(None) => self.judge_conn_change(conn, change, size),
+            Ok(None) if self.paused > 0 => {
+                self.park_first(conn, Incoming::Judge(change, size, None));
+            }
+            Ok(None) => self.judge_conn_change(conn, change, size, None),
             Err(e) => {
                 tracing::error!(
                     "could not look a change id up in document {}: {e:#}",
@@ -670,6 +756,7 @@ impl Room {
             waiters: Vec::new(),
             rejudged: 0,
             blobs_checked: true,
+            reverts: None,
         });
     }
 
@@ -700,7 +787,19 @@ impl Room {
             .collect()
     }
 
-    pub(super) fn judge_conn_change(&mut self, conn: ConnId, change: Arc<Change>, size: usize) {
+    /// Judges a client's change whose memory and journal checks are done. An undo (`undo_of`) whose
+    /// target is not resolved yet (`reverts` is `None`) is resolved first (see the `history`
+    /// module), off the task when that needs the store.
+    pub(super) fn judge_conn_change(
+        &mut self,
+        conn: ConnId,
+        change: Arc<Change>,
+        size: usize,
+        reverts: Option<Reverts>,
+    ) {
+        if change.undo_of.is_some() && reverts.is_none() {
+            return self.resolve_undo(conn, change, size);
+        }
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
@@ -717,8 +816,59 @@ impl Room {
             waiters: Vec::new(),
             rejudged: 0,
             blobs_checked: false,
+            reverts,
         };
         self.judge_item(item);
+    }
+
+    /// Makes a change ready to be judged against the tentative head: the server's own change is
+    /// made on whatever is current; an undo's target is looked up again (its seq moves if it was
+    /// judged again; a refused one refuses the undo) and the undo is judged from the older of its
+    /// base and that seq.
+    fn prepare(&self, item: &mut Item) -> Result<(), Refusal> {
+        if matches!(item.origin, Origin::Server { .. }) {
+            Arc::make_mut(&mut item.change).base = self.tentative.seq;
+        }
+        if !matches!(item.origin, Origin::Conn(_)) {
+            return Ok(());
+        }
+        let Some(r) = item.reverts.as_mut() else {
+            return Ok(());
+        };
+        if let (Some(ticket), Some(of)) = (r.ticket, item.change.undo_of.as_ref()) {
+            match self.recent.get(&item.author.client, of) {
+                Some(Seen::Tentative(t)) if t == ticket => {
+                    let Some((seq, inverse)) = self.pending_change(ticket) else {
+                        return Err(Refusal::Dependency(of.clone()));
+                    };
+                    r.seq = seq;
+                    r.inverse = Some(inverse);
+                }
+                Some(Seen::Durable(seq)) => {
+                    r.seq = seq;
+                    r.ticket = None;
+                }
+                _ => return Err(Refusal::Dependency(of.clone())),
+            }
+        }
+        let base = r.client_base.min(r.seq);
+        Arc::make_mut(&mut item.change).base = base;
+        Ok(())
+    }
+
+    /// The seq and kept inverse of the change still being written under `ticket`.
+    pub(super) fn pending_change(&self, ticket: Ticket) -> Option<(Seq, Arc<[Op]>)> {
+        self.pending
+            .iter()
+            .find(|p| p.item.ticket == Some(ticket))
+            .map(|p| (p.seq, Arc::from(p.accepted.inverse.as_slice())))
+    }
+
+    /// Whether a change still being written takes back the change `seq`.
+    pub(super) fn pending_reverts(&self, seq: Seq) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.item.reverts.as_ref().is_some_and(|r| r.seq == seq))
     }
 
     /// Judges a change (off the task when it is big) and goes on with the decision.
@@ -726,9 +876,8 @@ impl Room {
         let Some(mut item) = self.unless_locked(item) else {
             return;
         };
-        if matches!(item.origin, Origin::Server { .. }) {
-            // The server's change is made on whatever is current.
-            Arc::make_mut(&mut item.change).base = self.tentative.seq;
+        if let Err(refusal) = self.prepare(&mut item) {
+            return self.refuse_item(item, refusal);
         }
         let known = self.known(&item.author.client, &item.change.depends);
         let version = self.tentative_version;
@@ -742,13 +891,14 @@ impl Room {
             let head = self.tentative.clone();
             let stale = item.origin.server_stale();
             let (author, change) = (item.author.clone(), item.change.clone());
+            let reverts = item.reverts.clone();
             let (internal, encodes) = (self.internal.clone(), self.encodes.clone());
             let delay = self.state.room_hooks.judge_delay;
             tokio::spawn(async move {
                 let judging = tokio::task::spawn_blocking(move || {
                     std::thread::sleep(delay);
                     let started = Instant::now();
-                    let result = judge(&head, &author, &change, &known, stale);
+                    let result = judge(&head, &author, &change, &known, stale, reverts.as_ref());
                     metrics::decided(started.elapsed());
                     result
                 });
@@ -767,7 +917,14 @@ impl Room {
         }
         let started = Instant::now();
         let stale = item.origin.server_stale();
-        let result = judge(&self.tentative, &item.author, &item.change, &known, stale);
+        let result = judge(
+            &self.tentative,
+            &item.author,
+            &item.change,
+            &known,
+            stale,
+            item.reverts.as_ref(),
+        );
         metrics::decided(started.elapsed());
         if result.is_ok() {
             self.encodes.fetch_add(1, Ordering::Relaxed);
@@ -814,8 +971,11 @@ impl Room {
             return self.judge_item(item);
         }
         match item.origin {
-            Origin::Conn(conn) => self.park_first(conn, Incoming::Judge(item.change, item.size)),
-            Origin::Server { .. } => self.server_queue.push_front(item),
+            Origin::Conn(conn) => {
+                self.park_first(conn, Incoming::Judge(item.change, item.size, item.reverts));
+            }
+            // (A revert's later messages wait behind it: the server's queue goes first.)
+            Origin::Server { .. } | Origin::Revert { .. } => self.server_queue.push_front(item),
         }
     }
 
@@ -943,7 +1103,8 @@ impl Room {
                 ticket
             }
         };
-        let client = item.conn().map(|_| item.author.client.to_string());
+        let client = item.key().map(|_| item.author.client.to_string());
+        let reverts = item.reverts.as_ref().map(|r| r.seq);
         let record = Record {
             document: self.doc.clone(),
             seq,
@@ -957,12 +1118,16 @@ impl Room {
             inverse: d.inverse,
             paths: d.paths,
             reads: d.reads,
-            // TASK 11: the seq of the change `undo_of` names.
-            undo_of: None,
-            reverts: None,
+            // A client's undo names the undone change by its seq; a revert from history only
+            // says what it reverts.
+            undo_of: reverts.filter(|_| item.key().is_some()),
+            reverts,
             created_at: self.state.clock.now(),
-            // TASK 13: an assembly's component references.
-            extra: Vec::new(),
+            // The taken-back change is marked in the same transaction (refused if something else
+            // took it back first). TASK 13: an assembly's component references.
+            extra: reverts
+                .map(|seq| vec![Extra::SetRevertedBy { seq }])
+                .unwrap_or_default(),
         };
         self.tentative = Head {
             seq,
@@ -992,7 +1157,13 @@ impl Room {
     // ------------------------------------------------------------------ answering
 
     /// Refuses a message of a connection that never entered the pipeline.
-    fn reject(&mut self, conn: ConnId, change_id: &Arc<str>, code: RejectCode, message: &str) {
+    pub(super) fn reject(
+        &mut self,
+        conn: ConnId,
+        change_id: &Arc<str>,
+        code: RejectCode,
+        message: &str,
+    ) {
         metrics::change_rejected(code);
         self.note_refused(conn, change_id);
         let frame = self.encode(&ServerMsg::Rejected {
@@ -1031,17 +1202,43 @@ impl Room {
                 metrics::change_rejected(RejectCode::Locked);
                 let _ = reply.send(Err(ServerChangeError::Locked(conflicts)));
             }
-            Origin::Conn(_) => {
+            Origin::Conn(_) | Origin::Revert { .. } => {
                 self.answer_refused(item, RejectCode::Locked, message, conflicts, None);
             }
         }
     }
 
-    /// Tells everyone waiting for a change that it was refused.
+    /// Sends a change's answer to `conn`, or (once it waits on a ticket) to everyone waiting.
+    fn deliver(&mut self, conn: ConnId, ticket: Option<Ticket>, waiters: &[ConnId], frame: Bytes) {
+        match ticket {
+            Some(ticket) => {
+                for w in waiters {
+                    self.resolve(*w, ticket, frame.clone());
+                }
+            }
+            None => self.reply(conn, frame),
+        }
+    }
+
+    /// Tells everyone waiting for a change that it was refused. A revert from history is answered
+    /// `change.revert.result` with the code's name.
     fn answer_refused(
         &mut self,
         item: Item,
         code: RejectCode,
+        message: &str,
+        conflicts: Vec<Conflict>,
+        refusal: Option<Refusal>,
+    ) {
+        self.answer_refused_as(item, code, code.as_str(), message, conflicts, refusal);
+    }
+
+    /// [`Room::answer_refused`], a revert's result carrying `revert_code`.
+    fn answer_refused_as(
+        &mut self,
+        item: Item,
+        code: RejectCode,
+        revert_code: &str,
         message: &str,
         conflicts: Vec<Conflict>,
         refusal: Option<Refusal>,
@@ -1060,14 +1257,13 @@ impl Room {
                     message: message.to_owned(),
                     conflicts,
                 });
-                match item.ticket {
-                    Some(ticket) => {
-                        for w in &item.waiters {
-                            self.resolve(*w, ticket, frame.clone());
-                        }
-                    }
-                    None => self.reply(conn, frame),
-                }
+                self.deliver(conn, item.ticket, &item.waiters, frame);
+            }
+            Origin::Revert {
+                conn, request_id, ..
+            } => {
+                let frame = self.revert_result(request_id, Err((revert_code, message)));
+                self.deliver(conn, item.ticket, &item.waiters, frame);
             }
         }
     }
@@ -1083,16 +1279,43 @@ impl Room {
                     change_id: item.change.change_id.clone(),
                     seq,
                 });
-                match item.ticket {
-                    Some(ticket) => {
-                        for w in &item.waiters {
-                            self.resolve(*w, ticket, frame.clone());
-                        }
-                    }
-                    None => self.reply(conn, frame),
-                }
+                self.deliver(conn, item.ticket, &item.waiters, frame);
+            }
+            Origin::Revert {
+                conn, request_id, ..
+            } => {
+                // The requester applies the operations itself: it gets no change event.
+                let frame = self.revert_result(request_id, Ok((seq, item.change.ops.clone())));
+                self.deliver(conn, item.ticket, &item.waiters, frame);
             }
         }
+    }
+
+    /// An encoded `change.revert.result`: the seq and applied operations, or a code and message.
+    pub(super) fn revert_result(
+        &self,
+        request_id: String,
+        result: Result<(Seq, Vec<Op>), (&str, &str)>,
+    ) -> Bytes {
+        let msg = match result {
+            Ok((seq, ops)) => ServerMsg::RevertResult {
+                request_id,
+                ok: true,
+                seq: Some(seq),
+                ops,
+                code: None,
+                message: None,
+            },
+            Err((code, message)) => ServerMsg::RevertResult {
+                request_id,
+                ok: false,
+                seq: None,
+                ops: Vec::new(),
+                code: Some(code.to_owned()),
+                message: Some(message.chars().take(MAX_MESSAGE).collect()),
+            },
+        };
+        self.encode(&msg)
     }
 
     /// A change that will not be written because the room is closing: the server is told; clients
@@ -1168,6 +1391,15 @@ impl Room {
             self.recent.durable(key, seq);
             self.recent.trim();
         }
+        if let Some(r) = &p.item.reverts {
+            self.undone.insert(r.seq, super::UNDONE_KEEP);
+        }
+        self.note_change(
+            seq,
+            &p.item.author.user,
+            &p.item.author.name,
+            &p.item.change.command,
+        );
         self.answer_accepted(p.item, seq);
         metrics::change_accepted();
         self.maybe_snapshot();
@@ -1221,17 +1453,30 @@ impl Room {
                 if let Some(key) = front.item.key() {
                     self.recent.map.remove(&key);
                 }
-                tracing::warn!(
-                    "the journal refused change {seq} of document {}: {why}",
-                    self.doc
-                );
-                self.answer_refused(
-                    front.item,
-                    RejectCode::ServerError,
-                    NOT_STORED,
-                    Vec::new(),
-                    None,
-                );
+                if matches!(why, RefusedWhy::AlreadyReverted) {
+                    // Something else took the same change back first (the room's own checks
+                    // should have seen it; the journal is the backstop).
+                    self.answer_refused_as(
+                        front.item,
+                        RejectCode::Invalid,
+                        "already_reverted",
+                        super::history::ALREADY_UNDONE,
+                        Vec::new(),
+                        None,
+                    );
+                } else {
+                    tracing::warn!(
+                        "the journal refused change {seq} of document {}: {why}",
+                        self.doc
+                    );
+                    self.answer_refused(
+                        front.item,
+                        RejectCode::ServerError,
+                        NOT_STORED,
+                        Vec::new(),
+                        None,
+                    );
+                }
             }
         }
         for p in rest {
@@ -1254,15 +1499,23 @@ impl Room {
             let Some(mut item) = self.unless_locked(item) else {
                 continue;
             };
-            if matches!(item.origin, Origin::Server { .. }) {
-                Arc::make_mut(&mut item.change).base = self.tentative.seq;
+            if let Err(refusal) = self.prepare(&mut item) {
+                self.refuse_item(item, refusal);
+                continue;
             }
             // Judged here and now, so that the order of the changes is kept (their blobs were
             // checked already).
             let known = self.known(&item.author.client, &item.change.depends);
             let started = Instant::now();
             let stale = item.origin.server_stale();
-            let result = judge(&self.tentative, &item.author, &item.change, &known, stale);
+            let result = judge(
+                &self.tentative,
+                &item.author,
+                &item.change,
+                &known,
+                stale,
+                item.reverts.as_ref(),
+            );
             metrics::decided(started.elapsed());
             match result {
                 Ok(decision) => {

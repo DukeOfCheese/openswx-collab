@@ -192,6 +192,7 @@ impl Room {
             you,
             peers,
             locks: self.all_locks(),
+            broken: self.rebuilds.broken.clone(),
             encodes: self.encodes.clone(),
         };
         // What this client already sent here is answered from memory if it comes again.

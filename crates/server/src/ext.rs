@@ -134,6 +134,30 @@ pub enum Event {
         document: Id,
         by: Id,
     },
+    /// A document was put back to an earlier state (as one new change, `seq`).
+    DocumentRestored {
+        org: Id,
+        project: Id,
+        document: Id,
+        seq: u64,
+        by: Id,
+    },
+    /// A named version of a document was made.
+    VersionCreated {
+        org: Id,
+        project: Id,
+        document: Id,
+        version: Id,
+        by: Id,
+    },
+    /// A named version of a document was deleted.
+    VersionDeleted {
+        org: Id,
+        project: Id,
+        document: Id,
+        version: Id,
+        by: Id,
+    },
     /// A folder was created.
     FolderCreated {
         org: Id,

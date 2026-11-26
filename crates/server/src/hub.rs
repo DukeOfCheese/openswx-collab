@@ -177,6 +177,14 @@ impl Hub {
         }
     }
 
+    /// Sends a message to everyone who has a document open; nobody when its room is not open
+    /// (never opens one).
+    pub async fn notify(&self, doc: &str, msg: oswx_core::wire::ServerMsg) {
+        if let Some(room) = self.loaded(doc) {
+            room.notify(msg).await;
+        }
+    }
+
     /// The first people connected to a document (one entry per person, in the order they joined,
     /// at most [`room::MAX_ONLINE`]), and how many people are connected in all. Nobody when the
     /// document's room is not open; never opens one, never waits for one.

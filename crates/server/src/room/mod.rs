@@ -40,10 +40,12 @@
 
 mod change;
 pub mod conn;
+mod history;
 mod lifecycle;
 mod locks;
 mod people;
 mod presence;
+mod rebuild;
 mod util;
 mod welcome;
 
@@ -67,6 +69,7 @@ use util::Bounded;
 pub use conn::{ConnId, Heard, Outbox};
 pub use locks::MAX_LOCKS;
 pub use presence::MAX_ONLINE;
+pub use rebuild::{BLAME_KEEP, MAX_BROKE};
 
 /// WebSocket close codes the server uses, in one place.
 pub mod close {
@@ -135,6 +138,9 @@ pub struct Hooks {
 /// The most change ids a room remembers, whatever its snapshots; past it the oldest are forgotten
 /// (and their clients' later unknown ids are looked up in the journal).
 pub const MAX_REMEMBERED: usize = 100_000;
+
+/// How many of the changes most recently taken back (undone or reverted) a room remembers.
+pub const UNDONE_KEEP: usize = 4096;
 
 impl Default for Hooks {
     fn default() -> Self {
@@ -272,6 +278,8 @@ pub enum RoomCmd {
     },
     /// A change the server makes itself.
     ServerChange(Box<ServerChange>),
+    /// A message for every connection (`version.created`, and `reference.update` from Task 13).
+    Notify(Box<ServerMsg>),
     /// A sweep, as the room's own timer makes every `sweep_interval` seconds: locks expire, and a
     /// snapshot still owed (one that failed) is tried again (TASK 12: idle checks hang off it too).
     Tick,
@@ -405,6 +413,11 @@ impl RoomHandle {
             .await
             .map_err(|_| ServerChangeError::NotWritten)?;
         answer.await.unwrap_or(Err(ServerChangeError::NotWritten))
+    }
+
+    /// Sends a message to every connection of the room (none if the room is gone).
+    pub async fn notify(&self, msg: ServerMsg) {
+        let _ = self.send(RoomCmd::Notify(Box::new(msg))).await;
     }
 
     pub(crate) async fn leave(&self, conn: ConnId) {
@@ -545,6 +558,9 @@ enum Internal {
     Blobs(change::BlobCheck),
     Decided(change::Offloaded),
     Duplicate(change::DuplicateCheck),
+    Undo(history::UndoLookup),
+    Revert(history::RevertLookup),
+    Report(rebuild::ReportLookup),
     Welcome {
         conn: ConnId,
         result: anyhow::Result<Bytes>,
@@ -610,6 +626,12 @@ struct Room {
     shared: Arc<Shared>,
     /// The join order of the next connection.
     next_join: u64,
+    /// The most recent changes taken back (undone or reverted) by changes made durable here (the
+    /// journal has every older one, and a lookup in flight takes far less time than [`UNDONE_KEEP`]
+    /// more of them).
+    undone: Bounded<Seq>,
+    /// What does not rebuild, and what blaming needs.
+    rebuilds: rebuild::Rebuilds,
 }
 
 fn next_room_id() -> u64 {
@@ -658,6 +680,8 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         locks: locks::Locks::default(),
         shared: shared.clone(),
         next_join: 0,
+        undone: Bounded::default(),
+        rebuilds: rebuild::Rebuilds::default(),
         state,
     };
     tokio::spawn(room.run(control_rx, frames_rx, internal_rx));
@@ -746,6 +770,10 @@ impl Room {
                 message,
             } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
             RoomCmd::ServerChange(sc) => self.on_server_change(*sc),
+            RoomCmd::Notify(msg) => {
+                let frame = self.encode(&msg);
+                self.broadcast(&frame, &[]);
+            }
             RoomCmd::Tick => self.on_tick(),
             RoomCmd::Close {
                 code,
@@ -770,6 +798,9 @@ impl Room {
             Internal::Blobs(check) => self.on_blobs(check),
             Internal::Decided(decided) => self.on_offloaded(decided),
             Internal::Duplicate(check) => self.on_duplicate(check),
+            Internal::Undo(lookup) => self.on_undo_lookup(lookup),
+            Internal::Revert(lookup) => self.on_revert_lookup(lookup),
+            Internal::Report(lookup) => self.on_report_lookup(lookup),
             Internal::Welcome { conn, result } => self.on_welcome(conn, result),
             Internal::LockNews(conn) => self.flush_lock_news(conn),
             Internal::Snapshot { seq, ok } => {
@@ -896,8 +927,8 @@ impl Room {
     fn dispatch(&mut self, conn: ConnId, incoming: change::Incoming) {
         let (msg, size) = match incoming {
             change::Incoming::Msg(msg, size) => (msg, size),
-            change::Incoming::Judge(change, size) => {
-                return self.judge_conn_change(conn, change, size);
+            change::Incoming::Judge(change, size, reverts) => {
+                return self.judge_conn_change(conn, change, size, reverts);
             }
             change::Incoming::Malformed(code, message) => {
                 let frame = self.encode(&ServerMsg::Error {
@@ -921,10 +952,8 @@ impl Room {
             }
             ClientMsg::LockRelease { paths } => self.on_lock_release(conn, &paths),
             msg @ (ClientMsg::Presence { .. } | ClientMsg::Draft { .. }) => self.on_live(conn, msg),
-            // TASK 11: reverting from history and rebuild reports.
-            ClientMsg::Revert { .. } | ClientMsg::RebuildReport { .. } => {
-                tracing::debug!("a revert or rebuild report is ignored until Task 11");
-            }
+            ClientMsg::Revert { request_id, seq } => self.on_revert(conn, request_id, seq),
+            ClientMsg::RebuildReport { seq, errors } => self.on_report(conn, seq, errors),
             ClientMsg::Hello { .. } => {}
         }
     }

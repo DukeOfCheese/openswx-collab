@@ -18,6 +18,7 @@ pub mod auth;
 pub mod blobs;
 pub mod documents;
 pub mod folders;
+pub mod history;
 pub mod meta;
 pub mod orgs;
 pub mod projects;
@@ -56,6 +57,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(blobs::router())
         .merge(documents::router())
         .merge(folders::router())
+        .merge(history::router())
         .merge(crate::ws::router());
 
     // Routes with their own body limit, each wrapped in `with_body_limit` (blob uploads, document

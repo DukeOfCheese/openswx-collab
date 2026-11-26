@@ -1,11 +1,12 @@
 //! The welcome a joining connection gets: built and encoded off the room's task, from what the room
 //! had at the moment of the join.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use oswx_core::wire::{self, ChangeEvent, Lock, Peer, ServerMsg};
+use oswx_core::wire::{self, Broken, ChangeEvent, Lock, Peer, ServerMsg};
 use oswx_core::{Head, Seq};
 
 use crate::record::decode_ops;
@@ -29,6 +30,8 @@ pub(super) struct Welcome {
     pub peers: Vec<Peer>,
     /// Every lock.
     pub locks: Vec<Lock>,
+    /// What does not rebuild.
+    pub broken: BTreeMap<String, Broken>,
     pub encodes: Arc<AtomicU64>,
 }
 
@@ -64,8 +67,7 @@ impl Welcome {
             you: self.you,
             peers: self.peers,
             locks: self.locks,
-            // TASK 11: what does not rebuild.
-            broken: Default::default(),
+            broken: self.broken,
             content,
             changes,
         };
@@ -101,9 +103,8 @@ async fn change_events(
                     change_id: Arc::from(row.change_id.as_deref().unwrap_or("")),
                     ops: decode_ops(&row.ops)?,
                     command: Arc::from(row.command.as_str()),
-                    // TASK 11: undo.
-                    undo_of: None,
-                    reverts: None,
+                    undo_of: row.undo_of.as_deref().map(Arc::from),
+                    reverts: row.reverts.map(Seq::try_from).transpose()?,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()

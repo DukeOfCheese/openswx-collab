@@ -1,0 +1,508 @@
+//! A document's history: its changes, named versions, earlier states, and restoring one.
+//!
+//! - `GET /api/documents/{document}/history?before=&after=&limit=` (viewer): the changes with
+//!   `after < seq < before` (both optional), newest first, at most `limit` (default
+//!   [`HISTORY_LIMIT`], clamped to `1..=`[`HISTORY_MAX`]; a value that is not an integer is 422).
+//!   Each: `{seq, author, author_name, client_id, change_id, time, ops, command, reverts,
+//!   reverted_by, broke}` — `author` the user id, `client_id` and `change_id` `null` for a change
+//!   the server made (a restore, a revert from history), `ops` as [`crate::content::ops_json`]
+//!   renders them, `broke` what rebuild reports blamed on it (`{feature id: error}`) or `null`.
+//! - `GET /api/documents/{document}/versions` (viewer): `[{id, name, note, seq, created_at,
+//!   author: {id, name}}]`, newest seq first.
+//! - `POST /api/documents/{document}/versions` (editor): `{name, note?, seq?}` — `name` 1 to 200
+//!   characters (trimmed), unique in the document (409); `note` at most 4000; `seq` defaults to the
+//!   head and must be within `0..=head` (422). 201 with the version. An open room hears
+//!   `version.created`.
+//! - `DELETE /api/documents/{document}/versions/{version}` (project owner, as in the Python
+//!   server: versions are what others pin to). 204; 404 `no such version`.
+//! - `POST /api/documents/{document}/restore` (editor): `{seq}` or `{version}` (a name; it wins
+//!   over `seq`; 422 when neither is given). The document becomes, as one new change, what it was
+//!   at that state: the operations are `oswx_core::diff(durable head, state)`, submitted as a change
+//!   the server makes for the caller (`restore to <seq or version name>`), with no staleness check,
+//!   and refused (409 `{code: "locked", message, conflicts}`) while anyone but the caller holds a
+//!   lock. `{seq}` once durable (the head itself when nothing differs). Works whether or not the
+//!   document is open (it opens the room), and alongside live editing.
+//! - `GET /api/documents/{document}/content?seq=N` or `?version=<name>` (viewer; in
+//!   `routes::documents`): the document at that state, read with [`crate::snapshot::state_at`].
+//!
+//! A state that does not exist (below 0, beyond the head) is 404 `the document has no state N`; a
+//! version name that does not exist 404 `no version named 'x'`. A document the caller cannot see is
+//! 404 `no such document`, as everywhere.
+
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{delete, get, post};
+use oswx_core::{Conflict, ConflictKind, Refusal, Value};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::access::{CurrentUser, recheck_document, require_document};
+use crate::content::ops_json;
+use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery};
+use crate::ext::{Event, emit};
+use crate::hub::OpenError;
+use crate::record::decode_ops;
+use crate::room::{LockRule, ServerChangeError, ServerChangeOptions};
+use crate::routes::orgs::clean_name;
+use crate::security::ProjectRole;
+use crate::snapshot::{LoadError, state_at};
+use crate::state::AppState;
+use crate::store::{Document, HistoryRow, Version, new_id};
+
+/// How many changes a history page has unless `limit` says otherwise.
+pub const HISTORY_LIMIT: i64 = 100;
+/// The most changes a history page has.
+pub const HISTORY_MAX: i64 = 500;
+/// The longest note of a version, in characters.
+pub const NOTE_MAX: usize = 4000;
+/// The longest version name a request may give, in characters.
+pub const VERSION_NAME_MAX: usize = 200;
+
+pub(crate) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/documents/{document_id}/history", get(history))
+        .route(
+            "/api/documents/{document_id}/versions",
+            get(list_versions).post(create_version),
+        )
+        .route(
+            "/api/documents/{document_id}/versions/{version_id}",
+            delete(delete_version),
+        )
+        .route("/api/documents/{document_id}/restore", post(restore))
+}
+
+/// An integer query parameter (422 if it is not one).
+fn int_param(name: &str, value: Option<&str>) -> Result<Option<i64>, ApiError> {
+    value
+        .map(|v| {
+            v.trim()
+                .parse::<i64>()
+                .map_err(|_| ApiError::Unprocessable(format!("{name} must be an integer")))
+        })
+        .transpose()
+}
+
+/// A version name a request gives (422 over [`VERSION_NAME_MAX`] characters).
+fn version_name(name: &str) -> Result<&str, ApiError> {
+    if name.chars().count() > VERSION_NAME_MAX {
+        return Err(ApiError::Unprocessable(format!(
+            "version must be at most {VERSION_NAME_MAX} characters"
+        )));
+    }
+    Ok(name)
+}
+
+/// 404 for a state the document does not have.
+fn no_state(seq: i64) -> ApiError {
+    ApiError::NotFoundDetail(format!("the document has no state {seq}"))
+}
+
+/// The seq of the version `name` of `doc` (404 `no version named 'x'`).
+async fn version_seq(state: &AppState, doc: &str, name: &str) -> Result<i64, ApiError> {
+    let name = version_name(name)?;
+    match state.store.version_by_name(doc, name).await? {
+        Some(v) => Ok(v.seq),
+        None => Err(ApiError::NotFoundDetail(format!(
+            "no version named '{name}'"
+        ))),
+    }
+}
+
+/// The state `?seq=` / `?version=` ask for (`version` wins), or `None` for the head.
+pub(crate) async fn requested_seq(
+    state: &AppState,
+    doc: &Document,
+    seq: Option<&str>,
+    version: Option<&str>,
+) -> Result<Option<i64>, ApiError> {
+    if let Some(name) = version {
+        return Ok(Some(version_seq(state, &doc.id, name).await?));
+    }
+    int_param("seq", seq)
+}
+
+/// The document at `seq`, JSON-ready content (404 when it has no such state).
+pub(crate) async fn content_at(
+    state: &AppState,
+    doc: &Document,
+    seq: i64,
+) -> Result<Value, ApiError> {
+    match state_at(state.store.as_ref(), state.blobs.as_ref(), &doc.id, seq).await {
+        Ok(v) => Ok(v),
+        Err(LoadError::NoState(_) | LoadError::NoDocument) => Err(no_state(seq)),
+        Err(e) => Err(ApiError::Internal(e.into())),
+    }
+}
+
+// ------------------------------------------------------------------ history
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    before: Option<String>,
+    after: Option<String>,
+    limit: Option<String>,
+}
+
+/// One history entry.
+fn history_entry(row: HistoryRow) -> serde_json::Value {
+    let ops = match decode_ops(&row.ops) {
+        Ok(ops) => ops_json(&ops),
+        Err(e) => {
+            tracing::error!("change {} of a document is damaged: {e}", row.seq);
+            serde_json::Value::Null
+        }
+    };
+    let broke = row
+        .broke
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
+    json!({
+        "seq": row.seq, "author": row.author_id, "author_name": row.author_name.unwrap_or_default(),
+        "client_id": row.client_id, "change_id": row.change_id, "time": row.created_at,
+        "ops": ops, "command": row.command, "reverts": row.reverts,
+        "reverted_by": row.reverted_by, "broke": broke,
+    })
+}
+
+async fn history(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    ApiPath(document_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<HistoryQuery>,
+) -> Result<ApiJson<serde_json::Value>, ApiError> {
+    let before = int_param("before", query.before.as_deref())?;
+    let after = int_param("after", query.after.as_deref())?;
+    let limit = int_param("limit", query.limit.as_deref())?
+        .unwrap_or(HISTORY_LIMIT)
+        .clamp(1, HISTORY_MAX);
+    let (doc, _, _) = require_document(
+        state.store.as_ref(),
+        &user.id,
+        &document_id,
+        ProjectRole::Viewer,
+    )
+    .await?;
+    let rows = state
+        .store
+        .history(
+            &doc.id,
+            before.unwrap_or(i64::MAX),
+            after.unwrap_or(i64::MIN),
+            limit,
+        )
+        .await?;
+    let out = tokio::task::spawn_blocking(move || {
+        serde_json::Value::Array(rows.into_iter().map(history_entry).collect())
+    })
+    .await?;
+    Ok(ApiJson(out))
+}
+
+// ------------------------------------------------------------------ versions
+
+fn version_out(v: &Version, author_name: &str) -> serde_json::Value {
+    json!({
+        "id": v.id, "name": v.name, "note": v.note, "seq": v.seq, "created_at": v.created_at,
+        "author": {"id": v.author_id, "name": author_name},
+    })
+}
+
+async fn list_versions(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    ApiPath(document_id): ApiPath<String>,
+) -> Result<ApiJson<Vec<serde_json::Value>>, ApiError> {
+    let (doc, _, _) = require_document(
+        state.store.as_ref(),
+        &user.id,
+        &document_id,
+        ProjectRole::Viewer,
+    )
+    .await?;
+    let rows = state.store.versions(&doc.id).await?;
+    Ok(ApiJson(
+        rows.into_iter()
+            .map(|v| {
+                json!({
+                    "id": v.id, "name": v.name, "note": v.note, "seq": v.seq,
+                    "created_at": v.created_at,
+                    "author": {"id": v.author_id, "name": v.author_name.unwrap_or_default()},
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionIn {
+    name: String,
+    #[serde(default)]
+    note: String,
+    seq: Option<i64>,
+}
+
+/// Names a state: the version is a label on `seq` (the head by default). In order: the caller must
+/// be an editor; the name (1 to 200 characters, trimmed) and note (at most 4000) are checked
+/// (422); inside the transaction the caller's role is read again and `seq` checked against the
+/// head (422); a name the document already has is 409. After the commit an open room hears
+/// `version.created`.
+async fn create_version(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    ApiPath(document_id): ApiPath<String>,
+    ApiJson(body): ApiJson<VersionIn>,
+) -> Result<(StatusCode, ApiJson<serde_json::Value>), ApiError> {
+    let (doc, _, _) = require_document(
+        state.store.as_ref(),
+        &user.id,
+        &document_id,
+        ProjectRole::Editor,
+    )
+    .await?;
+    let name = clean_name(&body.name)?;
+    if body.note.chars().count() > NOTE_MAX {
+        return Err(ApiError::Unprocessable(format!(
+            "note must be at most {NOTE_MAX} characters"
+        )));
+    }
+    let author_name = state
+        .store
+        .user_by_id(&user.id)
+        .await?
+        .map(|u| u.name)
+        .unwrap_or_default();
+    let mut tx = state.store.begin().await?;
+    let (doc, project, _) =
+        recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Editor).await?;
+    let seq = body.seq.unwrap_or(doc.head_seq);
+    if !(0..=doc.head_seq).contains(&seq) {
+        return Err(ApiError::Unprocessable(format!(
+            "the document has no state {seq}"
+        )));
+    }
+    let version = Version {
+        id: new_id(),
+        document_id: doc.id.clone(),
+        seq,
+        name,
+        note: body.note,
+        author_id: user.id.clone(),
+        created_at: state.clock.now(),
+    };
+    if !tx.insert_version(&version).await? {
+        return Err(ApiError::Conflict(format!(
+            "there is already a version named '{}'",
+            version.name
+        )));
+    }
+    tx.commit().await?;
+    state
+        .hub
+        .notify(
+            &doc.id,
+            oswx_core::wire::ServerMsg::VersionCreated {
+                id: version.id.clone(),
+                name: version.name.clone(),
+                seq: u64::try_from(seq).unwrap_or_default(),
+            },
+        )
+        .await;
+    // TASK 13: every open assembly with components pinned to an older state of this part hears
+    // `reference.update {document, components}` (ids only), as the Python `where_pinned_older`.
+    emit(
+        &state.ext,
+        Event::VersionCreated {
+            org: project.org_id,
+            project: project.id,
+            document: doc.id,
+            version: version.id.clone(),
+            by: user.id,
+        },
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        ApiJson(version_out(&version, &author_name)),
+    ))
+}
+
+async fn delete_version(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    ApiPath((document_id, version_id)): ApiPath<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let (doc, _, _) = require_document(
+        state.store.as_ref(),
+        &user.id,
+        &document_id,
+        ProjectRole::Owner,
+    )
+    .await?;
+    let mut tx = state.store.begin().await?;
+    let (doc, project, _) =
+        recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Owner).await?;
+    // TASK 13: a version that assemblies pin is Task 13's rule (refuse or keep the pins working)
+    // and is checked here, inside the transaction.
+    if !tx.delete_version(&doc.id, &version_id).await? {
+        return Err(ApiError::NotFound("no such version"));
+    }
+    tx.commit().await?;
+    emit(
+        &state.ext,
+        Event::VersionDeleted {
+            org: project.org_id,
+            project: project.id,
+            document: doc.id,
+            version: version_id,
+            by: user.id,
+        },
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ------------------------------------------------------------------ restore
+
+#[derive(Debug, Deserialize)]
+struct RestoreIn {
+    seq: Option<i64>,
+    version: Option<String>,
+}
+
+/// What a 409 says about the conflicts that refused a change.
+fn conflicts_json(conflicts: &[Conflict]) -> serde_json::Value {
+    conflicts
+        .iter()
+        .map(|c| {
+            let kind = match c.kind {
+                ConflictKind::Written => "written",
+                ConflictKind::Removed => "removed",
+                ConflictKind::Read => "read",
+                ConflictKind::Locked => "locked",
+            };
+            json!({"path": c.path.iter().map(|s| &**s).collect::<Vec<_>>(), "seq": c.seq,
+                   "by": &*c.by, "kind": kind})
+        })
+        .collect()
+}
+
+/// The 409 for a refused restore.
+fn refused(code: &str, message: &str, conflicts: &[Conflict]) -> ApiError {
+    ApiError::ConflictWith(
+        json!({"code": code, "message": message, "conflicts": conflicts_json(conflicts)}),
+    )
+}
+
+/// What a change the pipeline refused says about itself.
+fn refusal_message(r: &Refusal) -> String {
+    match r {
+        Refusal::Stale(_) => "someone else changed this meanwhile".to_owned(),
+        Refusal::Dependency(id) => format!("it builds on {id}, which was refused"),
+        Refusal::NameTaken(name) => format!("the name {name} is taken"),
+        Refusal::IdTaken(id) => format!("the id {id} is taken"),
+        Refusal::Invalid(why) => why.clone(),
+        Refusal::TooOld => "the state is older than the history this server keeps".to_owned(),
+    }
+}
+
+async fn restore(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    ApiPath(document_id): ApiPath<String>,
+    ApiJson(body): ApiJson<RestoreIn>,
+) -> Result<ApiJson<serde_json::Value>, ApiError> {
+    let (doc, project, _) = require_document(
+        state.store.as_ref(),
+        &user.id,
+        &document_id,
+        ProjectRole::Editor,
+    )
+    .await?;
+    let (seq, label) = match (&body.version, body.seq) {
+        (Some(name), _) => (version_seq(&state, &doc.id, name).await?, name.clone()),
+        (None, Some(seq)) => (seq, seq.to_string()),
+        (None, None) => return Err(ApiError::Unprocessable("give seq or version".into())),
+    };
+    let author_name = state
+        .store
+        .user_by_id(&user.id)
+        .await?
+        .map(|u| u.name)
+        .unwrap_or_default();
+    let command = format!("restore to {label}");
+    // A room that unloads while the restore waits is opened again, once.
+    for attempt in 0..2 {
+        let room = match state.hub.open(&state, &doc.id).await {
+            Ok(room) => room,
+            Err(OpenError::NoDocument) => {
+                return Err(ApiError::NotFound(crate::access::NO_SUCH_DOCUMENT));
+            }
+            Err(e) => return Err(ApiError::Internal(e.into())),
+        };
+        let Some(head) = room.durable_head().await else {
+            continue;
+        };
+        let head_seq = i64::try_from(head.seq)?;
+        if !(0..=head_seq).contains(&seq) {
+            return Err(no_state(seq));
+        }
+        let target = content_at(&state, &doc, seq).await?;
+        let ops =
+            tokio::task::spawn_blocking(move || oswx_core::diff(&head.doc, &target.to_plain()))
+                .await?
+                .map_err(|e| refused("invalid", &e.to_string(), &[]))?;
+        if ops.is_empty() {
+            return Ok(ApiJson(json!({"seq": head_seq})));
+        }
+        let options = ServerChangeOptions {
+            check_stale: false,
+            locks: LockRule::AnyOfOtherUsers,
+        };
+        match room
+            .server_change(ops, &command, &user.id, &author_name, options)
+            .await
+        {
+            Ok(new_seq) => {
+                emit(
+                    &state.ext,
+                    Event::DocumentRestored {
+                        org: project.org_id,
+                        project: project.id,
+                        document: doc.id,
+                        seq: new_seq,
+                        by: user.id,
+                    },
+                )
+                .await;
+                return Ok(ApiJson(json!({"seq": new_seq})));
+            }
+            Err(ServerChangeError::Locked(conflicts)) => {
+                return Err(refused(
+                    "locked",
+                    "other people are editing this document; restore needs their locks released",
+                    &conflicts,
+                ));
+            }
+            Err(ServerChangeError::Refused(r)) => {
+                let conflicts = match &r {
+                    Refusal::Stale(c) => c.clone(),
+                    _ => Vec::new(),
+                };
+                return Err(refused(r.code().as_str(), &refusal_message(&r), &conflicts));
+            }
+            Err(ServerChangeError::NotWritten) if attempt == 0 && room.is_closed() => continue,
+            Err(ServerChangeError::NotWritten) => {
+                return Err(ApiError::Internal(anyhow::anyhow!(
+                    "the restore of document {} was not written",
+                    doc.id
+                )));
+            }
+        }
+    }
+    Err(ApiError::Internal(anyhow::anyhow!(
+        "the room of document {} went away twice during a restore",
+        doc.id
+    )))
+}

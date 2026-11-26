@@ -11,12 +11,14 @@
 // A message not wanted is handed back whole, to be kept in `seen`.
 #![allow(clippy::result_large_err)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use oswx_core::wire::{
-    self, ChangeEvent, ClientMsg, Lock, LockDenied, PROTOCOL_VERSION, Peer, RejectCode, ServerMsg,
+    self, Broken, ChangeEvent, ClientMsg, Lock, LockDenied, PROTOCOL_VERSION, Peer, RejectCode,
+    ServerMsg,
 };
 use oswx_core::{Change, Conflict, Op, Path, Plain, Pos, Seq, Value};
 use tokio::net::TcpStream;
@@ -111,8 +113,96 @@ pub struct Welcome {
     pub you: Peer,
     pub peers: Vec<Peer>,
     pub locks: Vec<Lock>,
+    pub broken: BTreeMap<String, Broken>,
     pub content: Option<Value>,
     pub changes: Option<Vec<ChangeEvent>>,
+}
+
+/// `change.revert.result`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevertResult {
+    pub request_id: String,
+    pub ok: bool,
+    pub seq: Option<Seq>,
+    pub ops: Vec<Op>,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+impl RevertResult {
+    /// The seq it was accepted as (panics if it failed).
+    #[track_caller]
+    pub fn seq(&self) -> Seq {
+        match (self.ok, self.seq) {
+            (true, Some(seq)) => seq,
+            _ => panic!("expected a revert, got {self:?}"),
+        }
+    }
+
+    /// Its failure code (panics if it succeeded).
+    #[track_caller]
+    pub fn code(&self) -> &str {
+        match (&self.code, self.ok) {
+            (Some(code), false) => code,
+            _ => panic!("expected a failed revert, got {self:?}"),
+        }
+    }
+}
+
+impl FromServer for RevertResult {
+    fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::RevertResult {
+                request_id,
+                ok,
+                seq,
+                ops,
+                code,
+                message,
+            } => Ok(RevertResult {
+                request_id,
+                ok,
+                seq,
+                ops,
+                code,
+                message,
+            }),
+            other => Err(other),
+        }
+    }
+}
+
+/// `rebuild.status`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RebuildStatus {
+    pub seq: Seq,
+    pub broken: BTreeMap<String, Broken>,
+}
+
+impl FromServer for RebuildStatus {
+    fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::RebuildStatus { seq, broken } => Ok(RebuildStatus { seq, broken }),
+            other => Err(other),
+        }
+    }
+}
+
+/// `version.created`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionCreated {
+    pub id: String,
+    pub name: String,
+    pub seq: Seq,
+}
+
+impl FromServer for VersionCreated {
+    fn pick(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::VersionCreated { id, name, seq } => Ok(VersionCreated { id, name, seq }),
+            other => Err(other),
+        }
+    }
 }
 
 /// How a connection was refused: the `error` frame (code, message) and the close code.
@@ -447,7 +537,7 @@ impl Live {
                 you,
                 peers,
                 locks,
-                broken: _,
+                broken,
                 content,
                 changes,
             }) => Ok(Live {
@@ -462,6 +552,7 @@ impl Live {
                     you,
                     peers,
                     locks,
+                    broken,
                     content,
                     changes,
                 },
@@ -645,6 +736,44 @@ impl Live {
         change.depends = depends;
         self.send_change(&change).await;
         self.outcome(&change.change_id).await
+    }
+
+    /// Undoes this client's change `of` with the inverse `ops` (the client's kept inverse), made on
+    /// the newest seq this client knows; waits for the answer.
+    pub async fn undo(&mut self, of: &str, ops: Vec<Op>) -> Outcome {
+        let change = self.undo_change(self.seq, of, ops);
+        self.send_change(&change).await;
+        self.outcome(&change.change_id).await
+    }
+
+    /// An undo of `of` with `ops` on `base`, not sent.
+    pub fn undo_change(&mut self, base: Seq, of: &str, ops: Vec<Op>) -> Change {
+        let mut change = self.make_change(base, ops);
+        change.undo_of = Some(Arc::from(of));
+        change.command = Arc::from("undo");
+        change
+    }
+
+    /// Asks to revert the change `seq` from history and waits for the result.
+    pub async fn revert(&mut self, seq: Seq) -> RevertResult {
+        self.send(&ClientMsg::Revert {
+            request_id: format!("rv{seq}"),
+            seq,
+        })
+        .await;
+        self.expect().await
+    }
+
+    /// Sends a rebuild report (no answer comes).
+    pub async fn report(&mut self, seq: Seq, errors: &[(&str, &str)]) {
+        self.send(&ClientMsg::RebuildReport {
+            seq,
+            errors: errors
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        })
+        .await;
     }
 
     /// Sends a change made on `base`, and waits for its answer.

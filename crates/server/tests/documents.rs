@@ -661,17 +661,24 @@ async fn a_failed_commit_leaves_no_snapshot_behind() {
 }
 
 #[tokio::test]
-async fn earlier_states_arrive_with_history() {
+async fn earlier_states_are_asked_for_by_seq_or_version() {
+    // (The states themselves are tested in history.rs.)
     let (server, w) = world().await;
     let id = w.document(&server, None, None, None).await;
-    for query in ["?seq=0", "?version=first", "?seq=x"] {
+    for (query, expected) in [
+        ("?seq=0", StatusCode::OK),
+        ("?seq=1", StatusCode::NOT_FOUND),
+        ("?seq=-1", StatusCode::NOT_FOUND),
+        ("?version=first", StatusCode::NOT_FOUND),
+        ("?seq=x", StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
         let (status, _) = server
             .get(
                 &format!("/api/documents/{id}/content{query}"),
                 Some(&w.admin),
             )
             .await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{query}");
+        assert_eq!(status, expected, "{query}");
     }
 }
 
