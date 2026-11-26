@@ -336,6 +336,7 @@ async fn write(store: &dyn Store, batch: Vec<Pending>, timeout: Duration) {
     let (records, replies): (Vec<Record>, Vec<Reply>) =
         batch.into_iter().map(|p| (p.record, p.reply)).unzip();
     let n = records.len();
+    crate::metrics::journal_batch(n);
     let results = match tokio::time::timeout(timeout, write_batch(store, &records)).await {
         Ok(Ok(results)) => results,
         Ok(Err(e)) => {

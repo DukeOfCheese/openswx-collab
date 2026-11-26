@@ -395,6 +395,14 @@ pub fn new_journal(store: &Arc<dyn Store>) -> JournalWriter {
     JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT)
 }
 
+/// Waits `d`, and not at all when it is zero (a zero-length tokio sleep still waits for the next
+/// timer tick, which on the journal's commit path costs every batch milliseconds).
+pub async fn pause(d: Duration) {
+    if !d.is_zero() {
+        tokio::time::sleep(d).await;
+    }
+}
+
 /// The password [`TestServer::register`] gives accounts.
 pub const PASSWORD: &str = "correct horse";
 
@@ -839,7 +847,7 @@ impl Store for FlakyStore {
             .preload_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        tokio::time::sleep(delay).await;
+        pause(delay).await;
         found
     }
 
@@ -854,7 +862,7 @@ impl Store for FlakyStore {
             .lookup_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        tokio::time::sleep(delay).await;
+        pause(delay).await;
         self.inner()
             .change_seq_by_client(document_id, client_id, change_id)
             .await
@@ -916,7 +924,7 @@ impl Tx for FlakyTx {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         self.inner.commit().await?;
-        tokio::time::sleep(delay).await;
+        pause(delay).await;
         Ok(())
     }
 
@@ -1425,6 +1433,7 @@ pub struct TestBlobs {
     exists_now: AtomicUsize,
     exists_most: AtomicUsize,
     puts: AtomicUsize,
+    put_failures: AtomicUsize,
 }
 
 impl TestBlobs {
@@ -1439,6 +1448,7 @@ impl TestBlobs {
             exists_now: AtomicUsize::new(0),
             exists_most: AtomicUsize::new(0),
             puts: AtomicUsize::new(0),
+            put_failures: AtomicUsize::new(0),
         }
     }
 
@@ -1482,6 +1492,11 @@ impl TestBlobs {
     pub fn puts(&self) -> usize {
         self.puts.load(Ordering::SeqCst)
     }
+
+    /// How many `put` calls failed because the double was told to fail.
+    pub fn put_failures(&self) -> usize {
+        self.put_failures.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -1510,7 +1525,7 @@ impl Blobs for TestBlobs {
             .exists_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        tokio::time::sleep(delay).await;
+        pause(delay).await;
         self.exists_now.fetch_sub(1, Ordering::SeqCst);
         if self.fail_exists.load(Ordering::SeqCst) {
             anyhow::bail!("the test storage was told to fail exists");
@@ -1524,8 +1539,9 @@ impl Blobs for TestBlobs {
             .put_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        tokio::time::sleep(delay).await;
+        pause(delay).await;
         if self.fail_put.load(Ordering::SeqCst) {
+            self.put_failures.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("the test storage was told to fail put");
         }
         self.inner.put(key, bytes).await

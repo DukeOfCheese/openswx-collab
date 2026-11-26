@@ -31,6 +31,8 @@ static JOURNAL_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
 static BROADCASTS: AtomicU64 = AtomicU64::new(0);
 static BROADCAST_RECIPIENTS: AtomicU64 = AtomicU64::new(0);
 static SLOW_CONSUMERS: AtomicU64 = AtomicU64::new(0);
+static JOURNAL_BATCHES: AtomicU64 = AtomicU64::new(0);
+static JOURNAL_RECORDS: AtomicU64 = AtomicU64::new(0);
 static LOCKS_GRANTED: AtomicU64 = AtomicU64::new(0);
 static LOCKS_DENIED: AtomicU64 = AtomicU64::new(0);
 static PRESENCE_RELAYED: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +72,12 @@ pub fn broadcast(recipients: usize) {
     BROADCAST_RECIPIENTS.fetch_add(recipients as u64, Ordering::Relaxed);
 }
 
+/// The journal wrote one batch (one transaction) of `records` records.
+pub fn journal_batch(records: usize) {
+    JOURNAL_BATCHES.fetch_add(1, Ordering::Relaxed);
+    JOURNAL_RECORDS.fetch_add(records as u64, Ordering::Relaxed);
+}
+
 /// A connection was closed because it did not read fast enough.
 pub fn slow_consumer() {
     SLOW_CONSUMERS.fetch_add(1, Ordering::Relaxed);
@@ -104,6 +112,9 @@ pub struct Counters {
     pub broadcasts: u64,
     pub broadcast_recipients: u64,
     pub slow_consumers: u64,
+    /// Journal transactions (batches) written, and the records in them.
+    pub journal_batches: u64,
+    pub journal_records: u64,
     pub locks_granted: u64,
     pub locks_denied: u64,
     pub presence_relayed: u64,
@@ -123,6 +134,8 @@ pub fn counters() -> Counters {
         broadcasts: get(&BROADCASTS),
         broadcast_recipients: get(&BROADCAST_RECIPIENTS),
         slow_consumers: get(&SLOW_CONSUMERS),
+        journal_batches: get(&JOURNAL_BATCHES),
+        journal_records: get(&JOURNAL_RECORDS),
         locks_granted: get(&LOCKS_GRANTED),
         locks_denied: get(&LOCKS_DENIED),
         presence_relayed: get(&PRESENCE_RELAYED),

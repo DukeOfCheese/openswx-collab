@@ -254,6 +254,9 @@ async fn scale_check_one_hundred_editors() {
     let (server, flaky) = TestServer::start_flaky(|_| {}).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
+    // What the run costs the database, for comparing runs: transactions (all of them) and journal
+    // batches (process-wide counters: run this test alone).
+    let (begins, journal) = (flaky.begins(), oswx_server::metrics::counters());
     let mut tasks = Vec::new();
     let server = std::sync::Arc::new(server);
     for i in 0..CLIENTS {
@@ -288,17 +291,25 @@ async fn scale_check_one_hundred_editors() {
         latencies.extend(l);
         rejected.extend(r);
     }
+    let transactions = flaky.begins() - begins;
+    let after = oswx_server::metrics::counters();
+    let batches = after.journal_batches - journal.journal_batches;
+    let records = after.journal_records - journal.journal_records;
     latencies.sort();
     let at = |q: f64| latencies[((latencies.len() as f64 - 1.0) * q) as usize];
     println!(
-        "scale: {} changes accepted, {} rejected {:?}; median {:?}, p99 {:?}, max {:?}; {} store lookups",
+        "scale: {} changes accepted, {} rejected {:?}; median {:?}, p99 {:?}, max {:?}; {} store lookups; \
+         {} journal batches of {:.1} records on average; {} transactions",
         latencies.len(),
         rejected.len(),
         rejected,
         at(0.5),
         at(0.99),
         latencies.last().unwrap(),
-        flaky.change_lookups()
+        flaky.change_lookups(),
+        batches,
+        records as f64 / batches.max(1) as f64,
+        transactions
     );
     assert_eq!(
         flaky.change_lookups(),
