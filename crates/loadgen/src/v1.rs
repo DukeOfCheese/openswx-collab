@@ -21,7 +21,7 @@ use crate::doc::{build_document, feature_id};
 const EMAIL: &str = "loadgen@example.com";
 const PASSWORD: &str = "loadgen password 1";
 /// The server wants a ping at least every 45 s; 15 s is what docs/protocol.md says.
-const PING_EVERY: Duration = Duration::from_secs(15);
+pub(crate) const PING_EVERY: Duration = Duration::from_secs(15);
 
 pub struct V1 {
     /// Makes client ids unique per run, so two runs never disconnect each other (4409).
@@ -48,8 +48,113 @@ async fn json_or_fail(what: &str, resp: reqwest::Response) -> Result<Value> {
     serde_json::from_str(&body).with_context(|| format!("{what}: the answer was not JSON"))
 }
 
+/// The REST part of a run, which both dialects share (the Rust server keeps the Python server's REST
+/// shapes): registers (or signs in) the loadgen account and creates an organisation, a project and `docs`
+/// documents. `run` goes into the names, so that two runs on one server do not collide.
+pub(crate) async fn rest_setup(
+    run: &str,
+    base_url: &str,
+    docs: usize,
+    features: usize,
+    doc_bytes: usize,
+) -> Result<Target> {
+    if features == 0 {
+        bail!("--features must be at least 1");
+    }
+    let base = base_url.trim_end_matches('/');
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+
+    let info = http
+        .get(format!("{base}/api/server"))
+        .send()
+        .await
+        .map_err(|e| anyhow!("cannot reach the server at {base}: {e}"))?;
+    let info = json_or_fail("GET /api/server", info).await?;
+    let server = format!(
+        "{} {} (protocol {})",
+        info["name"].as_str().unwrap_or("unknown server"),
+        info["version"].as_str().unwrap_or("?"),
+        info["protocol"]
+    );
+
+    let creds = json!({"email": EMAIL, "password": PASSWORD, "name": "Loadgen"});
+    let resp = http
+        .post(format!("{base}/api/auth/register"))
+        .json(&creds)
+        .send()
+        .await?;
+    let token = if resp.status().is_success() {
+        json_or_fail("register", resp).await?
+    } else {
+        // The first user exists already (an earlier scenario on the same server): sign in as it.
+        let login = http
+            .post(format!("{base}/api/auth/login"))
+            .json(&json!({"email": EMAIL, "password": PASSWORD}))
+            .send()
+            .await?;
+        if !login.status().is_success() {
+            bail!(
+                "the server has users but not the loadgen account; start it on a fresh database \
+                 (registration answered {})",
+                resp.status()
+            );
+        }
+        json_or_fail("login", login).await?
+    };
+    let token = token["token"]
+        .as_str()
+        .context("no token in the sign-in answer")?
+        .to_owned();
+
+    let auth = format!("Bearer {token}");
+    let org = http
+        .post(format!("{base}/api/orgs"))
+        .header("Authorization", &auth)
+        .json(&json!({"name": format!("Loadgen {run}")}))
+        .send()
+        .await?;
+    let org = json_or_fail("create organisation", org).await?;
+    let org = org["id"].as_str().context("no organisation id")?;
+    let project = http
+        .post(format!("{base}/api/orgs/{org}/projects"))
+        .header("Authorization", &auth)
+        .json(&json!({"name": format!("Bench {run}")}))
+        .send()
+        .await?;
+    let project = json_or_fail("create project", project).await?;
+    let project = project["id"].as_str().context("no project id")?;
+
+    let content = build_document(features, doc_bytes);
+    let document_bytes = serde_json::to_vec(&content)?.len();
+    let mut documents = Vec::with_capacity(docs);
+    for i in 0..docs {
+        let doc = http
+            .post(format!("{base}/api/projects/{project}/documents"))
+            .header("Authorization", &auth)
+            .json(&json!({"name": format!("Bench-{i}"), "content": content}))
+            .send()
+            .await?;
+        let doc = json_or_fail("create document", doc).await?;
+        documents.push(doc["id"].as_str().context("no document id")?.to_owned());
+    }
+    Ok(Target {
+        base_url: base.to_owned(),
+        token,
+        documents,
+        features,
+        document_bytes,
+        server,
+    })
+}
+
 #[async_trait]
 impl Dialect for V1 {
+    fn name(&self) -> &'static str {
+        "v1"
+    }
+
     async fn setup(
         &self,
         base_url: &str,
@@ -57,120 +162,11 @@ impl Dialect for V1 {
         features: usize,
         doc_bytes: usize,
     ) -> Result<Target> {
-        if features == 0 {
-            bail!("--features must be at least 1");
-        }
-        let base = base_url.trim_end_matches('/');
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()?;
-
-        let info = http
-            .get(format!("{base}/api/server"))
-            .send()
-            .await
-            .map_err(|e| anyhow!("cannot reach the server at {base}: {e}"))?;
-        let info = json_or_fail("GET /api/server", info).await?;
-        let server = format!(
-            "{} {} (protocol {})",
-            info["name"].as_str().unwrap_or("unknown server"),
-            info["version"].as_str().unwrap_or("?"),
-            info["protocol"]
-        );
-
-        let creds = json!({"email": EMAIL, "password": PASSWORD, "name": "Loadgen"});
-        let resp = http
-            .post(format!("{base}/api/auth/register"))
-            .json(&creds)
-            .send()
-            .await?;
-        let token = if resp.status().is_success() {
-            json_or_fail("register", resp).await?
-        } else {
-            // The first user exists already (an earlier scenario on the same server): sign in as it.
-            let login = http
-                .post(format!("{base}/api/auth/login"))
-                .json(&json!({"email": EMAIL, "password": PASSWORD}))
-                .send()
-                .await?;
-            if !login.status().is_success() {
-                bail!(
-                    "the server has users but not the loadgen account; start it on a fresh database \
-                     (registration answered {})",
-                    resp.status()
-                );
-            }
-            json_or_fail("login", login).await?
-        };
-        let token = token["token"]
-            .as_str()
-            .context("no token in the sign-in answer")?
-            .to_owned();
-
-        let auth = format!("Bearer {token}");
-        let run = &self.nonce;
-        let org = http
-            .post(format!("{base}/api/orgs"))
-            .header("Authorization", &auth)
-            .json(&json!({"name": format!("Loadgen {run}")}))
-            .send()
-            .await?;
-        let org = json_or_fail("create organisation", org).await?;
-        let org = org["id"].as_str().context("no organisation id")?;
-        let project = http
-            .post(format!("{base}/api/orgs/{org}/projects"))
-            .header("Authorization", &auth)
-            .json(&json!({"name": format!("Bench {run}")}))
-            .send()
-            .await?;
-        let project = json_or_fail("create project", project).await?;
-        let project = project["id"].as_str().context("no project id")?;
-
-        let content = build_document(features, doc_bytes);
-        let document_bytes = serde_json::to_vec(&content)?.len();
-        let mut documents = Vec::with_capacity(docs);
-        for i in 0..docs {
-            let doc = http
-                .post(format!("{base}/api/projects/{project}/documents"))
-                .header("Authorization", &auth)
-                .json(&json!({"name": format!("Bench-{i}"), "content": content}))
-                .send()
-                .await?;
-            let doc = json_or_fail("create document", doc).await?;
-            documents.push(doc["id"].as_str().context("no document id")?.to_owned());
-        }
-        Ok(Target {
-            base_url: base.to_owned(),
-            token,
-            documents,
-            features,
-            document_bytes,
-            server,
-        })
+        rest_setup(&self.nonce, base_url, docs, features, doc_bytes).await
     }
 
     async fn connect(&self, target: &Target, n: usize) -> Result<Box<dyn Peer>> {
-        if target.documents.is_empty() {
-            bail!("the target has no documents");
-        }
-        let doc = &target.documents[n % target.documents.len()];
-        let ws_base = if let Some(rest) = target.base_url.strip_prefix("https://") {
-            format!("wss://{rest}")
-        } else if let Some(rest) = target.base_url.strip_prefix("http://") {
-            format!("ws://{rest}")
-        } else {
-            bail!("the url must start with http:// or https://");
-        };
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(1 << 30))
-            .max_frame_size(None);
-        let (mut ws, _) = tokio_tungstenite::connect_async_with_config(
-            format!("{ws_base}/api/documents/{doc}/ws"),
-            Some(config),
-            false,
-        )
-        .await
-        .context("WebSocket handshake")?;
+        let mut ws = open_socket(target, n).await?;
 
         let hello = json!({
             "type": "hello", "protocol": 1, "token": target.token,
@@ -203,12 +199,7 @@ impl Dialect for V1 {
             }
         };
 
-        let shared = Arc::new(Shared {
-            seq: AtomicU64::new(seq),
-            open: AtomicBool::new(true),
-            protocol_errors: AtomicU64::new(0),
-            pending: Mutex::new(HashMap::new()),
-        });
+        let shared = Arc::new(Shared::new(seq));
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
@@ -265,6 +256,36 @@ impl Dialect for V1 {
     }
 }
 
+pub(crate) type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A WebSocket on document `target.documents[n % documents.len()]`, nothing sent yet. The same for both
+/// dialects, so that their numbers differ only by the protocol and the server.
+pub(crate) async fn open_socket(target: &Target, n: usize) -> Result<Socket> {
+    if target.documents.is_empty() {
+        bail!("the target has no documents");
+    }
+    let doc = &target.documents[n % target.documents.len()];
+    let ws_base = if let Some(rest) = target.base_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = target.base_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        bail!("the url must start with http:// or https://");
+    };
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(1 << 30))
+        .max_frame_size(None);
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(
+        format!("{ws_base}/api/documents/{doc}/ws"),
+        Some(config),
+        false,
+    )
+    .await
+    .context("WebSocket handshake")?;
+    Ok(ws)
+}
+
 /// A welcome counts only if it carries the whole document (we send no `last_seq`); returns its `seq`.
 fn parse_welcome(v: &Value) -> Result<u64> {
     if !v["content"].is_object() {
@@ -275,9 +296,9 @@ fn parse_welcome(v: &Value) -> Result<u64> {
 
 /// Takes the edit's entry out of the pending map when the edit ends, however it ends (answer, error, or the
 /// caller giving up on a timeout), so abandoned edits do not pile up.
-struct PendingGuard<'a> {
-    shared: &'a Shared,
-    id: String,
+pub(crate) struct PendingGuard<'a> {
+    pub(crate) shared: &'a Shared,
+    pub(crate) id: String,
 }
 
 impl Drop for PendingGuard<'_> {
@@ -290,15 +311,26 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
-struct Shared {
-    seq: AtomicU64,
-    open: AtomicBool,
-    protocol_errors: AtomicU64,
-    pending: Mutex<HashMap<String, oneshot::Sender<Outcome>>>,
+/// What a peer's socket tasks and its `edit` share. Both dialects use it; only reading a frame differs.
+pub(crate) struct Shared {
+    /// The newest seq heard of.
+    pub(crate) seq: AtomicU64,
+    pub(crate) open: AtomicBool,
+    pub(crate) protocol_errors: AtomicU64,
+    pub(crate) pending: Mutex<HashMap<String, oneshot::Sender<Outcome>>>,
 }
 
 impl Shared {
-    fn close(&self) {
+    pub(crate) fn new(seq: u64) -> Self {
+        Self {
+            seq: AtomicU64::new(seq),
+            open: AtomicBool::new(true),
+            protocol_errors: AtomicU64::new(0),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn close(&self) {
         self.open.store(false, Ordering::Relaxed);
         // Dropping the senders wakes every waiting edit with an error.
         self.pending
@@ -307,11 +339,11 @@ impl Shared {
             .clear();
     }
 
-    fn bump_seq(&self, seq: u64) {
+    pub(crate) fn bump_seq(&self, seq: u64) {
         self.seq.fetch_max(seq, Ordering::Relaxed);
     }
 
-    fn answer(&self, change_id: &str, outcome: Outcome) {
+    pub(crate) fn answer(&self, change_id: &str, outcome: Outcome) {
         let waiter = self
             .pending
             .lock()
@@ -445,12 +477,7 @@ mod tests {
     use super::*;
 
     fn shared() -> Shared {
-        Shared {
-            seq: AtomicU64::new(0),
-            open: AtomicBool::new(true),
-            protocol_errors: AtomicU64::new(0),
-            pending: Mutex::new(HashMap::new()),
-        }
+        Shared::new(0)
     }
 
     #[test]

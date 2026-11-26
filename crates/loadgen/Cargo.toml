@@ -16,11 +16,12 @@ chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 hdrhistogram.workspace = true
+oswx-core = { path = "../core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tokio-tungstenite.workspace = true
 uuid.workspace = true
 
@@ -28,4 +29,7 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
+# The v2 dialect's tests run against a server in the test process.
+oswx-server = { path = "../server" }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

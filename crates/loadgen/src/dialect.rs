@@ -1,5 +1,5 @@
 //! What a load run needs from a server, independent of its wire format. `v1` is the JSON protocol of the
-//! Python server; a second dialect for the Rust server plugs in here.
+//! Python server, `v2` the MessagePack protocol of the Rust server.
 
 use std::time::Duration;
 
@@ -7,6 +7,15 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait Dialect: Send + Sync + 'static {
+    /// `v1` or `v2`, for the report.
+    fn name(&self) -> &'static str;
+
+    /// How many connections the server (or the network) closed while their peers were still in use, by
+    /// WebSocket close code (`1006`: the socket ended without one). `None`: this dialect does not record it.
+    fn closes(&self) -> Option<std::collections::BTreeMap<String, u64>> {
+        None
+    }
+
     /// Registers (or signs in) the first user and creates an organisation, a project and `docs` documents
     /// of `features` features, about `doc_bytes` bytes each.
     async fn setup(

@@ -5,6 +5,7 @@ mod doc;
 mod report;
 mod scenarios;
 mod v1;
+mod v2;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -21,7 +22,10 @@ use crate::scenarios::RunResult;
 
 #[derive(Copy, Clone, ValueEnum)]
 enum DialectName {
+    /// The Python server: JSON frames, protocol 1.
     V1,
+    /// The Rust server: MessagePack frames, protocol 2.
+    V2,
 }
 
 #[derive(Parser)]
@@ -154,6 +158,7 @@ fn positive(name: &str, n: usize) -> Result<()> {
 async fn run(cli: Cli) -> Result<Report> {
     let dialect: Arc<dyn Dialect> = match cli.dialect {
         DialectName::V1 => Arc::new(v1::V1::new()),
+        DialectName::V2 => Arc::new(v2::V2::new()),
     };
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -245,7 +250,7 @@ async fn run(cli: Cli) -> Result<Report> {
     Ok(Report {
         scenario: name.to_owned(),
         params,
-        dialect: "v1".to_owned(),
+        dialect: dialect.name().to_owned(),
         server: target.server.clone(),
         database: cli.database,
         loadgen_commit: git_commit(),
@@ -261,6 +266,7 @@ async fn run(cli: Cli) -> Result<Report> {
         errors: m.errors,
         protocol_errors: m.protocol_errors,
         dropped_connections: m.dropped,
+        close_codes: dialect.closes(),
         connect_failed: m.connect_failed,
         latency_kind: kind.to_owned(),
         latency_ms: m.latency(),
