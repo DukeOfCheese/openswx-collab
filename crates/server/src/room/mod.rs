@@ -51,11 +51,15 @@
 //!
 //! A connection the hub closed because its access ended (4401, 4403, 4404) has its locks released
 //! at once, whichever of its `Leave` and the hub's `Revoked` reaches the room first; the hub's
-//! `Revoked` also releases the account's locks that already wait detached. A new connection of the
-//! same client that takes over a live one (4409) goes on under the old one's name in the room:
-//! everything of that client still in the works (answers awaited, parked messages, changes being
-//! judged, looked up, checked or written) is answered to the successor, in order, ahead of its own
-//! later work.
+//! `Revoked` also releases the account's locks that already wait detached.
+//!
+//! A new connection of the same client replaces the old one (4409) and inherits none of its work:
+//! what the old one had not yet handed to the journal is dropped where it comes back, what it had
+//! handed over completes. The client resends what it has no answer for, and each resend is answered
+//! once: by the change still being written (it waits for it), from memory once it is durable, after
+//! a duplicate check in flight, or judged afresh under the new connection's access. A client never
+//! receives its own changes as live events (only in a welcome's catch-up). Its locks stay with the
+//! client (released if the new connection may only look).
 
 mod change;
 pub mod conn;
@@ -903,13 +907,6 @@ struct Conn {
     joined: u64,
     /// When its session expires (clock seconds).
     expires: f64,
-    /// The changes whose answers it inherited from the connection it took over (its first resend
-    /// of one of them is answered by that answer, and nothing else). Bounded by what was in the
-    /// works at the takeover (at most [`MAX_REPLIES`] answers); an entry goes with that resend,
-    /// or with the connection.
-    inherited: std::collections::HashSet<Arc<str>>,
-    /// The role it joined with.
-    role: ProjectRole,
 }
 
 impl Conn {
@@ -1015,18 +1012,6 @@ struct Room {
     /// Restores found unchanged against a tentative head, waiting for that head's seq to become
     /// durable before they are answered.
     held_unchanged: Vec<(Seq, change::Item)>,
-    /// Sockets that took over a connection of their client, and the room's name for it (the
-    /// name of the connection taken over).
-    aliases: HashMap<ConnId, ConnId>,
-    /// Sockets taken over: their messages are ignored until their `Leave`.
-    retired: std::collections::HashSet<ConnId>,
-    /// Sockets taken over, and the name they served then: a `Revoked` for one voids what its
-    /// successor inherited from it (see `Room::void_inherited`). Kept while that name is in the
-    /// room.
-    served: HashMap<ConnId, ConnId>,
-    /// Names whose inherited work was voided, and the name their successor goes on under: work of
-    /// the old name coming back is answered to the successor as not written.
-    voided: HashMap<ConnId, ConnId>,
     /// Undos whose target's seq is being checked (a journal duplicate), by that change's ticket.
     undo_waiting: HashMap<change::Ticket, Vec<(ConnId, Arc<oswx_core::Change>, usize)>>,
     /// Since when nobody has been connected (clock seconds); `None` while someone is.
@@ -1111,10 +1096,6 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         rebuilds: rebuild::Rebuilds::default(),
         undo_waiting: HashMap::new(),
         held_unchanged: Vec::new(),
-        aliases: HashMap::new(),
-        retired: std::collections::HashSet::new(),
-        served: HashMap::new(),
-        voided: HashMap::new(),
         idle_since: Some(state.clock.now()),
         next_expiry: f64::INFINITY,
         snapshot_failing: false,
@@ -1259,28 +1240,17 @@ impl Room {
                     let _ = answer.send(JoinAnswer::Taken);
                 }
             }
-            RoomCmd::Leave(socket) => {
-                // (The last message of a socket: what the room keeps about it goes.)
-                if self.retired.remove(&socket) {
-                    return;
-                }
-                let conn = self.aliases.remove(&socket).unwrap_or(socket);
-                self.remove_conn(conn, None, true);
-            }
+            // (A socket no longer in the room, replaced say, finds nothing: its successor has a
+            // connection id of its own.)
+            RoomCmd::Leave(conn) => self.remove_conn(conn, None, true),
             RoomCmd::Frame { conn, msg, size } => {
-                if let Some(conn) = self.key(conn) {
-                    self.on_frame(conn, change::Incoming::Msg(*msg, size));
-                }
+                self.on_frame(conn, change::Incoming::Msg(*msg, size));
             }
             RoomCmd::Malformed {
                 conn,
                 code,
                 message,
-            } => {
-                if let Some(conn) = self.key(conn) {
-                    self.on_frame(conn, change::Incoming::Malformed(code, message));
-                }
-            }
+            } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
             RoomCmd::ServerChange(sc) => {
                 // A room nobody is connected to is idle from its last change by REST.
                 if self.conns.is_empty() {
@@ -1328,15 +1298,8 @@ impl Room {
             Internal::Undo(lookup) => self.on_undo_lookup(lookup),
             Internal::Revert(lookup) => self.on_revert_lookup(lookup),
             Internal::Report(lookup) => self.on_report_lookup(lookup),
-            // (Of a name whose successor was renamed, see `void_inherited`: it goes to it.)
-            Internal::Welcome { conn, result } => {
-                let conn = self.voided.get(&conn).copied().unwrap_or(conn);
-                self.on_welcome(conn, result);
-            }
-            Internal::LockNews(conn) => {
-                let conn = self.voided.get(&conn).copied().unwrap_or(conn);
-                self.flush_lock_news(conn);
-            }
+            Internal::Welcome { conn, result } => self.on_welcome(conn, result),
+            Internal::LockNews(conn) => self.flush_lock_news(conn),
             Internal::Snapshot { seq, ok } => {
                 self.snapshot_task = None;
                 self.snapshot_failing = !ok;
@@ -1411,17 +1374,9 @@ impl Room {
         reason: &str,
         user_wide: bool,
     ) {
-        if let Some(socket) = socket
-            && let Some(name) = self.served.get(&socket).copied()
-        {
-            // A connection that was taken over: the access its work was sent with is gone, so its
-            // successor does not keep what it inherited (the successor's own access is the hub's
-            // to judge).
-            self.void_inherited(socket, name);
-            return self.release_if(user_wide, code, user);
-        }
         if let Some(socket) = socket {
-            let found = self.key(socket).filter(|c| self.conns.contains_key(c));
+            // (A connection no longer in the room, replaced or gone, is not touched.)
+            let found = Some(socket).filter(|c| self.conns.contains_key(c));
             let order = &self.state.room_hooks.revoke_order;
             match found {
                 Some(conn) => {
@@ -1442,59 +1397,6 @@ impl Room {
     fn release_if(&mut self, user_wide: bool, code: u16, user: &Id) {
         if user_wide && close::ends_access(code) {
             self.release_detached_of(user);
-        }
-    }
-
-    /// The successor of the taken-over socket `socket` (which served the name `name`) loses what
-    /// it inherited: it goes on under a name of its own (its socket's id), so every piece of work
-    /// under `name` not yet handed to the journal is answered to it as not written when it comes
-    /// back ([`change::VOIDED`]), while answers it waits for from the journal still reach it.
-    fn void_inherited(&mut self, socket: ConnId, name: ConnId) {
-        self.served.remove(&socket);
-        let Some(successor) = self
-            .aliases
-            .iter()
-            .find(|(_, n)| **n == name)
-            .map(|(s, _)| *s)
-        else {
-            return;
-        };
-        let Some(c) = self.conns.remove(&name) else {
-            return;
-        };
-        let client = c.client.clone();
-        self.conns.insert(successor, c);
-        self.aliases.remove(&successor);
-        if self.by_client.get(&client) == Some(&name) {
-            self.by_client.insert(client, successor);
-        }
-        self.rename_waiters(name, successor);
-        self.rename_lock_news(name, successor);
-        for list in [&mut self.ready] {
-            for c in list.iter_mut() {
-                if *c == name {
-                    *c = successor;
-                }
-            }
-        }
-        for c in &mut self.slow {
-            if *c == name {
-                *c = successor;
-            }
-        }
-        self.voided.insert(name, successor);
-    }
-
-    /// The room's name for a connection's socket: the socket's own id, or the name of the
-    /// connection it took over (see `take_over`); `None` for a socket that was taken over (its
-    /// messages are ignored).
-    fn key(&self, socket: ConnId) -> Option<ConnId> {
-        match self.aliases.get(&socket) {
-            Some(conn) => Some(*conn),
-            // (A socket taken over never names the connection it served, which its successor holds
-            // now: not even after its own `Leave` took it out of `retired`.)
-            None if self.retired.contains(&socket) || self.served.contains_key(&socket) => None,
-            None => Some(socket),
         }
     }
 

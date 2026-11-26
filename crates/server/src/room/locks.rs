@@ -489,13 +489,6 @@ impl Room {
         }
     }
 
-    /// Moves the lock news waiting for connection `from` to `to`.
-    pub(super) fn rename_lock_news(&mut self, from: ConnId, to: ConnId) {
-        if let Some(news) = self.locks.news.remove(&from) {
-            self.locks.news.insert(to, news);
-        }
-    }
-
     /// At a revocation: the client's locks are released now, and announced.
     pub(super) fn locks_at_revoke(&mut self, client: &ClientId) {
         let released = self.locks.release_client(client);

@@ -128,11 +128,7 @@ impl Room {
             return;
         }
         if self.live_conn(conn).is_none() {
-            // (A report is not answered; a successor whose inheritance was voided goes on.)
-            if let Some(to) = self.voided.get(&conn).copied() {
-                self.unpark(to);
-            }
-            return;
+            return; // (dropped: see `Room::live_conn`)
         }
         let info = result.unwrap_or_else(|e| {
             tracing::warn!(

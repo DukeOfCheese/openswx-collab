@@ -159,7 +159,7 @@ impl Room {
             return;
         }
         if self.live_conn(conn).is_none() {
-            return self.void_change(conn, &change.change_id);
+            return; // (dropped: see `Room::live_conn`)
         }
         let id = change.change_id.clone();
         let row = match result {
@@ -205,8 +205,7 @@ impl Room {
     pub(super) fn checked(&mut self, ticket: super::change::Ticket) {
         for (conn, change, size) in self.undo_waiting.remove(&ticket).unwrap_or_default() {
             if self.live_conn(conn).is_none() {
-                self.void_change(conn, &change.change_id);
-                continue;
+                continue; // (dropped: see `Room::live_conn`)
             }
             if let Some(c) = self.conns.get_mut(&conn) {
                 c.busy = false;
@@ -264,12 +263,6 @@ impl Room {
             return;
         }
         let Some(c) = self.live_conn(conn) else {
-            if let Some(to) = self.voided.get(&conn).copied() {
-                self.unpark(to);
-                let frame =
-                    self.revert_result(request_id, Err(("server_error", super::change::VOIDED)));
-                self.reply(to, frame);
-            }
             return;
         };
         let (client, user, name) = (c.client.clone(), c.user.clone(), c.name.clone());
