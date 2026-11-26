@@ -46,6 +46,16 @@ server plan (1b), the import/docs plan (1c) and the client project. Nothing here
   already under a Set's path may be rearranged within that Set.
 - Reject codes: `stale`, `locked`, `dependency`, `name_taken`, `id_taken`, `invalid`, `missing_blob`,
   `read_only`, `too_old`, `server_error`.
+- Presence and drafts (from 1b Task 19b): the server relays them at most every 50 ms per document,
+  each peer's latest only. A lone entry comes as `presence` / `draft`; several come as
+  `presence.batch {presence: {client_id: data}, drafts: {client_id: data | nil}}` (2 to 256 entries,
+  each client at most once per kind; apply each entry as the message it stands for). A client never
+  gets its own back.
+- `peer.joined`, `peer.left`, `presence`, `draft` and `presence.batch` may be dropped for a client
+  that does not read fast enough (it is not closed for them); it is then sent
+  `peer.list {peers: [peer]}`: every other peer as it is now, presence and draft included, which
+  replaces what it knew of the others. Changes, answers and lock messages are never dropped; a client
+  too slow for those is still closed with 4408.
 
 `CHANGELOG.md` needs the same list when v2 ships. The import tool must give legacy documents with an
 empty-string key or id a valid name (no client operation can address `""`).

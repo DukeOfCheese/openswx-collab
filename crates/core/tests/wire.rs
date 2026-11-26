@@ -3,9 +3,11 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use common::{load, path, to_plain};
 use oswx_core::wire::{
-    MAX_DRAFT, MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
+    LiveEntry, MAX_BATCH_ENTRIES, MAX_DRAFT, MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES,
+    MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE, encode_live, encode_peer, encode_peer_list,
 };
 use oswx_core::{
     Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, DenyReason, Lock, LockDenied,
@@ -394,6 +396,27 @@ fn server_samples() -> Vec<ServerMsg> {
             client_id: Arc::from("u1.client-03"),
             data: None,
         },
+        ServerMsg::PresenceBatch {
+            presence: vec![
+                (Arc::from("u1.client-03"), to_plain(json!({"x": 1}))),
+                (Arc::from("u2.client-04"), to_plain(json!({"y": [1, 2]}))),
+            ],
+            drafts: vec![
+                (Arc::from("u1.client-03"), None),
+                (Arc::from("u3.client-05"), Some(to_plain(json!({"z": "a"})))),
+            ],
+        },
+        ServerMsg::PresenceBatch {
+            presence: vec![],
+            drafts: vec![
+                (Arc::from("u1.client-03"), None),
+                (Arc::from("u3.client-05"), None),
+            ],
+        },
+        ServerMsg::PeerList {
+            peers: vec![peer("client-03"), peer("client-04")],
+        },
+        ServerMsg::PeerList { peers: vec![] },
         ServerMsg::RebuildStatus {
             seq: 4,
             broken: broken(),
@@ -1464,6 +1487,216 @@ fn the_server_side_refuses_them_too() {
         decode_server(&corrupt(presence.to_vec())),
         Err(WireError::Invalid(_))
     ));
+}
+
+// --------------------------------------------------------------------- presence.batch, peer.list
+
+#[test]
+fn live_frames_from_encoded_entries_are_the_messages_encode_server_writes() {
+    let a = to_plain(json!({"pointer": [1, 2], "tool": "line"}));
+    let b = map_of_size(MAX_PRESENCE);
+    let entry = |c: &str, d: Option<&Plain>| LiveEntry::new(c, d);
+    let (pa, pb) = (entry("u1.a", Some(&a)), entry("u2.b", Some(&b)));
+    let (da, dn) = (entry("u1.a", Some(&a)), entry("u3.c", None));
+    // One entry: the plain message.
+    assert_eq!(
+        encode_live(&[&pa], &[]),
+        encode_server(&ServerMsg::Presence {
+            client_id: Arc::from("u1.a"),
+            data: a.clone()
+        })
+    );
+    assert_eq!(
+        encode_live(&[], &[&dn]),
+        encode_server(&ServerMsg::Draft {
+            client_id: Arc::from("u3.c"),
+            data: None
+        })
+    );
+    // More: a batch.
+    let batch = ServerMsg::PresenceBatch {
+        presence: vec![
+            (Arc::from("u1.a"), a.clone()),
+            (Arc::from("u2.b"), b.clone()),
+        ],
+        drafts: vec![
+            (Arc::from("u1.a"), Some(a.clone())),
+            (Arc::from("u3.c"), None),
+        ],
+    };
+    let bytes = encode_live(&[&pa, &pb], &[&da, &dn]);
+    assert_eq!(bytes, encode_server(&batch));
+    assert_eq!(decode_server(&bytes).unwrap(), batch);
+    // Big enough for 16-bit map headers.
+    let many: Vec<LiveEntry> = (0..MAX_BATCH_ENTRIES)
+        .map(|n| entry(&format!("u.{n}"), Some(&a)))
+        .collect();
+    let refs: Vec<&LiveEntry> = many.iter().collect();
+    let msg = ServerMsg::PresenceBatch {
+        presence: (0..MAX_BATCH_ENTRIES)
+            .map(|n| (Arc::from(format!("u.{n}")), a.clone()))
+            .collect(),
+        drafts: vec![],
+    };
+    assert_eq!(encode_live(&refs, &[]), encode_server(&msg));
+    // A peer list from encoded peers.
+    let peers = [peer("client-03"), peer("client-04")];
+    let encoded: Vec<Bytes> = peers.iter().map(encode_peer).collect();
+    let list = ServerMsg::PeerList {
+        peers: peers.to_vec(),
+    };
+    assert_eq!(
+        encode_peer_list(&encoded.iter().collect::<Vec<_>>()),
+        encode_server(&list)
+    );
+    let twenty: Vec<Peer> = (0..20).map(|n| peer(&format!("c{n}"))).collect();
+    let encoded: Vec<Bytes> = twenty.iter().map(encode_peer).collect();
+    assert_eq!(
+        encode_peer_list(&encoded.iter().collect::<Vec<_>>()),
+        encode_server(&ServerMsg::PeerList { peers: twenty })
+    );
+}
+
+#[test]
+fn decode_server_is_strict_about_a_presence_batch() {
+    let batch = |presence: Plain, drafts: Plain| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("presence.batch")),
+            pair("presence", presence),
+            pair("drafts", drafts),
+        ]))
+    };
+    let m = |pairs: Vec<(&str, Plain)>| {
+        Plain::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (Plain::from(k), v))
+                .collect(),
+        )
+    };
+    let data = || to_plain(json!({"x": 1}));
+    let good = batch(m(vec![("u.a", data())]), m(vec![("u.b", Plain::Nil)]));
+    assert!(decode_server(&good).is_ok());
+    let invalid = |frame: Vec<u8>, why: &str| {
+        assert!(
+            matches!(decode_server(&frame), Err(WireError::Invalid(_))),
+            "{why}"
+        );
+    };
+    invalid(
+        batch(m(vec![("u.a", data())]), m(vec![])),
+        "one entry is a presence message",
+    );
+    invalid(batch(m(vec![]), m(vec![])), "empty");
+    invalid(
+        batch(m(vec![("u.a", data()), ("u.a", data())]), m(vec![])),
+        "a client twice",
+    );
+    invalid(
+        batch(m(vec![("u.a", Plain::Nil), ("u.b", data())]), m(vec![])),
+        "presence is never nil",
+    );
+    for v in [json!([1]), json!("x"), json!(7), json!(true)] {
+        invalid(
+            batch(m(vec![("u.a", data())]), m(vec![("u.b", to_plain(v))])),
+            "a draft is a map or nil",
+        );
+    }
+    invalid(
+        batch(m(vec![("u.a", data()), ("", data())]), m(vec![])),
+        "an empty client id",
+    );
+    let numbered = Plain::Map(vec![(Plain::from(1), data()), (Plain::from("u.b"), data())]);
+    invalid(batch(numbered, m(vec![])), "client ids are strings");
+    invalid(
+        batch(Plain::Array(vec![data(), data()]), m(vec![])),
+        "presence is a map",
+    );
+    invalid(
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("presence.batch")),
+            pair("presence", m(vec![("u.a", data()), ("u.b", data())])),
+        ])),
+        "drafts is required",
+    );
+    // Sizes: an entry's data as a presence or draft may be; the entries in all.
+    invalid(
+        batch(
+            m(vec![
+                ("u.a", map_of_size(MAX_PRESENCE + 1)),
+                ("u.b", data()),
+            ]),
+            m(vec![]),
+        ),
+        "presence data over the presence limit",
+    );
+    assert!(
+        decode_server(&batch(
+            m(vec![("u.a", data())]),
+            m(vec![("u.b", map_of_size(MAX_DRAFT))])
+        ))
+        .is_ok()
+    );
+    invalid(
+        batch(
+            m(vec![("u.a", data())]),
+            m(vec![("u.b", map_of_size(MAX_DRAFT + 1))]),
+        ),
+        "draft data over the draft limit",
+    );
+    let half = MAX_BATCH_ENTRIES / 2 + 1;
+    let names: Vec<String> = (0..2 * half).map(|n| format!("u.{n}")).collect();
+    let too_many = m(names[..=MAX_BATCH_ENTRIES]
+        .iter()
+        .map(|n| (n.as_str(), data()))
+        .collect());
+    invalid(batch(too_many, m(vec![])), "too many entries");
+    let split = |range: std::ops::Range<usize>| {
+        m(names[range].iter().map(|n| (n.as_str(), data())).collect())
+    };
+    invalid(
+        batch(split(0..half), split(half..2 * half)),
+        "too many entries together",
+    );
+    // A key twice inside an entry's data.
+    let twice = Plain::Map(vec![pair("a", Plain::from(1)), pair("a", Plain::from(2))]);
+    invalid(
+        batch(m(vec![("u.a", twice), ("u.b", data())]), m(vec![])),
+        "a key twice in the data",
+    );
+    // The placeholder bytes of `corrupt` are no string.
+    let frame = encode_server(&ServerMsg::PresenceBatch {
+        presence: vec![
+            (Arc::from("u.a"), to_plain(json!({"k": "ZZZZ"}))),
+            (Arc::from("u.b"), data()),
+        ],
+        drafts: vec![],
+    });
+    invalid(corrupt(frame.to_vec()), "not UTF-8");
+}
+
+#[test]
+fn decode_server_is_strict_about_a_peer_list() {
+    let list = |peers: Json| frame(&json!({"t": "peer.list", "peers": peers}));
+    assert!(decode_server(&list(json!([]))).is_ok());
+    let good = json!({"client_id": "u.a", "user_id": "u", "name": "A", "colour": "#000"});
+    assert!(decode_server(&list(json!([good.clone()]))).is_ok());
+    for bad in [
+        json!({}),
+        json!([[good.clone()]]),
+        json!([{"client_id": "u.a"}]),
+        json!([with(good.clone(), "presence", json!([1]))]),
+        json!([with(good.clone(), "read_only", json!("yes"))]),
+    ] {
+        assert!(
+            matches!(
+                decode_server(&list(bad.clone())),
+                Err(WireError::Invalid(_))
+            ),
+            "{bad}"
+        );
+    }
+    assert!(decode_server(&frame(&json!({"t": "peer.list"}))).is_err());
 }
 
 // -------------------------------------------------------------------------------- duplicates

@@ -40,6 +40,8 @@ pub const MAX_DRAFT: usize = 128 * 1024;
 pub const MAX_REBUILD_ENTRIES: usize = 500;
 pub const MAX_REBUILD_KEY: usize = 200;
 pub const MAX_REBUILD_MESSAGE: usize = 500;
+/// Most entries (presence and drafts together) a `presence.batch` may carry.
+pub const MAX_BATCH_ENTRIES: usize = 256;
 
 /// Most containers (maps and lists) a frame may have open at once. A value may be `MAX_DEPTH`
 /// levels deep, but a keyed list costs one level and three wire containers (`{"$list": [[pos, item]]}`)
@@ -389,6 +391,20 @@ pub enum ServerMsg {
     Draft {
         client_id: ClientId,
         data: Option<Plain>,
+    },
+    /// The latest presence and drafts of several peers at once: what `presence` and `draft`
+    /// messages would have said, each peer at most once per kind (the server coalesces a peer's
+    /// updates to the latest). A draft of `None` clears it. At most [`MAX_BATCH_ENTRIES`] entries
+    /// in all, and at least two.
+    PresenceBatch {
+        presence: Vec<(ClientId, Plain)>,
+        drafts: Vec<(ClientId, Option<Plain>)>,
+    },
+    /// Every other peer as it is now, with its presence and draft: replaces what the client knew
+    /// of the others (the server sends it to a client that fell behind on `peer.joined`,
+    /// `peer.left`, `presence` and `draft`, which it then stopped sending to it).
+    PeerList {
+        peers: Vec<Peer>,
     },
     /// What does not rebuild, after the report about state `seq` changed it.
     RebuildStatus {
@@ -1051,6 +1067,160 @@ fn peer_from_wire(p: &Plain) -> Result<Peer, WireError> {
     })
 }
 
+/// The entries of a `presence.batch` map: client id to data, `nil` (a cleared draft) only where
+/// `nil_clears`. A client id at most once.
+fn live_map(
+    p: &Plain,
+    field: &str,
+    max: usize,
+    nil_clears: bool,
+) -> Result<Vec<(ClientId, Option<Plain>)>, WireError> {
+    let Plain::Map(pairs) = p else {
+        return invalid(format!("{field} must be a map"));
+    };
+    if pairs.len() > MAX_BATCH_ENTRIES {
+        return invalid(format!("{field} has too many entries"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let client_id = shared(k, field, 1, usize::MAX)?;
+        if !seen.insert(client_id.clone()) {
+            return invalid(format!("{field} names a client twice"));
+        }
+        let data = match v {
+            Plain::Nil if nil_clears => None,
+            v => Some(opaque_map(v, field, Some(max))?),
+        };
+        out.push((client_id, data));
+    }
+    Ok(out)
+}
+
+/// A peer's presence or draft, encoded once to be relayed to many: its client id and its data as
+/// MessagePack, ready to be written into a `presence`, `draft` or `presence.batch` frame by
+/// [`encode_live`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveEntry {
+    client_id: Bytes,
+    data: Bytes,
+}
+
+impl LiveEntry {
+    /// `data` of `None`: a cleared draft.
+    pub fn new(client_id: &str, data: Option<&Plain>) -> LiveEntry {
+        let mut id = Vec::new();
+        let _ = rmpv::encode::write_value(&mut id, &s(client_id));
+        let mut bytes = Vec::new();
+        let _ = rmpv::encode::write_value(&mut bytes, data.unwrap_or(&Plain::Nil));
+        LiveEntry {
+            client_id: Bytes::from(id),
+            data: Bytes::from(bytes),
+        }
+    }
+
+    /// The bytes it adds to a frame.
+    pub fn encoded_len(&self) -> usize {
+        self.client_id.len() + self.data.len()
+    }
+}
+
+/// A MessagePack map header for `n` pairs, as rmpv writes it.
+fn map_header(buf: &mut Vec<u8>, n: usize) {
+    match (u8::try_from(n), u16::try_from(n)) {
+        (Ok(small), _) if small < 16 => buf.push(0x80 | small),
+        (_, Ok(n)) => {
+            buf.push(0xde);
+            buf.extend_from_slice(&n.to_be_bytes());
+        }
+        _ => {
+            buf.push(0xdf);
+            buf.extend_from_slice(&u32::try_from(n).unwrap_or(u32::MAX).to_be_bytes());
+        }
+    }
+}
+
+/// A MessagePack array header for `n` items, as rmpv writes it.
+fn array_header(buf: &mut Vec<u8>, n: usize) {
+    match (u8::try_from(n), u16::try_from(n)) {
+        (Ok(small), _) if small < 16 => buf.push(0x90 | small),
+        (_, Ok(n)) => {
+            buf.push(0xdc);
+            buf.extend_from_slice(&n.to_be_bytes());
+        }
+        _ => {
+            buf.push(0xdd);
+            buf.extend_from_slice(&u32::try_from(n).unwrap_or(u32::MAX).to_be_bytes());
+        }
+    }
+}
+
+fn put_str(buf: &mut Vec<u8>, v: &str) {
+    let _ = rmpv::encode::write_value(buf, &s(v));
+}
+
+/// One frame relaying the `presence` and `drafts` entries (each client at most once per kind): a
+/// `presence` or `draft` message when there is one entry in all, a `presence.batch` when there
+/// are more (at most [`MAX_BATCH_ENTRIES`]). The bytes are those [`encode_server`] writes for the
+/// same message; only the entries' sizes are added up, nothing is encoded again.
+pub fn encode_live(presence: &[&LiveEntry], drafts: &[&LiveEntry]) -> Bytes {
+    let size: usize = presence.iter().chain(drafts).map(|e| e.encoded_len()).sum();
+    let mut buf = Vec::with_capacity(size + 48);
+    map_header(&mut buf, 3);
+    put_str(&mut buf, "t");
+    match (presence, drafts) {
+        ([one], []) | ([], [one]) => {
+            put_str(
+                &mut buf,
+                if presence.is_empty() {
+                    "draft"
+                } else {
+                    "presence"
+                },
+            );
+            put_str(&mut buf, "client_id");
+            buf.extend_from_slice(&one.client_id);
+            put_str(&mut buf, "data");
+            buf.extend_from_slice(&one.data);
+        }
+        _ => {
+            put_str(&mut buf, "presence.batch");
+            for (field, entries) in [("presence", presence), ("drafts", drafts)] {
+                put_str(&mut buf, field);
+                map_header(&mut buf, entries.len());
+                for e in entries {
+                    buf.extend_from_slice(&e.client_id);
+                    buf.extend_from_slice(&e.data);
+                }
+            }
+        }
+    }
+    Bytes::from(buf)
+}
+
+/// A peer as `peer.list` carries it, encoded once (for [`encode_peer_list`]).
+pub fn encode_peer(p: &Peer) -> Bytes {
+    let mut buf = Vec::new();
+    let _ = rmpv::encode::write_value(&mut buf, &peer_to_wire(p));
+    Bytes::from(buf)
+}
+
+/// A `peer.list` frame of peers from [`encode_peer`], written as they are: the bytes
+/// [`encode_server`] writes for the same message.
+pub fn encode_peer_list(peers: &[&Bytes]) -> Bytes {
+    let size: usize = peers.iter().map(|p| p.len()).sum();
+    let mut buf = Vec::with_capacity(size + 32);
+    map_header(&mut buf, 2);
+    put_str(&mut buf, "t");
+    put_str(&mut buf, "peer.list");
+    put_str(&mut buf, "peers");
+    array_header(&mut buf, peers.len());
+    for p in peers {
+        buf.extend_from_slice(p);
+    }
+    Bytes::from(buf)
+}
+
 fn lock_to_wire(l: &Lock) -> Plain {
     map_of(vec![
         ("path", path::to_wire(&l.path)),
@@ -1339,6 +1509,24 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
             .put("client_id", s(client_id))
             .put("data", data.clone().unwrap_or(Plain::Nil))
             .bytes(),
+        ServerMsg::PresenceBatch { presence, drafts } => Out::new("presence.batch")
+            .put(
+                "presence",
+                Plain::Map(presence.iter().map(|(c, d)| (s(c), d.clone())).collect()),
+            )
+            .put(
+                "drafts",
+                Plain::Map(
+                    drafts
+                        .iter()
+                        .map(|(c, d)| (s(c), d.clone().unwrap_or(Plain::Nil)))
+                        .collect(),
+                ),
+            )
+            .bytes(),
+        ServerMsg::PeerList { peers } => Out::new("peer.list")
+            .put("peers", arr(peers, peer_to_wire))
+            .bytes(),
         ServerMsg::RebuildStatus { seq, broken } => Out::new("rebuild.status")
             .put("seq", *seq)
             .put("broken", broken_map_to_wire(broken))
@@ -1465,6 +1653,30 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 .opt("data")?
                 .map(|p| opaque_map(p, "data", None))
                 .transpose()?,
+        }),
+        "presence.batch" => {
+            let presence = live_map(f.req("presence")?, "presence", MAX_PRESENCE, false)?;
+            let drafts = live_map(f.req("drafts")?, "drafts", MAX_DRAFT, true)?;
+            let n = presence.len() + drafts.len();
+            if !(2..=MAX_BATCH_ENTRIES).contains(&n) {
+                return invalid(format!(
+                    "a presence.batch has 2 to {MAX_BATCH_ENTRIES} entries"
+                ));
+            }
+            Ok(ServerMsg::PresenceBatch {
+                presence: presence
+                    .into_iter()
+                    .map(|(c, d)| d.map(|d| (c, d)))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| WireError::Invalid("presence data must be a map".into()))?,
+                drafts,
+            })
+        }
+        "peer.list" => Ok(ServerMsg::PeerList {
+            peers: list(f.req("peers")?, "peers", 0, usize::MAX)?
+                .iter()
+                .map(peer_from_wire)
+                .collect::<Result<_, _>>()?,
         }),
         "rebuild.status" => Ok(ServerMsg::RebuildStatus {
             seq: uint(f.req("seq")?, "seq")?,
