@@ -11,6 +11,9 @@ pub const PREFIX: &str = "OSWX_COLLAB_";
 
 const MIB: usize = 1 << 20;
 
+/// The region an S3 client names when none is set.
+pub const DEFAULT_S3_REGION: &str = "us-east-1";
+
 /// The longest interval a setting in seconds may be: a year.
 const MAX_SECONDS: f64 = 365.0 * 86400.0;
 
@@ -78,8 +81,22 @@ pub struct Settings {
     /// answered 409 "try again".
     pub database_lock_timeout: f64,
     pub storage_url: String,
-    /// For S3-compatible stores (MinIO), e.g. `http://minio:9000`.
+    /// For S3-compatible stores (MinIO, Garage, R2), e.g. `http://minio:9000`. Empty: AWS S3.
     pub s3_endpoint: String,
+    /// The bucket's region, from `AWS_DEFAULT_REGION` (or `AWS_REGION`), as the Python server's S3
+    /// client read it. Stores that have no regions take any name; `us-east-1` when unset.
+    pub s3_region: String,
+    /// The S3 credentials, from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and (temporary
+    /// credentials only) `AWS_SESSION_TOKEN`. With no key set, the machine's own AWS role is used.
+    pub s3_access_key_id: String,
+    pub s3_secret_access_key: String,
+    pub s3_session_token: String,
+    /// Whether the bucket goes in the path (`https://host/bucket/key`) rather than the host name
+    /// (`https://bucket.host/key`). Unset: in the path exactly when `s3_endpoint` is set, which is
+    /// what MinIO and Garage want and what the Python server's S3 client did.
+    pub s3_path_style: Option<bool>,
+    /// Seconds: a blob upload or download in which no bytes move for this long is given up on.
+    pub blob_idle_timeout: f64,
     /// How clients and browsers reach this server (OAuth callbacks, invite and reset links).
     pub public_url: String,
     /// False: the first account is the server admin and everyone else needs an invite.
@@ -134,6 +151,12 @@ impl Default for Settings {
             database_lock_timeout: crate::store::postgres::DEFAULT_LOCK_TIMEOUT,
             storage_url: "./data/storage".into(),
             s3_endpoint: String::new(),
+            s3_region: DEFAULT_S3_REGION.into(),
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: String::new(),
+            s3_session_token: String::new(),
+            s3_path_style: None,
+            blob_idle_timeout: 60.0,
             public_url: "http://localhost:8787".into(),
             open_registration: false,
             session_days: 30,
@@ -177,6 +200,27 @@ impl Settings {
         e.positive_seconds("DATABASE_LOCK_TIMEOUT", &mut s.database_lock_timeout)?;
         e.string("STORAGE_URL", &mut s.storage_url);
         e.string("S3_ENDPOINT", &mut s.s3_endpoint);
+        if e.get("S3_PATH_STYLE").is_some() {
+            let mut path_style = false;
+            e.boolean("S3_PATH_STYLE", &mut path_style)?;
+            s.s3_path_style = Some(path_style);
+        }
+        e.positive_seconds("BLOB_IDLE_TIMEOUT", &mut s.blob_idle_timeout)?;
+        // The S3 credentials and region have the names every S3 tool reads (and the Python
+        // server's client read), without this server's prefix.
+        let aws = |name: &str| env.get(name).map(|v| v.trim()).filter(|v| !v.is_empty());
+        if let Some(region) = aws("AWS_DEFAULT_REGION").or_else(|| aws("AWS_REGION")) {
+            s.s3_region = region.to_owned();
+        }
+        for (name, out) in [
+            ("AWS_ACCESS_KEY_ID", &mut s.s3_access_key_id),
+            ("AWS_SECRET_ACCESS_KEY", &mut s.s3_secret_access_key),
+            ("AWS_SESSION_TOKEN", &mut s.s3_session_token),
+        ] {
+            if let Some(value) = aws(name) {
+                *out = value.to_owned();
+            }
+        }
         e.string("PUBLIC_URL", &mut s.public_url);
         e.boolean("OPEN_REGISTRATION", &mut s.open_registration)?;
         e.positive_whole("SESSION_DAYS", &mut s.session_days)?;
@@ -324,6 +368,12 @@ impl fmt::Debug for Settings {
             .field("database_lock_timeout", &self.database_lock_timeout)
             .field("storage_url", &self.storage_url)
             .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("s3_access_key_id", &secret(&self.s3_access_key_id))
+            .field("s3_secret_access_key", &secret(&self.s3_secret_access_key))
+            .field("s3_session_token", &secret(&self.s3_session_token))
+            .field("s3_path_style", &self.s3_path_style)
+            .field("blob_idle_timeout", &self.blob_idle_timeout)
             .field("public_url", &self.public_url)
             .field("open_registration", &self.open_registration)
             .field("session_days", &self.session_days)
@@ -715,6 +765,54 @@ mod tests {
         assert_eq!(
             refused(&[("STORAGE_URL", " ")]).var,
             "OSWX_COLLAB_STORAGE_URL"
+        );
+    }
+
+    #[test]
+    fn s3_settings_have_the_names_the_python_server_read() {
+        let s = read(&[]);
+        assert_eq!(s.s3_region, "us-east-1");
+        assert_eq!(s.s3_path_style, None);
+        assert_eq!(s.blob_idle_timeout, 60.0);
+        assert!(s.s3_access_key_id.is_empty() && s.s3_secret_access_key.is_empty());
+
+        let mut vars = env(&[
+            ("STORAGE_URL", "s3://collab/prod"),
+            ("S3_ENDPOINT", "http://garage:3900"),
+            ("S3_PATH_STYLE", "off"),
+            ("BLOB_IDLE_TIMEOUT", "2.5"),
+        ]);
+        for (name, value) in [
+            ("AWS_ACCESS_KEY_ID", "GK-key-id"),
+            ("AWS_SECRET_ACCESS_KEY", " s3-secret "),
+            ("AWS_SESSION_TOKEN", "s3-token"),
+            ("AWS_REGION", "eu-west-1"),
+            ("AWS_DEFAULT_REGION", "garage"),
+        ] {
+            vars.insert(name.to_owned(), value.to_owned());
+        }
+        let s = Settings::from_env(&vars).unwrap();
+        assert_eq!(s.s3_endpoint, "http://garage:3900");
+        assert_eq!(s.s3_region, "garage", "AWS_DEFAULT_REGION first, as boto3");
+        assert_eq!(s.s3_access_key_id, "GK-key-id");
+        assert_eq!(s.s3_secret_access_key, "s3-secret");
+        assert_eq!(s.s3_session_token, "s3-token");
+        assert_eq!(s.s3_path_style, Some(false));
+        assert_eq!(s.blob_idle_timeout, 2.5);
+        let shown = format!("{s:?}");
+        for secret in ["GK-key-id", "s3-secret", "s3-token"] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+
+        vars.remove("AWS_DEFAULT_REGION");
+        assert_eq!(Settings::from_env(&vars).unwrap().s3_region, "eu-west-1");
+        assert_eq!(
+            refused(&[("S3_PATH_STYLE", "maybe")]).var,
+            "OSWX_COLLAB_S3_PATH_STYLE"
+        );
+        assert_eq!(
+            refused(&[("BLOB_IDLE_TIMEOUT", "0")]).var,
+            "OSWX_COLLAB_BLOB_IDLE_TIMEOUT"
         );
     }
 

@@ -1,4 +1,5 @@
-//! Blob and snapshot storage: a local folder ([`LocalBlobs`]) or, from Task 17, an S3 bucket.
+//! Blob and snapshot storage: a local folder ([`LocalBlobs`]) or a bucket of an S3-compatible
+//! store ([`S3Blobs`]).
 //!
 //! Storage is a flat map from keys to bytes. A key is a `/`-separated path of components made of
 //! ASCII letters, digits, `.`, `_` and `-`, none empty, none starting or ending with `.`
@@ -16,9 +17,16 @@
 //! Do not mix them: [`Blobs::get`] on a key written by [`Blobs::put_stream`] answers the stored
 //! (compressed, framed) bytes, and [`Blobs::get_stream`] on a key written by [`Blobs::put`] fails.
 
+pub mod s3;
+
+pub use s3::{S3Blobs, S3Config, S3Tuning};
+
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use async_compression::tokio::bufread::ZstdDecoder;
@@ -28,7 +36,7 @@ use bytes::Bytes;
 use futures_util::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
 
 /// A stream of bytes, as a request body or a blob being read.
@@ -83,24 +91,31 @@ pub trait Blobs: Send + Sync + 'static {
     async fn get_stream(&self, key: &str) -> anyhow::Result<Option<(u64, ByteStream)>>;
 
     /// Whether anything is stored under `key`. An outage is an error, never `false`: a storage that
-    /// cannot answer must not make a blob look missing.
+    /// cannot answer (unreachable, too slow, refusing the server's credentials, failing) must not
+    /// make a blob look missing.
     async fn exists(&self, key: &str) -> anyhow::Result<bool>;
 
     /// Stores `bytes` under `key` exactly as given, replacing what was there, all or nothing.
     async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()>;
 
-    /// The bytes [`Blobs::put`] stored under `key`, or `None` if there are none.
+    /// The bytes [`Blobs::put`] stored under `key`, or `None` if there are none. As with
+    /// [`Blobs::exists`], only a storage that answered "there is nothing under this key" is `None`;
+    /// any other failure is an error (a snapshot that cannot be read must not look absent).
     async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>>;
 
     /// Removes everything under `prefix`, which must end with `/` (`orgs/<id>/`; used when an
-    /// organisation is deleted). Removing nothing is fine.
+    /// organisation is deleted). Removing nothing is fine. Only keys that start with the whole
+    /// prefix are touched (`orgs/1/` never reaches `orgs/10/...`). If some of it could not be
+    /// removed, the rest still is, and the answer is an error saying how much was left.
     async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()>;
 
     /// Removes the value under `key` (a snapshot whose database row was never committed). Removing
     /// nothing is fine.
     async fn delete(&self, key: &str) -> anyhow::Result<()>;
 
-    /// Answers when the storage can be written (`GET /api/ready`).
+    /// Answers when the storage is there and can be used (`GET /api/ready`): the folder exists and
+    /// can be written, or the bucket exists and answers this server's credentials. A storage that is
+    /// missing or unreachable is an error.
     async fn health(&self) -> anyhow::Result<()>;
 }
 
@@ -156,9 +171,13 @@ fn windows_device(c: &str) -> bool {
 /// How many storage lookups [`missing_blobs`] runs at once.
 pub const LOOKUPS_AT_ONCE: usize = 16;
 
+/// How long [`missing_blobs`] waits for storage to say whether one blob is there. A change waits
+/// for this check, so a storage that is slow must fail it rather than hold the change.
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The blob references (hashes) that are malformed or name no blob of the organisation, in the order
-/// given, asking storage [`LOOKUPS_AT_ONCE`] at a time. A storage that cannot answer is an error,
-/// never "missing".
+/// given, asking storage [`LOOKUPS_AT_ONCE`] at a time. A storage that cannot answer, or does not
+/// within [`LOOKUP_TIMEOUT`] per blob, is an error, never "missing".
 pub async fn missing_blobs(
     blobs: &dyn Blobs,
     org_id: &str,
@@ -168,7 +187,13 @@ pub async fn missing_blobs(
         let key = is_sha256(&sha).then(|| blob_key(org_id, &sha));
         async move {
             let here = match key {
-                Some(key) => blobs.exists(&key).await?,
+                Some(key) => tokio::time::timeout(LOOKUP_TIMEOUT, blobs.exists(&key))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "storage did not say within {LOOKUP_TIMEOUT:?} whether a blob is there"
+                        )
+                    })??,
                 None => false,
             };
             anyhow::Ok((!here).then_some(sha))
@@ -180,129 +205,103 @@ pub async fn missing_blobs(
     Ok(checked.into_iter().flatten().collect())
 }
 
-// ------------------------------------------------------------------ local folder
+// ------------------------------------------------------------------ streams that stall
 
-/// The first bytes of every file [`Blobs::put_stream`] writes. The next 8 are the raw length
-/// (little-endian), then the zstd frame.
+/// The error of a stream that was given up on because no bytes moved for too long. It is the
+/// source of an [`io::Error`] of kind [`io::ErrorKind::TimedOut`].
+#[derive(Debug, thiserror::Error)]
+#[error("no bytes for {0:?}")]
+pub struct Stalled(pub Duration);
+
+fn stalled(idle: Duration) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, Stalled(idle))
+}
+
+/// `source`, for a reader this server drives (an upload's body, an object being read from a
+/// bucket): it fails with [`Stalled`] once no chunk has arrived for `idle`.
+pub fn fail_when_stalled(source: ByteStream, idle: Duration) -> ByteStream {
+    stream::unfold((source, false), move |(mut source, done)| async move {
+        if done {
+            return None;
+        }
+        match tokio::time::timeout(idle, source.next()).await {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), (source, false))),
+            Ok(Some(Err(err))) => Some((Err(err), (source, true))),
+            Ok(None) => None,
+            Err(_) => Some((Err(stalled(idle)), (source, true))),
+        }
+    })
+    .boxed()
+}
+
+/// `source`, for a reader this server does not drive (a download a client pulls at its own pace):
+/// `source` is dropped, and whatever it holds released (an open file, a connection to the bucket),
+/// once the reader has taken nothing for `idle` or `source` has produced nothing for `idle`. The
+/// reader then sees a [`Stalled`] error, or the stream ending early.
+///
+/// A task of its own pulls `source`, at most two chunks ahead of the reader. It ends when the
+/// stream does, when the reader is dropped, or at a stall. Must be called inside a tokio runtime.
+pub fn drop_when_stalled(source: ByteStream, idle: Duration) -> ByteStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(1);
+    tokio::spawn(async move {
+        let mut source = source;
+        loop {
+            let item = match tokio::time::timeout(idle, source.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => return,
+                Err(_) => Err(stalled(idle)),
+            };
+            let last = item.is_err();
+            // The reader went away (the send fails) or has not taken the chunk before this one
+            // for `idle` (the wait for room times out): either way `source` is dropped here.
+            match tokio::time::timeout(idle, tx.send(item)).await {
+                Ok(Ok(())) if !last => {}
+                _ => return,
+            }
+        }
+    });
+    stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+    .boxed()
+}
+
+// ------------------------------------------------------------------ the stored form of a blob
+
+/// The first bytes of every blob [`Blobs::put_stream`] stores. The next 8 are the raw length
+/// (little-endian), then the zstd frame. Both implementations store blobs in this form, so a folder
+/// can be copied into a bucket (or back) as it is.
 const MAGIC: [u8; 8] = *b"oswxblb1";
 /// The magic and the raw length.
 const HEADER_LEN: usize = 16;
 /// How much a blob read hands on at a time.
 const READ_CHUNK: usize = 64 << 10;
 
-/// Storage in a folder on this machine. Every write goes to a temporary file in the destination's
-/// folder, is flushed to disk, then renamed over the destination; the temporary file is removed on
-/// any failure, including a request dropped mid-upload.
-///
-/// A blob file is self-describing: a 16-byte header (a magic number and the raw length), then the
-/// zstd-compressed bytes. No database row is needed to read one.
-#[derive(Debug)]
-pub struct LocalBlobs {
-    root: PathBuf,
-    /// The longest body chunk [`Blobs::put_stream`] has held at once (for the streaming tests).
-    largest_chunk: AtomicUsize,
+/// The header of a stored blob of `raw_len` raw bytes.
+fn blob_header(raw_len: u64) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[..8].copy_from_slice(&MAGIC);
+    header[8..].copy_from_slice(&raw_len.to_le_bytes());
+    header
 }
 
-impl LocalBlobs {
-    /// Storage in the folder `root`, which is created if it does not exist.
-    pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root = root.as_ref();
-        std::fs::create_dir_all(root)
-            .with_context(|| format!("creating the storage folder {}", root.display()))?;
-        let root = std::path::absolute(root)?;
-        Ok(Self {
-            root,
-            largest_chunk: AtomicUsize::new(0),
-        })
+/// The raw length and the raw bytes of the blob stored as `stored` (under `key`, for messages).
+async fn decode_blob(
+    mut stored: impl AsyncRead + Send + Unpin + 'static,
+    key: &str,
+) -> anyhow::Result<(u64, ByteStream)> {
+    let mut header = [0u8; HEADER_LEN];
+    stored
+        .read_exact(&mut header)
+        .await
+        .with_context(|| format!("reading the header of {key}"))?;
+    if header[..8] != MAGIC {
+        bail!("{key} is not a blob file");
     }
-
-    /// The folder everything is kept in.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// The longest single body chunk any [`Blobs::put_stream`] call has held in memory: a test hook
-    /// for the promise that uploads are streamed.
-    #[doc(hidden)]
-    pub fn largest_chunk_held(&self) -> usize {
-        self.largest_chunk.load(Ordering::Relaxed)
-    }
-
-    fn path(&self, key: &str) -> anyhow::Result<PathBuf> {
-        check_key(key)?;
-        Ok(key.split('/').fold(self.root.clone(), |p, c| p.join(c)))
-    }
-
-    /// The folder `path` goes in, created.
-    async fn parent_of(path: &Path) -> anyhow::Result<&Path> {
-        let dir = path.parent().context("a storage path has a parent")?;
-        tokio::fs::create_dir_all(dir).await?;
-        Ok(dir)
-    }
-}
-
-/// A temporary file that is removed when this is dropped, unless it was renamed into place.
-struct TempFile {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TempFile {
-    /// A new, empty temporary file in `dir`, named so that no key can name it.
-    async fn create(dir: &Path) -> io::Result<(Self, File)> {
-        let path = dir.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await?;
-        Ok((Self { path, armed: true }, file))
-    }
-
-    /// Flushes `file` to disk and renames it to `dest`.
-    async fn persist(mut self, mut file: File, dest: &Path) -> io::Result<()> {
-        file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&self.path, dest).await?;
-        self.armed = false;
-        sync_dir(dest).await;
-        Ok(())
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if self.armed
-            && let Err(err) = std::fs::remove_file(&self.path)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                "could not remove the temporary file {}: {err}",
-                self.path.display()
-            );
-        }
-    }
-}
-
-/// Makes a rename into `path`'s folder durable (on Unix; Windows has no such step).
-async fn sync_dir(path: &Path) {
-    #[cfg(unix)]
-    if let Some(dir) = path.parent()
-        && let Ok(d) = File::open(dir).await
-    {
-        let _ = d.sync_all().await;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
-/// Whether `err` means "there is nothing there" (rather than "the storage failed").
-fn is_absent(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-    )
+    let raw_len = u64::from_le_bytes(header[8..].try_into()?);
+    let decoder = ZstdDecoder::new(BufReader::new(stored));
+    let chunks = ReaderStream::with_capacity(decoder, READ_CHUNK);
+    Ok((raw_len, exact_length(chunks, raw_len)))
 }
 
 /// `inner`, failing if it yields more or fewer than `expected` bytes in all.
@@ -340,6 +339,277 @@ fn exact_length(
     .boxed()
 }
 
+// ------------------------------------------------------------------ local folder
+
+/// How often a running server removes temporary upload files nothing owns any more
+/// ([`LocalBlobs::start_sweeper`]).
+pub const TEMP_SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// How long a temporary upload file must have been untouched before the sweep removes it. An
+/// upload that stalls is given up on within the blob idle timeout, so a file this old has no
+/// writer (and the sweep never takes a file its own process is writing, whatever its age).
+pub const TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// What every temporary file's name starts with. No key can name one ([`check_key`]).
+const TEMP_PREFIX: &str = ".tmp-";
+
+/// The temporary files this process is writing.
+type InUse = Arc<Mutex<HashSet<PathBuf>>>;
+
+/// Storage in a folder on this machine. Every write goes to a temporary file in the destination's
+/// folder, is flushed to disk, then renamed over the destination; the temporary file is removed on
+/// any failure, including a request dropped mid-upload. One left by a process that was killed is
+/// removed by the sweep ([`LocalBlobs::sweep_temp_files`]).
+///
+/// A blob file is self-describing: a 16-byte header (a magic number and the raw length), then the
+/// zstd-compressed bytes. No database row is needed to read one.
+///
+/// The folder must stay where it is: once it is gone (a volume that was unmounted), every write
+/// and [`Blobs::health`] fail rather than creating it again somewhere that will not last.
+#[derive(Debug)]
+pub struct LocalBlobs {
+    root: PathBuf,
+    /// The longest body chunk [`Blobs::put_stream`] has held at once (for the streaming tests).
+    largest_chunk: AtomicUsize,
+    in_use: InUse,
+}
+
+impl LocalBlobs {
+    /// Storage in the folder `root`, which is created if it does not exist.
+    pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("creating the storage folder {}", root.display()))?;
+        let root = std::path::absolute(root)?;
+        Ok(Self {
+            root,
+            largest_chunk: AtomicUsize::new(0),
+            in_use: InUse::default(),
+        })
+    }
+
+    /// The folder everything is kept in.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The longest single body chunk any [`Blobs::put_stream`] call has held in memory: a test hook
+    /// for the promise that uploads are streamed.
+    #[doc(hidden)]
+    pub fn largest_chunk_held(&self) -> usize {
+        self.largest_chunk.load(Ordering::Relaxed)
+    }
+
+    fn path(&self, key: &str) -> anyhow::Result<PathBuf> {
+        check_key(key)?;
+        Ok(key.split('/').fold(self.root.clone(), |p, c| p.join(c)))
+    }
+
+    /// Fails unless the storage folder is (still) there.
+    async fn root_is_there(&self) -> anyhow::Result<()> {
+        let there = tokio::fs::metadata(&self.root)
+            .await
+            .is_ok_and(|m| m.is_dir());
+        ensure!(
+            there,
+            "the storage folder {} is missing or cannot be reached",
+            self.root.display()
+        );
+        Ok(())
+    }
+
+    /// `nothing`, as the answer for a key whose file is not there, unless the storage folder itself
+    /// is gone: then nothing in it can be said to be absent, and the answer is an error.
+    async fn absent<T>(&self, nothing: T) -> anyhow::Result<T> {
+        self.root_is_there().await?;
+        Ok(nothing)
+    }
+
+    /// The folder `path` goes in, created (inside a storage folder that is there).
+    async fn parent_of<'p>(&self, path: &'p Path) -> anyhow::Result<&'p Path> {
+        self.root_is_there().await?;
+        let dir = path.parent().context("a storage path has a parent")?;
+        tokio::fs::create_dir_all(dir).await?;
+        Ok(dir)
+    }
+
+    /// Removes the temporary upload files under the storage folder that were last written more
+    /// than `older_than` ago and that this process is not writing, and answers how many it removed.
+    /// These are what a process that was killed mid-upload left behind. A file that cannot be
+    /// examined or removed is logged and skipped.
+    pub async fn sweep_temp_files(&self, older_than: Duration) -> anyhow::Result<usize> {
+        self.root_is_there().await?;
+        let (root, in_use) = (self.root.clone(), self.in_use.clone());
+        tokio::task::spawn_blocking(move || sweep(&root, &in_use, older_than))
+            .await
+            .context("sweeping temporary files")
+    }
+
+    /// Sweeps now and then every `every` ([`LocalBlobs::sweep_temp_files`] with `older_than`), in a
+    /// task that ends once this storage has been dropped. Must be called inside a tokio runtime.
+    pub fn start_sweeper(
+        self: &Arc<Self>,
+        every: Duration,
+        older_than: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak: Weak<Self> = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(blobs) = weak.upgrade() else { return };
+                match blobs.sweep_temp_files(older_than).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("removed {n} abandoned temporary upload files"),
+                    Err(err) => tracing::warn!("could not sweep temporary upload files: {err:#}"),
+                }
+                drop(blobs);
+                tokio::time::sleep(every).await;
+            }
+        })
+    }
+}
+
+/// The body of [`LocalBlobs::sweep_temp_files`], on the blocking pool.
+fn sweep(root: &Path, in_use: &InUse, older_than: Duration) -> usize {
+    let mut removed = 0;
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                if err.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!("could not read the folder {}: {err}", dir.display());
+                }
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                todo.push(path);
+                continue;
+            }
+            let temporary = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(TEMP_PREFIX));
+            if !temporary {
+                continue;
+            }
+            let age = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|at| at.elapsed().unwrap_or(Duration::ZERO));
+            let old = match age {
+                Ok(age) => age >= older_than,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    tracing::warn!("could not examine {}: {err}", path.display());
+                    false
+                }
+            };
+            // Held while removing, so that the file cannot become one in use in between.
+            let writing = in_use.lock().unwrap_or_else(PoisonError::into_inner);
+            if !old || writing.contains(&path) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!("could not remove {}: {err}", path.display()),
+            }
+        }
+    }
+    removed
+}
+
+/// A temporary file that is removed when this is dropped, unless it was renamed into place. For as
+/// long as this lives the sweep leaves the file alone.
+struct TempFile {
+    path: PathBuf,
+    armed: bool,
+    in_use: InUse,
+}
+
+impl TempFile {
+    /// A new, empty temporary file in `dir`, named so that no key can name it.
+    async fn create(dir: &Path, in_use: &InUse) -> io::Result<(Self, File)> {
+        let path = dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+        in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.clone());
+        // From here on dropping `tmp` takes the name out of `in_use` again.
+        let mut tmp = Self {
+            path,
+            armed: false,
+            in_use: in_use.clone(),
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp.path)
+            .await?;
+        tmp.armed = true;
+        Ok((tmp, file))
+    }
+
+    /// Flushes `file` to disk and renames it to `dest`.
+    async fn persist(mut self, mut file: File, dest: &Path) -> io::Result<()> {
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&self.path, dest).await?;
+        self.armed = false;
+        sync_dir(dest).await;
+        Ok(())
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(err) = std::fs::remove_file(&self.path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "could not remove the temporary file {}: {err}",
+                self.path.display()
+            );
+        }
+        self.in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
+/// Makes a rename into `path`'s folder durable (on Unix; Windows has no such step). A failure is
+/// logged: the file is in place, but a power cut could still lose its name.
+async fn sync_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let synced: io::Result<()> = async { File::open(dir).await?.sync_all().await }.await;
+        if let Err(err) = synced {
+            tracing::warn!(
+                "could not flush the folder {} to disk: {err}",
+                dir.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Whether `err` means "there is nothing there" (rather than "the storage failed").
+fn is_absent(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
 #[async_trait]
 impl Blobs for LocalBlobs {
     async fn put_stream(
@@ -349,9 +619,9 @@ impl Blobs for LocalBlobs {
         limit: u64,
     ) -> anyhow::Result<PutOutcome> {
         let dest = self.path(key)?;
-        let dir = Self::parent_of(&dest).await?;
+        let dir = self.parent_of(&dest).await?;
         // `tmp` is declared first so it is dropped last, after the file is closed.
-        let (tmp, mut file) = TempFile::create(dir).await?;
+        let (tmp, mut file) = TempFile::create(dir, &self.in_use).await?;
         // The header is written last, once the length is known; until then the file has no magic.
         file.write_all(&[0; HEADER_LEN]).await?;
         let mut encoder = ZstdEncoder::new(file);
@@ -370,11 +640,8 @@ impl Blobs for LocalBlobs {
         drop(body);
         encoder.shutdown().await?;
         let mut file = encoder.into_inner();
-        let mut header = [0u8; HEADER_LEN];
-        header[..8].copy_from_slice(&MAGIC);
-        header[8..].copy_from_slice(&raw_len.to_le_bytes());
         file.seek(io::SeekFrom::Start(0)).await?;
-        file.write_all(&header).await?;
+        file.write_all(&blob_header(raw_len)).await?;
         let tmp_path = tmp.path.clone();
         if let Err(err) = tmp.persist(file, &dest).await {
             // Someone else stored this content-addressed key meanwhile (Windows refuses to rename
@@ -397,37 +664,27 @@ impl Blobs for LocalBlobs {
 
     async fn get_stream(&self, key: &str) -> anyhow::Result<Option<(u64, ByteStream)>> {
         let path = self.path(key)?;
-        let mut file = match File::open(&path).await {
+        let file = match File::open(&path).await {
             Ok(file) => file,
-            Err(err) if is_absent(&err) => return Ok(None),
+            Err(err) if is_absent(&err) => return self.absent(None).await,
             Err(err) => return Err(err.into()),
         };
-        let mut header = [0u8; HEADER_LEN];
-        file.read_exact(&mut header)
-            .await
-            .with_context(|| format!("reading the header of {key}"))?;
-        if header[..8] != MAGIC {
-            bail!("{key} is not a blob file");
-        }
-        let raw_len = u64::from_le_bytes(header[8..].try_into()?);
-        let decoder = ZstdDecoder::new(BufReader::new(file));
-        let chunks = ReaderStream::with_capacity(decoder, READ_CHUNK);
-        Ok(Some((raw_len, exact_length(chunks, raw_len))))
+        Ok(Some(decode_blob(file, key).await?))
     }
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
         let path = self.path(key)?;
         match tokio::fs::metadata(&path).await {
             Ok(meta) => Ok(meta.is_file()),
-            Err(err) if is_absent(&err) => Ok(false),
+            Err(err) if is_absent(&err) => self.absent(false).await,
             Err(err) => Err(anyhow::Error::new(err).context(format!("looking for {key}"))),
         }
     }
 
     async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
         let dest = self.path(key)?;
-        let dir = Self::parent_of(&dest).await?;
-        let (tmp, mut file) = TempFile::create(dir).await?;
+        let dir = self.parent_of(&dest).await?;
+        let (tmp, mut file) = TempFile::create(dir, &self.in_use).await?;
         file.write_all(&bytes).await?;
         tmp.persist(file, &dest)
             .await
@@ -438,7 +695,7 @@ impl Blobs for LocalBlobs {
         let path = self.path(key)?;
         match tokio::fs::read(&path).await {
             Ok(data) => Ok(Some(Bytes::from(data))),
-            Err(err) if is_absent(&err) => Ok(None),
+            Err(err) if is_absent(&err) => self.absent(None).await,
             Err(err) => Err(anyhow::Error::new(err).context(format!("reading {key}"))),
         }
     }
@@ -465,8 +722,8 @@ impl Blobs for LocalBlobs {
     }
 
     async fn health(&self) -> anyhow::Result<()> {
-        tokio::fs::create_dir_all(&self.root).await?;
-        let (tmp, mut file) = TempFile::create(&self.root)
+        self.root_is_there().await?;
+        let (tmp, mut file) = TempFile::create(&self.root, &self.in_use)
             .await
             .context("the storage folder cannot be written")?;
         file.write_all(b"ok").await?;

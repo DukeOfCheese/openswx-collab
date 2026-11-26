@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::bail;
-
-use crate::blobs::{Blobs, LocalBlobs};
+use crate::blobs::{self, Blobs, LocalBlobs, S3Blobs, S3Config};
 use crate::clock::Clock;
 use crate::config::{Database, Settings, Storage};
 use crate::error::ApiError;
@@ -252,8 +250,9 @@ impl AppState {
 
     /// The state of a running server: the database `settings.database_url` names (opened, and its
     /// schema brought up to date as [`SqliteStore::open`] and [`PgStore::open`] do), the blob storage
-    /// `settings.storage_url` names (a folder, [`LocalBlobs`]; S3 is refused until Task 17), mail
-    /// through the operator's SMTP server ([`SmtpMailer`]) and the real Google and GitHub
+    /// `settings.storage_url` names (a folder, [`LocalBlobs`], whose abandoned temporary files are
+    /// swept now and every hour; or a bucket, [`S3Blobs`], which must take a write, a read and a
+    /// removal before the server starts), mail through the operator's SMTP server ([`SmtpMailer`]) and the real Google and GitHub
     /// ([`HttpProviders`]).
     pub async fn from_settings(settings: Settings) -> anyhow::Result<Self> {
         let store: Arc<dyn Store> = match settings.database()? {
@@ -270,10 +269,16 @@ impl AppState {
             ),
         };
         let blobs: Arc<dyn Blobs> = match settings.storage()? {
-            Storage::Local(folder) => Arc::new(LocalBlobs::new(folder)?),
-            // TASK 17: open the S3 storage here.
+            Storage::Local(folder) => {
+                let local = Arc::new(LocalBlobs::new(folder)?);
+                // (Detached: the sweeper ends by itself once the storage is dropped.)
+                drop(local.start_sweeper(blobs::TEMP_SWEEP_EVERY, blobs::TEMP_MAX_AGE));
+                local
+            }
             Storage::S3 { .. } => {
-                bail!("this build cannot use S3 storage yet (S3 storage arrives in Task 17)")
+                let config =
+                    S3Config::from_settings(&settings)?.expect("the storage URL names a bucket");
+                Arc::new(S3Blobs::open(config).await?)
             }
         };
         let mailer = Arc::new(SmtpMailer::new(&settings)?);

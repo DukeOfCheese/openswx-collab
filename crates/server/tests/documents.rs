@@ -4,7 +4,6 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -47,25 +46,9 @@ async fn content(server: &TestServer, doc: &str, token: &str) -> (StatusCode, Va
         .await
 }
 
-fn storage(server: &TestServer) -> PathBuf {
-    PathBuf::from(&server.state.settings.storage_url)
-}
-
-/// Every file under `dir` (none if it does not exist).
-fn files_under(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(files_under(&path));
-        } else {
-            out.push(path);
-        }
-    }
-    out
+/// The snapshots in the server's storage (of every document).
+async fn snapshots(server: &TestServer) -> Vec<String> {
+    server.stored_under("docs/").await
 }
 
 async fn viewer(server: &TestServer, w: &World, email: &str) -> (Token, Id) {
@@ -422,7 +405,7 @@ async fn content_the_core_refuses_is_422_and_nothing_is_written() {
             .unwrap()
             .is_empty()
     );
-    assert!(files_under(&storage(&server).join("docs")).is_empty());
+    assert!(snapshots(&server).await.is_empty());
 
     // 64 levels is fine.
     w.document(&server, Some(nested(64)), None, None).await;
@@ -626,7 +609,7 @@ async fn the_quota_hook_can_refuse_a_document_before_anything_is_written() {
             .unwrap()
             .is_empty()
     );
-    assert!(files_under(&storage(&server).join("docs")).is_empty());
+    assert!(snapshots(&server).await.is_empty());
 }
 
 #[tokio::test]
@@ -657,7 +640,7 @@ async fn a_failed_commit_leaves_no_snapshot_behind() {
             .unwrap()
             .is_empty()
     );
-    assert!(files_under(&storage(&server).join("docs")).is_empty());
+    assert!(snapshots(&server).await.is_empty());
 }
 
 #[tokio::test]
@@ -1073,7 +1056,7 @@ async fn when_a_failed_commit_cannot_be_settled_the_snapshot_is_kept() {
         .await
         .unwrap();
     assert_eq!(docs.len(), 1);
-    assert_eq!(files_under(&storage(&server).join("docs")).len(), 1);
+    assert_eq!(snapshots(&server).await.len(), 1);
     assert_eq!(
         content(&server, &docs[0].id, &w.admin).await.1["content"],
         stored_part()

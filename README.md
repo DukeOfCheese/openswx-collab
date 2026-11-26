@@ -54,6 +54,20 @@ python -m venv .venv
 .venv/Scripts/python tools/e2e_two_peers.py ../openswx                # needs an openswx checkout with its .venv
 ```
 
+The Rust server (`crates/server`) tests its S3 storage against an S3 server inside the test process, so
+`cargo test` needs nothing else. To run its tests with every file kept in S3, or against a real store:
+
+```
+OSWX_TEST_STORAGE=s3 cargo test -p oswx-server                        # every test server on S3 (in-process)
+# Against a store you have. The bucket must exist; each test works under a prefix of its own (t-<id>).
+# For Garage as deploy/docker-compose.s3.yml sets it up, start just Garage with its S3 port published:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env \
+#     run -d -p 127.0.0.1:3900:3900 garage
+OSWX_TEST_S3_URL=http://127.0.0.1:3900 OSWX_TEST_S3_BUCKET=openswx-collab OSWX_TEST_S3_REGION=garage \
+OSWX_TEST_S3_ACCESS_KEY=<S3_ACCESS_KEY> OSWX_TEST_S3_SECRET_KEY=<S3_SECRET_KEY> \
+  cargo test -p oswx-server --test storage_s3                         # add OSWX_TEST_STORAGE=s3 for the other tests
+```
+
 The first account created on a server is its admin; everyone else joins through an invite link.
 Self-hosting with Docker, Postgres, TLS and Google/GitHub sign-in: `docs/self-hosting.md`.
 

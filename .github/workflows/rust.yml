@@ -49,3 +49,50 @@ jobs:
         # Four tests at a time: each test server holds up to six connections (and a test may start
         # two servers), well inside the service's default max_connections of 100.
         run: cargo test -p oswx-server -- --test-threads=4
+
+  s3:
+    # The storage tests again, with every test server keeping its files in a real S3-compatible
+    # store: Garage, the store of deploy/docker-compose.s3.yml, started as that file starts it.
+    # (Everywhere else these tests run against an S3 server inside the test process.)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Garage
+        run: |
+          access_key="GK$(openssl rand -hex 16)"
+          secret_key="$(openssl rand -hex 32)"
+          docker run -d --name garage -p 127.0.0.1:3900:3900 \
+            -e GARAGE_RPC_SECRET="$(openssl rand -hex 32)" \
+            -e GARAGE_DEFAULT_ACCESS_KEY="$access_key" \
+            -e GARAGE_DEFAULT_SECRET_KEY="$secret_key" \
+            -e GARAGE_DEFAULT_BUCKET=oswx-test \
+            -v "$PWD/deploy/garage.toml:/etc/garage.toml:ro" \
+            dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5 \
+            /garage server --single-node --default-bucket
+          for _ in $(seq 1 60); do
+            # (Any answer will do: an unsigned request is refused, which is an answer.)
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3900/)" != "000" ]; then
+              break
+            fi
+            sleep 1
+          done
+          {
+            echo "OSWX_TEST_S3_ACCESS_KEY=$access_key"
+            echo "OSWX_TEST_S3_SECRET_KEY=$secret_key"
+          } >> "$GITHUB_ENV"
+      - name: Test (S3 storage on Garage)
+        env:
+          OSWX_TEST_STORAGE: s3
+          OSWX_TEST_S3_URL: http://127.0.0.1:3900
+          OSWX_TEST_S3_BUCKET: oswx-test
+          OSWX_TEST_S3_REGION: garage
+        run: >-
+          cargo test -p oswx-server
+          --test storage_s3 --test storage --test documents --test lifecycle
+          --test journal --test pipeline --test live
+      - name: Garage's log
+        if: failure()
+        run: docker logs garage

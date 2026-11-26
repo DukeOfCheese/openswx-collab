@@ -15,11 +15,17 @@
 //!   Ranges are not supported: a `Range` header is ignored and the whole blob comes back with 200
 //!   (`Accept-Ranges: none`). No such blob, or a path that is not a SHA-256, is 404 `no such blob`.
 //!
+//! A transfer in which no bytes move for `blob_idle_timeout` seconds is given up on: a stalled
+//! upload is answered 400 `the upload did not finish` and leaves nothing in storage; a download
+//! whose client stops reading has its side of storage (an open file, a connection to the bucket)
+//! released, and ends short.
+//!
 //! Blobs belong to the organisation, not the project: every project of an organisation reaches the
 //! same blobs ([`blob_key`]). A project you have no role in is 404 `no such project`.
 
 use std::error::Error as StdError;
 use std::io;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -32,7 +38,9 @@ use http_body_util::LengthLimitError;
 use sha2::{Digest, Sha256};
 
 use crate::access::{CurrentUser, require_project};
-use crate::blobs::{ByteStream, PutError, blob_key, is_sha256};
+use crate::blobs::{
+    ByteStream, PutError, blob_key, drop_when_stalled, fail_when_stalled, is_sha256,
+};
 use crate::error::{ApiError, ApiJson, ApiPath};
 use crate::security::ProjectRole;
 use crate::state::AppState;
@@ -134,7 +142,8 @@ async fn upload(
     }
     let limit = state.settings.max_blob_bytes as u64;
     let key = blob_key(&project.org_id, &sha);
-    let body = verified(body, sha);
+    let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);
+    let body = fail_when_stalled(verified(body, sha), idle);
     if state.blobs.exists(&key).await? {
         // Already stored: read and check the body (so the client is answered, not cut off), but
         // write nothing.
@@ -282,7 +291,10 @@ async fn download(
             (header::CONTENT_LENGTH, HeaderValue::from(raw_len)),
             (header::ACCEPT_RANGES, HeaderValue::from_static("none")),
         ],
-        Body::from_stream(chunks),
+        Body::from_stream(drop_when_stalled(
+            chunks,
+            Duration::from_secs_f64(state.settings.blob_idle_timeout),
+        )),
     )
         .into_response())
 }

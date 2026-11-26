@@ -4,23 +4,35 @@
 //! `OSWX_TEST_DATABASE_URL` names a PostgreSQL database (`tools/test_postgres_rust.py` starts one),
 //! against PostgreSQL: each test server then gets a schema of its own in that database
 //! ([`PgSchema`]), dropped when the test ends, so tests run side by side as they do on SQLite.
+//!
+//! Blobs and snapshots are kept in a folder of that temporary directory, or, when
+//! `OSWX_TEST_STORAGE` is `s3`, in S3: an S3-compatible server of the test's own inside the test
+//! process ([`FakeS3`]), or the real endpoint `OSWX_TEST_S3_URL` names (each test server under a
+//! prefix of its own). Tests look at what is stored through [`TestServer::stored_under`].
 #![allow(dead_code)] // each test file uses part of the harness
 
+mod contract;
 mod live;
 mod providers;
+mod s3;
+
+#[allow(unused_imports)] // (only the storage tests run the storage contract)
+pub use contract::*;
 
 #[allow(unused_imports)] // (not every test file uses the live client)
 pub use live::*;
 #[allow(unused_imports)] // (only the sign-in tests use the fake providers)
 pub use providers::*;
+#[allow(unused_imports)] // (only the storage tests use the fake S3 themselves)
+pub use s3::*;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oswx_server::blobs::{Blobs, LocalBlobs};
+use oswx_server::blobs::{Blobs, LocalBlobs, S3Blobs};
 use oswx_server::hub::Hub;
 use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
@@ -55,6 +67,8 @@ pub struct TestServer {
     db: TestDb,
     /// What `state.store` is, so that `restart` can put the reopened database in its place.
     store_kind: StoreKind,
+    /// Where blobs and snapshots are kept; kept across `restart`.
+    storage: TestStorage,
     /// The database and storage live here; kept across `restart`.
     dir: Arc<TempDir>,
     /// On PostgreSQL: the test's schema, kept across `restart` and dropped with the last server on
@@ -263,9 +277,83 @@ async fn open_store(settings: &Settings) -> TestDb {
     }
 }
 
-/// Opens the blob storage the settings name: a folder in the test's temporary directory.
-fn open_blobs(settings: &Settings) -> Arc<dyn Blobs> {
-    Arc::new(LocalBlobs::new(&settings.storage_url).expect("the test storage folder"))
+/// The environment variable that says where the tests keep blobs and snapshots: `s3` for S3
+/// ([`FakeS3`], or the real endpoint `OSWX_TEST_S3_URL` names); anything else, or unset, for a
+/// folder.
+const STORAGE_ENV: &str = "OSWX_TEST_STORAGE";
+
+/// Whether the tests keep blobs and snapshots in S3 (`OSWX_TEST_STORAGE=s3`) rather than a folder.
+pub fn on_s3() -> bool {
+    std::env::var(STORAGE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("s3"))
+}
+
+/// Where a test server keeps blobs and snapshots, as the test itself reaches it.
+#[derive(Clone)]
+pub enum TestStorage {
+    /// A folder in the test's temporary directory.
+    Local(PathBuf),
+    /// A bucket: of the fake S3 server that is kept alive here, or of a real endpoint.
+    S3 {
+        blobs: Arc<S3Blobs>,
+        fake: Option<Arc<FakeS3>>,
+    },
+}
+
+impl TestStorage {
+    /// Every key in storage that starts with `prefix`, sorted. In a folder that includes temporary
+    /// files (`.tmp-...`); on the fake S3, one `.unfinished-upload/<n>` for every part of a
+    /// multipart upload that was neither completed nor aborted (when `prefix` is empty).
+    pub async fn stored_under(&self, prefix: &str) -> Vec<String> {
+        let mut keys = match self {
+            Self::Local(root) => {
+                let mut keys = Vec::new();
+                let mut todo = vec![root.clone()];
+                while let Some(dir) = todo.pop() {
+                    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            todo.push(path);
+                        } else if let Ok(inside) = path.strip_prefix(root) {
+                            let parts: Vec<_> = inside
+                                .components()
+                                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                                .collect();
+                            keys.push(parts.join("/"));
+                        }
+                    }
+                }
+                keys
+            }
+            Self::S3 { blobs, fake } => {
+                let mut keys = blobs.keys().await.expect("the test bucket lists its keys");
+                let parts = fake.as_ref().map_or(0, |f| f.parts_held());
+                keys.extend((0..parts).map(|n| format!(".unfinished-upload/{n}")));
+                keys
+            }
+        };
+        keys.retain(|k| k.starts_with(prefix));
+        keys.sort();
+        keys
+    }
+}
+
+/// Opens the blob storage the tests run against. This is the one place that decides it: the folder
+/// the settings name, in the test's temporary directory, or S3 ([`on_s3`]).
+async fn open_blobs(settings: &Settings, dir: &Path) -> (Arc<dyn Blobs>, TestStorage) {
+    if !on_s3() {
+        let local = LocalBlobs::new(&settings.storage_url).expect("the test storage folder");
+        let storage = TestStorage::Local(local.root().to_path_buf());
+        return (Arc::new(local), storage);
+    }
+    let (config, fake) = match real_s3() {
+        Some(config) => (config, None),
+        None => {
+            let fake = Arc::new(FakeS3::start(dir).await);
+            (fake.config(""), Some(fake))
+        }
+    };
+    let blobs = Arc::new(S3Blobs::open(config).await.expect("the test bucket works"));
+    (blobs.clone(), TestStorage::S3 { blobs, fake })
 }
 
 impl TestServer {
@@ -306,7 +394,7 @@ impl TestServer {
         };
         settings(&mut s);
         let db = open_store(&s).await;
-        let blobs = open_blobs(&s);
+        let (blobs, storage) = open_blobs(&s, dir.path()).await;
         let plain: Arc<dyn Store> = db.store();
         let mut app_state = AppState::new(s, plain.clone(), blobs);
         let providers = Arc::new(FakeProviders::default());
@@ -321,7 +409,7 @@ impl TestServer {
         } else {
             StoreKind::Custom
         };
-        Self::serve(app_state, providers, db, store_kind, dir, schema).await
+        Self::serve(app_state, providers, db, store_kind, storage, dir, schema).await
     }
 
     /// Starts with the test settings changed by `settings` and the store wrapped in a [`FlakyStore`],
@@ -410,6 +498,7 @@ impl TestServer {
             providers,
             db,
             self.store_kind.clone(),
+            self.storage.clone(),
             self.dir.clone(),
             self.schema.clone(),
         )
@@ -421,6 +510,7 @@ impl TestServer {
         providers: Arc<FakeProviders>,
         db: TestDb,
         store_kind: StoreKind,
+        storage: TestStorage,
         dir: Arc<TempDir>,
         schema: Option<Arc<PgSchema>>,
     ) -> Self {
@@ -445,6 +535,7 @@ impl TestServer {
             providers,
             db,
             store_kind,
+            storage,
             dir,
             schema,
             stop: Some(stop),
@@ -2293,6 +2384,29 @@ impl TestServer {
         })
         .await;
         (server, handle.expect("the state function ran"))
+    }
+
+    /// Every key in the server's storage that starts with `prefix`, sorted
+    /// ([`TestStorage::stored_under`]).
+    pub async fn stored_under(&self, prefix: &str) -> Vec<String> {
+        self.storage.stored_under(prefix).await
+    }
+
+    /// The server's storage as the S3 storage it is, if it is ([`on_s3`]).
+    pub fn s3_blobs(&self) -> Option<Arc<S3Blobs>> {
+        match &self.storage {
+            TestStorage::S3 { blobs, .. } => Some(blobs.clone()),
+            TestStorage::Local(_) => None,
+        }
+    }
+
+    /// The fake S3 server this test server keeps its files in, if it does ([`on_s3`] and no real
+    /// endpoint).
+    pub fn fake_s3(&self) -> Option<Arc<FakeS3>> {
+        match &self.storage {
+            TestStorage::S3 { fake, .. } => fake.clone(),
+            TestStorage::Local(_) => None,
+        }
     }
 
     /// The open room of a document (panics if there is none).

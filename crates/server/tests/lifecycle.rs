@@ -5,7 +5,6 @@ mod common;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -136,9 +135,13 @@ fn entry_lines(zip: &mut Zip, name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The storage folder of the test server.
-fn storage(server: &TestServer) -> PathBuf {
-    PathBuf::from(&server.state.settings.storage_url)
+/// Whether the server's storage holds anything under `<kind>/<id>/` (`orgs`: an organisation's
+/// blobs; `docs`: a document's snapshots).
+async fn has_files(server: &TestServer, kind: &str, id: &str) -> bool {
+    !server
+        .stored_under(&format!("{kind}/{id}/"))
+        .await
+        .is_empty()
 }
 
 /// Waits (up to five seconds) for `done` to hold.
@@ -1523,9 +1526,8 @@ async fn deleting_an_organisation_removes_everything_in_it() {
         .post("/api/orgs", Some(&world.admin), json!({"name": "Other"}))
         .await;
     let other = other["id"].as_str().unwrap().to_owned();
-    let org_files = storage(&server).join("orgs").join(&world.org);
-    let doc_files = storage(&server).join("docs").join(&doc);
-    assert!(org_files.is_dir() && doc_files.is_dir());
+    assert!(has_files(&server, "orgs", &world.org).await);
+    assert!(has_files(&server, "docs", &doc).await);
 
     let bad = [
         (
@@ -1576,8 +1578,14 @@ async fn deleting_an_organisation_removes_everything_in_it() {
     assert_eq!(orgs.as_array().unwrap().len(), 1);
     assert_eq!(orgs[0]["id"], other.as_str());
     assert_eq!(server.get("/api/orgs", Some(&bob)).await.1, json!([]));
-    assert!(!org_files.exists(), "the blobs are gone");
-    assert!(!doc_files.exists(), "the snapshots are gone");
+    assert!(
+        !has_files(&server, "orgs", &world.org).await,
+        "the blobs are gone"
+    );
+    assert!(
+        !has_files(&server, "docs", &doc).await,
+        "the snapshots are gone"
+    );
     // people keep their accounts
     assert_eq!(server.get("/api/me", Some(&bob)).await.0, 200);
 
@@ -1692,7 +1700,7 @@ async fn deleting_an_organisation_closes_its_open_documents_and_nothing_more_is_
                 .unwrap()
                 .is_none()
         );
-        assert!(!storage(&server).join("docs").join(doc).exists());
+        assert!(!has_files(&server, "docs", doc).await);
     }
     // The other organisation's document is still open and takes changes.
     assert_eq!(edit(&mut kept, 8).await, 1);
@@ -1739,16 +1747,11 @@ async fn deleting_an_organisation_removes_its_files_and_leaves_another_organisat
     assert_eq!(edit(&mut a, 3).await, 1);
     drop(a);
 
-    let root = storage(&server);
-    let ours = [
-        root.join("orgs").join(&world.org),
-        root.join("docs").join(&doc),
-    ];
-    let theirs = [
-        root.join("orgs").join(&other),
-        root.join("docs").join(&kept),
-    ];
-    assert!(ours.iter().chain(&theirs).all(|p| p.is_dir()));
+    let ours = [("orgs", world.org.as_str()), ("docs", doc.as_str())];
+    let theirs = [("orgs", other.as_str()), ("docs", kept.as_str())];
+    for (kind, id) in ours.iter().chain(&theirs) {
+        assert!(has_files(&server, kind, id).await, "{kind}/{id}");
+    }
 
     assert_eq!(
         delete_org(&server, &world.org, &world.admin, robotics())
@@ -1756,11 +1759,14 @@ async fn deleting_an_organisation_removes_its_files_and_leaves_another_organisat
             .0,
         204
     );
-    for path in &ours {
-        assert!(!path.exists(), "{} is gone", path.display());
+    for (kind, id) in ours {
+        assert!(!has_files(&server, kind, id).await, "{kind}/{id} is gone");
     }
-    for path in &theirs {
-        assert!(path.is_dir(), "{} is untouched", path.display());
+    for (kind, id) in theirs {
+        assert!(
+            has_files(&server, kind, id).await,
+            "{kind}/{id} is untouched"
+        );
     }
     let mut removed = blobs.removed();
     removed.sort();
@@ -1809,10 +1815,7 @@ async fn files_that_cannot_be_removed_do_not_fail_the_deletion() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        storage(&server).join("docs").join(&doc).exists(),
-        "left behind"
-    );
+    assert!(has_files(&server, "docs", &doc).await, "left behind");
     let text = logs.text();
     assert!(
         text.contains("could not remove") && text.contains(&world.org),
@@ -2005,7 +2008,7 @@ async fn an_extension_can_refuse_deleting_an_organisation() {
     let (_, orgs) = server.get("/api/orgs", Some(&world.admin)).await;
     assert_eq!(orgs[0]["id"], world.org.as_str());
     assert!(server.state.hub.recorded().is_empty());
-    assert!(storage(&server).join("docs").join(&doc).exists());
+    assert!(has_files(&server, "docs", &doc).await);
     // The hook is not asked by someone who may not delete the organisation anyway.
     let (bob, _) = world.editor(&server, "bob@example.com").await;
     let asked = recorder.calls().len();

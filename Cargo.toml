@@ -20,16 +20,21 @@ futures-util = "0.3"
 hdrhistogram = "7"
 http-body-util = "0.1"
 hex = "0.4"
+# S3-compatible storage only; 0.12 shares the workspace's reqwest 0.12 and ring (no second TLS stack).
+object_store = { version = "0.12", default-features = false, features = ["aws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 sysinfo = "0.33"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tokio-tungstenite ={ version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 imbl = "7"
 rmpv = "1"
+# An in-process S3 server for the storage tests (dev-dependencies only).
+s3s = "0.17"
+s3s-fs = "0.17"
 thiserror = "2"
 tower-http = { version = "0.6", default-features = false, features = ["catch-panic"] }
 serde_json = "1"
