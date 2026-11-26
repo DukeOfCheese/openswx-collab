@@ -1669,18 +1669,11 @@ impl Room {
         if self.pending.is_empty() {
             self.tentative = self.durable.clone();
         }
-        // Everyone but those waiting for this change's answer hears of it, in seq order; and no
-        // connection of the client that made it (a client never receives its own changes back
-        // live: after a reconnect it resends them and is answered, or sees them in its welcome's
-        // catch-up).
-        let mut except = p.item.waiters.clone();
-        except.extend(
-            self.conns
-                .iter()
-                .filter(|(_, c)| c.client == p.item.author.client)
-                .map(|(id, _)| *id),
-        );
-        self.broadcast(&p.event, &except);
+        // Everyone but those waiting for this change's answer hears of it, in seq order. That
+        // includes a connection of the client that made it which is not waiting for it (one that
+        // replaced the sender before resending): every connection sees every change in seq
+        // order, and a later resend is answered `accepted` with this seq from memory.
+        self.broadcast(&p.event, &p.item.waiters);
         // Locks on what this change took out of the document go with it.
         self.drop_locks_under(&a.writes, &a.removed);
         if let Some(key) = p.item.key() {

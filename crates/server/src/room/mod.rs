@@ -57,9 +57,12 @@
 //! what the old one had not yet handed to the journal is dropped where it comes back, what it had
 //! handed over completes. The client resends what it has no answer for, and each resend is answered
 //! once: by the change still being written (it waits for it), from memory once it is durable, after
-//! a duplicate check in flight, or judged afresh under the new connection's access. A client never
-//! receives its own changes as live events (only in a welcome's catch-up). Its locks stay with the
-//! client (released if the new connection may only look).
+//! a duplicate check in flight, or judged afresh under the new connection's access. Every
+//! connection receives every durable change as an event, in seq order, except the connections
+//! waiting for its answer (they get `accepted`): a new connection that had not resent its client's
+//! change yet when it became durable receives it as an event, and its resend is then answered
+//! `accepted` with the same seq. Its locks stay with the client (released if the new connection may
+//! only look).
 
 mod change;
 pub mod conn;
@@ -252,15 +255,16 @@ impl Gate {
     }
 }
 
-/// Counts which message of a revoked connection reached its room first (see
+/// Counts whether the hub's `Revoked` for a connection found it still in its room (see
 /// [`Hooks::revoke_order`]).
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct RevokeOrder {
     /// The hub's `Revoked` found the connection still there.
     pub revoked_first: AtomicUsize,
-    /// The connection's `Leave` had removed it already.
-    pub leave_first: AtomicUsize,
+    /// The connection was gone already: its own `Leave` came first, or a newer connection of its
+    /// client had replaced it.
+    pub gone_first: AtomicUsize,
 }
 
 /// Rooms tests stop dead (see [`Hooks::stall`]).
@@ -439,6 +443,8 @@ pub struct ConnStatus {
     pub client_id: String,
     pub queued_frames: usize,
     pub queued_bytes: usize,
+    /// Answers it waits for (each counts toward [`MAX_REPLIES`]).
+    pub waiting_answers: usize,
 }
 
 /// A connection asking to join, made by the WebSocket handshake once the hello was checked.
@@ -1324,6 +1330,7 @@ impl Room {
                 client_id: c.client.to_string(),
                 queued_frames: c.outbox.queued_frames(),
                 queued_bytes: c.outbox.queued_bytes(),
+                waiting_answers: c.replies.len(),
             })
             .collect();
         connections.sort_by(|a, b| a.client_id.cmp(&b.client_id));
@@ -1387,7 +1394,7 @@ impl Room {
                     self.remove_conn(conn, None, true);
                 }
                 None => {
-                    order.leave_first.fetch_add(1, Ordering::Relaxed);
+                    order.gone_first.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
