@@ -27,8 +27,8 @@
 //! sets both on the connection it makes first, so that a database that will not take them says
 //! so when the server starts.
 //!
-//! With the defaults the server holds at most **12** connections (5 + 5 + 2), opened as they are
-//! needed. A caller waits up to 30 s for a free one ([`super::is_busy`]: 503). Every connection is
+//! With the defaults the server holds at most **12** connections (5 + 5 + 2): one of each pool
+//! opened when the store is (and kept), the others as they are needed. A caller waits up to 30 s for a free one ([`super::is_busy`]: 503). Every connection is
 //! opened with:
 //!
 //! - `default_transaction_isolation = read committed`, whatever the database or role is set to:
@@ -104,6 +104,8 @@ const STATEMENT_TIMEOUT_MS: u32 = 30_000;
 /// How long a transaction may sit without a statement before the database ends it, in
 /// milliseconds.
 const IDLE_IN_TRANSACTION_MS: u32 = 60_000;
+/// Connections each pool keeps open while idle (see [`PgStore::warm`]).
+const WARM_CONNECTIONS: u32 = 1;
 /// Prepared statements kept per connection: every fixed statement of [`super::sql`] fits.
 const STATEMENT_CACHE: usize = 256;
 
@@ -235,6 +237,8 @@ impl PgStore {
         let pool = |connections: u32| {
             PgPoolOptions::new()
                 .max_connections(connections.max(1))
+                // (Kept by the pool from when it closes an idle connection on: see `warm`.)
+                .min_connections(WARM_CONNECTIONS)
                 .acquire_timeout(ACQUIRE_TIMEOUT)
         };
         let longest = Duration::from_secs_f64(MAX_LOCK_TIMEOUT);
@@ -251,8 +255,8 @@ impl PgStore {
         let lock_timeout_ms = config.lock_timeout.as_millis().max(1);
         let journal_lock_timeout_ms = config.journal_lock_timeout.as_millis().max(1);
         // One connection made here and now shows whether the database answers, and says why not
-        // at once (a pool would try again until its wait ran out). The pools open theirs as they
-        // are needed.
+        // at once (a pool would try again until its wait ran out). The pools open one each just
+        // below and the rest as they are needed.
         let mut probe = options
             .connect()
             .await
@@ -273,13 +277,33 @@ impl PgStore {
                 .clone()
                 .options([("lock_timeout", journal_lock_timeout_ms)]),
         );
-        Ok(Self {
+        let store = Self {
             transactions,
             reads,
             journal,
             options: Arc::new(options),
             migrator: &MIGRATOR,
-        })
+        };
+        store.warm().await;
+        Ok(store)
+    }
+
+    /// Opens one connection of each pool now. Opening one takes tens of milliseconds (on
+    /// Windows about 35 ms: a new server process, and the password exchange), which would
+    /// otherwise land on the first request, or the first document opened (whose room lease is
+    /// taken on the journal's connections). The pools keep [`WARM_CONNECTIONS`] open from then on:
+    /// sqlx opens new ones when it closes idle ones, but not at the start. A pool that cannot open
+    /// one now opens it when it is first needed, as it would have.
+    async fn warm(&self) {
+        let open = |pool: &PgPool| {
+            let pool = pool.clone();
+            async move { drop(pool.acquire().await) }
+        };
+        tokio::join!(
+            open(&self.transactions),
+            open(&self.reads),
+            open(&self.journal)
+        );
     }
 
     /// A connection of its own for migrations, without the statement timeout (building an index
