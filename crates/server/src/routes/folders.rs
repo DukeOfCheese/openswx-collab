@@ -165,16 +165,16 @@ async fn create_folder(
     }
     tx.insert_folder(&folder).await?;
     tx.commit().await?;
-    emit(
-        &state.ext,
-        Event::FolderCreated {
-            org: project.org_id,
-            project: project.id,
-            folder: folder.id.clone(),
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::FolderCreated {
+        org: project.org_id,
+        project: project.id,
+        folder: folder.id.clone(),
+        by: user.id,
+    };
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move { emit(&ext, event).await })
+        .await;
     Ok((StatusCode::CREATED, ApiJson(folder_out(&folder))))
 }
 
@@ -270,31 +270,32 @@ async fn patch_folder(
         folder.name.clone_from(name);
     }
     tx.commit().await?;
+    let mut events = Vec::new();
     if name.is_some() {
-        emit(
-            &state.ext,
-            Event::FolderRenamed {
-                org: project.org_id.clone(),
-                project: project.id.clone(),
-                folder: folder.id.clone(),
-                by: user.id.clone(),
-            },
-        )
-        .await;
+        events.push(Event::FolderRenamed {
+            org: project.org_id.clone(),
+            project: project.id.clone(),
+            folder: folder.id.clone(),
+            by: user.id.clone(),
+        });
     }
     if body.parent_id.is_some() {
-        emit(
-            &state.ext,
-            Event::FolderMoved {
-                org: project.org_id.clone(),
-                project: project.id.clone(),
-                folder: folder.id.clone(),
-                parent: folder.parent_id.clone(),
-                by: user.id.clone(),
-            },
-        )
-        .await;
+        events.push(Event::FolderMoved {
+            org: project.org_id.clone(),
+            project: project.id.clone(),
+            folder: folder.id.clone(),
+            parent: folder.parent_id.clone(),
+            by: user.id.clone(),
+        });
     }
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move {
+            for event in events {
+                emit(&ext, event).await;
+            }
+        })
+        .await;
     Ok(ApiJson(folder_out(&folder)))
 }
 
@@ -313,16 +314,16 @@ async fn delete_folder(
     tx.move_child_folders(&folder.id, parent).await?;
     tx.delete_folder(&folder.id).await?;
     tx.commit().await?;
-    emit(
-        &state.ext,
-        Event::FolderDeleted {
-            org: project.org_id,
-            project: project.id,
-            folder: folder.id,
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::FolderDeleted {
+        org: project.org_id,
+        project: project.id,
+        folder: folder.id,
+        by: user.id,
+    };
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move { emit(&ext, event).await })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

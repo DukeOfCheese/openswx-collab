@@ -1,26 +1,58 @@
-//! The open documents (rooms).
+//! The open documents (rooms) and the document connections.
 //!
 //! The hub maps a document id to its room's [`RoomHandle`]. [`Hub::open`] loads a room at most once
 //! per document however many connections ask at the same moment (a gate per document); a load that
 //! fails is reported to the caller and not remembered. A room takes itself out of the hub when it
-//! unloads.
+//! ends. A room unloading because it is idle stays in the hub until its final snapshot is written,
+//! and [`Hub::open`] waits for it to end rather than load the document beside it; it never hands
+//! out a room that has begun to unload.
 //!
-//! [`Hub::online`] reads what each open room publishes (never loading a room or waiting for one);
-//! Task 12 gives the hub the drops (`drop_account`, `drop_user` only record the call for now) and
-//! the sweeper.
+//! [`Hub::online`] reads what each open room publishes (never loading a room or waiting for one).
+//!
+//! # Connections and drops
+//!
+//! Every document connection is registered here from the moment its session is known
+//! ([`Hub::register`]) until it ends (the [`Registration`] is dropped), with its account, its
+//! document, the hash of its session's token and, once settled, its project and role. This is what
+//! the drops act on, straight through the connection's [`Outbox`] (closing it at once: whatever is
+//! queued is dropped, the close frame goes out, its reader stops reading, and its room processes no
+//! more of its frames), so a drop takes effect whatever the room is busy with:
+//!
+//! | call | which connections | close |
+//! |---|---|---|
+//! | [`Hub::drop_account`] | every connection of the account | 4401 `sign in again` |
+//! | [`Hub::drop_session`] | every connection made with that session | 4401 `sign in again` |
+//! | [`Hub::drop_user`] | the account's connections to the organisation's documents whose role, read again now, went or differs | 4403 `your access changed` |
+//! | [`Hub::close_document`] | every connection to the document (its room unloads) | 4404 with the reason |
+//!
+//! A connection whose handshake is still working out its role when a drop concerns it is told to
+//! work it out again ([`Registration::settle`] answers false), so a role read before a change is
+//! never kept. A session that expires while connected is closed by its room's tick (4401).
+//!
+//! The registry also counts each account's connections: [`Hub::register`] refuses one more than
+//! `max_connections_per_user`.
+//!
+//! # Sweeper
+//!
+//! Once a room is open, a sweeper runs every `sweep_interval` seconds and asks each room, without
+//! waiting for it, to sweep and to unload itself if it is idle ([`RoomHandle::sweep`]). A room that
+//! does not answer is asked again next time; no room can hold up the others.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::access::role_in_project;
 use crate::lease;
-use crate::room::{self, RoomHandle, RoomInit, close};
+use crate::metrics::{self, DropCause};
+use crate::room::{self, ConnId, Outbox, RoomHandle, RoomInit, close};
+use crate::security::ProjectRole;
 use crate::snapshot::{LoadError, load_head};
 use crate::state::AppState;
-use crate::store::Id;
+use crate::store::{Id, Store};
 
 /// How long a room lease is said to last (a hint for other nodes; the epoch is the guard).
 const LEASE_TTL: f64 = 60.0;
@@ -47,17 +79,66 @@ pub enum OpenError {
     Failed(#[from] anyhow::Error),
 }
 
+/// Why a connection could not be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RegisterError {
+    /// The account has `max_connections_per_user` connections open already.
+    #[error("too many connections")]
+    TooMany,
+    /// The server is shutting down.
+    #[error("the server is shutting down")]
+    ShuttingDown,
+}
+
+/// What the hub holds now (for `/metrics`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Gauges {
+    /// Rooms open (unloading ones included).
+    pub rooms: usize,
+    /// Document connections registered (handshakes past the session check included).
+    pub connections: usize,
+}
+
+/// A registered connection.
+#[derive(Debug)]
+struct Entry {
+    user: Id,
+    doc: Id,
+    token_hash: String,
+    outbox: Arc<Outbox>,
+    /// The project and role it joined with, once its handshake settled them.
+    settled: Option<(Id, ProjectRole)>,
+    /// A drop concerned it before it settled: its handshake works its role out again.
+    recheck: bool,
+}
+
+#[derive(Debug, Default)]
+struct Registry {
+    entries: HashMap<ConnId, Entry>,
+    per_user: HashMap<Id, usize>,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     rooms: Mutex<HashMap<Id, RoomHandle>>,
     /// One per document being opened, so that it is loaded once.
     gates: Mutex<HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
     closing: AtomicBool,
-    /// The drop and close calls made so far (for tests; Task 12 gives drops their behaviour).
+    registry: Mutex<Registry>,
+    sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The drop and close calls made so far (for tests).
     calls: Mutex<Vec<String>>,
 }
 
-/// The open rooms. Cloning is cheap: clones share them.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(task) = lock(&self.sweeper).take() {
+            task.abort();
+        }
+    }
+}
+
+/// The open rooms and the connections. Cloning is cheap: clones share them.
 #[derive(Debug, Clone, Default)]
 pub struct Hub {
     inner: Arc<Inner>,
@@ -65,6 +146,45 @@ pub struct Hub {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A connection's place in the hub's registry; dropping it unregisters the connection (and frees
+/// its account's slot).
+#[derive(Debug)]
+pub struct Registration {
+    hub: Hub,
+    conn: ConnId,
+}
+
+impl Registration {
+    /// Records the project and role the connection joins with. Answers false (and forgets the
+    /// request) when a drop concerned the connection since it registered or since the last call:
+    /// the caller reads the session and the role again and calls again.
+    pub fn settle(&self, project: &Id, role: ProjectRole) -> bool {
+        let mut registry = lock(&self.hub.inner.registry);
+        let Some(entry) = registry.entries.get_mut(&self.conn) else {
+            return false;
+        };
+        if std::mem::take(&mut entry.recheck) {
+            return false;
+        }
+        entry.settled = Some((project.clone(), role));
+        true
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut registry = lock(&self.hub.inner.registry);
+        if let Some(entry) = registry.entries.remove(&self.conn)
+            && let Some(n) = registry.per_user.get_mut(&entry.user)
+        {
+            *n -= 1;
+            if *n == 0 {
+                registry.per_user.remove(&entry.user);
+            }
+        }
+    }
 }
 
 impl Hub {
@@ -81,19 +201,33 @@ impl Hub {
         calls.push(call);
     }
 
-    /// The drop and close calls made so far, as `drop_account <user>`, `drop_user <user> <org>` and
-    /// `close_document <doc>` (for tests).
+    /// The drop and close calls made so far, as `drop_account <user>`, `drop_session`,
+    /// `drop_user <user> <org>` and `close_document <doc>` (for tests).
     #[doc(hidden)]
     pub fn recorded(&self) -> Vec<String> {
         lock(&self.inner.calls).clone()
     }
 
-    /// The room of `doc` if it is open.
+    /// The room of `doc` if it is open (and not unloading).
     pub fn loaded(&self, doc: &str) -> Option<RoomHandle> {
         lock(&self.inner.rooms)
             .get(doc)
-            .filter(|r| !r.is_closed())
+            .filter(|r| !r.is_closed() && !r.is_unloading())
             .cloned()
+    }
+
+    /// The room of `doc` if it is open, after waiting for one that is unloading to end.
+    async fn current(&self, doc: &str) -> Option<RoomHandle> {
+        loop {
+            let room = lock(&self.inner.rooms).get(doc).cloned()?;
+            if room.is_closed() {
+                return None;
+            }
+            if !room.is_unloading() {
+                return Some(room);
+            }
+            room.ended().await;
+        }
     }
 
     /// The room of `doc`, loading it if it is not open: the document (which must exist and not be
@@ -102,7 +236,7 @@ impl Hub {
         if self.inner.closing.load(Ordering::SeqCst) {
             return Err(OpenError::ShuttingDown);
         }
-        if let Some(room) = self.loaded(doc) {
+        if let Some(room) = self.current(doc).await {
             return Ok(room);
         }
         let gate = lock(&self.inner.gates)
@@ -111,7 +245,7 @@ impl Hub {
             .clone();
         let opened = {
             let _held = gate.lock().await;
-            match self.loaded(doc) {
+            match self.current(doc).await {
                 Some(room) => Ok(room),
                 None if self.inner.closing.load(Ordering::SeqCst) => Err(OpenError::ShuttingDown),
                 None => match load(state, doc).await {
@@ -126,6 +260,7 @@ impl Hub {
                             !closing
                         };
                         if kept {
+                            self.ensure_sweeper(state.settings.sweep_interval);
                             Ok(room)
                         } else {
                             // Shutdown began while it loaded: it closes at once, unseen.
@@ -148,8 +283,8 @@ impl Hub {
         opened
     }
 
-    /// Takes the room `id` of `doc` out of the hub (a room unloading itself); a newer room of the
-    /// same document is left alone.
+    /// Takes the room `id` of `doc` out of the hub (a room ending); a newer room of the same
+    /// document is left alone.
     pub(crate) fn forget(&self, doc: &str, id: u64) {
         let mut rooms = lock(&self.inner.rooms);
         if rooms.get(doc).is_some_and(|r| r.id() == id) {
@@ -157,23 +292,171 @@ impl Hub {
         }
     }
 
-    /// Closes every connection of an account that no longer exists or may no longer sign in.
+    // ------------------------------------------------------------------ connections
+
+    /// Registers a document connection whose session is known (see the module documentation).
+    /// Refused when the account has `max` connections already, or the server is shutting down.
+    pub fn register(
+        &self,
+        conn: ConnId,
+        user: &Id,
+        doc: &Id,
+        token_hash: &str,
+        outbox: Arc<Outbox>,
+        max: usize,
+    ) -> Result<Registration, RegisterError> {
+        if self.inner.closing.load(Ordering::SeqCst) {
+            return Err(RegisterError::ShuttingDown);
+        }
+        let mut registry = lock(&self.inner.registry);
+        let n = registry.per_user.entry(user.clone()).or_default();
+        if *n >= max {
+            if *n == 0 {
+                registry.per_user.remove(user);
+            }
+            return Err(RegisterError::TooMany);
+        }
+        *n += 1;
+        registry.entries.insert(
+            conn,
+            Entry {
+                user: user.clone(),
+                doc: doc.clone(),
+                token_hash: token_hash.to_owned(),
+                outbox,
+                settled: None,
+                recheck: false,
+            },
+        );
+        Ok(Registration {
+            hub: self.clone(),
+            conn,
+        })
+    }
+
+    /// How many document connections the account has registered.
+    pub fn connections_of(&self, user: &str) -> usize {
+        lock(&self.inner.registry)
+            .per_user
+            .get(user)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Open rooms and registered connections.
+    pub fn gauges(&self) -> Gauges {
+        Gauges {
+            rooms: lock(&self.inner.rooms).len(),
+            connections: lock(&self.inner.registry).entries.len(),
+        }
+    }
+
+    /// Closes the settled connections `pick` chooses with `code` and `reason`, and marks the
+    /// unsettled ones it chooses for a recheck. Answers how many were closed.
+    fn close_where(&self, code: u16, reason: &str, pick: impl Fn(&Entry) -> bool) -> usize {
+        let mut registry = lock(&self.inner.registry);
+        let mut closed = 0;
+        for entry in registry.entries.values_mut().filter(|e| pick(e)) {
+            if entry.settled.is_some() {
+                entry.outbox.close_now(code, reason);
+                closed += 1;
+            } else {
+                entry.recheck = true;
+            }
+        }
+        closed
+    }
+
+    /// Closes (4401) every connection of an account that no longer exists or may no longer sign
+    /// in, or whose sessions all ended (password changed or reset, signed out everywhere).
     pub async fn drop_account(&self, user: &Id) {
         self.record(format!("drop_account {user}"));
+        let n = self.close_where(close::SIGN_IN, "sign in again", |e| e.user == *user);
+        metrics::dropped(DropCause::Account, n);
     }
 
-    /// Closes the connections a user has to an organisation's documents after their role changed.
-    pub async fn drop_user(&self, user: &Id, org: &Id) {
+    /// Closes (4401) every connection made with the session of this token hash (it was ended).
+    pub async fn drop_session(&self, token_hash: &str) {
+        self.record("drop_session".to_owned());
+        let n = self.close_where(close::SIGN_IN, "sign in again", |e| {
+            e.token_hash == token_hash
+        });
+        metrics::dropped(DropCause::Session, n);
+    }
+
+    /// After a user's role in an organisation or one of its projects changed: reads the role of
+    /// each of their connections to the organisation's documents again, and closes (4403) those
+    /// whose role went or is not the one they joined with. Connections whose role did not change
+    /// stay. If the role cannot be read, the connection is closed.
+    pub async fn drop_user(&self, store: &dyn Store, user: &Id, org: &Id) {
         self.record(format!("drop_user {user} {org}"));
+        let settled: Vec<(ConnId, Id, ProjectRole)> = {
+            let mut registry = lock(&self.inner.registry);
+            let mut out = Vec::new();
+            for (conn, entry) in registry.entries.iter_mut().filter(|(_, e)| e.user == *user) {
+                match &entry.settled {
+                    Some((project, role)) => out.push((*conn, project.clone(), *role)),
+                    None => entry.recheck = true,
+                }
+            }
+            out
+        };
+        // The role now, per project (read without holding the registry).
+        let mut now: HashMap<Id, Option<Option<ProjectRole>>> = HashMap::new();
+        for (_, project, _) in &settled {
+            if now.contains_key(project) {
+                continue;
+            }
+            let role = match store.project_by_id(project).await {
+                // Another organisation's project: not this change's concern.
+                Ok(Some(p)) if p.org_id != *org => None,
+                Ok(Some(p)) => Some(role_in_project(store, user, &p).await.unwrap_or_else(|e| {
+                    tracing::error!("could not read a role again, closing the connection: {e:?}");
+                    None
+                })),
+                Ok(None) => Some(None),
+                Err(e) => {
+                    tracing::error!("could not read a role again, closing the connection: {e:#}");
+                    Some(None)
+                }
+            };
+            now.insert(project.clone(), role);
+        }
+        let changed: Vec<ConnId> = settled
+            .into_iter()
+            .filter(|(_, project, role)| {
+                now.get(project)
+                    .is_some_and(|r| r.is_some_and(|r| r != Some(*role)))
+            })
+            .map(|(conn, _, _)| conn)
+            .collect();
+        let n = {
+            let registry = lock(&self.inner.registry);
+            let mut n = 0;
+            for conn in &changed {
+                if let Some(entry) = registry.entries.get(conn) {
+                    entry
+                        .outbox
+                        .close_now(close::ACCESS_CHANGED, "your access changed");
+                    n += 1;
+                }
+            }
+            n
+        };
+        metrics::dropped(DropCause::Access, n);
     }
 
-    /// Closes every connection to a document, telling the clients why (`GONE`), and unloads its
-    /// room without a snapshot (the document was deleted).
+    /// Closes every connection to a document (4404, telling the clients why) and unloads its room
+    /// without waiting for it and without a snapshot (the document was deleted: a later join is
+    /// refused because the document is gone).
     pub async fn close_document(&self, doc: &Id, reason: &str) {
         self.record(format!("close_document {doc}"));
+        let n = self.close_where(close::GONE, reason, |e| e.doc == *doc);
+        metrics::dropped(DropCause::Document, n);
         let room = lock(&self.inner.rooms).remove(doc);
         if let Some(room) = room {
-            room.close(close::GONE, reason, false).await;
+            let reason = reason.to_owned();
+            tokio::spawn(async move { room.close(close::GONE, &reason, false).await });
         }
     }
 
@@ -193,11 +476,57 @@ impl Hub {
             .map_or_else(|| (Vec::new(), 0), |room| room.online())
     }
 
-    /// Closes every room: each waits briefly for the journal's answers to changes in flight, closes
-    /// its connections with `GOING_AWAY` and writes a final snapshot if it has new changes. No room
-    /// opens afterwards.
+    // ------------------------------------------------------------------ sweeper
+
+    /// Starts the sweeper unless it runs already. It holds the hub weakly: it stops when the hub
+    /// is gone or shutting down.
+    fn ensure_sweeper(&self, every: f64) {
+        let mut sweeper = lock(&self.inner.sweeper);
+        if sweeper.is_some() {
+            return;
+        }
+        let hub: Weak<Inner> = Arc::downgrade(&self.inner);
+        let every = Duration::from_secs_f64(every.max(0.001));
+        *sweeper = Some(tokio::spawn(async move {
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let Some(inner) = hub.upgrade() else {
+                    return;
+                };
+                if inner.closing.load(Ordering::SeqCst) {
+                    return;
+                }
+                Hub { inner }.sweep();
+            }
+        }));
+    }
+
+    /// One round of the sweeper: asks every open room to sweep and unload itself if it may,
+    /// without waiting for any. Answers how many rooms were asked (a room that could not be asked,
+    /// its queue full or its last sweep not yet taken, is skipped this round).
+    pub fn sweep(&self) -> usize {
+        let rooms: Vec<RoomHandle> = lock(&self.inner.rooms).values().cloned().collect();
+        rooms.iter().filter(|r| r.sweep()).count()
+    }
+
+    // ------------------------------------------------------------------ shutdown
+
+    /// Whether the hub is shutting down (no new rooms, no new connections).
+    pub fn is_closing(&self) -> bool {
+        self.inner.closing.load(Ordering::SeqCst)
+    }
+
+    /// Closes every room: each stops taking frames, waits briefly for the journal's answers to
+    /// changes in flight, closes its connections with `GOING_AWAY` and writes a final snapshot if
+    /// it has new changes. No room opens and no connection registers afterwards. Calling it again
+    /// does nothing more.
     pub async fn shutdown(&self) {
         self.inner.closing.store(true, Ordering::SeqCst);
+        if let Some(task) = lock(&self.inner.sweeper).take() {
+            task.abort();
+        }
         let rooms: Vec<RoomHandle> = lock(&self.inner.rooms).drain().map(|(_, r)| r).collect();
         let closing = rooms
             .iter()

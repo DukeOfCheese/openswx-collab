@@ -117,6 +117,10 @@ impl Room {
             req.outbox.close(close::MOVED, "reconnect");
             return;
         }
+        if req.outbox.is_closed() {
+            // Closed on its way here (its access ended): it never joins.
+            return;
+        }
         // Dead locks go before anyone's are taken up again (or handed to a replacement).
         self.expire_locks();
         if let Some(old) = self.by_client.get(&req.client).copied() {
@@ -171,7 +175,10 @@ impl Room {
             live_rate: Bucket::default(),
             lock_rate: Bucket::default(),
             joined: self.next_join,
+            expires: req.session_expires,
         };
+        self.next_expiry = self.next_expiry.min(req.session_expires);
+        self.idle_since = None;
         self.next_join += 1;
         let you = conn.peer();
         let mut others: Vec<&Conn> = self.conns.values().collect();
@@ -241,6 +248,9 @@ impl Room {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
+        if self.conns.is_empty() {
+            self.idle_since = Some(self.state.clock.now());
+        }
         let registered = self.by_client.get(&c.client) == Some(&conn);
         if registered {
             self.by_client.remove(&c.client);

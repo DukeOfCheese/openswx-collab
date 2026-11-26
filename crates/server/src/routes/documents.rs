@@ -363,16 +363,16 @@ async fn create(
             role
         }
     };
-    emit(
-        &state.ext,
-        Event::DocumentCreated {
-            org: org_id,
-            project: project_id,
-            document: document.id.clone(),
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::DocumentCreated {
+        org: org_id,
+        project: project_id,
+        document: document.id.clone(),
+        by: user.id,
+    };
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move { emit(&ext, event).await })
+        .await;
     Ok((StatusCode::CREATED, ApiJson(doc_out(&document, Some(role)))))
 }
 
@@ -534,31 +534,32 @@ async fn patch_document(
         doc.folder_id.clone_from(folder);
     }
     tx.commit().await?;
+    let mut events = Vec::new();
     if name.is_some() {
-        emit(
-            &state.ext,
-            Event::DocumentRenamed {
-                org: project.org_id.clone(),
-                project: project.id.clone(),
-                document: doc.id.clone(),
-                by: user.id.clone(),
-            },
-        )
-        .await;
+        events.push(Event::DocumentRenamed {
+            org: project.org_id.clone(),
+            project: project.id.clone(),
+            document: doc.id.clone(),
+            by: user.id.clone(),
+        });
     }
     if body.folder_id.is_some() {
-        emit(
-            &state.ext,
-            Event::DocumentMoved {
-                org: project.org_id.clone(),
-                project: project.id.clone(),
-                document: doc.id.clone(),
-                folder: doc.folder_id.clone(),
-                by: user.id.clone(),
-            },
-        )
-        .await;
+        events.push(Event::DocumentMoved {
+            org: project.org_id.clone(),
+            project: project.id.clone(),
+            document: doc.id.clone(),
+            folder: doc.folder_id.clone(),
+            by: user.id.clone(),
+        });
     }
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move {
+            for event in events {
+                emit(&ext, event).await;
+            }
+        })
+        .await;
     Ok(ApiJson(doc_out(&doc, Some(role))))
 }
 
@@ -586,20 +587,22 @@ async fn delete_document(
     // open], "in_projects_you_cannot_open": n}` when assemblies that are not deleted use it
     // (rolling back).
     tx.commit().await?;
+    let after = state.clone();
     state
-        .hub
-        .close_document(&doc.id, "the document was deleted")
+        .after_commit(async move {
+            after
+                .hub
+                .close_document(&doc.id, "the document was deleted")
+                .await;
+            let event = Event::DocumentDeleted {
+                org: project.org_id,
+                project: project.id,
+                document: doc.id,
+                by: user.id,
+            };
+            emit(&after.ext, event).await;
+        })
         .await;
-    emit(
-        &state.ext,
-        Event::DocumentDeleted {
-            org: project.org_id,
-            project: project.id,
-            document: doc.id,
-            by: user.id,
-        },
-    )
-    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

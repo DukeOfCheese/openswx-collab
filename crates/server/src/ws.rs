@@ -19,6 +19,7 @@
 //! | the first frame is late, text, not a hello, or malformed | `bad_hello` | 4400 |
 //! | `protocol` is not [`PROTOCOL_VERSION`] | `protocol` | 4426 |
 //! | the token is not a live session | `unauthorized` | 4401 |
+//! | the account has `max_connections_per_user` document connections open already | `too_many_connections` | 4429 |
 //! | the document is missing or deleted, or the account has no role in its project | `not_found` | 4404 |
 //! | the server is stopping | `shutting_down` | 1001 |
 //! | the server failed | `server_error` | 1011 |
@@ -27,6 +28,10 @@
 //! connection's client id is `<user id>.<client id of the hello>`; a second connection with the same
 //! one replaces the first (4409). After the welcome, a text frame or a malformed one is answered with
 //! `error` (`bad_message`) and the connection kept; a second hello is ignored.
+//!
+//! From the session check on, the connection is registered with the hub ([`crate::hub`]), which
+//! closes it when its access ends; if that happens while its role is being read, the session and
+//! the role are read again.
 
 use std::time::Duration;
 
@@ -41,9 +46,9 @@ use std::sync::Arc;
 
 use crate::access::project_role;
 use crate::error::ApiPath;
-use crate::hub::OpenError;
+use crate::hub::{OpenError, RegisterError};
 use crate::room::conn::{self, Outbox, error_frame};
-use crate::room::{JoinRequest, close};
+use crate::room::{JoinError, JoinRequest, close};
 use crate::security::{ProjectRole, token_hash};
 use crate::state::AppState;
 
@@ -53,6 +58,8 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const JOIN_TRIES: usize = 3;
 /// How many of a client's latest change ids a join loads into the room's memory.
 const RECENT_IDS: i64 = 1000;
+/// How many times the session and role are read when drops keep coming during the handshake.
+const SETTLE_TRIES: usize = 3;
 /// The longest close reason sent.
 const MAX_REASON: usize = 120;
 
@@ -142,21 +149,45 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     let server_error = |e: anyhow::Error| {
         tracing::error!("a document connection failed: {e:#}");
     };
-    let user_id = match state
+    let hash = token_hash(&token);
+    drop(token);
+    let session = match state
         .sessions
-        .get(state.store.as_ref(), &token_hash(&token), state.clock.now())
+        .session(state.store.as_ref(), &hash, state.clock.now())
         .await
     {
-        Ok(Some(id)) => id,
+        Ok(Some(session)) => session,
         Ok(None) => return refuse(socket, "unauthorized", "sign in again", close::SIGN_IN).await,
         Err(e) => {
             server_error(e);
             return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
         }
     };
-    drop(token);
+    let user_id = session.user_id.clone();
+    let mut session_expires = session.expires_at;
+    let outbox = Outbox::new(4 * state.settings.max_change_bytes);
+    let conn = conn::next_id();
+    let registration = match state.hub.register(
+        conn,
+        &user_id,
+        &document_id,
+        &hash,
+        outbox.clone(),
+        state.settings.max_connections_per_user,
+    ) {
+        Ok(registration) => registration,
+        Err(RegisterError::TooMany) => {
+            crate::metrics::connection_refused();
+            let message = "too many connections";
+            return refuse(socket, "too_many_connections", message, close::TOO_MANY).await;
+        }
+        Err(RegisterError::ShuttingDown) => {
+            let message = "the server is shutting down";
+            return refuse(socket, "shutting_down", message, close::GOING_AWAY).await;
+        }
+    };
     let not_found = "no such document";
-    let found = async {
+    let found = || async {
         let Some(doc) = state
             .store
             .document_by_id(&document_id)
@@ -174,22 +205,56 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
             .await?
             .map(|u| u.name)
             .unwrap_or_default();
-        Ok(role.map(|role| (role, name)))
+        Ok(role.map(|role| (role, name, doc.project_id)))
     };
-    let (role, name) = match found.await {
-        Ok(Some(found)) => found,
-        Ok(None) => return refuse(socket, "not_found", not_found, close::GONE).await,
-        Err(e) => {
-            server_error(e);
-            return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
+    let mut settled = None;
+    for attempt in 0..SETTLE_TRIES {
+        if attempt > 0 {
+            // A drop concerned this connection while its role was read: is the session still
+            // live?
+            match state
+                .sessions
+                .session(state.store.as_ref(), &hash, state.clock.now())
+                .await
+            {
+                Ok(Some(s)) if s.user_id == user_id => session_expires = s.expires_at,
+                Ok(_) => {
+                    drop(registration);
+                    return refuse(socket, "unauthorized", "sign in again", close::SIGN_IN).await;
+                }
+                Err(e) => {
+                    server_error(e);
+                    drop(registration);
+                    return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
+                }
+            }
         }
+        match found().await {
+            Ok(Some((role, name, project))) => {
+                if registration.settle(&project, role) {
+                    settled = Some((role, name));
+                    break;
+                }
+            }
+            Ok(None) => {
+                drop(registration);
+                return refuse(socket, "not_found", not_found, close::GONE).await;
+            }
+            Err(e) => {
+                server_error(e);
+                drop(registration);
+                return refuse(socket, "server_error", "try again", close::SERVER_ERROR).await;
+            }
+        }
+    }
+    let Some((role, name)) = settled else {
+        drop(registration);
+        return refuse(socket, "busy", "try again", close::TOO_SLOW).await;
     };
 
     let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
     let (sink, stream) = socket.split();
-    let outbox = Outbox::new(4 * state.settings.max_change_bytes);
     tokio::spawn(conn::write(sink, outbox.clone()));
-    let conn = conn::next_id();
     let heard = conn::Heard::new(state.clock.clone());
     let mut request = JoinRequest {
         conn,
@@ -204,6 +269,7 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
         recent_ids: Vec::new(),
         ids_complete: false,
         room: 0,
+        session_expires,
     };
     let mut joined = None;
     for _ in 0..JOIN_TRIES {
@@ -211,16 +277,19 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
             Ok(room) => room,
             Err(OpenError::NoDocument) => {
                 send_refusal(&outbox, "not_found", not_found, close::GONE);
+                drop(registration);
                 return drain(stream).await;
             }
             Err(OpenError::ShuttingDown) => {
                 let message = "the server is shutting down";
                 send_refusal(&outbox, "shutting_down", message, close::GOING_AWAY);
+                drop(registration);
                 return drain(stream).await;
             }
             Err(OpenError::Failed(e)) => {
                 server_error(e);
                 send_refusal(&outbox, "server_error", "try again", close::SERVER_ERROR);
+                drop(registration);
                 return drain(stream).await;
             }
         };
@@ -244,6 +313,7 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
                 Err(e) => {
                     server_error(e);
                     send_refusal(&outbox, "server_error", "try again", close::SERVER_ERROR);
+                    drop(registration);
                     return drain(stream).await;
                 }
             }
@@ -254,15 +324,22 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
                 joined = Some(room);
                 break;
             }
-            // The room unloaded at that moment: open it again.
-            Err(back) => request = *back,
+            // The room was ending at that moment: open it again.
+            Err(JoinError::Gone(back)) => request = *back,
+            Err(JoinError::Lost) => {
+                outbox.close(close::MOVED, "reconnect");
+                drop(registration);
+                return drain(stream).await;
+            }
         }
     }
     let Some(room) = joined else {
         send_refusal(&outbox, "busy", "try again", close::TOO_SLOW);
+        drop(registration);
         return drain(stream).await;
     };
     conn::read(stream, conn, outbox, heard, room, max).await;
+    drop(registration);
 }
 
 /// An `error` and a close, through a connection's queue (whose writer is already running).

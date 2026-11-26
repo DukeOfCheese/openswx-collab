@@ -88,15 +88,15 @@ async fn create_project(
     })
     .await?;
     tx.commit().await?;
-    emit(
-        &state.ext,
-        Event::ProjectCreated {
-            org: org_id.clone(),
-            project: project.id.clone(),
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::ProjectCreated {
+        org: org_id.clone(),
+        project: project.id.clone(),
+        by: user.id,
+    };
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move { emit(&ext, event).await })
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(json!({"id": project.id, "name": project.name, "org_id": org_id, "role": "owner"})),
@@ -121,15 +121,15 @@ async fn rename_project(
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     tx.set_project_name(&project.id, &name).await?;
     tx.commit().await?;
-    emit(
-        &state.ext,
-        Event::ProjectRenamed {
-            org: project.org_id.clone(),
-            project: project.id.clone(),
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::ProjectRenamed {
+        org: project.org_id.clone(),
+        project: project.id.clone(),
+        by: user.id,
+    };
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move { emit(&ext, event).await })
+        .await;
     Ok(Json(
         json!({"id": project.id, "name": name, "org_id": project.org_id}),
     ))
@@ -160,21 +160,23 @@ async fn delete_project(
     // (`{"message", "assemblies" the caller can open, "in_projects_you_cannot_open"}`).
     tx.delete_project(&project.id).await?;
     tx.commit().await?;
-    for document in &documents {
-        state
-            .hub
-            .close_document(document, "the project was deleted")
-            .await;
-    }
-    emit(
-        &state.ext,
-        Event::ProjectDeleted {
-            org: project.org_id,
-            project: project.id,
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::ProjectDeleted {
+        org: project.org_id,
+        project: project.id,
+        by: user.id,
+    };
+    let after = state.clone();
+    state
+        .after_commit(async move {
+            for document in &documents {
+                after
+                    .hub
+                    .close_document(document, "the project was deleted")
+                    .await;
+            }
+            emit(&after.ext, event).await;
+        })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -244,18 +246,23 @@ async fn set_member(
         .await?;
     }
     tx.commit().await?;
-    state.hub.drop_user(&user_id, &project.org_id).await;
-    emit(
-        &state.ext,
-        Event::ProjectMemberSet {
-            org: project.org_id,
-            project: project.id,
-            user: user_id.clone(),
-            role: role.as_str(),
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::ProjectMemberSet {
+        org: project.org_id.clone(),
+        project: project.id,
+        user: user_id.clone(),
+        role: role.as_str(),
+        by: user.id,
+    };
+    let (after, member, org) = (state.clone(), user_id.clone(), project.org_id);
+    state
+        .after_commit(async move {
+            after
+                .hub
+                .drop_user(after.store.as_ref(), &member, &org)
+                .await;
+            emit(&after.ext, event).await;
+        })
+        .await;
     Ok(Json(json!({"user_id": user_id, "role": role.as_str()})))
 }
 
@@ -278,16 +285,21 @@ async fn remove_member(
         return Err(ApiError::NotFound("not a member of the project"));
     }
     tx.commit().await?;
-    state.hub.drop_user(&user_id, &project.org_id).await;
-    emit(
-        &state.ext,
-        Event::ProjectMemberRemoved {
-            org: project.org_id,
-            project: project.id,
-            user: user_id,
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::ProjectMemberRemoved {
+        org: project.org_id.clone(),
+        project: project.id,
+        user: user_id.clone(),
+        by: user.id,
+    };
+    let (after, org) = (state.clone(), project.org_id);
+    state
+        .after_commit(async move {
+            after
+                .hub
+                .drop_user(after.store.as_ref(), &user_id, &org)
+                .await;
+            emit(&after.ext, event).await;
+        })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }

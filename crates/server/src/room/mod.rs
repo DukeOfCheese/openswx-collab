@@ -36,7 +36,18 @@
 //! See the `locks` module (advisory leases on paths that also stop other clients' changes) and the
 //! `presence` module (pointers, selections and drafts relayed at once, never stored; the online
 //! list the document list reads without asking the room). The room ticks every
-//! `sweep_interval` seconds while it is loaded; a tick expires locks.
+//! `sweep_interval` seconds while it is loaded; a tick expires locks, retries a snapshot it owes
+//! and closes connections whose session has expired (4401).
+//!
+//! # Leaving
+//!
+//! The hub closes connections whose access ended straight through their [`Outbox`] (whatever the
+//! room is busy with); the room processes no frame of a connection whose outbox is closed, and
+//! removes it when its reader reports it gone. The hub's sweeper asks each room
+//! ([`RoomCmd::Sweep`]) whether it may unload: a room with no connections, no locks, nothing in
+//! flight and idle for `room_idle` seconds writes a final snapshot (if it has changes since the
+//! last), leaves the hub, and ends. A join that reaches a room which has begun to end is handed
+//! back to the joiner, which opens the document again.
 
 mod change;
 pub mod conn;
@@ -87,7 +98,8 @@ pub mod close {
     pub const BAD_HELLO: u16 = 4400;
     /// The session is not valid: sign in again.
     pub const SIGN_IN: u16 = 4401;
-    /// The account's access to the document changed (Task 12).
+    /// The account's access to the document changed (its role in the project went or is no
+    /// longer the one it connected with): reconnect to get the new one.
     pub const ACCESS_CHANGED: u16 = 4403;
     /// The document does not exist, or no longer does, or is not yours to open.
     pub const GONE: u16 = 4404;
@@ -97,6 +109,10 @@ pub mod close {
     pub const REPLACED: u16 = 4409;
     /// The document moved or was reloaded: reconnect (and resend what was not acknowledged).
     pub const MOVED: u16 = 4410;
+    /// The account has as many document connections open as it may
+    /// (`max_connections_per_user`): close one first. Not 4408 (`TOO_SLOW`), which a client
+    /// answers by reconnecting at once; reconnecting does not help here.
+    pub const TOO_MANY: u16 = 4429;
     /// The client speaks another protocol version.
     pub const PROTOCOL: u16 = 4426;
 }
@@ -136,6 +152,115 @@ pub struct Hooks {
     /// The most stored operation bytes one page of history, or one catch-up in a welcome, carries
     /// ([`PAGE_BYTES`]).
     pub page_bytes: u64,
+    /// Rooms of the documents named here stop dead when the hub's sweeper reaches them, until
+    /// released (a room that does not answer).
+    pub stall: Arc<Stall>,
+    /// Shut: the steps after a REST commit ([`crate::state::AppState::after_commit`]) wait here
+    /// before they start (so that a test can drop the request meanwhile).
+    pub after_commit: Arc<Gate>,
+}
+
+/// A gate tests shut to hold work at a point and open to let it go on.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct Gate {
+    shut: std::sync::atomic::AtomicBool,
+    waiting: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl Gate {
+    /// From now on, whoever reaches the gate waits.
+    pub fn shut(&self) {
+        self.shut.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets everyone through, now and later.
+    pub fn open(&self) {
+        self.shut.store(false, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    /// Waits while the gate is shut.
+    pub async fn pass(&self) {
+        if !self.shut.load(Ordering::SeqCst) {
+            return;
+        }
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.shut.load(Ordering::SeqCst) {
+                break;
+            }
+            changed.await;
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// How many wait at the gate.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
+    /// Waits until at least `n` wait at the gate.
+    pub async fn until_waiting(&self, n: usize) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.waiting() >= n {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// Rooms tests stop dead (see [`Hooks::stall`]).
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct Stall {
+    docs: Mutex<std::collections::HashSet<String>>,
+    gate: Gate,
+}
+
+impl Stall {
+    /// The room of `doc` stops at its next sweep by the hub, until [`Stall::release`].
+    pub fn stall(&self, doc: &str) {
+        self.gate.shut();
+        self.docs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(doc.to_owned());
+    }
+
+    /// Every stopped room goes on.
+    pub fn release(&self) {
+        self.docs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.gate.open();
+    }
+
+    /// Waits until `n` rooms are stopped.
+    pub async fn until_stopped(&self, n: usize) {
+        self.gate.until_waiting(n).await;
+    }
+
+    async fn hold(&self, doc: &str) {
+        let stalled = self
+            .docs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(doc);
+        if stalled {
+            self.gate.pass().await;
+        }
+    }
 }
 
 /// The most stored operation bytes (the journal's `ops` column) one history page or one welcome's
@@ -157,6 +282,8 @@ impl Default for Hooks {
             index_keep: INDEX_KEEP,
             max_remembered: MAX_REMEMBERED,
             page_bytes: PAGE_BYTES,
+            stall: Arc::default(),
+            after_commit: Arc::default(),
         }
     }
 }
@@ -268,11 +395,30 @@ pub struct JoinRequest {
     /// The room (`RoomHandle::id`) whose lease was held when `recent_ids` were read; another room
     /// refuses the join (the client reconnects and they are read again).
     pub room: u64,
+    /// When the session the connection signed in with expires (the room closes it then, 4401).
+    pub session_expires: f64,
+}
+
+/// What became of a join a room was sent.
+pub enum JoinAnswer {
+    /// The room took it (and either registered the connection or closed it).
+    Taken,
+    /// The room had begun to end: open the document again.
+    Bounced(Box<JoinRequest>),
+}
+
+/// Why [`RoomHandle::join`] did not join.
+pub enum JoinError {
+    /// The room is gone or ending: here is the request back, to try another.
+    Gone(Box<JoinRequest>),
+    /// The room ended without answering (it failed): the connection should reconnect.
+    Lost,
 }
 
 /// A command for a room.
 pub enum RoomCmd {
-    Join(Box<JoinRequest>),
+    /// A join, and where to say what became of it.
+    Join(Box<JoinRequest>, Option<oneshot::Sender<JoinAnswer>>),
     /// The connection's reader stopped: the client went away.
     Leave(ConnId),
     /// A decoded message from a connection; `size` is the frame's length in bytes.
@@ -291,9 +437,13 @@ pub enum RoomCmd {
     ServerChange(Box<ServerChange>),
     /// A message for every connection (`version.created`, and `reference.update` from Task 13).
     Notify(Box<ServerMsg>),
-    /// A sweep, as the room's own timer makes every `sweep_interval` seconds: locks expire, and a
-    /// snapshot still owed (one that failed) is tried again (TASK 12: idle checks hang off it too).
+    /// A sweep, as the room's own timer makes every `sweep_interval` seconds: locks expire, a
+    /// snapshot still owed (one that failed) is tried again, and connections whose session expired
+    /// close.
     Tick,
+    /// The hub's sweeper: a tick, then the room unloads itself if it may (see the module
+    /// documentation).
+    Sweep,
     /// Stop: wait (briefly) for the journal's answers to changes in flight, close every connection
     /// with `code`, write a final snapshot if `snapshot` and there is anything new, then answer
     /// `done`.
@@ -326,6 +476,10 @@ struct Shared {
     /// Locks held, and how many of those are detached.
     locks: AtomicUsize,
     detached: AtomicUsize,
+    /// The room has begun to unload because it was idle: the hub opens no join into it.
+    unloading: std::sync::atomic::AtomicBool,
+    /// A [`RoomCmd::Sweep`] waits in its queue (the sweeper sends no second one).
+    sweep_queued: std::sync::atomic::AtomicBool,
 }
 
 /// How the rest of the server reaches a room. Cloning is cheap.
@@ -361,15 +515,45 @@ impl RoomHandle {
         channel.send(cmd).await.map_err(|e| Box::new(e.0))
     }
 
-    /// Asks the room to take a connection. The request comes back if the room is gone.
-    pub async fn join(&self, req: JoinRequest) -> Result<(), Box<JoinRequest>> {
-        match self.send(RoomCmd::Join(Box::new(req))).await {
-            Ok(()) => Ok(()),
-            Err(cmd) => match *cmd {
-                RoomCmd::Join(req) => Err(req),
+    /// Whether the room has begun to unload (idle): it takes no more joins.
+    pub fn is_unloading(&self) -> bool {
+        self.shared.unloading.load(Ordering::SeqCst)
+    }
+
+    /// Waits until the room's task has ended (or no longer takes commands).
+    pub async fn ended(&self) {
+        self.control.closed().await;
+    }
+
+    /// Asks the room to take a connection, and waits until it has (or has closed it). The request
+    /// comes back if the room is gone or ending.
+    pub async fn join(&self, req: JoinRequest) -> Result<(), JoinError> {
+        let (answer, answered) = oneshot::channel();
+        if let Err(cmd) = self.send(RoomCmd::Join(Box::new(req), Some(answer))).await {
+            return match *cmd {
+                RoomCmd::Join(req, _) => Err(JoinError::Gone(req)),
                 _ => unreachable!("send hands back what it was given"),
-            },
+            };
         }
+        match answered.await {
+            Ok(JoinAnswer::Taken) => Ok(()),
+            Ok(JoinAnswer::Bounced(req)) => Err(JoinError::Gone(req)),
+            Err(_) => Err(JoinError::Lost),
+        }
+    }
+
+    /// The hub's sweeper: asks the room, without waiting, to sweep and unload itself if it may.
+    /// Answers false when the room could not be asked this time (gone, its queue full, or a sweep
+    /// already waiting in it).
+    pub fn sweep(&self) -> bool {
+        if self.shared.sweep_queued.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if self.control.try_send(RoomCmd::Sweep).is_err() {
+            self.shared.sweep_queued.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
     }
 
     pub(crate) async fn frame(
@@ -585,6 +769,8 @@ struct Conn {
     lock_rate: presence::Bucket,
     /// When it joined the room, in join order.
     joined: u64,
+    /// When its session expires (clock seconds).
+    expires: f64,
 }
 
 impl Conn {
@@ -627,6 +813,9 @@ struct Closing {
     code: u16,
     reason: String,
     snapshot: bool,
+    /// Unloading because idle: the final snapshot is written while the room is still in the hub
+    /// (which keeps joiners waiting for it to end), and it leaves the hub only after.
+    idle: bool,
     done: Vec<oneshot::Sender<()>>,
     /// Stop waiting for the journal then.
     deadline: Instant,
@@ -684,11 +873,38 @@ struct Room {
     rebuilds: rebuild::Rebuilds,
     /// Undos whose target's seq is being checked (a journal duplicate), by that change's ticket.
     undo_waiting: HashMap<change::Ticket, Vec<(ConnId, Arc<oswx_core::Change>, usize)>>,
+    /// Since when nobody has been connected (clock seconds); `None` while someone is.
+    idle_since: Option<f64>,
+    /// No connection's session expires before this (clock seconds).
+    next_expiry: f64,
+    /// The last snapshot attempt failed: further failures are not logged as warnings until one
+    /// succeeds (one warning per outage).
+    snapshot_failing: bool,
 }
 
 fn next_room_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// After a room has finished: nobody can send it anything any more, and what was sent but not
+/// taken is answered: joins go back to their joiners (who open the document again), a close is told
+/// it is done, and everything else is dropped (its sender sees the room gone).
+fn wind_up(control: &mut mpsc::Receiver<RoomCmd>, frames: &mut mpsc::Receiver<RoomCmd>) {
+    control.close();
+    frames.close();
+    while let Ok(cmd) = control.try_recv() {
+        match cmd {
+            RoomCmd::Join(req, Some(answer)) => {
+                let _ = answer.send(JoinAnswer::Bounced(req));
+            }
+            RoomCmd::Close { done, .. } => {
+                let _ = done.send(());
+            }
+            _ => {}
+        }
+    }
+    while frames.try_recv().is_ok() {}
 }
 
 /// Starts a room's task and answers its handle.
@@ -735,8 +951,12 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         undone: Bounded::default(),
         rebuilds: rebuild::Rebuilds::default(),
         undo_waiting: HashMap::new(),
+        idle_since: Some(state.clock.now()),
+        next_expiry: f64::INFINITY,
+        snapshot_failing: false,
         state,
     };
+    crate::metrics::room_loaded();
     tokio::spawn(room.run(control_rx, frames_rx, internal_rx));
     RoomHandle {
         id,
@@ -765,6 +985,11 @@ impl Room {
                 Some(event) = internal.recv() => self.on_internal(event),
                 _ = sweep.tick() => self.on_tick(),
                 cmd = control.recv(), if control_open => match cmd {
+                    Some(RoomCmd::Sweep) => {
+                        let hooks = self.state.room_hooks.clone();
+                        hooks.stall.hold(&self.doc).await;
+                        self.on_command(RoomCmd::Sweep);
+                    }
                     Some(cmd) => self.on_command(cmd),
                     // Nobody can reach the room any more (the hub is gone).
                     None => {
@@ -788,6 +1013,8 @@ impl Room {
                 .is_some_and(|c| self.pending.is_empty() || c.deadline <= Instant::now())
             {
                 self.finish().await;
+                wind_up(&mut control, &mut frames);
+                crate::metrics::room_unloaded();
                 return;
             }
         }
@@ -798,6 +1025,46 @@ impl Room {
     fn on_tick(&mut self) {
         self.sweep();
         self.maybe_snapshot();
+        self.close_expired_sessions();
+    }
+
+    /// The hub's sweep: a tick, or an unload if the room may (whose final snapshot then stands
+    /// for the snapshot a tick would try again).
+    fn on_sweep(&mut self) {
+        self.shared.sweep_queued.store(false, Ordering::SeqCst);
+        self.sweep();
+        self.close_expired_sessions();
+        if self.may_unload() {
+            self.begin_unload();
+        } else {
+            self.maybe_snapshot();
+        }
+    }
+
+    /// Closes (4401) the connections whose session has expired.
+    fn close_expired_sessions(&mut self) {
+        let now = self.state.clock.now();
+        if now < self.next_expiry {
+            return;
+        }
+        let expired: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.expires <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in &expired {
+            if let Some(c) = self.conns.get(conn) {
+                c.outbox.close_now(close::SIGN_IN, "sign in again");
+            }
+            self.remove_conn(*conn, None, true);
+        }
+        crate::metrics::dropped(crate::metrics::DropCause::Expired, expired.len());
+        self.next_expiry = self
+            .conns
+            .values()
+            .map(|c| c.expires)
+            .fold(f64::INFINITY, f64::min);
     }
 
     /// Whether the room takes the next frame now.
@@ -812,7 +1079,12 @@ impl Room {
 
     fn on_command(&mut self, cmd: RoomCmd) {
         match cmd {
-            RoomCmd::Join(req) => self.join(*req),
+            RoomCmd::Join(req, answer) => {
+                self.join(*req);
+                if let Some(answer) = answer {
+                    let _ = answer.send(JoinAnswer::Taken);
+                }
+            }
             RoomCmd::Leave(conn) => self.remove_conn(conn, None, true),
             RoomCmd::Frame { conn, msg, size } => {
                 self.on_frame(conn, change::Incoming::Msg(*msg, size));
@@ -822,12 +1094,19 @@ impl Room {
                 code,
                 message,
             } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
-            RoomCmd::ServerChange(sc) => self.on_server_change(*sc),
+            RoomCmd::ServerChange(sc) => {
+                // A room nobody is connected to is idle from its last change by REST.
+                if self.conns.is_empty() {
+                    self.idle_since = Some(self.state.clock.now());
+                }
+                self.on_server_change(*sc);
+            }
             RoomCmd::Notify(msg) => {
                 let frame = self.encode(&msg);
                 self.broadcast(&frame, &[]);
             }
             RoomCmd::Tick => self.on_tick(),
+            RoomCmd::Sweep => self.on_sweep(),
             RoomCmd::Close {
                 code,
                 reason,
@@ -858,6 +1137,7 @@ impl Room {
             Internal::LockNews(conn) => self.flush_lock_news(conn),
             Internal::Snapshot { seq, ok } => {
                 self.snapshot_task = None;
+                self.snapshot_failing = !ok;
                 if ok {
                     self.snapshot_seq = self.snapshot_seq.max(seq);
                     self.recent.trim();
@@ -898,6 +1178,9 @@ impl Room {
     // ------------------------------------------------------------------ frames
 
     fn on_frame(&mut self, conn: ConnId, incoming: change::Incoming) {
+        if self.conns.get(&conn).is_some_and(|c| c.outbox.is_closed()) {
+            return; // (closed: see `dispatch`)
+        }
         // Presence and drafts are not answered and wait for nothing: relayed now, whatever the
         // connection's other messages wait for.
         let incoming = match incoming {
@@ -978,6 +1261,11 @@ impl Room {
 
     /// What every message a client sends leads to. Later tasks add their messages here.
     fn dispatch(&mut self, conn: ConnId, incoming: change::Incoming) {
+        if self.conns.get(&conn).is_some_and(|c| c.outbox.is_closed()) {
+            // Closed (its access ended, or it broke a limit): nothing more of it is processed. Its
+            // reader reports it gone, and the room then removes it.
+            return;
+        }
         let (msg, size) = match incoming {
             change::Incoming::Msg(msg, size) => (msg, size),
             change::Incoming::Judge(change, size, reverts) => {
