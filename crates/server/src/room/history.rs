@@ -247,7 +247,7 @@ impl Room {
                 seq,
                 result,
             };
-            let _ = internal.send(Internal::Revert(lookup));
+            let _ = internal.send(Internal::Revert(Box::new(lookup)));
         });
     }
 

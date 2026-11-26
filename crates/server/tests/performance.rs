@@ -38,6 +38,58 @@ async fn a_broadcast_is_encoded_once_for_everyone() {
     assert_eq!(after - before, 2);
 }
 
+/// Presence in a busy room goes out once per tick, each peer's latest only and many peers to a
+/// frame, and nobody gets their own back. In a quiet room a presence goes out at once, as it came.
+#[tokio::test]
+async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut senders = Vec::new();
+    for _ in 0..4 {
+        senders.push(Live::connect(&server, &doc, &world.admin).await);
+    }
+    let mut watcher = Live::connect(&server, &doc, &world.admin).await;
+    for s in &mut senders {
+        s.drain().await;
+    }
+    watcher.drain().await;
+    senders[0].presence(json!({"n": -1})).await;
+    let first: Relayed = watcher.expect().await;
+    assert_eq!(first.data, Some(plain(json!({"n": -1}))));
+    assert_eq!(watcher.batches, 0, "alone, it goes as it came");
+    let before = server.room_status(&doc).await.encodes;
+    for n in 0..30 {
+        for s in &mut senders {
+            s.presence(json!({"n": n})).await;
+        }
+    }
+    let last = Some(plain(json!({"n": 29})));
+    let mut latest = std::collections::HashMap::new();
+    let mut relayed = 0;
+    while latest.len() < 4 || latest.values().any(|d| *d != last) {
+        let r: Relayed = watcher.expect().await;
+        relayed += 1;
+        latest.insert(r.client_id, r.data);
+    }
+    assert!(relayed < 60, "{relayed} relayed of 120 sent");
+    assert!(watcher.batches > 0, "several peers to a frame");
+    // Encoded once per frame for everyone, and once more for each sender in it (without itself).
+    let encodes = server.room_status(&doc).await.encodes - before;
+    assert!(encodes < 30, "{encodes} frames encoded");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for s in &mut senders {
+        let own = s.client_id.clone();
+        let seen = s.drain().await;
+        assert!(
+            seen.iter()
+                .all(|m| !matches!(m, ServerMsg::Presence { client_id, .. }
+                if **client_id == *own)),
+            "{own} got its own presence back"
+        );
+        assert!(seen.iter().any(|m| matches!(m, ServerMsg::Presence { .. })));
+    }
+}
+
 async fn upload(server: &TestServer, world: &World, body: &[u8]) -> String {
     let sha = hex::encode(Sha256::digest(body));
     let r = reqwest::Client::new()

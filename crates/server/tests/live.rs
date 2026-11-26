@@ -835,11 +835,26 @@ async fn the_61st_presence_in_a_second_is_dropped() {
         }
     }
     a.drain().await;
+    // (Relayed at the next tick, each kind's latest.)
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let got = relayed(&b.drain().await);
-    assert_eq!(got.len(), 60, "presence and drafts share the allowance");
-    assert_eq!(got[59].data, Some(plain(json!({"n": 59}))));
+    let last = |kind: &str| {
+        got.iter()
+            .rev()
+            .find(|r| r.kind == kind)
+            .unwrap()
+            .data
+            .clone()
+    };
+    assert_eq!(last("presence"), Some(plain(json!({"n": 58}))));
+    assert_eq!(last("draft"), Some(plain(json!({"n": 59}))));
+    assert!(
+        got.iter().all(|r| r.data != Some(plain(json!({"n": 60})))),
+        "presence and drafts share the allowance: the 61st is dropped"
+    );
     a.presence(json!({"n": "late"})).await;
     a.drain().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(relayed(&b.drain().await).is_empty());
     clock.advance(1.0);
     a.presence(json!({"n": "next second"})).await;
@@ -856,17 +871,27 @@ async fn a_presence_flood_is_dropped() {
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect(&server, &doc, &world.admin).await;
-    // Two hundred in each of two seconds: five a second get through.
+    // Two hundred in each of two seconds: five a second get through (and of those, each tick
+    // relays the latest).
+    let mut got = Vec::new();
     for second in 0..2 {
         for n in 0..200 {
             a.presence(json!({"n": [second, n]})).await;
         }
         a.drain().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        got.extend(relayed(&b.drain().await));
         clock.advance(1.0);
     }
-    let got = relayed(&b.drain().await);
-    assert_eq!(got.len(), 10);
-    assert_eq!(got[5].data, Some(plain(json!({"n": [1, 0]}))));
+    let allowed: Vec<_> = (0..2)
+        .flat_map(|s| (0..5).map(move |n| Some(plain(json!({"n": [s, n]})))))
+        .collect();
+    assert!(got.iter().all(|r| allowed.contains(&r.data)), "{got:?}");
+    assert_eq!(got.last().unwrap().data, Some(plain(json!({"n": [1, 4]}))));
+    assert!(
+        got.iter()
+            .any(|r| r.data == Some(plain(json!({"n": [0, 4]}))))
+    );
 }
 
 /// Waits for a presence of `who` at `live`, answering how long it took (panics after a second).

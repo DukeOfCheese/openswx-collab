@@ -466,6 +466,10 @@ pub struct Live {
     pub seen: Vec<ServerMsg>,
     /// How the server closed the socket, once it did: the close code (1006 for none) and reason.
     pub closed: Option<(u16, String)>,
+    /// `presence.batch` frames received (each is read as the messages it stands for).
+    pub batches: usize,
+    /// The messages of a `presence.batch` not read yet.
+    unfolded: std::collections::VecDeque<ServerMsg>,
     changes: u64,
     items: u64,
     tag: String,
@@ -559,6 +563,8 @@ impl Live {
                 seq,
                 seen: Vec::new(),
                 closed: None,
+                batches: 0,
+                unfolded: std::collections::VecDeque::new(),
                 changes: 0,
                 items: 0,
                 tag: random_client_id()[..6].to_owned(),
@@ -592,10 +598,28 @@ impl Live {
     /// The next message, or `None` if none comes within `wait` (or the socket closed: see
     /// [`Live::closed`]).
     pub async fn try_recv(&mut self, wait: Duration) -> Option<ServerMsg> {
+        if let Some(msg) = self.unfolded.pop_front() {
+            return Some(msg);
+        }
         if self.closed.is_some() {
             return None;
         }
         match next_frame(&mut self.ws, wait).await? {
+            // A batch is read as the `draft` and `presence` messages it stands for.
+            Ok(ServerMsg::PresenceBatch { presence, drafts }) => {
+                self.unfolded.extend(
+                    drafts
+                        .into_iter()
+                        .map(|(client_id, data)| ServerMsg::Draft { client_id, data })
+                        .chain(
+                            presence
+                                .into_iter()
+                                .map(|(client_id, data)| ServerMsg::Presence { client_id, data }),
+                        ),
+                );
+                self.batches += 1;
+                self.unfolded.pop_front()
+            }
             Ok(msg) => {
                 self.note(&msg);
                 Some(msg)

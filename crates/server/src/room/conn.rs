@@ -12,6 +12,14 @@
 //!   so one big frame is never too slow by itself, and what a socket can hold is that frame plus the
 //!   limit.
 //!
+//! Frames the client can do without, who is here (`peer.joined`, `peer.left`), `presence` and
+//! `draft`, are **soft** ([`Outbox::push_soft`]): they count for neither limit, and a connection
+//! with more than [`MAX_SOFT`] of them (or [`MAX_SOFT_BYTES`]) waiting falls behind on them instead
+//! of being closed. Soft frames are then dropped until it has written what it had and the room has
+//! sent it the peers as they are now (`peer.list`, [`Outbox::catch_up`]). A connection is only
+//! closed for what must arrive (answers, changes, locks); frames are written in the order they were
+//! queued, soft or not.
+//!
 //! The reader decodes frames (on the blocking pool when they are large) and hands messages to the
 //! room; malformed ones are answered in their turn through the room. Every frame read counts as
 //! hearing from the client ([`Heard`]: a connection silent for `lock_ttl` loses its locks). A
@@ -36,8 +44,16 @@ use tokio::sync::{Notify, watch};
 use super::{RoomHandle, close};
 use crate::clock::Clock;
 
-/// The most frames a connection may have waiting, the one being written included.
+/// The most frames a connection may have waiting, the one being written included (soft frames
+/// not counted).
 pub const MAX_QUEUED: usize = 2000;
+/// The most soft frames a connection may have waiting before it is behind on them.
+pub const MAX_SOFT: usize = 64;
+/// The most bytes of soft frames a connection may have waiting before it is behind on them (one
+/// frame of any size may always wait alone).
+pub const MAX_SOFT_BYTES: usize = 1024 * 1024;
+/// The most frames the writer hands the socket with one flush.
+const MAX_PER_WRITE: usize = 64;
 /// How long closing may wait for the last frames and the close frame to be written.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// After the server closed a connection, how long the reader keeps reading (and dropping) what the
@@ -104,13 +120,35 @@ pub enum Pushed {
     TooSlow,
 }
 
+/// What [`Outbox::push_soft`] did with a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Soft {
+    Queued,
+    /// The connection is closing or closed; the frame was dropped.
+    Closed,
+    /// The connection is behind on soft frames: this one was dropped, and so will every soft frame
+    /// be until [`Outbox::catch_up`] says it may catch up.
+    Behind,
+}
+
 #[derive(Debug)]
 struct State {
-    queue: VecDeque<Bytes>,
+    /// Frames that must arrive (answers, changes, locks), each with its place in the order of all
+    /// frames.
+    queue: VecDeque<(u64, Bytes)>,
     /// Bytes in `queue`.
     queued: usize,
-    /// The length of the frame the writer is sending, if any.
-    in_flight: Option<usize>,
+    /// Frames that may be dropped for a connection that does not keep up (who is here, presence
+    /// and drafts), in the same order as `queue`.
+    soft: VecDeque<(u64, Bytes)>,
+    /// Bytes in `soft`.
+    soft_queued: usize,
+    /// Soft frames were dropped: none is queued until the room has sent what replaces them.
+    behind: bool,
+    /// The place of the next frame queued.
+    next: u64,
+    /// The length of the frame the writer is sending, if any, and whether it is a soft one.
+    in_flight: Option<(usize, bool)>,
     /// The writer waits: the welcome, which must go first, is not ready yet.
     held: bool,
     /// The close frame to send once the queue is written (or at once, when aborting).
@@ -144,6 +182,11 @@ impl Outbox {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 queued: 0,
+                soft: VecDeque::new(),
+                soft_queued: 0,
+                behind: false,
+                // 0 is the welcome's, ahead of everything.
+                next: 1,
                 in_flight: None,
                 held: true,
                 close: None,
@@ -166,13 +209,15 @@ impl Outbox {
         if s.life != Life::Open {
             return Pushed::Closed;
         }
-        let waiting = s.queue.len() + usize::from(s.in_flight.is_some());
+        // Soft frames count for nothing here: they have limits of their own.
+        let writing = s.in_flight.filter(|(_, soft)| !soft).is_some();
+        let waiting = s.queue.len() + usize::from(writing);
         // The bytes behind the oldest unwritten frame: everything queued when a frame is being
         // written, otherwise everything but the first queued one.
-        let behind = match (s.in_flight, s.queue.front()) {
-            (Some(_), _) => Some(s.queued),
-            (None, Some(first)) => Some(s.queued - first.len()),
-            (None, None) => None,
+        let behind = match (writing, s.queue.front()) {
+            (true, _) => Some(s.queued),
+            (false, Some((_, first))) => Some(s.queued - first.len()),
+            (false, None) => None,
         };
         let over = behind.is_some_and(|b| b + frame.len() > self.max_behind);
         if waiting >= MAX_QUEUED || over {
@@ -181,10 +226,64 @@ impl Outbox {
             return Pushed::TooSlow;
         }
         s.queued += frame.len();
-        s.queue.push_back(frame);
+        let at = s.next;
+        s.next += 1;
+        s.queue.push_back((at, frame));
         drop(s);
         self.wake.notify_one();
         Pushed::Queued
+    }
+
+    /// Queues a frame that may be dropped (who is here, presence, drafts) unless the connection is
+    /// behind on them: more than [`MAX_SOFT`] soft frames or [`MAX_SOFT_BYTES`] waiting. Then this
+    /// one and every later one is dropped, never closing the connection, until the room sends what
+    /// replaces them ([`Outbox::catch_up`]).
+    pub fn push_soft(&self, frame: Bytes) -> Soft {
+        let mut s = self.lock();
+        if s.life != Life::Open {
+            return Soft::Closed;
+        }
+        if s.behind {
+            return Soft::Behind;
+        }
+        let writing = s.in_flight.filter(|(_, soft)| *soft).is_some();
+        let waiting = s.soft.len() + usize::from(writing);
+        if waiting >= MAX_SOFT || (waiting > 0 && s.soft_queued + frame.len() > MAX_SOFT_BYTES) {
+            s.behind = true;
+            return Soft::Behind;
+        }
+        Self::queue_soft(&mut s, frame);
+        drop(s);
+        self.wake.notify_one();
+        Soft::Queued
+    }
+
+    fn queue_soft(s: &mut State, frame: Bytes) {
+        s.soft_queued += frame.len();
+        let at = s.next;
+        s.next += 1;
+        s.soft.push_back((at, frame));
+    }
+
+    /// Whether the connection is behind on soft frames.
+    pub fn is_behind(&self) -> bool {
+        self.lock().behind
+    }
+
+    /// For a connection behind on soft frames that has written every one it had queued: queues
+    /// `make()`, what replaces the ones dropped (the peers as they are now), and takes soft frames
+    /// again. Answers whether it did.
+    pub fn catch_up(&self, make: impl FnOnce() -> Bytes) -> bool {
+        let mut s = self.lock();
+        let writing = s.in_flight.filter(|(_, soft)| *soft).is_some();
+        if s.life != Life::Open || !s.behind || writing || !s.soft.is_empty() {
+            return false;
+        }
+        Self::queue_soft(&mut s, make());
+        s.behind = false;
+        drop(s);
+        self.wake.notify_one();
+        true
     }
 
     /// Puts `first` (the welcome) ahead of everything queued and lets the writer start.
@@ -192,7 +291,7 @@ impl Outbox {
         let mut s = self.lock();
         if s.life == Life::Open {
             s.queued += first.len();
-            s.queue.push_front(first);
+            s.queue.push_front((0, first));
         }
         s.held = false;
         drop(s);
@@ -220,13 +319,19 @@ impl Outbox {
             return;
         }
         s.life = Life::Aborting;
-        s.queue.clear();
-        s.queued = 0;
+        Self::drop_queued(&mut s);
         s.close = Some((code, reason.to_owned()));
         s.closed_with = Some(code);
         drop(s);
         self.life.send_replace(Life::Aborting);
         self.wake.notify_one();
+    }
+
+    fn drop_queued(s: &mut State) {
+        s.queue.clear();
+        s.queued = 0;
+        s.soft.clear();
+        s.soft_queued = 0;
     }
 
     /// The close code the server closed the connection with, if it did.
@@ -239,16 +344,45 @@ impl Outbox {
         self.lock().life != Life::Open
     }
 
-    /// Bytes waiting to be written, the frame being written included.
+    /// Bytes waiting to be written, soft frames and the frame being written included.
     pub fn queued_bytes(&self) -> usize {
         let s = self.lock();
-        s.queued + s.in_flight.unwrap_or(0)
+        s.queued + s.soft_queued + s.in_flight.map_or(0, |(n, _)| n)
     }
 
-    /// Frames waiting to be written, the one being written included.
+    /// Frames waiting to be written, soft frames and the one being written included.
     pub fn queued_frames(&self) -> usize {
         let s = self.lock();
-        s.queue.len() + usize::from(s.in_flight.is_some())
+        s.queue.len() + s.soft.len() + usize::from(s.in_flight.is_some())
+    }
+
+    /// The next frame to write, in the order they were queued, soft or not.
+    fn pop(s: &mut State) -> Option<Bytes> {
+        let soft = match (s.queue.front(), s.soft.front()) {
+            (Some((a, _)), Some((b, _))) => b < a,
+            (None, Some(_)) => true,
+            (_, None) => false,
+        };
+        let (_, frame) = if soft {
+            let f = s.soft.pop_front()?;
+            s.soft_queued -= f.1.len();
+            f
+        } else {
+            let f = s.queue.pop_front()?;
+            s.queued -= f.1.len();
+            f
+        };
+        s.in_flight = Some((frame.len(), soft));
+        Some(frame)
+    }
+
+    /// The next frame if one is ready to be written now.
+    fn try_next(&self) -> Option<Bytes> {
+        let mut s = self.lock();
+        if s.held || s.life == Life::Aborting {
+            return None;
+        }
+        Self::pop(&mut s)
     }
 
     async fn next(&self) -> Next {
@@ -257,10 +391,8 @@ impl Outbox {
                 let mut s = self.lock();
                 if !s.held
                     && s.life != Life::Aborting
-                    && let Some(frame) = s.queue.pop_front()
+                    && let Some(frame) = Self::pop(&mut s)
                 {
-                    s.queued -= frame.len();
-                    s.in_flight = Some(frame.len());
                     return Next::Frame(frame);
                 }
                 if let Some((code, reason)) = s.close.take() {
@@ -279,8 +411,7 @@ impl Outbox {
     fn dead(&self) {
         let mut s = self.lock();
         s.life = Life::Aborting;
-        s.queue.clear();
-        s.queued = 0;
+        Self::drop_queued(&mut s);
         s.in_flight = None;
         drop(s);
         self.life.send_replace(Life::Aborting);
@@ -293,10 +424,9 @@ pub async fn write(mut sink: SplitSink<WebSocket, Message>, outbox: Arc<Outbox>)
     loop {
         match outbox.next().await {
             Next::Frame(frame) => {
-                crate::metrics::frame_out(frame.len());
                 // A close that drops the queue also abandons a frame stuck on a socket nobody reads.
                 let sent = tokio::select! {
-                    sent = sink.send(Message::Binary(frame)) => sent.is_ok(),
+                    sent = write_queued(&mut sink, &outbox, frame) => sent.is_ok(),
                     _ = life.wait_for(|l| *l == Life::Aborting) => true,
                 };
                 outbox.written();
@@ -316,6 +446,27 @@ pub async fn write(mut sink: SplitSink<WebSocket, Message>, outbox: Arc<Outbox>)
             }
         }
     }
+}
+
+/// Writes `first` and whatever else is queued by then (up to [`MAX_PER_WRITE`] frames) with one
+/// flush: a burst of frames costs the socket one write, not one each. A frame counts as written
+/// once the WebSocket layer has it.
+async fn write_queued(
+    sink: &mut SplitSink<WebSocket, Message>,
+    outbox: &Outbox,
+    first: Bytes,
+) -> Result<(), axum::Error> {
+    crate::metrics::frame_out(first.len());
+    sink.feed(Message::Binary(first)).await?;
+    for _ in 1..MAX_PER_WRITE {
+        outbox.written();
+        let Some(frame) = outbox.try_next() else {
+            break;
+        };
+        crate::metrics::frame_out(frame.len());
+        sink.feed(Message::Binary(frame)).await?;
+    }
+    sink.flush().await
 }
 
 /// An `error` frame.
@@ -480,11 +631,7 @@ mod tests {
 
     /// Takes the next frame as the writer would, leaving it in flight.
     fn start_writing(outbox: &Outbox) -> Option<usize> {
-        let mut s = outbox.lock();
-        let f = s.queue.pop_front()?;
-        s.queued -= f.len();
-        s.in_flight = Some(f.len());
-        Some(f.len())
+        Outbox::pop(&mut outbox.lock()).map(|f| f.len())
     }
 
     #[test]
@@ -533,6 +680,94 @@ mod tests {
             outbox.written();
         }
         assert_eq!((outbox.queued_bytes(), outbox.queued_frames()), (0, 0));
+    }
+
+    #[test]
+    fn soft_frames_never_close_a_connection_and_count_for_no_limit() {
+        let outbox = Outbox::new(usize::MAX);
+        outbox.release(frame(1));
+        for _ in 1..MAX_QUEUED {
+            assert_eq!(outbox.push(frame(1)), Pushed::Queued);
+        }
+        // The frame limit is reached by what must arrive only.
+        for _ in 0..MAX_SOFT {
+            assert_eq!(outbox.push_soft(frame(10)), Soft::Queued);
+        }
+        assert!(!outbox.is_behind());
+        // One more soft frame: behind, not closed; it and the later ones are dropped.
+        assert_eq!(outbox.push_soft(frame(10)), Soft::Behind);
+        assert_eq!(outbox.push_soft(frame(1)), Soft::Behind);
+        assert!(outbox.is_behind() && !outbox.is_closed());
+        assert_eq!(outbox.queued_frames(), MAX_QUEUED + MAX_SOFT);
+        // The byte limit of what must arrive counts no soft byte either.
+        let outbox = Outbox::new(1000);
+        outbox.release(frame(1));
+        assert_eq!(outbox.push_soft(frame(900)), Soft::Queued);
+        assert_eq!(outbox.push(frame(1000)), Pushed::Queued);
+        assert!(!outbox.is_closed());
+    }
+
+    #[test]
+    fn soft_bytes_are_bounded_but_one_frame_may_be_any_size() {
+        let outbox = Outbox::new(1000);
+        outbox.release(frame(1));
+        assert_eq!(outbox.push_soft(frame(MAX_SOFT_BYTES * 3)), Soft::Queued);
+        assert_eq!(outbox.push_soft(frame(1)), Soft::Behind);
+        let outbox = Outbox::new(1000);
+        outbox.release(frame(1));
+        assert_eq!(outbox.push_soft(frame(MAX_SOFT_BYTES - 10)), Soft::Queued);
+        assert_eq!(outbox.push_soft(frame(10)), Soft::Queued);
+        assert_eq!(outbox.push_soft(frame(1)), Soft::Behind);
+    }
+
+    #[test]
+    fn a_connection_behind_catches_up_once_it_has_written_its_soft_frames() {
+        let outbox = Outbox::new(1000);
+        outbox.release(frame(1));
+        assert_eq!(start_writing(&outbox), Some(1));
+        outbox.written();
+        assert!(!outbox.catch_up(|| frame(5)), "not behind");
+        for _ in 0..MAX_SOFT {
+            outbox.push_soft(frame(2));
+        }
+        assert_eq!(outbox.push_soft(frame(2)), Soft::Behind);
+        assert!(!outbox.catch_up(|| frame(5)), "soft frames still wait");
+        for _ in 0..MAX_SOFT - 1 {
+            start_writing(&outbox);
+            outbox.written();
+        }
+        assert_eq!(start_writing(&outbox), Some(2));
+        assert!(!outbox.catch_up(|| frame(5)), "one is being written");
+        outbox.written();
+        assert!(outbox.catch_up(|| frame(5)));
+        assert!(!outbox.is_behind());
+        assert_eq!(outbox.push_soft(frame(3)), Soft::Queued);
+        assert_eq!(start_writing(&outbox), Some(5), "the catch-up goes first");
+        outbox.written();
+        assert_eq!(start_writing(&outbox), Some(3));
+    }
+
+    #[test]
+    fn frames_go_out_in_the_order_they_were_queued_soft_or_not() {
+        let outbox = Outbox::new(1000);
+        outbox.push_soft(frame(2));
+        outbox.push(frame(3));
+        outbox.push_soft(frame(4));
+        outbox.push_soft(frame(5));
+        outbox.push(frame(6));
+        outbox.release(frame(1));
+        let mut order = Vec::new();
+        while let Some(n) = start_writing(&outbox) {
+            outbox.written();
+            order.push(n);
+        }
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!((outbox.queued_bytes(), outbox.queued_frames()), (0, 0));
+        // A close that drops the queue drops soft frames too.
+        outbox.push_soft(frame(7));
+        outbox.close_now(close::TOO_SLOW, "too slow");
+        assert_eq!(outbox.queued_frames(), 0);
+        assert_eq!(outbox.push_soft(frame(1)), Soft::Closed);
     }
 
     #[tokio::test]

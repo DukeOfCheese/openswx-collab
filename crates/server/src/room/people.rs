@@ -177,6 +177,8 @@ impl Room {
             heard: req.heard,
             presence: None,
             draft: None,
+            presence_news: None,
+            draft_news: None,
             live_rate: Bucket::default(),
             lock_rate: Bucket::default(),
             joined: self.next_join,
@@ -190,7 +192,7 @@ impl Room {
         others.sort_by_key(|c| c.joined);
         let peers: Vec<Peer> = others.into_iter().map(Conn::peer).collect();
         let joined = self.encode(&ServerMsg::PeerJoined(you.clone()));
-        self.broadcast(&joined, &[]);
+        self.broadcast_soft(&joined);
         self.announce_join_locks(back, released);
         let welcome = Welcome {
             store: self.state.store.clone(),
@@ -256,6 +258,7 @@ impl Room {
             return;
         };
         let revoked = c.outbox.close_code().is_some_and(close::ends_access);
+        self.behind.remove(&conn);
         if self.conns.is_empty() {
             self.idle_since = Some(self.state.clock.now());
         }
@@ -280,7 +283,7 @@ impl Room {
             let left = self.encode(&ServerMsg::PeerLeft {
                 client_id: c.client.clone(),
             });
-            self.broadcast(&left, &[]);
+            self.broadcast_soft(&left);
         }
         if registered && revoked {
             self.locks_at_revoke(&c.client);

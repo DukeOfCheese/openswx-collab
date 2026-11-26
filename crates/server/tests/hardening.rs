@@ -585,6 +585,86 @@ async fn a_reader_that_never_reads_is_dropped_before_it_costs_memory() {
     assert_eq!(stuck.closed().await.0, 4408);
 }
 
+/// A reader that does not keep up with presence and drafts (and who comes and goes) falls behind on
+/// them instead of being closed: they are dropped for it, and once it has written what it had it
+/// is sent everyone as they are now. What must arrive (a change) still does, in order.
+#[tokio::test]
+async fn a_reader_behind_on_presence_is_kept_and_sent_the_peers_when_it_reads_again() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut stuck =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("slow-reader")).await;
+    let stuck_id = stuck.client_id.clone();
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    let pad = "x".repeat(120_000);
+    let status = |s: &oswx_server::room::RoomStatus| {
+        s.connections
+            .iter()
+            .find(|c| c.client_id == stuck_id)
+            .cloned()
+    };
+    // Big drafts, as fast as each may send them, until the reader's socket and its queue are full.
+    let mut n = 0;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        n += 1;
+        a.draft(Some(json!({"n": n, "pad": pad}))).await;
+        b.draft(Some(json!({"n": n, "pad": pad}))).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.drain().await;
+        b.drain().await;
+        let c = status(&server.room_status(&doc).await).expect("the slow reader is still there");
+        assert!(
+            c.queued_bytes <= 1024 * 1024 + 2 * 130_000,
+            "{} bytes queued",
+            c.queued_bytes
+        );
+        if c.behind {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the reader never fell behind");
+    }
+    // More of them while it is behind cost it nothing.
+    for _ in 0..5 {
+        n += 1;
+        a.draft(Some(json!({"n": n, "pad": pad}))).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    b.presence(json!({"tool": "last"})).await;
+    let seq = a.change(vec![set_depth(3)], vec![], vec![]).await.seq();
+    let c = status(&server.room_status(&doc).await).expect("still there");
+    assert!(c.behind && c.queued_bytes <= 1024 * 1024 + 3 * 130_000);
+    // It reads again: what its socket held, the change in its place, and then the peers as they
+    // are now; never a close.
+    let (a_id, b_id) = (a.client_id.clone(), b.client_id.clone());
+    let mut change_seen = false;
+    let peers = loop {
+        match stuck.recv().await {
+            ServerMsg::Change(ev) => {
+                assert_eq!(ev.seq, seq);
+                change_seen = true;
+            }
+            ServerMsg::PeerList { peers } => break peers,
+            _ => {}
+        }
+    };
+    assert!(change_seen, "the change came before the list it is behind");
+    let peer = |id: &str| peers.iter().find(|p| &*p.client_id == id).unwrap().clone();
+    assert_eq!(peers.len(), 2, "everyone but itself");
+    assert_eq!(peer(&a_id).draft, Some(plain(json!({"n": n, "pad": pad}))));
+    assert_eq!(peer(&b_id).presence, Some(plain(json!({"tool": "last"}))));
+    assert!(stuck.closed.is_none());
+    // And it takes presence again as it comes.
+    a.presence(json!({"tool": "again"})).await;
+    let r: Relayed = stuck.expect().await;
+    assert_eq!(
+        (r.client_id.as_str(), r.data),
+        (a_id.as_str(), Some(plain(json!({"tool": "again"}))))
+    );
+    assert!(!status(&server.room_status(&doc).await).unwrap().behind);
+}
+
 // ------------------------------------------------------------------ storage and database trouble
 
 /// A change sent while the journal cannot commit: nobody is told it was accepted, every client is

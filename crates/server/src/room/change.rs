@@ -466,7 +466,8 @@ pub(super) struct Pending {
 pub(super) struct Submit {
     generation: u64,
     seq: Seq,
-    record: Record,
+    /// (Boxed: the channel's blocks are sized by its messages.)
+    record: Box<Record>,
 }
 
 /// The journal's answer for one record.
@@ -541,7 +542,7 @@ pub(super) fn pump(
     tokio::spawn(async move {
         while let Some(s) = submit_rx.recv().await {
             let at = Instant::now();
-            let receipt = journal.submit(s.record).await;
+            let receipt = journal.submit(*s.record).await;
             if receipt_tx.send((s.generation, s.seq, at, receipt)).is_err() {
                 break;
             }
@@ -1058,7 +1059,7 @@ impl Room {
                     version,
                     result,
                 };
-                let _ = internal.send(Internal::Decided(decided));
+                let _ = internal.send(Internal::Decided(Box::new(decided)));
             });
             return;
         }
@@ -1166,7 +1167,7 @@ impl Room {
                 asked: unchecked.into_iter().map(|(_, pin)| pin).collect(),
                 result,
             };
-            let _ = internal.send(Internal::References(check));
+            let _ = internal.send(Internal::References(Box::new(check)));
         });
     }
 
@@ -1250,7 +1251,7 @@ impl Room {
                 asked: unknown,
                 result,
             };
-            let _ = internal.send(Internal::Blobs(check));
+            let _ = internal.send(Internal::Blobs(Box::new(check)));
         });
     }
 
@@ -1390,7 +1391,7 @@ impl Room {
         let submit = Submit {
             generation: self.generation,
             seq,
-            record,
+            record: Box::new(record),
         };
         if self.journal.send(submit).is_err() {
             self.lose("the journal pump stopped");
@@ -1739,7 +1740,10 @@ impl Room {
                         &item.change.change_id,
                     ))
                     .await;
-                    let _ = internal.send(Internal::Duplicate(DuplicateCheck { item, result }));
+                    let _ = internal.send(Internal::Duplicate(Box::new(DuplicateCheck {
+                        item,
+                        result,
+                    })));
                 });
             }
             _ => {

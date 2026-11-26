@@ -453,6 +453,8 @@ pub struct ConnStatus {
     pub queued_bytes: usize,
     /// Answers it waits for (each counts toward [`MAX_REPLIES`]).
     pub waiting_answers: usize,
+    /// It is behind on soft frames (who is here, presence, drafts): they are dropped for it.
+    pub behind: bool,
 }
 
 /// A connection asking to join, made by the WebSocket handshake once the hello was checked.
@@ -914,6 +916,9 @@ struct Conn {
     /// The last presence and draft it sent, for the welcomes of those who join later.
     presence: Option<oswx_core::Plain>,
     draft: Option<oswx_core::Plain>,
+    /// Its presence and draft not yet relayed to the others (the latest of each), encoded once.
+    presence_news: Option<oswx_core::wire::LiveEntry>,
+    draft_news: Option<oswx_core::wire::LiveEntry>,
     /// Its allowance of presence and draft messages, and of `lock.acquire`s.
     live_rate: presence::Bucket,
     lock_rate: presence::Bucket,
@@ -941,12 +946,13 @@ impl Conn {
 enum Internal {
     Journal(change::Outcome),
     Lookup(change::Lookup),
-    Blobs(change::BlobCheck),
-    References(change::RefCheck),
-    Decided(change::Offloaded),
-    Duplicate(change::DuplicateCheck),
+    // (Boxed: the channel's blocks are sized by its largest message, and these are rare.)
+    Blobs(Box<change::BlobCheck>),
+    References(Box<change::RefCheck>),
+    Decided(Box<change::Offloaded>),
+    Duplicate(Box<change::DuplicateCheck>),
     Undo(history::UndoLookup),
-    Revert(history::RevertLookup),
+    Revert(Box<history::RevertLookup>),
     Report(rebuild::ReportLookup),
     Welcome {
         conn: ConnId,
@@ -1035,6 +1041,13 @@ struct Room {
     /// The last snapshot attempt failed: further failures are not logged as warnings until one
     /// succeeds (one warning per outage).
     snapshot_failing: bool,
+    /// Connections with presence or drafts not yet relayed, each once.
+    live_news: Vec<ConnId>,
+    /// When presence and drafts were last relayed, and when they will be next.
+    live_sent: Instant,
+    live_due: Option<Instant>,
+    /// Connections behind on soft frames, to be sent the peers once they have written theirs.
+    behind: std::collections::HashSet<ConnId>,
 }
 
 fn next_room_id() -> u64 {
@@ -1113,6 +1126,13 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         idle_since: Some(state.clock.now()),
         next_expiry: f64::INFINITY,
         snapshot_failing: false,
+        live_news: Vec::new(),
+        // The first presence is relayed at once.
+        live_sent: Instant::now()
+            .checked_sub(presence::LIVE_TICK)
+            .unwrap_or_else(Instant::now),
+        live_due: None,
+        behind: std::collections::HashSet::new(),
         state,
     };
     crate::metrics::room_loaded();
@@ -1166,8 +1186,12 @@ impl Room {
                         c.deadline = Instant::now();
                     }
                 }
+                // (Relayed just below.)
+                () = tokio::time::sleep_until(self.live_due.unwrap_or(far)),
+                    if self.live_due.is_some() => {}
             }
             self.run_parked();
+            self.relay_live_when_due();
             self.reap();
             if self
                 .closing
@@ -1305,12 +1329,12 @@ impl Room {
         match event {
             Internal::Journal(outcome) => self.on_journal(outcome),
             Internal::Lookup(lookup) => self.on_lookup(lookup),
-            Internal::Blobs(check) => self.on_blobs(check),
-            Internal::References(check) => self.on_references(check),
-            Internal::Decided(decided) => self.on_offloaded(decided),
-            Internal::Duplicate(check) => self.on_duplicate(check),
+            Internal::Blobs(check) => self.on_blobs(*check),
+            Internal::References(check) => self.on_references(*check),
+            Internal::Decided(decided) => self.on_offloaded(*decided),
+            Internal::Duplicate(check) => self.on_duplicate(*check),
             Internal::Undo(lookup) => self.on_undo_lookup(lookup),
-            Internal::Revert(lookup) => self.on_revert_lookup(lookup),
+            Internal::Revert(lookup) => self.on_revert_lookup(*lookup),
             Internal::Report(lookup) => self.on_report_lookup(lookup),
             Internal::Welcome { conn, result } => self.on_welcome(conn, result),
             Internal::LockNews(conn) => self.flush_lock_news(conn),
@@ -1339,6 +1363,7 @@ impl Room {
                 queued_frames: c.outbox.queued_frames(),
                 queued_bytes: c.outbox.queued_bytes(),
                 waiting_answers: c.replies.len(),
+                behind: c.outbox.is_behind(),
             })
             .collect();
         connections.sort_by(|a, b| a.client_id.cmp(&b.client_id));
@@ -1540,6 +1565,15 @@ impl Room {
 #[cfg(test)]
 mod tests {
     use super::close;
+
+    /// Every open document has these channels, whose memory comes in blocks of 32 messages sized by
+    /// the largest message: rare big ones are boxed.
+    #[test]
+    fn the_messages_of_a_rooms_channels_stay_small() {
+        assert!(std::mem::size_of::<super::Internal>() <= 128);
+        assert!(std::mem::size_of::<super::change::Submit>() <= 32);
+        assert!(std::mem::size_of::<super::RoomCmd>() <= 128);
+    }
 
     #[test]
     fn only_codes_that_end_access_release_locks_at_once() {
