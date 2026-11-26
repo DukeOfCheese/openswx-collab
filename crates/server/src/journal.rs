@@ -26,6 +26,17 @@
 //!   record only (and, through the seq check, the ones after it);
 //! - `documents.head_seq` and `updated_at` are updated once per document.
 //!
+//! A document that is deleted (itself, or with its project or organisation) is refused like one
+//! that does not exist, `Refused(NoDocument)`: its row is locked when that is read, so a deletion
+//! either came first and is seen, or waits for this batch.
+//!
+//! If the transaction cannot have a lock in time (PostgreSQL's `55P03` after the journal's lock
+//! timeout, 2 s: someone holds the row of one of the batch's documents) or is the one ended in
+//! a deadlock, the batch is written again **one document at a time**, each in a transaction of
+//! its own: the records of the document that is blocked come back `Unknown` (its room reloads),
+//! and every other document's are stored. A document someone holds on to never costs the others
+//! more than that wait.
+//!
 //! The rows go in with **one multi-row insert per batch**: every document's records up to its
 //! first one with [`Extra`] writes (which, and the ones after it, are inserted one at a time,
 //! each depending on the one before). If that insert leaves a row out (a duplicate, which rooms
@@ -125,7 +136,7 @@ pub enum RefusedWhy {
     /// The record breaks a column limit; it was never queued.
     #[error("invalid record: {0}")]
     Invalid(String),
-    /// The document does not exist.
+    /// The document does not exist, or is deleted.
     #[error("no such document")]
     NoDocument,
     /// `Extra::AssemblyRefs` chose a part that no longer exists or was deleted since the room
@@ -404,8 +415,9 @@ async fn write(store: &dyn Store, batch: Vec<Pending>, timeout: Duration) {
     }
 }
 
-/// Writes the batch: with one insert for all it can, or, when that insert left a row out, again
-/// one record at a time. An `Err` is an error outside any savepoint: nothing is known.
+/// Writes the batch in one transaction; or, when that transaction could not have a lock in time,
+/// one document at a time, so that only the blocked document's records are `Unknown`. An `Err` is
+/// an error outside any savepoint: nothing is known of any record.
 async fn write_batch(
     store: &dyn Store,
     records: &[Record],
@@ -415,10 +427,46 @@ async fn write_batch(
     for (i, r) in records.iter().enumerate() {
         of_doc.entry(r.document.as_str()).or_default().push(i);
     }
-    if let Some(results) = write_transaction(store, records, &of_doc, true).await? {
+    let blocked = match write_documents(store, records, &of_doc).await {
+        Err(e) if of_doc.len() > 1 && crate::store::is_conflict(&e) => e,
+        outcome => return outcome,
+    };
+    tracing::warn!(
+        "a journal batch of {} documents waited too long for a lock; writing them one at a time: \
+         {blocked:#}",
+        of_doc.len()
+    );
+    let mut results: Vec<Result<(), JournalError>> =
+        vec![Err(JournalError::Unknown); records.len()];
+    for (&doc, indices) in &of_doc {
+        let alone = BTreeMap::from([(doc, indices.clone())]);
+        match write_documents(store, records, &alone).await {
+            Ok(written) => {
+                for &i in indices {
+                    results[i].clone_from(&written[i]);
+                }
+            }
+            Err(e) => tracing::error!(
+                "the {} journal records of document {doc} could not be written: {e:#}",
+                indices.len()
+            ),
+        }
+    }
+    Ok(results)
+}
+
+/// Writes the records of the documents in `of_doc` in one transaction: with one insert for all
+/// it can, or, when that insert left a row out, again one record at a time. The results of the
+/// other records are `Unknown`.
+async fn write_documents(
+    store: &dyn Store,
+    records: &[Record],
+    of_doc: &BTreeMap<&str, Vec<usize>>,
+) -> anyhow::Result<Vec<Result<(), JournalError>>> {
+    if let Some(results) = write_transaction(store, records, of_doc, true).await? {
         return Ok(results);
     }
-    write_transaction(store, records, &of_doc, false)
+    write_transaction(store, records, of_doc, false)
         .await?
         .context("a batch written one record at a time has no insert to leave a row out")
 }
@@ -463,7 +511,7 @@ async fn write_transaction(
     let mut tx = store.begin_journal().await?;
     // Every document row this transaction will lock, in ascending id order before anything else.
     let mut rows: Vec<String> = of_doc.keys().map(|doc| (*doc).to_owned()).collect();
-    for extra in records.iter().flat_map(|r| &r.extra) {
+    for extra in of_doc.values().flatten().flat_map(|&i| &records[i].extra) {
         if let Extra::AssemblyRefs { chosen, .. } = extra {
             rows.extend(chosen.iter().map(|c| c.part_id.clone()));
         }
@@ -541,7 +589,7 @@ async fn write_transaction(
 }
 
 /// Locks the lease row of `doc` and answers its epoch and the document's head (`None`: there is
-/// no such document). A document without a lease row gets one, at epoch 0, only for a batch whose
+/// no such document, or it is deleted). A document without a lease row gets one, at epoch 0, only for a batch whose
 /// first record of it carries epoch 0.
 async fn lock_lease(
     tx: &mut dyn Tx,
@@ -555,7 +603,7 @@ async fn lock_lease(
             // the first `lease::acquire` then moves it to epoch 1. The document is checked
             // first, so that a missing one never reaches the insert (whose foreign key would
             // fail the whole batch).
-            if tx.document_by_id(doc).await?.is_none() {
+            if live_document(tx, doc).await?.is_none() {
                 return Ok(None);
             }
             let first = RoomLease {
@@ -576,10 +624,22 @@ async fn lock_lease(
     };
     // The head is read only now, with the lease row held: on PostgreSQL a batch that waited on
     // that lock for another writer's transaction must not use a head read before it waited.
-    let Some(document) = tx.document_by_id(doc).await? else {
+    let Some(document) = live_document(tx, doc).await? else {
         return Ok(None);
     };
     Ok(Some((lease, document.head_seq)))
+}
+
+/// The document, unless it is deleted: nothing more is written to one that is (what is left of
+/// it is being removed, or kept only for what refers to it).
+async fn live_document(
+    tx: &mut dyn Tx,
+    doc: &str,
+) -> anyhow::Result<Option<crate::store::Document>> {
+    Ok(tx
+        .document_by_id(doc)
+        .await?
+        .filter(|d| d.deleted_at.is_none()))
 }
 
 /// The row of a record, borrowing its strings and bytes.

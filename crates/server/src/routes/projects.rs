@@ -78,6 +78,7 @@ async fn create_project(
         name,
         created_at: state.clock.now(),
     };
+    let _turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Member).await?;
     tx.insert_project(&project).await?;
@@ -116,6 +117,7 @@ async fn rename_project(
         ProjectRole::Owner,
     )
     .await?;
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     tx.set_project_name(&project.id, &name).await?;
@@ -133,8 +135,10 @@ async fn rename_project(
     ))
 }
 
-/// Deletes a project and everything in it, and closes its open documents. (Snapshot files in
-/// storage are left, as the Python server leaves them.)
+/// Deletes a project and everything in it, and closes its open documents. The request marks it
+/// (and its documents) deleted, in one short transaction: from then on it does not exist for
+/// anyone. Its rows and its documents' stored snapshots are removed afterwards, in the background
+/// ([`crate::purge`]).
 async fn delete_project(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -147,16 +151,14 @@ async fn delete_project(
         ProjectRole::Owner,
     )
     .await?;
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     let documents = tx.project_document_ids(&project.id).await?;
-    // Every document row the deletion removes (the deleted ones too) is locked in ascending id
-    // order before any is touched: the lock order of `crate::store`.
-    tx.lock_documents(&documents).await?;
-    // As for one document: mark them deleted first, then look for users outside the project, in one
-    // transaction.
-    tx.mark_project_documents_deleted(&project.id, state.clock.now())
-        .await?;
+    let now = state.clock.now();
+    // As for one document: mark them deleted first (their rows locked in ascending id order: the
+    // lock order of `crate::store`), then look for users outside the project, in one transaction.
+    tx.mark_project_documents_deleted(&project.id, now).await?;
     let users = tx.assemblies_using_project(&project.id).await?;
     if !users.is_empty() {
         tx.rollback().await?;
@@ -169,14 +171,14 @@ async fn delete_project(
         )
         .await?);
     }
-    tx.delete_project(&project.id).await?;
+    tx.mark_project_deleted(&project.id, now).await?;
     let event = Event::ProjectDeleted {
         org: project.org_id,
         project: project.id,
         by: user.id,
     };
     let (revoker, ext) = (state.clone(), state.ext.clone());
-    state
+    let committed = state
         .commit_then(
             tx,
             |_| async move {
@@ -189,7 +191,10 @@ async fn delete_project(
             },
             async move { emit(&ext, event).await },
         )
-        .await?;
+        .await;
+    // (Also after a commit that reported an error: the purger goes by what is marked.)
+    state.wake_purger();
+    committed?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -240,6 +245,7 @@ async fn set_member(
         ProjectRole::Owner,
     )
     .await?;
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     if tx.org_member(&project.org_id, &user_id).await?.is_none() {
@@ -295,6 +301,7 @@ async fn remove_member(
         ProjectRole::Owner,
     )
     .await?;
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     if !tx.delete_project_member(&project.id, &user_id).await? {

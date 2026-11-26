@@ -239,7 +239,8 @@ async fn record_broke(
     fresh: BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let seq = i64::try_from(seq)?;
-    let mut tx = store.begin().await?;
+    // (The server's own write, as the journal's are: never on a request's connection.)
+    let mut tx = store.begin_journal().await?;
     let Some(current) = tx.change_broke(doc, seq).await? else {
         return Ok(()); // (no such change)
     };

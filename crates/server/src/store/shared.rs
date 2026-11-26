@@ -110,6 +110,26 @@ macro_rules! store_impl {
                 Ok(Box::new(self.begin_journal_tx().await?))
             }
 
+            async fn deleted_projects(&self, limit: i64) -> Result<Vec<Id>> {
+                q::deleted_projects(&mut *self.reader().await?, limit).await
+            }
+
+            async fn deleted_orgs(&self, limit: i64) -> Result<Vec<Id>> {
+                q::deleted_orgs(&mut *self.reader().await?, limit).await
+            }
+
+            async fn documents_of_deleted_project(
+                &self,
+                project_id: &str,
+                limit: i64,
+            ) -> Result<Vec<Id>> {
+                q::documents_of_deleted_project(&mut *self.reader().await?, project_id, limit).await
+            }
+
+            async fn projects_left_in_org(&self, org_id: &str) -> Result<u64> {
+                q::projects_left_in_org(&mut *self.reader().await?, org_id).await
+            }
+
             async fn user_count(&self) -> Result<u64> {
                 q::user_count(&mut *self.reader().await?).await
             }
@@ -712,6 +732,34 @@ macro_rules! store_impl {
                 now: f64,
             ) -> Result<()> {
                 q::mark_project_documents_deleted(self.conn(), project_id, now).await
+            }
+
+            async fn mark_project_deleted(&mut self, id: &str, now: f64) -> Result<bool> {
+                q::mark_project_deleted(self.conn(), id, now).await
+            }
+
+            async fn mark_org_deleted(&mut self, id: &str, now: f64) -> Result<bool> {
+                q::mark_org_deleted(self.conn(), id, now).await
+            }
+
+            async fn purge_document_rows(&mut self, document_id: &str, limit: i64) -> Result<u64> {
+                q::purge_document_rows(self.conn(), document_id, limit).await
+            }
+
+            async fn purge_document(&mut self, id: &str) -> Result<()> {
+                q::purge_document(self.conn(), id).await
+            }
+
+            async fn purge_project_rows(&mut self, project_id: &str, limit: i64) -> Result<u64> {
+                q::purge_project_rows(self.conn(), project_id, limit).await
+            }
+
+            async fn purge_project(&mut self, id: &str) -> Result<bool> {
+                q::purge_project(self.conn(), id).await
+            }
+
+            async fn purge_org(&mut self, id: &str) -> Result<bool> {
+                q::purge_org(self.conn(), id).await
             }
 
             async fn insert_document(&mut self, document: &Document) -> Result<()> {
@@ -1574,15 +1622,149 @@ macro_rules! store_impl {
                 project_id: &str,
                 now: f64,
             ) -> Result<()> {
-                // One row at a time, in ascending id order (the lock order rule of `crate::assemblies`).
-                let ids: Vec<Id> = sqlx::query_scalar(sql::PROJECT_LIVE_DOCUMENT_IDS)
+                // Locked in ascending id order (the lock order of `crate::store`), then marked
+                // in one statement.
+                sqlx::query(sql::$dialect::LOCK_PROJECT_DOCUMENTS)
                     .bind(project_id)
-                    .fetch_all(&mut *c)
+                    .execute(&mut *c)
                     .await?;
-                for id in ids {
-                    mark_document_deleted(&mut *c, &id, now).await?;
-                }
+                sqlx::query(sql::MARK_PROJECT_DOCUMENTS_DELETED)
+                    .bind(project_id)
+                    .bind(now)
+                    .execute(c)
+                    .await?;
                 Ok(())
+            }
+
+            pub async fn mark_project_deleted(c: &mut $Conn, id: &str, now: f64) -> Result<bool> {
+                let done = sqlx::query(sql::MARK_PROJECT_DELETED)
+                    .bind(id)
+                    .bind(now)
+                    .execute(c)
+                    .await?;
+                Ok(done.rows_affected() == 1)
+            }
+
+            pub async fn mark_org_deleted(c: &mut $Conn, id: &str, now: f64) -> Result<bool> {
+                let done = sqlx::query(sql::MARK_ORG_DELETED)
+                    .bind(id)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                if done.rows_affected() != 1 {
+                    return Ok(false);
+                }
+                // Document rows in ascending id order before they are marked (the lock order).
+                sqlx::query(sql::$dialect::LOCK_ORG_DOCUMENTS)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await?;
+                for statement in [
+                    sql::MARK_ORG_DOCUMENTS_DELETED,
+                    sql::MARK_ORG_PROJECTS_DELETED,
+                ] {
+                    sqlx::query(statement)
+                        .bind(id)
+                        .bind(now)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                for statement in [
+                    sql::DELETE_ORG_PROJECT_MEMBERS,
+                    sql::DELETE_ORG_INVITES,
+                    sql::DELETE_ORG_MEMBERS,
+                ] {
+                    sqlx::query(statement).bind(id).execute(&mut *c).await?;
+                }
+                Ok(true)
+            }
+
+            pub async fn deleted_projects(c: &mut $Conn, limit: i64) -> Result<Vec<Id>> {
+                Ok(sqlx::query_scalar(sql::DELETED_PROJECTS)
+                    .bind(limit)
+                    .fetch_all(c)
+                    .await?)
+            }
+
+            pub async fn deleted_orgs(c: &mut $Conn, limit: i64) -> Result<Vec<Id>> {
+                Ok(sqlx::query_scalar(sql::DELETED_ORGS)
+                    .bind(limit)
+                    .fetch_all(c)
+                    .await?)
+            }
+
+            pub async fn documents_of_deleted_project(
+                c: &mut $Conn,
+                project_id: &str,
+                limit: i64,
+            ) -> Result<Vec<Id>> {
+                Ok(sqlx::query_scalar(sql::DOCUMENTS_OF_DELETED_PROJECT)
+                    .bind(project_id)
+                    .bind(limit)
+                    .fetch_all(c)
+                    .await?)
+            }
+
+            pub async fn projects_left_in_org(c: &mut $Conn, org_id: &str) -> Result<u64> {
+                let n: i64 = sqlx::query_scalar(sql::PROJECTS_LEFT_IN_ORG)
+                    .bind(org_id)
+                    .fetch_one(c)
+                    .await?;
+                Ok(u64::try_from(n)?)
+            }
+
+            pub async fn purge_document_rows(
+                c: &mut $Conn,
+                document_id: &str,
+                limit: i64,
+            ) -> Result<u64> {
+                let mut gone = 0;
+                for statement in [
+                    sql::PURGE_CHANGES,
+                    sql::PURGE_SNAPSHOTS,
+                    sql::PURGE_VERSIONS,
+                    sql::PURGE_ASSEMBLY_REFS,
+                ] {
+                    let left = limit - i64::try_from(gone)?;
+                    if left <= 0 {
+                        break;
+                    }
+                    gone += sqlx::query(statement)
+                        .bind(document_id)
+                        .bind(left)
+                        .execute(&mut *c)
+                        .await?
+                        .rows_affected();
+                }
+                Ok(gone)
+            }
+
+            pub async fn purge_document(c: &mut $Conn, id: &str) -> Result<()> {
+                sqlx::query(sql::PURGE_DOCUMENT).bind(id).execute(c).await?;
+                Ok(())
+            }
+
+            pub async fn purge_project_rows(
+                c: &mut $Conn,
+                project_id: &str,
+                limit: i64,
+            ) -> Result<u64> {
+                let done = sqlx::query(sql::PURGE_FOLDERS)
+                    .bind(project_id)
+                    .bind(limit)
+                    .execute(c)
+                    .await?;
+                Ok(done.rows_affected())
+            }
+
+            pub async fn purge_project(c: &mut $Conn, id: &str) -> Result<bool> {
+                let done = sqlx::query(sql::PURGE_PROJECT).bind(id).execute(c).await?;
+                Ok(done.rows_affected() == 1)
+            }
+
+            pub async fn purge_org(c: &mut $Conn, id: &str) -> Result<bool> {
+                let done = sqlx::query(sql::PURGE_ORG).bind(id).execute(c).await?;
+                Ok(done.rows_affected() == 1)
             }
 
             pub async fn insert_document(c: &mut $Conn, d: &Document) -> Result<()> {

@@ -19,6 +19,8 @@ pub mod lease;
 pub mod mail;
 pub mod metrics;
 pub mod oauth;
+pub mod org_queue;
+pub mod purge;
 pub mod record;
 pub mod room;
 pub mod routes;

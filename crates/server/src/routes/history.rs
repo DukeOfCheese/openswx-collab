@@ -322,7 +322,7 @@ async fn create_version(
     ApiPath(document_id): ApiPath<String>,
     ApiJson(body): ApiJson<VersionIn>,
 ) -> Result<(StatusCode, ApiJson<serde_json::Value>), ApiError> {
-    let (doc, _, _) = require_document(
+    let (doc, project, _) = require_document(
         state.store.as_ref(),
         &user.id,
         &document_id,
@@ -344,6 +344,7 @@ async fn create_version(
         .await?
         .map(|u| u.name)
         .unwrap_or_default();
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     let (doc, project, _) =
         recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Editor).await?;
@@ -431,13 +432,14 @@ async fn delete_version(
     user: CurrentUser,
     ApiPath((document_id, version_id)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let (doc, _, _) = require_document(
+    let (doc, project, _) = require_document(
         state.store.as_ref(),
         &user.id,
         &document_id,
         ProjectRole::Owner,
     )
     .await?;
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     let (doc, project, _) =
         recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Owner).await?;

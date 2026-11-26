@@ -45,14 +45,20 @@ async fn delete_org(
     token: &str,
     body: Value,
 ) -> (StatusCode, Value) {
-    server
+    let answer = server
         .call(
             Method::DELETE,
             &format!("/api/orgs/{org}"),
             Some(token),
             Some(body),
         )
-        .await
+        .await;
+    // The organisation is gone when the request is answered; what was in it is removed in the
+    // background, which the tests that look at rows and files wait for here.
+    if answer.0 == StatusCode::NO_CONTENT && !server.state.purger.gate().is_shut() {
+        server.purged().await;
+    }
+    answer
 }
 
 fn robotics() -> Value {
@@ -1802,6 +1808,8 @@ async fn files_that_cannot_be_removed_do_not_fail_the_deletion() {
     let doc = world.document(&server, None, None, None).await;
     blobs.fail_removals.store(true, Ordering::SeqCst);
     let logs = LogCapture::start();
+    // (The purger is held: it would try again for as long as the storage fails.)
+    server.state.purger.gate().shut();
     assert_eq!(
         delete_org(&server, &world.org, &world.admin, robotics()).await,
         (StatusCode::NO_CONTENT, Value::Null)
@@ -1815,12 +1823,17 @@ async fn files_that_cannot_be_removed_do_not_fail_the_deletion() {
             .unwrap()
             .is_none()
     );
+    server.state.purger.gate().open();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !logs.text().contains("removing what was deleted failed") {
+        assert!(tokio::time::Instant::now() < deadline, "{}", logs.text());
+        pause(Duration::from_millis(20)).await;
+    }
+    // The files are still there, and so are the rows that say they are still to be removed.
     assert!(has_files(&server, "docs", &doc).await, "left behind");
+    assert!(server.state.purger.busy());
     let text = logs.text();
-    assert!(
-        text.contains("could not remove") && text.contains(&world.org),
-        "{text}"
-    );
+    assert!(text.contains("will be tried again"), "{text}");
     logs.assert_never_logged(&["Robotics", "ada@example.com", "Ada", "Bracket", PASSWORD]);
 }
 
@@ -2352,6 +2365,7 @@ fn deleting(server: &TestServer, world: &World) -> tokio::task::JoinHandle<Statu
 
 /// Asserts that nothing of `doc` is left in the database: no row, and no journal row.
 async fn nothing_left_of(server: &TestServer, doc: &str) {
+    server.purged().await;
     let store = &server.state.store;
     assert!(store.document_by_id(doc).await.unwrap().is_none());
     let rows = store.changes_between(doc, 0, i64::MAX, 100).await.unwrap();
@@ -2403,6 +2417,7 @@ async fn a_change_sent_between_the_deletions_commit_and_the_close_is_written_now
     tokio::time::timeout(Duration::from_secs(10), gate.until_waiting(1))
         .await
         .expect("the deletion committed");
+    // (Marked deleted: its rows are removed once the request has gone on.)
     assert!(
         server
             .state
@@ -2410,7 +2425,7 @@ async fn a_change_sent_between_the_deletions_commit_and_the_close_is_written_now
             .document_by_id(&doc)
             .await
             .unwrap()
-            .is_none()
+            .is_some_and(|d| d.deleted_at.is_some())
     );
     assert!(server.state.hub.loaded(&doc).is_some());
     // Bob, still connected, sends changes into the room of a document that is gone.
@@ -2419,7 +2434,7 @@ async fn a_change_sent_between_the_deletions_commit_and_the_close_is_written_now
         b.send_change(&change).await;
     }
     pause(Duration::from_millis(300)).await;
-    nothing_left_of_rows(&server, &doc).await;
+    no_row_after(&server, &doc, 1).await;
     gate.open();
     assert_eq!(deletion.await.unwrap(), 204);
     // The room could not store them and said so; then Bob is closed. No row was written.
@@ -2441,16 +2456,16 @@ async fn a_change_sent_between_the_deletions_commit_and_the_close_is_written_now
     }
 }
 
-/// Asserts that the journal has no row of `doc`.
-async fn nothing_left_of_rows(server: &TestServer, doc: &str) {
+/// Asserts that the journal has no row of `doc` after `seq`.
+async fn no_row_after(server: &TestServer, doc: &str, seq: i64) {
     let rows = server
         .state
         .store
-        .changes_between(doc, 0, i64::MAX, 100)
+        .changes_between(doc, seq, i64::MAX, 100)
         .await
         .unwrap();
     assert!(
         rows.is_empty(),
-        "journal rows of a deleted document: {rows:?}"
+        "journal rows written to a deleted document: {rows:?}"
     );
 }

@@ -277,7 +277,9 @@ async fn deleting_a_project_removes_everything_in_it() {
         StatusCode::NO_CONTENT
     );
     let store = &server.state.store;
+    // Gone at once; its rows are removed in the background.
     assert!(store.project_by_id(&w.project).await.unwrap().is_none());
+    server.purged().await;
     assert!(
         store
             .project_member(&w.project, &bob_id)

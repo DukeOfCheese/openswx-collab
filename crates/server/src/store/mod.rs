@@ -118,6 +118,21 @@
 //! | a journal row is the next of its document, written under the lease's epoch | the journal locks the document's row and its lease row before it reads either ([`Tx::lock_documents`], [`Tx::lock_room_lease`]) |
 //! | a part an assembly newly uses is not deleted, and a deleted part has no user | [`Tx::lock_live_document`] against the deletion's own update of the row |
 //!
+//! ## Deleting much
+//!
+//! No transaction removes an unbounded number of rows. Deleting a project or an organisation
+//! **marks** it and its documents deleted in a few statements ([`Tx::mark_project_deleted`],
+//! [`Tx::mark_org_deleted`]); every query but the purger's then leaves them out, and the journal
+//! refuses their documents. The rows go afterwards, a bounded chunk a transaction
+//! ([`crate::purge`]). So no document row is held across a long cascade, on either database.
+//!
+//! ## Requests queue in the server
+//!
+//! Requests that change one organisation would queue on its row lock, each holding a connection.
+//! They queue in the process instead, before they open a transaction ([`crate::org_queue`]): the
+//! row lock is still what makes them safe, the queue is what keeps the waiters from using the
+//! connections up.
+//!
 //! ## Lock order
 //!
 //! A transaction that takes more than one of these takes them in this order, and several of one
@@ -728,6 +743,24 @@ pub trait Store: Send + Sync + 'static {
     /// takes (a request's transaction gives up after a few seconds). Never for a request.
     async fn begin_journal(&self) -> anyhow::Result<Box<dyn Tx>>;
 
+    /// The projects marked deleted whose rows are still there, by id, at most `limit`: what the
+    /// purger ([`crate::purge`]) has left to remove.
+    async fn deleted_projects(&self, limit: i64) -> anyhow::Result<Vec<Id>>;
+
+    /// The organisations marked deleted whose rows are still there, by id, at most `limit`.
+    async fn deleted_orgs(&self, limit: i64) -> anyhow::Result<Vec<Id>>;
+
+    /// The documents a project marked deleted still has, by id, at most `limit` (none for a
+    /// project that is not marked).
+    async fn documents_of_deleted_project(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Id>>;
+
+    /// How many project rows an organisation still has, the marked ones included.
+    async fn projects_left_in_org(&self, org_id: &str) -> anyhow::Result<u64>;
+
     /// How many accounts exist, deleted and disabled ones included (the registration mode).
     async fn user_count(&self) -> anyhow::Result<u64>;
 
@@ -1168,14 +1201,49 @@ pub trait Tx: Send {
     /// The ids of every document in a project, deleted ones included.
     async fn project_document_ids(&mut self, project_id: &str) -> anyhow::Result<Vec<Id>>;
 
-    /// Marks every document of a project that is not yet deleted as deleted at `now`, one row at
-    /// a time in ascending id order: part rows are always locked in ascending id order
-    /// ([`crate::assemblies`], "Lock order").
+    /// Marks every document of a project that is not yet deleted as deleted at `now`, in one
+    /// statement, after locking the project's document rows in ascending id order (the lock order
+    /// of this module).
     async fn mark_project_documents_deleted(
         &mut self,
         project_id: &str,
         now: f64,
     ) -> anyhow::Result<()>;
+
+    /// Marks a project deleted at `now`; `false` if it already was (or is gone). From the commit
+    /// it does not exist for any query but the purger's ([`Store::deleted_projects`]); its rows are
+    /// removed afterwards ([`crate::purge`]). Mark its documents too
+    /// ([`Tx::mark_project_documents_deleted`]).
+    async fn mark_project_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool>;
+
+    /// Marks an organisation deleted at `now`, with its projects and their documents (document
+    /// rows locked in ascending id order first), and removes its members, its invites and the
+    /// roles in its projects: from the commit nobody has a way into it and no query but the
+    /// purger's finds it. `false` (nothing done) if it already was marked (or is gone). A few
+    /// statements whatever the organisation holds; what is left is removed afterwards
+    /// ([`crate::purge`]).
+    async fn mark_org_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool>;
+
+    /// Removes up to `limit` of the rows that hang on a document (journal rows first, then
+    /// snapshot rows, named versions, an assembly's references) and answers how many went; 0 when
+    /// none is left. For the purger: a document of a deleted project, a chunk a transaction.
+    async fn purge_document_rows(&mut self, document_id: &str, limit: i64) -> anyhow::Result<u64>;
+
+    /// Removes the row of a document whose project is marked deleted (nothing otherwise). Purge
+    /// its rows first ([`Tx::purge_document_rows`]): the database removes what is left with it.
+    async fn purge_document(&mut self, id: &str) -> anyhow::Result<()>;
+
+    /// Removes up to `limit` folders of a project (each with the folders inside it) and answers
+    /// how many went; 0 when none is left. For the purger.
+    async fn purge_project_rows(&mut self, project_id: &str, limit: i64) -> anyhow::Result<u64>;
+
+    /// Removes the row of a project marked deleted once it has no document left; `false` if it
+    /// still has one (or is not marked, or is gone).
+    async fn purge_project(&mut self, id: &str) -> anyhow::Result<bool>;
+
+    /// Removes the row of an organisation marked deleted once it has no project left; `false`
+    /// if it still has one (or is not marked, or is gone).
+    async fn purge_org(&mut self, id: &str) -> anyhow::Result<bool>;
 
     /// Adds a document.
     async fn insert_document(&mut self, document: &Document) -> anyhow::Result<()>;

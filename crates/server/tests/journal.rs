@@ -1470,15 +1470,12 @@ async fn an_acquisition_waits_for_the_batch_that_checked_the_lease() {
 }
 
 /// One organisation whose row lock is held for a long time, and requests queued on it, must not
-/// take the connections the journal and other organisations need.
+/// take the connections the journal and other organisations need: the queued requests wait in
+/// the server (holding no connection), the journal has connections of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_busy_organisation_holds_up_neither_the_journal_nor_other_organisations() {
-    if !common::on_postgres() {
-        eprintln!("skipped on SQLite: it has one writer, and no row lock to wait for");
-        return;
-    }
-    // Four connections for requests (two of them for transactions), a lock timeout of a second.
-    let (server, flaky) = TestServer::start_flaky(|s| s.database_lock_timeout = 1.0).await;
+    // Four connections for requests (two of them for transactions).
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
     let world = World::new(&server).await.unwrap();
     let (status, other) = server
         .post(
@@ -1489,7 +1486,26 @@ async fn a_busy_organisation_holds_up_neither_the_journal_nor_other_organisation
         .await;
     assert_eq!(status, StatusCode::CREATED);
     let other = other["id"].as_str().unwrap().to_owned();
-    let doc = new_doc(&server, &world, "D").await;
+    let (status, elsewhere) = server
+        .post(
+            &format!("/api/orgs/{other}/projects"),
+            Some(&world.admin),
+            serde_json::json!({"name": "Elsewhere"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, doc) = server
+        .post(
+            &format!(
+                "/api/projects/{}/documents",
+                elsewhere["id"].as_str().unwrap()
+            ),
+            Some(&world.admin),
+            serde_json::json!({"name": "D", "content": common::part()}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let doc = doc["id"].as_str().unwrap().to_owned();
     let epoch = lease(&server, &doc).await;
     let server = Arc::new(server);
 
@@ -1522,42 +1538,99 @@ async fn a_busy_organisation_holds_up_neither_the_journal_nor_other_organisation
                 .await
         }));
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    while server.state.org_queue.waiting(&world.org) < 3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
-    // The journal writes at once: its connections are its own.
-    let written = tokio::time::timeout(
-        Duration::from_secs(3),
-        server.state.journal.append(simple(&doc, 1, epoch)),
-    )
-    .await
-    .expect("the journal is not held up by requests waiting for a lock");
-    assert_eq!(written, Ok(()));
-    // Another organisation's write goes through as soon as the waiters have given up.
-    let (status, body) = tokio::time::timeout(
-        Duration::from_secs(12),
-        server.post(
-            &format!("/api/orgs/{other}/projects"),
-            Some(&world.admin),
-            serde_json::json!({"name": "Elsewhere"}),
-        ),
-    )
-    .await
-    .expect("another organisation is not held up");
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    // Each queued write gave up on the lock: 409, try again. Nothing of them was written.
-    for task in queued {
-        assert_eq!(
-            task.await.unwrap(),
-            (
-                StatusCode::CONFLICT,
-                serde_json::json!({"detail":
-                    "another request changed the same thing at the same moment; try again"})
-            )
-        );
+    // The journal writes at once, on PostgreSQL (on SQLite the parked request holds the one
+    // writer: there the journal waits for it, as every write does).
+    if common::on_postgres() {
+        let written = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.state.journal.append(simple(&doc, 1, epoch)),
+        )
+        .await
+        .expect("the journal is not held up by requests waiting for a lock");
+        assert_eq!(written, Ok(()));
+        // And so does another organisation's write.
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.post(
+                &format!("/api/orgs/{other}/projects"),
+                Some(&world.admin),
+                serde_json::json!({"name": "Meanwhile"}),
+            ),
+        )
+        .await
+        .expect("another organisation is not held up");
+        assert_eq!(status, StatusCode::CREATED, "{body}");
     }
     assert!(!holder.is_finished());
+    assert!(queued.iter().all(|task| !task.is_finished()));
     flaky.org_gate.open();
     assert_eq!(holder.await.unwrap().0, StatusCode::OK);
-    let projects = store(&server).projects_in_org(&world.org).await.unwrap();
-    assert!(projects.iter().all(|p| !p.name.starts_with("Queued")));
+    // Each queued write then has its turn.
+    for task in queued {
+        assert_eq!(task.await.unwrap().0, StatusCode::CREATED);
+    }
+}
+
+/// Someone holds the row of one document of a batch for longer than the journal waits for a
+/// lock. Only that document's records are not written (they come back `Unknown`, and its room
+/// reloads); the other document's, in the same batch, are stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_locked_document_costs_only_its_own_changes() {
+    if !common::on_postgres() {
+        eprintln!("skipped on SQLite: it has one writer, and no row lock to wait for");
+        return;
+    }
+    let (server, _flaky) = TestServer::start_flaky(|s| s.database_journal_lock_timeout = 0.5).await;
+    let world = World::new(&server).await.unwrap();
+    let (a, b) = (
+        new_doc(&server, &world, "A").await,
+        new_doc(&server, &world, "B").await,
+    );
+    let (ea, eb) = (lease(&server, &a).await, lease(&server, &b).await);
+    let writer = slow_writer(&server);
+    // A transaction of a request holds A's row.
+    let mut holder = server.state.store.begin().await.unwrap();
+    holder
+        .lock_documents(std::slice::from_ref(&a))
+        .await
+        .unwrap();
+    // One batch: records of both documents.
+    let started = std::time::Instant::now();
+    let receipts = [
+        writer.submit(simple(&b, 1, eb)).await,
+        writer.submit(simple(&a, 1, ea)).await,
+        writer.submit(simple(&b, 2, eb)).await,
+        writer.submit(simple(&a, 2, ea)).await,
+    ];
+    let mut outcomes = Vec::new();
+    for receipt in receipts {
+        outcomes.push(receipt.outcome().await);
+    }
+    assert_eq!(
+        outcomes,
+        [
+            Ok(()),
+            Err(JournalError::Unknown),
+            Ok(()),
+            Err(JournalError::Unknown)
+        ]
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        (head_seq(&server, &a).await, head_seq(&server, &b).await),
+        (0, 2)
+    );
+    assert_eq!(row_count(&server, &a).await, 0);
+    // Once the row is free the blocked document is written to again.
+    holder.rollback().await.unwrap();
+    assert_eq!(writer.append(simple(&a, 1, ea)).await, Ok(()));
+    assert_eq!(head_seq(&server, &a).await, 1);
 }

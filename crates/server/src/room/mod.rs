@@ -236,6 +236,11 @@ impl Gate {
         self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Whether whoever reaches the gate now waits.
+    pub fn is_shut(&self) -> bool {
+        self.shut.load(Ordering::SeqCst)
+    }
+
     /// How many wait at the gate.
     pub fn waiting(&self) -> usize {
         self.waiting.load(Ordering::SeqCst)

@@ -15,6 +15,8 @@ use crate::hub::Hub;
 use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
+use crate::org_queue::{OrgQueue, OrgTurn};
+use crate::purge::Purger;
 use crate::sessions::Sessions;
 use crate::store::postgres::PgConfig;
 use crate::store::{PgStore, SqliteStore, Store, Tx, new_id};
@@ -43,6 +45,10 @@ pub struct AppState {
     pub after_commits: Arc<InFlight>,
     /// How many exports run at once, and how patient they are ([`Exports`]).
     pub exports: Arc<Exports>,
+    /// Removes what was marked deleted, in the background ([`crate::purge`]).
+    pub purger: Purger,
+    /// Whose turn it is to change each organisation ([`crate::org_queue`]).
+    pub org_queue: OrgQueue,
 }
 
 /// What the revoking steps of [`AppState::commit_then`] know of the commit.
@@ -139,7 +145,22 @@ impl AppState {
             room_hooks: Arc::default(),
             after_commits: Arc::default(),
             exports: Arc::default(),
+            purger: Purger::default(),
+            org_queue: OrgQueue::default(),
         }
+    }
+
+    /// The turn to change something in the organisation `org`, taken before the request opens
+    /// its transaction and kept until it has committed: requests that change one organisation
+    /// run one at a time, and those that wait hold no database connection
+    /// ([`crate::org_queue`]). 503 when too many already wait, or the turn does not come in time.
+    pub async fn org_turn(&self, org: &str) -> Result<OrgTurn, ApiError> {
+        self.org_queue.turn(org).await
+    }
+
+    /// Tells the purger that something was marked deleted (or that the server has just started).
+    pub fn wake_purger(&self) {
+        self.purger.wake(self.store.clone(), self.blobs.clone());
     }
 
     /// Commits a request's transaction and runs what follows it, all in a task of its own that
@@ -289,12 +310,14 @@ impl AppState {
         Ok(state)
     }
 
-    /// The orderly end of a server, once it has stopped accepting requests: closes the rooms and
-    /// connections (each room waits briefly for the journal's answers to its changes in flight,
+    /// The orderly end of a server, once it has stopped accepting requests: stops the
+    /// purger at its next chunk (what it has not removed stays marked, for the next start), the
+    /// rooms and connections (each room waits briefly for the journal's answers to its changes in flight,
     /// closes its sockets with 1001 and writes a final snapshot of its durable head), waits (a
     /// while) for the steps after REST commits still running, then writes what the journal still
     /// has queued and stops it. Calling it again does no harm.
     pub async fn shutdown(&self) {
+        self.purger.stop().await;
         self.hub.shutdown().await;
         if tokio::time::timeout(AFTER_COMMIT_WAIT, self.after_commits.idle())
             .await
@@ -313,6 +336,11 @@ impl AppState {
 ///
 /// Serve it with connection info (`into_make_service_with_connect_info::<SocketAddr>()`): sign-in
 /// and password reset limits are kept per client address, and without it every client shares one.
+///
+/// Building it also wakes the purger ([`crate::purge`]), which goes on with whatever an earlier
+/// run of the server marked deleted and did not finish removing; so it must be called inside a
+/// tokio runtime.
 pub fn app(state: AppState) -> axum::Router {
+    state.wake_purger();
     crate::routes::router(state)
 }

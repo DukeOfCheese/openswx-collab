@@ -683,9 +683,13 @@ async fn sign_in_code(
             Ok(Attempt::Again) => {}
             // Another sign-in made the same account, or attached the same identity, at the same
             // moment (the database refused this one's row): the next try finds what the other
-            // made.
-            Err(ApiError::Internal(e))
-                if attempt < SEAT_ATTEMPTS && crate::store::is_unique_violation(&e) => {}
+            // made. After the last try the app is told, as for any failure here.
+            Err(ApiError::Internal(e)) if crate::store::is_unique_violation(&e) => {
+                if attempt == SEAT_ATTEMPTS {
+                    tracing::error!("a sign-in kept meeting a taken key: {e:#}");
+                    return Ok(Back::error("server_error"));
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -726,6 +730,10 @@ async fn sign_in_once(
         _ => None,
     };
 
+    let _turn = match &approval {
+        Some(approval) => Some(state.org_turn(approval.org()).await?),
+        None => None,
+    };
     let mut tx = state.store.begin().await?;
     let mut created: Option<(bool, Option<Accepted>)> = None;
     let mut attached = false;
@@ -762,7 +770,8 @@ async fn sign_in_once(
                 Some(user) => {
                     attach(&mut *tx, provider, identity, &user.id).await?;
                     attached = true;
-                    Some(user)
+                    // (As it is under the lock `attach` took: it may have been deleted since.)
+                    tx.user_by_id(&user.id).await?
                 }
             }
         }
@@ -901,13 +910,15 @@ async fn create_account(
     Ok(Ok((user, first, accepted)))
 }
 
-/// Attaches the identity to the account. Does not commit.
+/// Attaches the identity to the account, whose row it locks first (an account gains a way in
+/// under the same lock its deletion and the removal of its ways in take). Does not commit.
 async fn attach(
     tx: &mut dyn Tx,
     provider: Provider,
     identity: &Identity,
     user_id: &str,
 ) -> anyhow::Result<()> {
+    tx.lock_user(user_id).await?;
     tx.insert_oauth_identity(&OAuthIdentity {
         provider: provider.name().to_owned(),
         subject: identity.subject.clone(),

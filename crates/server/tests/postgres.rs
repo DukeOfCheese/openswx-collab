@@ -647,7 +647,7 @@ async fn a_statement_out_of_time_or_no_free_connection_is_503_and_a_taken_key_50
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_gives_up_on_a_lock_and_the_journal_does_not() {
+async fn a_request_gives_up_on_a_lock_and_the_journal_a_little_later() {
     use axum::http::StatusCode;
     needs_postgres!();
     let schema = PgSchema::create().await;
@@ -655,6 +655,7 @@ async fn a_request_gives_up_on_a_lock_and_the_journal_does_not() {
         pool: 4,
         journal_pool: 2,
         lock_timeout: Duration::from_millis(300),
+        journal_lock_timeout: Duration::from_millis(1500),
     };
     let store = PgStore::open(&schema.url, true, config).await.unwrap();
     let rows = fill(&store).await;
@@ -677,26 +678,71 @@ async fn a_request_gives_up_on_a_lock_and_the_journal_does_not() {
         "another request changed the same thing at the same moment; try again"
     );
     drop(request);
-    // The journal's transaction waits for as long as the lock is held.
-    let mut journal = {
-        let (store, doc) = (store.clone(), rows.doc.clone());
+    // The journal's transaction waits its own, longer, time: it goes on when the lock is freed
+    // within it ...
+    let waiting = |store: PgStore, doc: String| {
         tokio::spawn(async move {
             let mut tx = store.begin_journal().await.unwrap();
-            tx.lock_documents(&[doc]).await.unwrap();
-            tx.commit().await.unwrap();
+            let locked = tx.lock_documents(&[doc]).await;
+            if locked.is_ok() {
+                tx.commit().await.unwrap();
+            }
+            locked
         })
     };
+    let mut journal = waiting(store.clone(), rows.doc.clone());
     assert!(
-        tokio::time::timeout(Duration::from_millis(1500), &mut journal)
+        tokio::time::timeout(Duration::from_millis(800), &mut journal)
             .await
             .is_err(),
-        "the journal's transaction gave up or did not wait"
+        "the journal's transaction gave up as early as a request's, or did not wait"
     );
     holder.commit().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), journal)
         .await
         .expect("it goes on once the lock is free")
+        .unwrap()
         .unwrap();
+    // ... and gives up, as a conflict, when it is not.
+    let mut holder = store.begin().await.unwrap();
+    holder
+        .lock_documents(std::slice::from_ref(&rows.doc))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let err = waiting(store.clone(), rows.doc.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(is_conflict(&err), "{err:#}");
+    assert!(started.elapsed() >= Duration::from_millis(1400));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(holder);
+}
+
+#[tokio::test]
+async fn a_lock_timeout_as_long_as_a_statement_may_run_is_refused() {
+    needs_postgres!();
+    let schema = PgSchema::create().await;
+    for config in [
+        PgConfig {
+            lock_timeout: Duration::from_secs(21),
+            ..PgConfig::default()
+        },
+        PgConfig {
+            journal_lock_timeout: Duration::from_secs(30),
+            ..PgConfig::default()
+        },
+    ] {
+        let err = PgStore::connect(&schema.url, config).await.unwrap_err();
+        assert!(err.to_string().contains("at most 20 s"), "{err:#}");
+    }
+    let longest = PgConfig {
+        lock_timeout: Duration::from_secs(20),
+        journal_lock_timeout: Duration::from_secs(20),
+        ..PgConfig::default()
+    };
+    PgStore::connect(&schema.url, longest).await.unwrap();
 }
 
 #[tokio::test]
@@ -722,7 +768,7 @@ async fn every_connection_runs_read_committed_with_timeouts() {
         .await
         .unwrap();
     assert_eq!(idle, "1min");
-    // A request's transaction waits five seconds for a lock; the journal's and a read, for ever.
+    // A request's transaction waits five seconds for a lock, the journal's two; a read takes none.
     let lock: String = sqlx::query_scalar("SHOW lock_timeout")
         .fetch_one(tx.conn())
         .await
@@ -734,7 +780,7 @@ async fn every_connection_runs_read_committed_with_timeouts() {
         .fetch_one(tx.conn())
         .await
         .unwrap();
-    assert_eq!(lock, "0");
+    assert_eq!(lock, "2s");
     assert_eq!(scalar::<String>(&store, "SHOW lock_timeout").await, "0");
 }
 

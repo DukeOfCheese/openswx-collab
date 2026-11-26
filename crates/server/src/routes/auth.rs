@@ -212,6 +212,11 @@ async fn register(
     // The seat hook is asked before the transaction (never while it holds the writer).
     let approval = approve_invite(&state, body.invite.as_deref(), &email, None, now).await?;
 
+    // (Joining an organisation changes it: this request takes its turn, as any other does.)
+    let _turn = match &approval {
+        Some(approval) => Some(state.org_turn(approval.org()).await?),
+        None => None,
+    };
     let mut tx = state.store.begin().await?;
     if tx.user_by_email(&email).await?.is_some() {
         return Err(ApiError::Conflict(EMAIL_TAKEN.into()));

@@ -189,6 +189,7 @@ async fn rename_org(
 ) -> Result<Json<Value>, ApiError> {
     let name = clean_name(&body.name)?;
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Owner).await?;
+    let _turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Owner).await?;
     tx.set_org_name(&org_id, &name).await?;
@@ -240,6 +241,7 @@ async fn set_member_role(
         .parse()
         .map_err(|_| ApiError::Unprocessable("role must be one of owner, admin, member".into()))?;
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
+    let _turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     let mine = recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     let Some(member) = tx.org_member(&org_id, &user_id).await? else {
@@ -287,6 +289,7 @@ async fn remove_member(
     ApiPath((org_id, user_id)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Member).await?;
+    let _turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     let mine = recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Member).await?;
     let Some(member) = tx.org_member(&org_id, &user_id).await? else {
@@ -488,6 +491,7 @@ async fn create_invite(
         expires_at: now + body.days as f64 * 86400.0,
         accepted_by: None,
     };
+    let _turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     tx.insert_invite(&invite).await?;
@@ -548,6 +552,7 @@ async fn revoke_invite(
     ApiPath((org_id, invite_id)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_org(state.store.as_ref(), &user.id, &org_id, OrgRole::Admin).await?;
+    let _turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     if !tx.delete_invite(&org_id, &invite_id).await? {
@@ -682,6 +687,13 @@ pub(crate) struct Accepted {
     joined: bool,
 }
 
+impl Approval {
+    /// The organisation the approved invite is to.
+    pub(crate) fn org(&self) -> &str {
+        &self.invite.org_id
+    }
+}
+
 impl Accepted {
     /// Tells the extensions: `member_added` and the events. Run after the commit
     /// ([`AppState::commit_then`]).
@@ -814,6 +826,7 @@ async fn accept(
     else {
         return Err(ApiError::NotFound(INVITE_INVALID));
     };
+    let _turn = state.org_turn(approval.org()).await?;
     let mut tx = state.store.begin().await?;
     let Some(invite) = find_invite(&mut *tx, Some(&body.token), &me.email, now).await? else {
         return Err(ApiError::NotFound(INVITE_INVALID));

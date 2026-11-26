@@ -137,13 +137,15 @@ pub const DELETE_EXPIRED_LOGIN_CODES: &str = "DELETE FROM login_codes WHERE expi
 // ------------------------------------------------------------------ organisations
 
 /// [`super::Tx::insert_org`].
-pub const INSERT_ORG: &str = "INSERT INTO orgs (id, name, created_at) VALUES ($1, $2, $3)";
+pub const INSERT_ORG: &str =
+    "INSERT INTO orgs (id, name, created_at, deleted_at) VALUES ($1, $2, $3, NULL)";
 
 /// [`super::Tx::set_org_name`].
 pub const SET_ORG_NAME: &str = "UPDATE orgs SET name = $2 WHERE id = $1";
 
 /// [`super::Store::org_by_id`], [`super::Tx::org_by_id`].
-pub const ORG_BY_ID: &str = "SELECT id, name, created_at FROM orgs WHERE id = $1";
+pub const ORG_BY_ID: &str =
+    "SELECT id, name, created_at FROM orgs WHERE id = $1 AND deleted_at IS NULL";
 
 /// [`super::Store::org_member`], [`super::Tx::org_member`].
 pub const ORG_MEMBER: &str = "SELECT org_id, user_id, role, created_at FROM org_members \
@@ -229,7 +231,7 @@ pub const DELETE_INVITE: &str = "DELETE FROM invites WHERE org_id = $1 AND id = 
 
 /// [`super::Tx::insert_project`].
 pub const INSERT_PROJECT: &str =
-    "INSERT INTO projects (id, org_id, name, created_at) VALUES ($1, $2, $3, $4)";
+    "INSERT INTO projects (id, org_id, name, created_at, deleted_at) VALUES ($1, $2, $3, $4, NULL)";
 
 /// [`super::Tx::set_project_name`].
 pub const SET_PROJECT_NAME: &str = "UPDATE projects SET name = $2 WHERE id = $1";
@@ -238,16 +240,16 @@ pub const SET_PROJECT_NAME: &str = "UPDATE projects SET name = $2 WHERE id = $1"
 pub const DELETE_PROJECT: &str = "DELETE FROM projects WHERE id = $1";
 
 /// [`super::Store::project_by_id`], [`super::Tx::project_by_id`].
-pub const PROJECT_BY_ID: &str = "SELECT id, org_id, name, created_at FROM projects WHERE id = $1";
+pub const PROJECT_BY_ID: &str =
+    "SELECT id, org_id, name, created_at FROM projects WHERE id = $1 AND deleted_at IS NULL";
 
 /// [`super::Store::projects_in_org`].
-pub const PROJECTS_IN_ORG: &str =
-    "SELECT id, org_id, name, created_at FROM projects WHERE org_id = $1 ORDER BY name, id";
+pub const PROJECTS_IN_ORG: &str = "SELECT id, org_id, name, created_at FROM projects WHERE org_id = $1 AND deleted_at IS NULL ORDER BY name, id";
 
 /// [`super::Store::member_projects`].
 pub const MEMBER_PROJECTS: &str = "SELECT p.id, p.name, p.org_id, pm.role FROM projects p \
      JOIN project_members pm ON pm.project_id = p.id \
-     WHERE p.org_id = $1 AND pm.user_id = $2 ORDER BY p.name, p.id";
+     WHERE p.org_id = $1 AND pm.user_id = $2 AND p.deleted_at IS NULL ORDER BY p.name, p.id";
 
 /// [`super::Store::project_member`], [`super::Tx::project_member`].
 pub const PROJECT_MEMBER: &str = "SELECT project_id, user_id, role FROM project_members \
@@ -272,10 +274,91 @@ pub const DELETE_PROJECT_MEMBER: &str =
 /// [`super::Tx::project_document_ids`].
 pub const PROJECT_DOCUMENT_IDS: &str = "SELECT id FROM documents WHERE project_id = $1 ORDER BY id";
 
-/// [`super::Tx::mark_project_documents_deleted`], first statement: the documents to mark, in the
-/// order they are marked (then [`MARK_DOCUMENT_DELETED`] for each).
-pub const PROJECT_LIVE_DOCUMENT_IDS: &str =
-    "SELECT id FROM documents WHERE project_id = $1 AND deleted_at IS NULL ORDER BY id";
+/// [`super::Tx::mark_project_documents_deleted`], after the dialect's `LOCK_PROJECT_DOCUMENTS`:
+/// every document of the project that is not yet deleted, in one statement.
+pub const MARK_PROJECT_DOCUMENTS_DELETED: &str =
+    "UPDATE documents SET deleted_at = $2 WHERE project_id = $1 AND deleted_at IS NULL";
+
+/// [`super::Tx::mark_project_deleted`].
+pub const MARK_PROJECT_DELETED: &str =
+    "UPDATE projects SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL";
+
+// ------------------------------------------------------------------ deleting an organisation
+
+/// [`super::Tx::mark_org_deleted`]: the organisation itself ...
+pub const MARK_ORG_DELETED: &str =
+    "UPDATE orgs SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL";
+
+/// ... its documents (after the dialect's `LOCK_ORG_DOCUMENTS`) ...
+pub const MARK_ORG_DOCUMENTS_DELETED: &str = "UPDATE documents SET deleted_at = $2 \
+     WHERE deleted_at IS NULL AND project_id IN (SELECT id FROM projects WHERE org_id = $1)";
+
+/// ... its projects ...
+pub const MARK_ORG_PROJECTS_DELETED: &str =
+    "UPDATE projects SET deleted_at = $2 WHERE org_id = $1 AND deleted_at IS NULL";
+
+/// ... and what gave anyone a way in: roles in its projects, its invites, its members.
+pub const DELETE_ORG_PROJECT_MEMBERS: &str = "DELETE FROM project_members \
+     WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)";
+
+pub const DELETE_ORG_INVITES: &str = "DELETE FROM invites WHERE org_id = $1";
+
+pub const DELETE_ORG_MEMBERS: &str = "DELETE FROM org_members WHERE org_id = $1";
+
+// ------------------------------------------------------------------ removing what was deleted
+
+/// [`super::Store::deleted_projects`]: by id, at most `$1`.
+pub const DELETED_PROJECTS: &str =
+    "SELECT id FROM projects WHERE deleted_at IS NOT NULL ORDER BY id LIMIT $1";
+
+/// [`super::Store::deleted_orgs`]: by id, at most `$1`.
+pub const DELETED_ORGS: &str =
+    "SELECT id FROM orgs WHERE deleted_at IS NOT NULL ORDER BY id LIMIT $1";
+
+/// [`super::Store::documents_of_deleted_project`]: by id, at most `$2`; none unless the project
+/// is marked deleted.
+pub const DOCUMENTS_OF_DELETED_PROJECT: &str = "SELECT d.id FROM documents d \
+     JOIN projects p ON p.id = d.project_id \
+     WHERE d.project_id = $1 AND p.deleted_at IS NOT NULL ORDER BY d.id LIMIT $2";
+
+/// [`super::Store::projects_left_in_org`]: how many project rows an organisation still has.
+pub const PROJECTS_LEFT_IN_ORG: &str = "SELECT COUNT(*) FROM projects WHERE org_id = $1";
+
+/// [`super::Tx::purge_document_rows`], one after another until `$2` rows are gone: the journal ...
+pub const PURGE_CHANGES: &str = "DELETE FROM changes WHERE document_id = $1 AND seq IN \
+     (SELECT seq FROM changes WHERE document_id = $1 ORDER BY seq LIMIT $2)";
+
+/// ... the snapshot rows ...
+pub const PURGE_SNAPSHOTS: &str = "DELETE FROM snapshots WHERE document_id = $1 \
+     AND (epoch, seq) IN (SELECT epoch, seq FROM snapshots WHERE document_id = $1 LIMIT $2)";
+
+/// ... the named versions ...
+pub const PURGE_VERSIONS: &str = "DELETE FROM versions WHERE document_id = $1 AND id IN \
+     (SELECT id FROM versions WHERE document_id = $1 LIMIT $2)";
+
+/// ... and an assembly's references.
+pub const PURGE_ASSEMBLY_REFS: &str = "DELETE FROM assembly_refs WHERE assembly_id = $1 \
+     AND component_id IN \
+     (SELECT component_id FROM assembly_refs WHERE assembly_id = $1 LIMIT $2)";
+
+/// [`super::Tx::purge_document`]: the row of a document whose project is marked deleted (and, by
+/// the schema, the little that still refers to it: its lease).
+pub const PURGE_DOCUMENT: &str = "DELETE FROM documents WHERE id = $1 AND project_id IN \
+     (SELECT id FROM projects WHERE deleted_at IS NOT NULL)";
+
+/// [`super::Tx::purge_project_rows`]: a deleted project's folders, at most `$2` at a time (a
+/// folder takes the folders inside it with it) ...
+pub const PURGE_FOLDERS: &str = "DELETE FROM folders WHERE project_id = $1 AND id IN \
+     (SELECT id FROM folders WHERE project_id = $1 LIMIT $2)";
+
+/// [`super::Tx::purge_project`]: the row of a project marked deleted that has no document left
+/// (and, by the schema, its role rows).
+pub const PURGE_PROJECT: &str = "DELETE FROM projects WHERE id = $1 AND deleted_at IS NOT NULL \
+     AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.project_id = $1)";
+
+/// [`super::Tx::purge_org`]: the row of an organisation marked deleted that has no project left.
+pub const PURGE_ORG: &str = "DELETE FROM orgs WHERE id = $1 AND deleted_at IS NOT NULL \
+     AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.org_id = $1)";
 
 // ------------------------------------------------------------------ documents
 
@@ -613,7 +696,8 @@ pub const USER_MEMBERSHIPS: &str = "SELECT o.id, o.name, m.role, m.created_at AS
 
 /// [`super::Store::user_project_roles`].
 pub const USER_PROJECT_ROLES: &str = "SELECT p.id, p.name, p.org_id, pm.role FROM projects p \
-     JOIN project_members pm ON pm.project_id = p.id WHERE pm.user_id = $1 ORDER BY p.name, p.id";
+     JOIN project_members pm ON pm.project_id = p.id \
+     WHERE pm.user_id = $1 AND p.deleted_at IS NULL ORDER BY p.name, p.id";
 
 /// [`super::Store::user_sessions`].
 pub const USER_SESSIONS: &str = "SELECT token_hash, user_id, created_at, expires_at, label \
@@ -684,6 +768,20 @@ dialects! {
     IN_ID_ORDER_LOCKED:
         " ORDER BY id",
         " ORDER BY id FOR NO KEY UPDATE";
+
+    /// [`crate::store::Tx::mark_project_documents_deleted`], first statement: the project's
+    /// documents, locked in ascending id order before they are marked together.
+    LOCK_PROJECT_DOCUMENTS:
+        "SELECT id FROM documents WHERE project_id = $1 ORDER BY id",
+        "SELECT id FROM documents WHERE project_id = $1 ORDER BY id FOR NO KEY UPDATE";
+
+    /// [`crate::store::Tx::mark_org_deleted`]: the organisation's documents, locked in ascending
+    /// id order before they are marked together.
+    LOCK_ORG_DOCUMENTS:
+        "SELECT d.id FROM documents d JOIN projects p ON p.id = d.project_id \
+         WHERE p.org_id = $1 ORDER BY d.id",
+        "SELECT d.id FROM documents d JOIN projects p ON p.id = d.project_id \
+         WHERE p.org_id = $1 ORDER BY d.id FOR NO KEY UPDATE OF d";
 
     /// [`crate::store::Tx::move_folder_documents`], first statement: the documents in the folder, locked
     /// in ascending id order before they are updated together.

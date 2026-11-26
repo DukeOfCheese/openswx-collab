@@ -1131,6 +1131,7 @@ org_members.created_at DOUBLE PRECISION NN
 orgs.id VARCHAR(32) NN pk1
 orgs.name VARCHAR(200) NN
 orgs.created_at DOUBLE PRECISION NN
+orgs.deleted_at DOUBLE PRECISION
 password_resets.token_hash VARCHAR(64) NN pk1
 password_resets.user_id VARCHAR(32) NN
 password_resets.expires_at DOUBLE PRECISION NN
@@ -1141,6 +1142,7 @@ projects.id VARCHAR(32) NN pk1
 projects.org_id VARCHAR(32) NN
 projects.name VARCHAR(200) NN
 projects.created_at DOUBLE PRECISION NN
+projects.deleted_at DOUBLE PRECISION
 room_leases.document_id VARCHAR(32) NN pk1
 room_leases.node_id VARCHAR(64) NN
 room_leases.epoch BIGINT NN

@@ -384,17 +384,18 @@ async fn create(
         created_at: now,
     };
     state.blobs.put(&key, bytes).await?;
-    let role = match insert_document(&state, &user, &document, &snapshot, &references).await {
-        Ok(role) => role,
-        Err(InsertError::BeforeCommit(err)) => {
-            forget_snapshot(&state, &key).await;
-            return Err(err);
-        }
-        Err(InsertError::Commit(err, role)) => {
-            settle_commit_error(&state, &document, &key, err).await?;
-            role
-        }
-    };
+    let role =
+        match insert_document(&state, &user, &document, &snapshot, &references, &org_id).await {
+            Ok(role) => role,
+            Err(InsertError::BeforeCommit(err)) => {
+                forget_snapshot(&state, &key).await;
+                return Err(err);
+            }
+            Err(InsertError::Commit(err, role)) => {
+                settle_commit_error(&state, &document, &key, err).await?;
+                role
+            }
+        };
     let event = Event::DocumentCreated {
         org: org_id,
         project: project_id,
@@ -520,7 +521,9 @@ async fn insert_document(
     document: &Document,
     snapshot: &SnapshotRow,
     references: &References,
+    org_id: &str,
 ) -> Result<ProjectRole, InsertError> {
+    let _turn = state.org_turn(org_id).await?;
     let mut tx = state.store.begin().await?;
     let (_, role) = recheck_project(
         &mut *tx,
@@ -614,6 +617,7 @@ async fn patch_document(
     if let Some(Some(folder)) = &body.folder_id {
         folder_in(state.store.folder_by_id(folder).await?, &project.id)?;
     }
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     let (mut doc, _, role) =
         recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Editor).await?;
@@ -671,6 +675,7 @@ async fn delete_document(
         ProjectRole::Owner,
     )
     .await?;
+    let _turn = state.org_turn(&project.org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_document(&mut *tx, &user.id, &doc.id, ProjectRole::Owner).await?;
     if !tx.mark_document_deleted(&doc.id, state.clock.now()).await? {

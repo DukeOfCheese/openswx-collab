@@ -80,6 +80,9 @@ pub struct Settings {
     /// Seconds a request's transaction waits for another's row lock on PostgreSQL before it is
     /// answered 409 "try again".
     pub database_lock_timeout: f64,
+    /// Seconds the journal writer's transaction waits for a row lock on PostgreSQL before it
+    /// writes the batch again one document at a time.
+    pub database_journal_lock_timeout: f64,
     pub storage_url: String,
     /// For S3-compatible stores (MinIO, Garage, R2), e.g. `http://minio:9000`. Empty: AWS S3.
     pub s3_endpoint: String,
@@ -149,6 +152,7 @@ impl Default for Settings {
             database_pool: crate::store::postgres::DEFAULT_POOL,
             database_journal_pool: crate::store::postgres::DEFAULT_JOURNAL_POOL,
             database_lock_timeout: crate::store::postgres::DEFAULT_LOCK_TIMEOUT,
+            database_journal_lock_timeout: crate::store::postgres::DEFAULT_JOURNAL_LOCK_TIMEOUT,
             storage_url: "./data/storage".into(),
             s3_endpoint: String::new(),
             s3_region: DEFAULT_S3_REGION.into(),
@@ -198,6 +202,25 @@ impl Settings {
         e.positive_whole("DATABASE_POOL", &mut s.database_pool)?;
         e.positive_whole("DATABASE_JOURNAL_POOL", &mut s.database_journal_pool)?;
         e.positive_seconds("DATABASE_LOCK_TIMEOUT", &mut s.database_lock_timeout)?;
+        e.positive_seconds(
+            "DATABASE_JOURNAL_LOCK_TIMEOUT",
+            &mut s.database_journal_lock_timeout,
+        )?;
+        // A lock wait as long as the statement timeout would never be the one to end.
+        for (name, seconds) in [
+            ("DATABASE_LOCK_TIMEOUT", s.database_lock_timeout),
+            (
+                "DATABASE_JOURNAL_LOCK_TIMEOUT",
+                s.database_journal_lock_timeout,
+            ),
+        ] {
+            if seconds > crate::store::postgres::MAX_LOCK_TIMEOUT {
+                return Err(ConfigError::new(
+                    name,
+                    "a number of seconds above zero and at most 20 (statements end after 30)",
+                ));
+            }
+        }
         e.string("STORAGE_URL", &mut s.storage_url);
         e.string("S3_ENDPOINT", &mut s.s3_endpoint);
         if e.get("S3_PATH_STYLE").is_some() {
@@ -366,6 +389,10 @@ impl fmt::Debug for Settings {
             .field("database_pool", &self.database_pool)
             .field("database_journal_pool", &self.database_journal_pool)
             .field("database_lock_timeout", &self.database_lock_timeout)
+            .field(
+                "database_journal_lock_timeout",
+                &self.database_journal_lock_timeout,
+            )
             .field("storage_url", &self.storage_url)
             .field("s3_endpoint", &self.s3_endpoint)
             .field("s3_region", &self.s3_region)
@@ -834,6 +861,16 @@ mod tests {
         let s = read(&[]);
         assert_eq!((s.database_pool, s.database_journal_pool), (10, 2));
         assert_eq!(s.database_lock_timeout, 5.0);
+        assert_eq!(s.database_journal_lock_timeout, 2.0);
+        // A lock timeout must end before the statement timeout (30 s) does.
+        for name in ["DATABASE_LOCK_TIMEOUT", "DATABASE_JOURNAL_LOCK_TIMEOUT"] {
+            assert_eq!(read(&[(name, "20")]).database_pool, 10, "20 s is allowed");
+            for bad in ["20.5", "30", "31", "86400"] {
+                let err = refused(&[(name, bad)]);
+                assert_eq!(err.var, format!("OSWX_COLLAB_{name}"), "{bad}");
+                assert!(err.expected.contains("at most 20"), "{err}");
+            }
+        }
         let s = read(&[
             ("DATABASE_POOL", " 32 "),
             ("DATABASE_JOURNAL_POOL", "4"),

@@ -66,7 +66,7 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use crate::access::{CurrentUser, NO_SUCH_ORG, recheck_org, require_org};
-use crate::blobs::{Blobs, blob_key, is_sha256};
+use crate::blobs::{blob_key, is_sha256};
 use crate::content::{blob_refs, json_from_plain, ops_blob_refs};
 use crate::error::{ApiError, ApiJson, ApiPath, detail_response};
 use crate::export::{Archive, Pipe, close_entry, download};
@@ -371,22 +371,23 @@ async fn delete_org(
     // Asked before the transaction (never while it holds the writer).
     check_org_delete(&state.ext, &org.id).await?;
 
+    let _turn = state.org_turn(&org.id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org.id, OrgRole::Owner).await?;
     let renamed = tx.org_by_id(&org.id).await?.is_none_or(|now| !named(&now));
     if renamed {
         return Err(ApiError::Unprocessable(TYPE_THE_NAME.into()));
     }
-    // The cascade would lock the organisation's document rows in no particular order: they are
-    // locked in ascending id order first (the lock order of `crate::store`).
+    // Marked, not removed: from this commit the organisation, its projects and its documents are
+    // gone for everyone and nobody is a member; what is left of them in the database and in
+    // storage is removed afterwards, a little at a time (`crate::purge`).
     let documents = tx.org_document_ids(&org.id).await?;
-    tx.lock_documents(&documents).await?;
     let members = tx.org_member_ids(&org.id).await?;
-    tx.delete_org(&org.id).await?;
+    tx.mark_org_deleted(&org.id, state.clock.now()).await?;
 
     let (revoker, open) = (state.clone(), documents.clone());
     let (after, org_id, by) = (state.clone(), org.id, user.id);
-    state
+    let committed = state
         .commit_then(
             tx,
             |_| async move {
@@ -395,7 +396,6 @@ async fn delete_org(
                 }
             },
             async move {
-                remove_org_files(after.blobs.as_ref(), &org_id, &documents).await;
                 for member in &members {
                     notify_member_removed(&after.ext, &org_id, member).await;
                 }
@@ -404,36 +404,11 @@ async fn delete_org(
                 emit(&after.ext, deleted).await;
             },
         )
-        .await?;
+        .await;
+    // (Also after a commit that reported an error: the purger goes by what is marked.)
+    state.wake_purger();
+    committed?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Removes what a deleted organisation left in storage: its blobs (`orgs/<org>/`; blobs are kept
-/// per organisation, so no other organisation's are touched) and the snapshots of its documents
-/// (`docs/<document>/`, which also takes snapshots whose rows were never written). Failures are
-/// logged, with ids and storage keys only; the files they leave are wasted space, nothing more.
-async fn remove_org_files(blobs: &dyn Blobs, org: &str, documents: &[Id]) {
-    let prefixes = documents
-        .iter()
-        .map(|d| format!("docs/{d}/"))
-        .chain([format!("orgs/{org}/")]);
-    let mut failed = 0usize;
-    for prefix in prefixes {
-        if let Err(e) = blobs.delete_prefix(&prefix).await {
-            if failed == 0 {
-                tracing::error!(org, "could not remove {prefix} from storage: {e:#}");
-            }
-            failed += 1;
-        }
-    }
-    if failed > 0 {
-        tracing::error!(
-            org,
-            "could not remove all stored files of the deleted organisation: {failed} of {} \
-             removals failed",
-            documents.len() + 1
-        );
-    }
 }
 
 /// A zip of everything in the organisation, streamed (see the module documentation).

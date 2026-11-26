@@ -1644,3 +1644,116 @@ async fn two_first_sign_ins_that_both_count_nobody_make_one_admin() {
     );
     assert_eq!(count(&server, "SELECT COUNT(*) FROM users").await, 1);
 }
+
+// ------------------------------------------------------------------ Task 16, fix round 2
+
+/// A sign-in that meets a taken key on every try (which only a fault of the server can make
+/// happen) still ends at the app, with an error it knows: never a 500 page in the browser.
+#[tokio::test]
+async fn a_sign_in_that_keeps_meeting_a_taken_key_goes_back_to_the_app() {
+    let server = TestServer::start_with(|s| {
+        google(s);
+        s.open_registration = true;
+    })
+    .await;
+    server.register("first@example.com").await;
+    // No two accounts may have one name (a rule of this test's own), and one is called `ada`
+    // already: every try to make the account of the person `ada` is refused by the database.
+    server
+        .sql("CREATE UNIQUE INDEX test_one_name ON users (name)")
+        .await;
+    let (s, _) = server
+        .post(
+            "/api/auth/register",
+            None,
+            json!({"email": "other@example.com", "password": PASSWORD, "name": "ada"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    server.providers.person("ada", "ada@example.com");
+    let (back, _) = oauth(&server, "google", "ada", None).await;
+    assert_eq!(error(&back), "server_error");
+    assert_eq!(
+        count(
+            &server,
+            "SELECT COUNT(*) FROM users WHERE email = 'ada@example.com'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(&server, "SELECT COUNT(*) FROM oauth_identities").await,
+        0
+    );
+}
+
+/// An account that is being deleted gains no way in: attaching a provider takes the account's
+/// row, as its deletion does, and looks at the account again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_being_deleted_gains_no_provider() {
+    let (server, flaky) = TestServer::start_flaky(|s| {
+        google(s);
+        s.open_registration = true;
+    })
+    .await;
+    // (The first account: its address counts as confirmed, so a provider with it is attached.)
+    let (ada, ada_id) = server.register("ada@example.com").await;
+    server.providers.person("ada", "ada@example.com");
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    let r = start(&server, "google", &params).await;
+    let state = query(&location(&r))["state"][0].clone();
+    let server = Arc::new(server);
+    // The deletion holds the account's row and is parked before it empties the account ...
+    flaky.erase_gate.shut();
+    let deleting = {
+        let (server, ada) = (server.clone(), ada.clone());
+        tokio::spawn(async move {
+            server
+                .call(
+                    reqwest::Method::DELETE,
+                    "/api/me",
+                    Some(&ada),
+                    Some(json!({"current_password": PASSWORD})),
+                )
+                .await
+        })
+    };
+    flaky.erase_gate.until_waiting(1).await;
+    // ... while the same person signs in through the provider.
+    let signing_in = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let r = callback(
+                &server,
+                "google",
+                &[("code", "ada"), ("state", state.as_str())],
+            )
+            .await;
+            query(&location(&r))
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    flaky.erase_gate.open();
+    assert_eq!(deleting.await.unwrap().0, StatusCode::NO_CONTENT);
+    let back = signing_in.await.unwrap();
+    // Either the sign-in saw the account go (PostgreSQL: it waited for the account's row), or
+    // it came wholly after (SQLite) and made a new account with the address the deletion freed.
+    // Never: an identity that signs in to the deleted account.
+    assert_eq!(
+        count(
+            &server,
+            &format!("SELECT COUNT(*) FROM oauth_identities WHERE user_id = '{ada_id}'")
+        )
+        .await,
+        0,
+        "{back:?}"
+    );
+    if !back.contains_key("code") {
+        assert_eq!(error(&back), "account_disabled");
+        assert_eq!(
+            count(&server, "SELECT COUNT(*) FROM oauth_identities").await,
+            0
+        );
+    }
+}

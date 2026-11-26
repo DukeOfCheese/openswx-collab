@@ -483,6 +483,12 @@ impl TestServer {
         let mut state = self.state.clone();
         state.hub = Hub::default();
         state.sessions = Sessions::default();
+        // (A new process has a purger of its own, which starts with what is still marked.)
+        state.purger = oswx_server::purge::Purger::new(
+            self.state.purger.chunk_rows(),
+            oswx_server::purge::RETRY,
+        );
+        state.org_queue = oswx_server::org_queue::OrgQueue::default();
         let db = open_store(&state.settings).await;
         let reopened: Arc<dyn Store> = db.store();
         match &self.store_kind {
@@ -559,6 +565,14 @@ impl TestServer {
             }
         }
         self.state.shutdown().await;
+    }
+
+    /// Waits until everything that was deleted has been removed from the database and storage
+    /// (the purger has nothing left to do).
+    pub async fn purged(&self) {
+        tokio::time::timeout(Duration::from_secs(60), self.state.purger.idle())
+            .await
+            .expect("the purger finishes");
     }
 
     /// The test database as this server opened it.
@@ -860,6 +874,8 @@ pub struct FlakyStore {
     pub org_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `insert_user` parks here (a registration has then counted the accounts).
     pub user_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every `erase_user` parks here (an account's deletion then holds its locks).
+    pub erase_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `set_document_head` parks here (the journal has then locked and written what a
     /// batch writes, and not yet committed).
     pub head_gate: Arc<oswx_server::room::Gate>,
@@ -903,6 +919,7 @@ impl FlakyStore {
             commit_gate: Arc::default(),
             head_gate: Arc::default(),
             user_gate: Arc::default(),
+            erase_gate: Arc::default(),
             org_gate: Arc::default(),
             commit_patience: Arc::default(),
             parts_gate: Arc::default(),
@@ -1052,6 +1069,7 @@ impl FlakyStore {
             commit_gate: self.commit_gate.clone(),
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
+            erase_gate: self.erase_gate.clone(),
             org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
@@ -1131,6 +1149,28 @@ impl Store for FlakyStore {
     async fn begin_journal(&self) -> anyhow::Result<Box<dyn Tx>> {
         self.before_begin();
         Ok(self.flaky(self.inner().begin_journal().await?))
+    }
+
+    async fn deleted_projects(&self, limit: i64) -> anyhow::Result<Vec<Id>> {
+        self.inner().deleted_projects(limit).await
+    }
+
+    async fn deleted_orgs(&self, limit: i64) -> anyhow::Result<Vec<Id>> {
+        self.inner().deleted_orgs(limit).await
+    }
+
+    async fn documents_of_deleted_project(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Id>> {
+        self.inner()
+            .documents_of_deleted_project(project_id, limit)
+            .await
+    }
+
+    async fn projects_left_in_org(&self, org_id: &str) -> anyhow::Result<u64> {
+        self.inner().projects_left_in_org(org_id).await
     }
 
     async fn user_count(&self) -> anyhow::Result<u64> {
@@ -1500,6 +1540,7 @@ pub struct FlakyTx<'a> {
     commit_gate: Arc<oswx_server::room::Gate>,
     head_gate: Arc<oswx_server::room::Gate>,
     user_gate: Arc<oswx_server::room::Gate>,
+    erase_gate: Arc<oswx_server::room::Gate>,
     org_gate: Arc<oswx_server::room::Gate>,
     commit_patience: Arc<Mutex<Option<Duration>>>,
     ref_writes: Arc<AtomicUsize>,
@@ -1569,6 +1610,7 @@ impl Tx for FlakyTx<'_> {
             commit_gate: self.commit_gate.clone(),
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
+            erase_gate: self.erase_gate.clone(),
             org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
@@ -1840,6 +1882,34 @@ impl Tx for FlakyTx<'_> {
             .await
     }
 
+    async fn mark_project_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool> {
+        self.inner.mark_project_deleted(id, now).await
+    }
+
+    async fn mark_org_deleted(&mut self, id: &str, now: f64) -> anyhow::Result<bool> {
+        self.inner.mark_org_deleted(id, now).await
+    }
+
+    async fn purge_document_rows(&mut self, document_id: &str, limit: i64) -> anyhow::Result<u64> {
+        self.inner.purge_document_rows(document_id, limit).await
+    }
+
+    async fn purge_document(&mut self, id: &str) -> anyhow::Result<()> {
+        self.inner.purge_document(id).await
+    }
+
+    async fn purge_project_rows(&mut self, project_id: &str, limit: i64) -> anyhow::Result<u64> {
+        self.inner.purge_project_rows(project_id, limit).await
+    }
+
+    async fn purge_project(&mut self, id: &str) -> anyhow::Result<bool> {
+        self.inner.purge_project(id).await
+    }
+
+    async fn purge_org(&mut self, id: &str) -> anyhow::Result<bool> {
+        self.inner.purge_org(id).await
+    }
+
     async fn insert_document(&mut self, document: &Document) -> anyhow::Result<()> {
         self.inner.insert_document(document).await
     }
@@ -2087,6 +2157,7 @@ impl Tx for FlakyTx<'_> {
         name: &str,
         now: f64,
     ) -> anyhow::Result<()> {
+        self.erase_gate.pass().await;
         self.inner.erase_user(id, email, name, now).await
     }
 
@@ -2236,6 +2307,7 @@ pub struct TestBlobs {
     put_delay: Mutex<Duration>,
     fail_exists: AtomicBool,
     fail_put: AtomicBool,
+    fail_delete: AtomicBool,
     exists_calls: AtomicUsize,
     exists_now: AtomicUsize,
     exists_most: AtomicUsize,
@@ -2251,6 +2323,7 @@ impl TestBlobs {
             put_delay: Mutex::new(Duration::ZERO),
             fail_exists: AtomicBool::new(false),
             fail_put: AtomicBool::new(false),
+            fail_delete: AtomicBool::new(false),
             exists_calls: AtomicUsize::new(0),
             exists_now: AtomicUsize::new(0),
             exists_most: AtomicUsize::new(0),
@@ -2281,6 +2354,11 @@ impl TestBlobs {
     }
 
     /// Makes `put` fail or delegate again.
+    /// Makes every removal of a prefix fail (`true`), as a storage that is away; or work again.
+    pub fn fail_delete(&self, fail: bool) {
+        self.fail_delete.store(fail, Ordering::SeqCst);
+    }
+
     pub fn fail_put(&self, fail: bool) {
         self.fail_put.store(fail, Ordering::SeqCst);
     }
@@ -2359,6 +2437,9 @@ impl Blobs for TestBlobs {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        if self.fail_delete.load(Ordering::SeqCst) {
+            anyhow::bail!("the test storage was told to fail removals");
+        }
         self.inner.delete_prefix(prefix).await
     }
 

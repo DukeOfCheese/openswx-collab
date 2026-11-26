@@ -64,10 +64,15 @@ CREATE TABLE password_resets (
 );
 CREATE INDEX ix_password_resets_user_id ON password_resets (user_id);
 
+-- deleted_at: set when the organisation is deleted. From then on it is gone for everyone (its
+-- members and invites go in the same transaction); the server removes what is left of it (its
+-- projects, their documents and journals, its files) afterwards, a little at a time, and this row
+-- last.
 CREATE TABLE orgs (
     id VARCHAR(32) NOT NULL PRIMARY KEY,
     name VARCHAR(200) NOT NULL,
-    created_at DOUBLE PRECISION NOT NULL
+    created_at DOUBLE PRECISION NOT NULL,
+    deleted_at DOUBLE PRECISION NULL
 );
 
 CREATE TABLE org_members (
@@ -97,7 +102,10 @@ CREATE TABLE projects (
     id VARCHAR(32) NOT NULL PRIMARY KEY,
     org_id VARCHAR(32) NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
     name VARCHAR(200) NOT NULL,
-    created_at DOUBLE PRECISION NOT NULL
+    created_at DOUBLE PRECISION NOT NULL,
+    -- Set when the project (or its organisation) is deleted: gone for everyone from then on, and
+    -- removed afterwards, as an organisation is.
+    deleted_at DOUBLE PRECISION NULL
 );
 CREATE INDEX ix_projects_org_id ON projects (org_id);
 

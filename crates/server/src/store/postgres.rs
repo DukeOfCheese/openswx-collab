@@ -12,11 +12,19 @@
 //!   transaction and then reads through [`Store`] never waits for a connection that only other
 //!   transactions could give back (as on SQLite, where the writer and the readers are apart);
 //! - **the journal** ([`Store::begin_journal`]): `journal_pool` connections (2 unless
-//!   configured) for the journal writer, lease acquisitions and snapshot rows, which no request
-//!   can use up. These have **no** `lock_timeout`: what the journal waits for are document rows a
-//!   request's transaction changed or is deleting, which that transaction's own timeouts bound,
-//!   and failing a batch instead would answer every record in it `Unknown` and make every room in
-//!   it reload.
+//!   configured) for the journal writer, lease acquisitions, snapshot rows and rebuild reports,
+//!   which no request can use up. These have a shorter `lock_timeout` (2 s unless configured):
+//!   the journal writes many documents' records in one transaction, and must not let one
+//!   document whose row someone holds keep the others waiting. When a batch runs into it
+//!   (`55P03`), the writer writes the batch again one document at a time
+//!   ([`crate::journal`]): only the records of the blocked document come back `Unknown` (its
+//!   room reloads); every other document's are stored.
+//!
+//! Both lock timeouts are at most 20 s ([`MAX_LOCK_TIMEOUT`]), well below the statement timeout,
+//! so that a lock wait ends as a lock wait (409, or the journal's fallback) and not as a statement
+//! that ran out of time (503, or a failed batch). [`PgStore::connect`] refuses longer ones, and
+//! sets both on the connection it makes first, so that a database that will not take them says
+//! so when the server starts.
 //!
 //! With the defaults the server holds at most **12** connections (5 + 5 + 2), opened as they are
 //! needed. A caller waits up to 30 s for a free one ([`super::is_busy`]: 503). Every connection is
@@ -76,6 +84,12 @@ pub const DEFAULT_JOURNAL_POOL: u32 = 2;
 /// How many seconds a request's transaction waits for a row lock, unless the settings say
 /// otherwise (`OSWX_COLLAB_DATABASE_LOCK_TIMEOUT`).
 pub const DEFAULT_LOCK_TIMEOUT: f64 = 5.0;
+/// How many seconds the journal's transaction waits for a row lock, unless the settings say
+/// otherwise (`OSWX_COLLAB_DATABASE_JOURNAL_LOCK_TIMEOUT`).
+pub const DEFAULT_JOURNAL_LOCK_TIMEOUT: f64 = 2.0;
+/// The longest lock timeout, in seconds: well below the statement timeout (30 s), so that a wait
+/// for a lock ends as one.
+pub const MAX_LOCK_TIMEOUT: f64 = 20.0;
 /// How long a caller waits for a connection.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest one statement may run (waiting for a lock included), in milliseconds.
@@ -95,6 +109,8 @@ pub struct PgConfig {
     pub journal_pool: u32,
     /// How long a request's transaction waits for a row lock before it fails (`55P03`).
     pub lock_timeout: Duration,
+    /// How long the journal's transaction waits for a row lock before it fails (`55P03`).
+    pub journal_lock_timeout: Duration,
 }
 
 impl Default for PgConfig {
@@ -103,6 +119,7 @@ impl Default for PgConfig {
             pool: DEFAULT_POOL,
             journal_pool: DEFAULT_JOURNAL_POOL,
             lock_timeout: Duration::from_secs_f64(DEFAULT_LOCK_TIMEOUT),
+            journal_lock_timeout: Duration::from_secs_f64(DEFAULT_JOURNAL_LOCK_TIMEOUT),
         }
     }
 }
@@ -114,6 +131,7 @@ impl PgConfig {
             pool: settings.database_pool,
             journal_pool: settings.database_journal_pool,
             lock_timeout: Duration::from_secs_f64(settings.database_lock_timeout),
+            journal_lock_timeout: Duration::from_secs_f64(settings.database_journal_lock_timeout),
         }
     }
 }
@@ -198,19 +216,37 @@ impl PgStore {
                 .max_connections(connections.max(1))
                 .acquire_timeout(ACQUIRE_TIMEOUT)
         };
+        let longest = Duration::from_secs_f64(MAX_LOCK_TIMEOUT);
+        anyhow::ensure!(
+            config.lock_timeout <= longest && config.journal_lock_timeout <= longest,
+            "a lock timeout is at most {MAX_LOCK_TIMEOUT} s (statements end after {} s)",
+            STATEMENT_TIMEOUT_MS / 1000
+        );
         let lock_timeout_ms = config.lock_timeout.as_millis().max(1);
+        let journal_lock_timeout_ms = config.journal_lock_timeout.as_millis().max(1);
         // One connection made here and now shows whether the database answers, and says why not
         // at once (a pool would try again until its wait ran out). The pools open theirs as they
         // are needed.
-        let probe = options
+        let mut probe = options
             .connect()
             .await
             .map_err(|e| cannot_connect(&options, &e))?;
+        // The lock timeouts are tried on it: a database that will not take them says so now.
+        for ms in [lock_timeout_ms, journal_lock_timeout_ms] {
+            sqlx::query(&format!("SET lock_timeout = {ms}"))
+                .execute(&mut probe)
+                .await
+                .context("the database did not take the lock timeout")?;
+        }
         let _ = probe.close().await;
         let transactions = pool(for_transactions)
             .connect_lazy_with(options.clone().options([("lock_timeout", lock_timeout_ms)]));
         let reads = pool(for_reads).connect_lazy_with(options.clone());
-        let journal = pool(config.journal_pool).connect_lazy_with(options.clone());
+        let journal = pool(config.journal_pool).connect_lazy_with(
+            options
+                .clone()
+                .options([("lock_timeout", journal_lock_timeout_ms)]),
+        );
         Ok(Self {
             transactions,
             reads,
