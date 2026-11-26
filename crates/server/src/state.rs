@@ -10,12 +10,13 @@ use anyhow::bail;
 use crate::blobs::{Blobs, LocalBlobs};
 use crate::clock::Clock;
 use crate::config::{Database, Settings, Storage};
+use crate::error::ApiError;
 use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
 use crate::journal::{self, JournalWriter};
 use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::sessions::Sessions;
-use crate::store::{SqliteStore, Store, new_id};
+use crate::store::{SqliteStore, Store, Tx, new_id};
 
 /// The server's shared state. Cloning is cheap: every field is shared.
 #[derive(Clone)]
@@ -112,12 +113,66 @@ impl AppState {
         }
     }
 
-    /// Runs what a request does after its database commit (forgetting sessions, closing document
-    /// connections, mail, extension notifications and events, in that order) to completion in a
-    /// task of its own, and answers what it answers. The request waits for it, but if the request
-    /// is dropped meanwhile (its client went away) the steps still all run: a commit that took
-    /// away someone's access is always followed by the hub closing their connections. Shutdown
-    /// waits (a while) for steps still running.
+    /// Commits a request's transaction and runs what follows it, all in a task of its own that
+    /// the request awaits but does not own: if the request is dropped (its client went away)
+    /// once this is called, the commit and every step after it still run. Shutdown waits (a
+    /// while) for such tasks.
+    ///
+    /// The steps come in two kinds, in this order:
+    ///
+    /// - `revoking`: forgetting sessions and the hub's drops and closes. They run after the
+    ///   commit **whether it succeeded or reported an error** (an error can come after the commit
+    ///   took effect: a connection lost during `COMMIT`). That is safe: [`Hub::drop_user`] reads
+    ///   the roles again and drops nobody whose role did not change, and the other drops cost at
+    ///   worst a reconnect.
+    /// - `announcing`: mail, extension notifications and events. They run only after a commit
+    ///   that succeeded; their answer is the request's.
+    ///
+    /// A commit error is answered as the error (500) after the revoking steps.
+    ///
+    /// # Which hub call a route makes
+    ///
+    /// Every route whose commit takes away access calls one of these among its revoking steps
+    /// (after any `sessions.forget_*`):
+    ///
+    /// | the commit | revoking step |
+    /// |---|---|
+    /// | ends every session of an account (password changed or reset, account disabled or deleted, signed out everywhere) | `sessions.forget_user`, then [`Hub::drop_account`] |
+    /// | ends one session (sign-out) | `sessions.forget_token`, then [`Hub::drop_session`] |
+    /// | changes or removes a role in an organisation or one of its projects (member role, member removal, project member set or removed) | [`Hub::drop_user`] for that user and organisation |
+    /// | deletes a document, or a project or organisation with its documents | [`Hub::close_document`] for each document |
+    ///
+    /// # Panics
+    ///
+    /// If the steps panic (the panic is passed on to the request).
+    pub async fn commit_then<T, R, A>(
+        &self,
+        tx: Box<dyn Tx>,
+        revoking: R,
+        announcing: A,
+    ) -> Result<T, ApiError>
+    where
+        T: Send + 'static,
+        R: Future<Output = ()> + Send + 'static,
+        A: Future<Output = T> + Send + 'static,
+    {
+        let gate = self.room_hooks.after_commit.clone();
+        self.detached(async move {
+            let committed = tx.commit().await;
+            gate.pass().await;
+            revoking.await;
+            match committed {
+                Ok(()) => Ok(announcing.await),
+                Err(e) => Err(ApiError::Internal(e)),
+            }
+        })
+        .await
+    }
+
+    /// Runs what follows a write that has no transaction for the request to commit (a restore,
+    /// written by the room's journal; a document creation, whose commit has its own handling of an
+    /// uncertain outcome) to completion in a task of its own, as [`AppState::commit_then`] runs
+    /// its steps, and answers what it answers.
     ///
     /// # Panics
     ///
@@ -127,12 +182,24 @@ impl AppState {
         T: Send + 'static,
         F: Future<Output = T> + Send + 'static,
     {
-        let running = self.after_commits.start();
         let gate = self.room_hooks.after_commit.clone();
-        let task = tokio::spawn(async move {
-            let _running = running;
+        self.detached(async move {
             gate.pass().await;
             steps.await
+        })
+        .await
+    }
+
+    /// Runs `work` in a tracked task of its own, which a dropped caller does not cancel.
+    async fn detached<T, F>(&self, work: F) -> T
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let running = self.after_commits.start();
+        let task = tokio::spawn(async move {
+            let _running = running;
+            work.await
         });
         match task.await {
             Ok(answer) => answer,

@@ -164,7 +164,6 @@ async fn create_folder(
         }
     }
     tx.insert_folder(&folder).await?;
-    tx.commit().await?;
     let event = Event::FolderCreated {
         org: project.org_id,
         project: project.id,
@@ -173,8 +172,8 @@ async fn create_folder(
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move { emit(&ext, event).await })
-        .await;
+        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .await?;
     Ok((StatusCode::CREATED, ApiJson(folder_out(&folder))))
 }
 
@@ -269,7 +268,6 @@ async fn patch_folder(
         tx.set_folder_name(&folder.id, name).await?;
         folder.name.clone_from(name);
     }
-    tx.commit().await?;
     let mut events = Vec::new();
     if name.is_some() {
         events.push(Event::FolderRenamed {
@@ -290,12 +288,12 @@ async fn patch_folder(
     }
     let ext = state.ext.clone();
     state
-        .after_commit(async move {
+        .commit_then(tx, async {}, async move {
             for event in events {
                 emit(&ext, event).await;
             }
         })
-        .await;
+        .await?;
     Ok(ApiJson(folder_out(&folder)))
 }
 
@@ -313,7 +311,6 @@ async fn delete_folder(
     tx.move_folder_documents(&folder.id, parent).await?;
     tx.move_child_folders(&folder.id, parent).await?;
     tx.delete_folder(&folder.id).await?;
-    tx.commit().await?;
     let event = Event::FolderDeleted {
         org: project.org_id,
         project: project.id,
@@ -322,8 +319,8 @@ async fn delete_folder(
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move { emit(&ext, event).await })
-        .await;
+        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

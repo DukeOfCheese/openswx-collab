@@ -533,7 +533,6 @@ async fn patch_document(
         tx.set_document_folder(&doc.id, folder.as_deref()).await?;
         doc.folder_id.clone_from(folder);
     }
-    tx.commit().await?;
     let mut events = Vec::new();
     if name.is_some() {
         events.push(Event::DocumentRenamed {
@@ -554,12 +553,12 @@ async fn patch_document(
     }
     let ext = state.ext.clone();
     state
-        .after_commit(async move {
+        .commit_then(tx, async {}, async move {
             for event in events {
                 emit(&ext, event).await;
             }
         })
-        .await;
+        .await?;
     Ok(ApiJson(doc_out(&doc, Some(role))))
 }
 
@@ -586,23 +585,25 @@ async fn delete_document(
     // "assemblies use this part; remove it from them first", "assemblies": [those the caller can
     // open], "in_projects_you_cannot_open": n}` when assemblies that are not deleted use it
     // (rolling back).
-    tx.commit().await?;
-    let after = state.clone();
+    let event = Event::DocumentDeleted {
+        org: project.org_id,
+        project: project.id,
+        document: doc.id.clone(),
+        by: user.id,
+    };
+    let (revoker, ext) = (state.clone(), state.ext.clone());
     state
-        .after_commit(async move {
-            after
-                .hub
-                .close_document(&doc.id, "the document was deleted")
-                .await;
-            let event = Event::DocumentDeleted {
-                org: project.org_id,
-                project: project.id,
-                document: doc.id,
-                by: user.id,
-            };
-            emit(&after.ext, event).await;
-        })
-        .await;
+        .commit_then(
+            tx,
+            async move {
+                revoker
+                    .hub
+                    .close_document(&doc.id, "the document was deleted")
+                    .await;
+            },
+            async move { emit(&ext, event).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

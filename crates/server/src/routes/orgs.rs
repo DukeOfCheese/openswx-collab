@@ -150,15 +150,14 @@ async fn create_org(
         created_at: now,
     })
     .await?;
-    tx.commit().await?;
     let event = Event::OrgCreated {
         org: org.id.clone(),
         by: user.id,
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move { emit(&ext, event).await })
-        .await;
+        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({"id": org.id, "name": org.name, "role": "owner", "members": 1})),
@@ -176,15 +175,14 @@ async fn rename_org(
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Owner).await?;
     tx.set_org_name(&org_id, &name).await?;
-    tx.commit().await?;
     let event = Event::OrgRenamed {
         org: org_id.clone(),
         by: user.id,
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move { emit(&ext, event).await })
-        .await;
+        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .await?;
     Ok(Json(json!({"id": org_id, "name": name})))
 }
 
@@ -241,23 +239,26 @@ async fn set_member_role(
     }
     tx.set_org_member_role(&org_id, &user_id, role.as_str())
         .await?;
-    tx.commit().await?;
     let event = Event::MemberRoleChanged {
         org: org_id.clone(),
         user: user_id.clone(),
         role: role.as_str(),
         by: user.id,
     };
-    let (after, member) = (state.clone(), user_id.clone());
+    let (revoker, member) = (state.clone(), user_id.clone());
+    let ext = state.ext.clone();
     state
-        .after_commit(async move {
-            after
-                .hub
-                .drop_user(after.store.as_ref(), &member, &org_id)
-                .await;
-            emit(&after.ext, event).await;
-        })
-        .await;
+        .commit_then(
+            tx,
+            async move {
+                revoker
+                    .hub
+                    .drop_user(revoker.store.as_ref(), &member, &org_id)
+                    .await;
+            },
+            async move { emit(&ext, event).await },
+        )
+        .await?;
     Ok(Json(json!({"user_id": user_id, "role": role.as_str()})))
 }
 
@@ -287,24 +288,29 @@ async fn remove_member(
     }
     tx.delete_project_members_in_org(&org_id, &user_id).await?;
     tx.delete_org_member(&org_id, &user_id).await?;
-    tx.commit().await?;
     let event = Event::MemberRemoved {
         org: org_id.clone(),
         user: user_id.clone(),
         by: user.id,
     };
-    let after = state.clone();
+    let (revoker, member, org) = (state.clone(), user_id.clone(), org_id.clone());
+    let ext = state.ext.clone();
+    // Access goes first: their open documents close before any extension hears of it.
     state
-        .after_commit(async move {
-            // Access goes first: their open documents close before any extension hears of it.
-            after
-                .hub
-                .drop_user(after.store.as_ref(), &user_id, &org_id)
-                .await;
-            notify_member_removed(&after.ext, &org_id, &user_id).await;
-            emit(&after.ext, event).await;
-        })
-        .await;
+        .commit_then(
+            tx,
+            async move {
+                revoker
+                    .hub
+                    .drop_user(revoker.store.as_ref(), &member, &org)
+                    .await;
+            },
+            async move {
+                notify_member_removed(&ext, &org_id, &user_id).await;
+                emit(&ext, event).await;
+            },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -468,7 +474,6 @@ async fn create_invite(
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
     tx.insert_invite(&invite).await?;
-    tx.commit().await?;
 
     let url = format!(
         "{}/invite/{token}",
@@ -485,7 +490,7 @@ async fn create_invite(
     };
     let after = state.clone();
     let emailed = state
-        .after_commit(async move {
+        .commit_then(tx, async {}, async move {
             let mut emailed = false;
             if let Some((to, (subject, text))) = mail {
                 emailed =
@@ -494,7 +499,7 @@ async fn create_invite(
             emit(&after.ext, event).await;
             emailed
         })
-        .await;
+        .await?;
     let mut out = invite_out(&invite)?; // (written by this request: it parses)
     out["token"] = json!(token);
     out["url"] = json!(url);
@@ -531,7 +536,6 @@ async fn revoke_invite(
     if !tx.delete_invite(&org_id, &invite_id).await? {
         return Err(ApiError::NotFound(NO_SUCH_INVITE));
     }
-    tx.commit().await?;
     let event = Event::InviteRevoked {
         org: org_id,
         invite: invite_id,
@@ -539,8 +543,8 @@ async fn revoke_invite(
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move { emit(&ext, event).await })
-        .await;
+        .commit_then(tx, async {}, async move { emit(&ext, event).await })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -639,7 +643,7 @@ pub(crate) struct Accepted {
 
 impl Accepted {
     /// Tells the extensions: `member_added` and the events. Run after the commit
-    /// ([`AppState::after_commit`]).
+    /// ([`AppState::commit_then`]).
     pub(crate) async fn announce(self, ext: Arc<dyn Extensions>) {
         if self.joined {
             notify_member_added(&ext, &self.org, &self.user).await;
@@ -769,13 +773,12 @@ async fn accept(
         return Err(ApiError::NotFound(INVITE_INVALID));
     };
     let accepted = accept_invite(&mut *tx, &invite, Some(&approval), &me.id, now).await?;
-    tx.commit().await?;
     let answer = json!({
         "org": {"id": invite.org_id, "name": approval.org_name},
         "role": accepted.role.as_str(),
     });
     state
-        .after_commit(accepted.announce(state.ext.clone()))
-        .await;
+        .commit_then(tx, async {}, accepted.announce(state.ext.clone()))
+        .await?;
     Ok(Json(answer))
 }

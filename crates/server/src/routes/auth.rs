@@ -246,20 +246,19 @@ async fn register(
         None => None,
     };
     let token = start_session(&mut *tx, &state.settings, &user.id, "", now).await?;
-    tx.commit().await?;
-    tracing::info!(user = %user.id, server_admin = first, "account created");
     let registered = Event::Registered {
         user: user.id.clone(),
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move {
+        .commit_then(tx, async {}, async move {
             emit(&ext, registered).await;
             if let Some(accepted) = accepted {
                 accepted.announce(ext).await;
             }
         })
-        .await;
+        .await?;
+    tracing::info!(user = %user.id, server_admin = first, "account created");
     Ok((
         StatusCode::CREATED,
         Json(json!({"token": token, "user": me_out(&user)})),
@@ -311,14 +310,13 @@ async fn login(
     let mut tx = state.store.begin().await?;
     tx.delete_expired_user_sessions(&user.id, now).await?;
     let token = start_session(&mut *tx, &state.settings, &user.id, &body.label, now).await?;
-    tx.commit().await?;
     let signed_in = Event::SignedIn {
         user: user.id.clone(),
     };
     let ext = state.ext.clone();
     state
-        .after_commit(async move { emit(&ext, signed_in).await })
-        .await;
+        .commit_then(tx, async {}, async move { emit(&ext, signed_in).await })
+        .await?;
     Ok(Json(json!({"token": token, "user": me_out(&user)})))
 }
 
@@ -327,15 +325,18 @@ async fn login(
 async fn logout(State(state): State<AppState>, user: CurrentUser) -> Result<StatusCode, ApiError> {
     let mut tx = state.store.begin().await?;
     tx.delete_session(&user.token_hash).await?;
-    tx.commit().await?;
-    let after = state.clone();
+    let (revoker, hash) = (state.clone(), user.token_hash.clone());
+    let ext = state.ext.clone();
     state
-        .after_commit(async move {
-            after.sessions.forget_token(&user.token_hash);
-            after.hub.drop_session(&user.token_hash).await;
-            emit(&after.ext, Event::SignedOut { user: user.id }).await;
-        })
-        .await;
+        .commit_then(
+            tx,
+            async move {
+                revoker.sessions.forget_token(&hash);
+                revoker.hub.drop_session(&hash).await;
+            },
+            async move { emit(&ext, Event::SignedOut { user: user.id }).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -439,18 +440,25 @@ async fn update_me(
         tx.delete_other_user_sessions(&user.id, &current.token_hash)
             .await?;
     }
-    tx.commit().await?;
-    if password_hash.is_some() {
-        let after = state.clone();
-        let user_id = user.id.clone();
-        state
-            .after_commit(async move {
-                after.sessions.forget_user(&user_id);
-                after.hub.drop_account(&user_id).await;
-                emit(&after.ext, Event::PasswordChanged { user: user_id }).await;
-            })
-            .await;
-    }
+    let changed = password_hash.is_some();
+    let (revoker, ext) = (state.clone(), state.ext.clone());
+    let (revoked, announced) = (user.id.clone(), user.id.clone());
+    state
+        .commit_then(
+            tx,
+            async move {
+                if changed {
+                    revoker.sessions.forget_user(&revoked);
+                    revoker.hub.drop_account(&revoked).await;
+                }
+            },
+            async move {
+                if changed {
+                    emit(&ext, Event::PasswordChanged { user: announced }).await;
+                }
+            },
+        )
+        .await?;
     Ok(Json(me_out(&load(&state, &current).await?)))
 }
 
@@ -505,7 +513,6 @@ async fn request_reset(
         expires_at: now + f64::from(settings.reset_minutes) * 60.0,
     })
     .await?;
-    tx.commit().await?;
     let url = format!(
         "{}/reset-password/{token}",
         settings.public_url.trim_end_matches('/')
@@ -513,7 +520,7 @@ async fn request_reset(
     let (subject, text) = reset_text(&url, settings.reset_minutes);
     let after = state.clone();
     state
-        .after_commit(async move {
+        .commit_then(tx, async {}, async move {
             send_logged(
                 after.mailer.as_ref(),
                 &after.settings,
@@ -525,7 +532,7 @@ async fn request_reset(
             let requested = Event::PasswordResetRequested { user: user.id };
             emit(&after.ext, requested).await;
         })
-        .await;
+        .await?;
     Ok(answer)
 }
 
@@ -576,16 +583,21 @@ async fn confirm_reset(
     tx.set_user_email_verified(&user.id, true).await?;
     tx.delete_user_sessions(&user.id).await?;
     tx.delete_user_password_resets(&user.id).await?;
-    tx.commit().await?;
-    let after = state.clone();
+    let (revoker, revoked) = (state.clone(), user.id.clone());
+    let ext = state.ext.clone();
     state
-        .after_commit(async move {
-            after.sessions.forget_user(&user.id);
-            after.hub.drop_account(&user.id).await;
-            let completed = Event::PasswordResetCompleted { user: user.id };
-            emit(&after.ext, completed).await;
-        })
-        .await;
+        .commit_then(
+            tx,
+            async move {
+                revoker.sessions.forget_user(&revoked);
+                revoker.hub.drop_account(&revoked).await;
+            },
+            async move {
+                let completed = Event::PasswordResetCompleted { user: user.id };
+                emit(&ext, completed).await;
+            },
+        )
+        .await?;
     Ok(Json(
         json!({"message": "your password is set; sign in again in openswx"}),
     ))
