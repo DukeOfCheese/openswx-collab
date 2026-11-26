@@ -1236,6 +1236,14 @@ impl Room {
     }
 
     fn refuse_item(&mut self, item: Item, refusal: Refusal) {
+        // An undo or revert is judged from the taken-back change's seq: below the index's floor it
+        // can never work, so it is `invalid`, not `too_old` (which says: reload and try again).
+        let refusal = match refusal {
+            Refusal::TooOld if item.reverts.is_some() => {
+                Refusal::Invalid(super::history::TOO_OLD.to_owned())
+            }
+            other => other,
+        };
         let conflicts = match &refusal {
             Refusal::Stale(conflicts) => conflicts.clone(),
             _ => Vec::new(),
@@ -1356,14 +1364,23 @@ impl Room {
                 code: None,
                 message: None,
             },
-            Err((code, message)) => ServerMsg::RevertResult {
-                request_id,
-                ok: false,
-                seq: None,
-                ops: Vec::new(),
-                code: Some(code.to_owned()),
-                message: Some(message.chars().take(MAX_MESSAGE).collect()),
-            },
+            Err((code, message)) => {
+                // Only the documented codes reach a client.
+                let code = if wire::REVERT_CODES.contains(&code) {
+                    code
+                } else {
+                    tracing::error!("a revert in document {} failed with code {code}", self.doc);
+                    "server_error"
+                };
+                ServerMsg::RevertResult {
+                    request_id,
+                    ok: false,
+                    seq: None,
+                    ops: Vec::new(),
+                    code: Some(code.to_owned()),
+                    message: Some(message.chars().take(MAX_MESSAGE).collect()),
+                }
+            }
         };
         self.encode(&msg)
     }
@@ -1599,16 +1616,25 @@ impl Room {
 
     pub(super) fn on_duplicate(&mut self, check: DuplicateCheck) {
         let DuplicateCheck { mut item, result } = check;
-        if let Some(ticket) = item.ticket {
+        let ticket = item.ticket;
+        if let Some(ticket) = ticket {
             // (Connections that sent it again while it was looked up.)
             item.waiters
                 .extend(self.checking.remove(&ticket).unwrap_or_default());
         }
+        self.settle_duplicate(item, result);
+        if let Some(ticket) = ticket {
+            self.checked(ticket);
+        }
+    }
+
+    fn settle_duplicate(&mut self, item: Item, result: anyhow::Result<Option<i64>>) {
         match result {
             Ok(Some(seq)) => {
                 let seq = Seq::try_from(seq).unwrap_or_default();
-                if let Some((client, id)) = item.key() {
-                    self.recent.remember(&client, &id, seq);
+                if let Some(key) = item.key() {
+                    // Settled now: durable (`remember` would leave the `Checking` mark in place).
+                    self.recent.durable(key, seq);
                     self.recent.trim();
                 }
                 self.answer_accepted(item, seq);

@@ -47,6 +47,8 @@ use oswx_core::RejectCode;
 
 /// What an undo of a change already taken back is told.
 pub(super) const ALREADY_UNDONE: &str = "that change was already undone";
+/// What an undo or revert of a change older than the history the room keeps is told.
+pub(super) const TOO_OLD: &str = "that change is too old to take back";
 /// What an undo naming no change of the sender's is told.
 const NOT_YOURS: &str = "there is no change of yours with that id to undo";
 /// What a client is told when the journal could not be read.
@@ -107,6 +109,18 @@ impl Room {
                     };
                     return self.judge_conn_change(conn, change, size, Some(reverts));
                 }
+            }
+            // The journal refused it as a duplicate and its seq is being looked up: wait for that
+            // check, then resolve again (the connection's later messages wait too).
+            Some(Seen::Checking(ticket)) => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.busy = true;
+                    self.undo_waiting
+                        .entry(ticket)
+                        .or_default()
+                        .push((conn, change, size));
+                }
+                return;
             }
             // Memory holds every id this client journaled here, and not this one.
             None if self.recent.is_complete(&client) => {
@@ -180,6 +194,17 @@ impl Room {
             self.park_first(conn, Incoming::Judge(change, size, Some(reverts)));
         } else {
             self.judge_conn_change(conn, change, size, Some(reverts));
+        }
+    }
+
+    /// The duplicate check of the change under `ticket` has answered: the undos waiting for it are
+    /// resolved again, each before anything its connection sent after it.
+    pub(super) fn checked(&mut self, ticket: super::change::Ticket) {
+        for (conn, change, size) in self.undo_waiting.remove(&ticket).unwrap_or_default() {
+            if let Some(c) = self.conns.get_mut(&conn) {
+                c.busy = false;
+                self.park_first(conn, Incoming::Judge(change, size, None));
+            }
         }
     }
 

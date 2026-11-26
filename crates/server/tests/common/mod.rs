@@ -529,6 +529,7 @@ pub struct FlakyStore {
     inner: RwLock<Arc<dyn Store>>,
     fail_health: AtomicBool,
     fail_commit: Arc<AtomicBool>,
+    fail_reverted_by: Arc<AtomicBool>,
     commit_then_fail: Arc<AtomicBool>,
     fail_document_reads: AtomicBool,
     panic_on_begin: AtomicBool,
@@ -538,6 +539,10 @@ pub struct FlakyStore {
     change_lookups: AtomicUsize,
     lookup_delay: Mutex<Duration>,
     duplicate_inserts: Arc<AtomicUsize>,
+    /// The order change-id lookups ended and undo targets were asked for in.
+    lookup_log: Mutex<Vec<&'static str>>,
+    /// A delay for the next change-id lookup only.
+    lookup_delay_once: Mutex<Option<Duration>>,
     preloads: AtomicUsize,
     preload_delay: Mutex<Duration>,
     commit_delay: Arc<Mutex<Duration>>,
@@ -549,6 +554,7 @@ impl FlakyStore {
             inner: RwLock::new(inner),
             fail_health: AtomicBool::new(false),
             fail_commit: Arc::new(AtomicBool::new(false)),
+            fail_reverted_by: Arc::new(AtomicBool::new(false)),
             commit_then_fail: Arc::new(AtomicBool::new(false)),
             fail_document_reads: AtomicBool::new(false),
             panic_on_begin: AtomicBool::new(false),
@@ -558,6 +564,8 @@ impl FlakyStore {
             change_lookups: AtomicUsize::new(0),
             lookup_delay: Mutex::new(Duration::ZERO),
             duplicate_inserts: Arc::new(AtomicUsize::new(0)),
+            lookup_log: Mutex::new(Vec::new()),
+            lookup_delay_once: Mutex::new(None),
             preloads: AtomicUsize::new(0),
             preload_delay: Mutex::new(Duration::ZERO),
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
@@ -579,6 +587,29 @@ impl FlakyStore {
             .lookup_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = d;
+    }
+
+    /// Makes the next [`Store::change_seq_by_client`] (only) wait this long first.
+    pub fn lookup_delay_once(&self, d: Duration) {
+        *self
+            .lookup_delay_once
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(d);
+    }
+
+    /// In which order change-id lookups ended and undo targets were asked for.
+    pub fn lookup_log(&self) -> Vec<&'static str> {
+        self.lookup_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn log_lookup(&self, what: &'static str) {
+        self.lookup_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(what);
     }
 
     /// How many journal inserts found the change id already there (a duplicate reaching the journal).
@@ -661,6 +692,11 @@ impl FlakyStore {
     }
 
     /// Makes [`Store::document_by_id`] fail (`true`) or delegate again (`false`).
+    /// Makes every journal `set_reverted_by` fail (an extra write of an undo or revert).
+    pub fn fail_reverted_by(&self, fail: bool) {
+        self.fail_reverted_by.store(fail, Ordering::SeqCst);
+    }
+
     pub fn fail_document_reads(&self, fail: bool) {
         self.fail_document_reads.store(fail, Ordering::SeqCst);
     }
@@ -686,7 +722,9 @@ impl Store for FlakyStore {
         self.begins.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FlakyTx {
             inner: self.inner().begin().await?,
+            savepoint: false,
             fail_commit: self.fail_commit.clone(),
+            fail_reverted_by: self.fail_reverted_by.clone(),
             commit_then_fail: self.commit_then_fail.clone(),
             hang_commit: self.hang_commit.clone(),
             refuse_change: self.refuse_change.clone(),
@@ -859,14 +897,24 @@ impl Store for FlakyStore {
         change_id: &str,
     ) -> anyhow::Result<Option<i64>> {
         self.change_lookups.fetch_add(1, Ordering::SeqCst);
-        let delay = *self
-            .lookup_delay
+        let once = self
+            .lookup_delay_once
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let delay = once.unwrap_or_else(|| {
+            *self
+                .lookup_delay
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
         pause(delay).await;
-        self.inner()
+        let found = self
+            .inner()
             .change_seq_by_client(document_id, client_id, change_id)
-            .await
+            .await;
+        self.log_lookup("change id looked up");
+        found
     }
 
     async fn undo_target(
@@ -875,6 +923,7 @@ impl Store for FlakyStore {
         client_id: &str,
         change_id: &str,
     ) -> anyhow::Result<Option<UndoTarget>> {
+        self.log_lookup("undo target asked");
         let delay = *self
             .lookup_delay
             .lock()
@@ -947,10 +996,14 @@ impl Store for FlakyStore {
     }
 }
 
-/// [`FlakyStore`]'s transaction. Every [`Tx`] method delegates; add yours when you add one.
-pub struct FlakyTx {
-    inner: Box<dyn Tx>,
+/// [`FlakyStore`]'s transaction (or a savepoint in one). Every [`Tx`] method delegates; add yours
+/// when you add one.
+pub struct FlakyTx<'a> {
+    inner: Box<dyn Tx + 'a>,
+    /// A savepoint: its commit is not made to fail, hang or wait (only the outer one is).
+    savepoint: bool,
     fail_commit: Arc<AtomicBool>,
+    fail_reverted_by: Arc<AtomicBool>,
     commit_then_fail: Arc<AtomicBool>,
     hang_commit: Arc<AtomicBool>,
     refuse_change: Arc<Mutex<Option<String>>>,
@@ -959,8 +1012,11 @@ pub struct FlakyTx {
 }
 
 #[async_trait]
-impl Tx for FlakyTx {
+impl Tx for FlakyTx<'_> {
     async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        if self.savepoint {
+            return self.inner.commit().await;
+        }
         if self.hang_commit.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -986,7 +1042,26 @@ impl Tx for FlakyTx {
     }
 
     async fn savepoint(&mut self) -> anyhow::Result<Box<dyn Tx + '_>> {
-        self.inner.savepoint().await
+        let (fail_commit, fail_reverted_by) =
+            (self.fail_commit.clone(), self.fail_reverted_by.clone());
+        let (commit_then_fail, hang_commit) =
+            (self.commit_then_fail.clone(), self.hang_commit.clone());
+        let (refuse_change, duplicate_inserts, commit_delay) = (
+            self.refuse_change.clone(),
+            self.duplicate_inserts.clone(),
+            self.commit_delay.clone(),
+        );
+        Ok(Box::new(FlakyTx {
+            inner: self.inner.savepoint().await?,
+            savepoint: true,
+            fail_commit,
+            fail_reverted_by,
+            commit_then_fail,
+            hang_commit,
+            refuse_change,
+            duplicate_inserts,
+            commit_delay,
+        }))
     }
 
     async fn user_count(&mut self) -> anyhow::Result<u64> {
@@ -1305,6 +1380,9 @@ impl Tx for FlakyTx {
         seq: i64,
         by: i64,
     ) -> anyhow::Result<bool> {
+        if self.fail_reverted_by.load(Ordering::SeqCst) {
+            anyhow::bail!("the flaky store was told to fail set_reverted_by");
+        }
         self.inner.set_reverted_by(document_id, seq, by).await
     }
 

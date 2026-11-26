@@ -682,6 +682,8 @@ struct Room {
     undone: Bounded<Seq>,
     /// What does not rebuild, and what blaming needs.
     rebuilds: rebuild::Rebuilds,
+    /// Undos whose target's seq is being checked (a journal duplicate), by that change's ticket.
+    undo_waiting: HashMap<change::Ticket, Vec<(ConnId, Arc<oswx_core::Change>, usize)>>,
 }
 
 fn next_room_id() -> u64 {
@@ -732,6 +734,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         next_join: 0,
         undone: Bounded::default(),
         rebuilds: rebuild::Rebuilds::default(),
+        undo_waiting: HashMap::new(),
         state,
     };
     tokio::spawn(room.run(control_rx, frames_rx, internal_rx));

@@ -108,9 +108,10 @@ fn no_state(seq: i64) -> ApiError {
     ApiError::NotFoundDetail(format!("the document has no state {seq}"))
 }
 
-/// The seq of the version `name` of `doc` (404 `no version named 'x'`).
+/// The seq of the version `name` of `doc` (404 `no version named 'x'`); the name is trimmed, as
+/// it was when the version was made.
 async fn version_seq(state: &AppState, doc: &str, name: &str) -> Result<i64, ApiError> {
-    let name = version_name(name)?;
+    let name = version_name(name)?.trim();
     match state.store.version_by_name(doc, name).await? {
         Some(v) => Ok(v.seq),
         None => Err(ApiError::NotFoundDetail(format!(

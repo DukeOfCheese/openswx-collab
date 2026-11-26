@@ -392,6 +392,38 @@ async fn undoing_a_set_that_replaced_someone_elses_items_brings_them_back() {
 }
 
 #[tokio::test]
+async fn an_undo_of_a_change_whose_seq_is_being_checked_waits_for_the_check() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let x = a.make_change(0, vec![set_depth(20)]);
+    assert_eq!(a.resend(&x).await.seq(), 1);
+    // The room forgets X; X sent again reaches the journal, which refuses it as a duplicate, and
+    // the room looks its seq up (slowly).
+    server.room(&doc).forget_change_ids().await;
+    // The duplicate check is slow; the undo's own resend check (the client is no longer complete
+    // then) is quick, so the undo arrives while X's seq is still being checked.
+    flaky.lookup_delay_once(std::time::Duration::from_millis(800));
+    let mut again = x.clone();
+    again.base = 1;
+    a.send_change(&again).await;
+    pause(std::time::Duration::from_millis(200)).await;
+    let undo = a.undo_change(1, &x.change_id, vec![set_depth(10)]);
+    a.send_change(&undo).await;
+    assert_eq!(a.outcome(&x.change_id).await, Outcome::Accepted(1));
+    assert_eq!(a.outcome(&undo.change_id).await.seq(), 2);
+    // The undo's target was read only once the check had answered.
+    let log = flaky.lookup_log();
+    let asked = log
+        .iter()
+        .position(|e| *e == "undo target asked")
+        .expect("asked");
+    // (Lookups: X's duplicate check, which ends last of the two, and the undo's resend check.)
+    assert_eq!(log[..asked].len(), 2, "{log:?}");
+}
+
+#[tokio::test]
 async fn an_undo_sent_before_its_change_was_acknowledged_works() {
     let (server, world) = world().await;
     let (bob, _) = editor(&server, &world, "bob@example.com", "Bob").await;
@@ -680,6 +712,64 @@ async fn a_revert_does_not_silently_undo_a_restore_or_another_revert() {
     assert_eq!(b.revert(3).await.code(), "stale");
     assert_eq!(b.revert(4).await.code(), "already_reverted");
     assert_eq!(depth(&content(&server, &doc, &bob, "").await), 30);
+}
+
+#[tokio::test]
+async fn a_change_older_than_the_history_kept_cannot_be_taken_back_and_says_so() {
+    // The index keeps no history before the latest snapshot (every 2 changes).
+    let hooks = oswx_server::room::Hooks {
+        index_keep: 0,
+        ..oswx_server::room::Hooks::default()
+    };
+    let server =
+        TestServer::start_custom(|s| s.snapshot_every = 2, |s| s.room_hooks = Arc::new(hooks))
+            .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let first = a.make_change(0, vec![set_depth(20)]);
+    a.send_change(&first).await;
+    assert_eq!(a.outcome(&first.change_id).await.seq(), 1);
+    let name = ["features", "f1", "name"];
+    assert_eq!(
+        a.change(vec![set(&name, json!("Base"))], vec![], vec![])
+            .await
+            .seq(),
+        2
+    );
+    // Not `too_old` (which tells a client to reload and try again): it never will work.
+    let undo = a
+        .undo(&first.change_id, kept_inverse(&server, &doc, 1).await)
+        .await;
+    let (code, message) = rejected(&undo);
+    assert_eq!(code, RejectCode::Invalid);
+    assert!(message.contains("too old"), "{message}");
+    let revert = a.revert(1).await;
+    assert_eq!(revert.code(), "invalid");
+    assert!(revert.message.unwrap().contains("too old"));
+}
+
+#[tokio::test]
+async fn a_revert_or_undo_the_journal_cannot_write_is_a_server_error_and_changes_nothing() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let first = a.make_change(0, vec![set_depth(20)]);
+    a.send_change(&first).await;
+    assert_eq!(a.outcome(&first.change_id).await.seq(), 1);
+    flaky.fail_reverted_by(true);
+    let failed = a.revert(1).await;
+    assert_eq!(failed.code(), "server_error");
+    let undo = a
+        .undo(&first.change_id, kept_inverse(&server, &doc, 1).await)
+        .await;
+    assert_eq!(rejected(&undo).0, RejectCode::ServerError);
+    assert_eq!(depth(&content(&server, &doc, &world.admin, "").await), 20);
+    // Once the journal works again, so does the revert.
+    flaky.fail_reverted_by(false);
+    assert_eq!(a.revert(1).await.seq(), 2);
+    assert_eq!(depth(&content(&server, &doc, &world.admin, "").await), 10);
 }
 
 #[tokio::test]
@@ -1408,6 +1498,24 @@ async fn versions_belong_to_their_document() {
         restore(&server, &other, &out, json!({"seq": 0})).await.0,
         404
     );
+}
+
+#[tokio::test]
+async fn version_names_are_trimmed_when_looked_up_as_when_made() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(a.change(vec![set_depth(20)], vec![], vec![]).await.seq(), 1);
+    let (status, v) = new_version(&server, &doc, &world.admin, json!({"name": "  Rev A "})).await;
+    assert_eq!((status, v["name"].clone()), (201, json!("Rev A")));
+    assert_eq!(
+        depth(&content(&server, &doc, &world.admin, "?version=%20Rev%20A%20%20").await),
+        20
+    );
+    assert_eq!(a.change(vec![set_depth(30)], vec![], vec![]).await.seq(), 2);
+    let (status, body) = restore(&server, &doc, &world.admin, json!({"version": " Rev A\t"})).await;
+    assert_eq!((status, body), (200, json!({"seq": 3})));
+    assert_eq!(depth(&content(&server, &doc, &world.admin, "").await), 20);
 }
 
 #[tokio::test]
