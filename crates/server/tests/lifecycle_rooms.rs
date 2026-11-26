@@ -529,7 +529,11 @@ async fn a_request_dropped_after_its_commit_still_closes_connections() {
     ] {
         assert!(recorded.contains(&call), "{call} in {recorded:?}");
     }
-    assert_eq!(server.state.after_commits.running(), 0);
+    // Every request's steps after its commit run to the end although its client went away
+    // (hearing `version.created` does not mean the steps after it are done: wait for them).
+    tokio::time::timeout(WAIT, server.state.after_commits.idle())
+        .await
+        .expect("the steps after the commits finish");
 }
 
 // ------------------------------------------------------------------ sessions expiring
