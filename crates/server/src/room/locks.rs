@@ -469,6 +469,26 @@ impl Room {
         self.announce_locks(detached, Vec::new());
     }
 
+    /// At a revocation: the user's locks that wait detached (of clients of theirs no connection
+    /// holds now) are released, and announced.
+    pub(super) fn release_detached_of(&mut self, user: &str) {
+        let prefix = format!("{user}.");
+        let gone: Vec<ClientId> = self
+            .locks
+            .detached
+            .keys()
+            .filter(|c| c.starts_with(&prefix) && !self.by_client.contains_key(*c))
+            .cloned()
+            .collect();
+        let mut released = Vec::new();
+        for client in gone {
+            released.extend(self.locks.release_client(&client));
+        }
+        if !released.is_empty() {
+            self.announce_locks(Vec::new(), released);
+        }
+    }
+
     /// At a revocation: the client's locks are released now, and announced.
     pub(super) fn locks_at_revoke(&mut self, client: &ClientId) {
         let released = self.locks.release_client(client);

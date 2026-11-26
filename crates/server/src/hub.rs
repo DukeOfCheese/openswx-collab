@@ -125,8 +125,16 @@ struct Entry {
     recheck: bool,
     /// The room that took it, once one did.
     room: Option<RoomHandle>,
-    /// How a drop closed it, if one did (told to its room when the room takes it later).
-    revoked: Option<(u16, String)>,
+    /// How a drop closed it, if one did, and whether account-wide (told to its room when the room
+    /// takes it later).
+    revoked: Option<(u16, String, bool)>,
+    /// A newer connection of the same client to the same document was let past the connection
+    /// limit to take this one over: no other may use it for that.
+    superseded: bool,
+    /// It was let past the limit to take over this connection, and has not joined yet (until it
+    /// does, no other connection of its client may take over: the limit is passed by one at
+    /// most).
+    taking_over: Option<ConnId>,
 }
 
 /// Everything but the token hash, which is never printed.
@@ -140,6 +148,8 @@ impl std::fmt::Debug for Entry {
             .field("recheck", &self.recheck)
             .field("room", &self.room.as_ref().map(RoomHandle::id))
             .field("revoked", &self.revoked)
+            .field("superseded", &self.superseded)
+            .field("taking_over", &self.taking_over)
             .finish_non_exhaustive()
     }
 }
@@ -147,24 +157,44 @@ impl std::fmt::Debug for Entry {
 impl Entry {
     /// Closes the connection for a drop: its outbox at once, and its room (if it has one) is told
     /// to remove it and release its locks.
-    fn revoke(&mut self, conn: ConnId, code: u16, reason: &str) -> Option<(RoomHandle, ConnId)> {
+    /// `user_wide`: the account's access ended (its detached locks in the room go too).
+    fn revoke(
+        &mut self,
+        conn: ConnId,
+        code: u16,
+        reason: &str,
+        user_wide: bool,
+    ) -> Option<Revoked> {
         self.outbox.close_now(code, reason);
-        self.revoked = Some((code, reason.to_owned()));
-        self.room.clone().map(|room| (room, conn))
+        self.revoked = Some((code, reason.to_owned(), user_wide));
+        self.room
+            .clone()
+            .map(|room| (room, conn, self.user.clone()))
     }
 }
 
+/// A revoked connection's room, the connection and its account.
+type Revoked = (RoomHandle, ConnId, Id);
+
 /// Tells the rooms of revoked connections (never under the registry lock).
-fn tell_rooms(revoked: Vec<(RoomHandle, ConnId)>, code: u16, reason: &str) {
-    for (room, conn) in revoked {
-        room.revoke(conn, code, reason);
+fn tell_rooms(revoked: Vec<Revoked>, code: u16, reason: &str, user_wide: bool) {
+    for (room, conn, user) in revoked {
+        room.revoke(Some(conn), &user, code, reason, user_wide);
     }
 }
 
 #[derive(Debug, Default)]
 struct Registry {
     entries: HashMap<ConnId, Entry>,
-    per_user: HashMap<Id, usize>,
+    /// The connections of each account (their number is what the limit counts).
+    by_user: HashMap<Id, std::collections::HashSet<ConnId>>,
+}
+
+impl Registry {
+    /// The connections of `user`.
+    fn of(&self, user: &str) -> impl Iterator<Item = ConnId> + '_ {
+        self.by_user.get(user).into_iter().flatten().copied()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -230,10 +260,12 @@ impl Registration {
                 return;
             };
             entry.room = Some(room.clone());
-            entry.revoked.clone()
+            // Its take-over is done: the next one of its client may come.
+            entry.taking_over = None;
+            entry.revoked.clone().map(|r| (r, entry.user.clone()))
         };
-        if let Some((code, reason)) = revoked {
-            room.revoke(self.conn, code, &reason);
+        if let Some(((code, reason, user_wide), user)) = revoked {
+            room.revoke(Some(self.conn), &user, code, &reason, user_wide);
         }
     }
 }
@@ -241,12 +273,19 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         let mut registry = lock(&self.hub.inner.registry);
-        if let Some(entry) = registry.entries.remove(&self.conn)
-            && let Some(n) = registry.per_user.get_mut(&entry.user)
+        let Some(entry) = registry.entries.remove(&self.conn) else {
+            return;
+        };
+        // A take-over that never joined gives the connection it was to replace back.
+        if let Some(old) = entry.taking_over
+            && let Some(e) = registry.entries.get_mut(&old)
         {
-            *n -= 1;
-            if *n == 0 {
-                registry.per_user.remove(&entry.user);
+            e.superseded = false;
+        }
+        if let Some(conns) = registry.by_user.get_mut(&entry.user) {
+            conns.remove(&self.conn);
+            if conns.is_empty() {
+                registry.by_user.remove(&entry.user);
             }
         }
     }
@@ -380,18 +419,40 @@ impl Hub {
         if self.inner.closing.load(Ordering::SeqCst) {
             return Err(RegisterError::ShuttingDown);
         }
-        let mut registry = lock(&self.inner.registry);
-        let n = registry.per_user.get(user).copied().unwrap_or(0);
-        let takeover = || {
-            registry
-                .entries
-                .values()
-                .any(|e| e.user == *user && e.doc == *doc && e.client == *client)
-        };
-        if n >= max && !takeover() {
-            return Err(RegisterError::TooMany);
+        // The limit and the take-over exemption are decided under one lock: of handshakes racing
+        // with the same client id, only one may take over a given connection.
+        let mut guard = lock(&self.inner.registry);
+        let registry = &mut *guard;
+        let n = registry.by_user.get(user).map_or(0, |c| c.len());
+        let mut taking_over = None;
+        if n >= max {
+            let same = |e: &Entry| e.doc == *doc && e.client == *client;
+            let mut replaced = None;
+            for c in registry.of(user) {
+                let Some(e) = registry.entries.get(&c) else {
+                    continue;
+                };
+                if same(e) && e.taking_over.is_some() {
+                    // Another connection of this client is taking over already.
+                    return Err(RegisterError::TooMany);
+                }
+                if same(e) && !e.superseded {
+                    replaced = Some(c);
+                }
+            }
+            let Some(replaced) = replaced else {
+                return Err(RegisterError::TooMany);
+            };
+            if let Some(e) = registry.entries.get_mut(&replaced) {
+                e.superseded = true;
+            }
+            taking_over = Some(replaced);
         }
-        *registry.per_user.entry(user.clone()).or_default() += 1;
+        registry
+            .by_user
+            .entry(user.clone())
+            .or_default()
+            .insert(conn);
         registry.entries.insert(
             conn,
             Entry {
@@ -404,6 +465,8 @@ impl Hub {
                 recheck: false,
                 room: None,
                 revoked: None,
+                superseded: false,
+                taking_over,
             },
         );
         Ok(Registration {
@@ -415,10 +478,9 @@ impl Hub {
     /// How many document connections the account has registered.
     pub fn connections_of(&self, user: &str) -> usize {
         lock(&self.inner.registry)
-            .per_user
+            .by_user
             .get(user)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |c| c.len())
     }
 
     /// Open rooms and registered connections.
@@ -431,14 +493,21 @@ impl Hub {
 
     /// Closes the settled connections `pick` chooses with `code` and `reason` (and tells their
     /// rooms), and marks the unsettled ones it chooses for a recheck. Answers how many were closed.
-    fn close_where(&self, code: u16, reason: &str, pick: impl Fn(&Entry) -> bool) -> usize {
+    /// `user_wide`: the access of the accounts it closes ended (their detached locks go too).
+    fn close_where(
+        &self,
+        code: u16,
+        reason: &str,
+        user_wide: bool,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> usize {
         let (closed, revoked) = {
             let mut registry = lock(&self.inner.registry);
             let mut revoked = Vec::new();
             let mut closed = 0;
             for (conn, entry) in registry.entries.iter_mut().filter(|(_, e)| pick(e)) {
                 if entry.settled.is_some() {
-                    revoked.extend(entry.revoke(*conn, code, reason));
+                    revoked.extend(entry.revoke(*conn, code, reason, user_wide));
                     closed += 1;
                 } else {
                     entry.recheck = true;
@@ -446,24 +515,56 @@ impl Hub {
             }
             (closed, revoked)
         };
-        tell_rooms(revoked, code, reason);
+        tell_rooms(revoked, code, reason, user_wide);
         closed
+    }
+
+    /// Tells every open room `pick` chooses that the access of `user` there ended: their locks
+    /// that wait detached (a client that went away a moment before) are released.
+    fn release_detached(
+        &self,
+        user: &Id,
+        code: u16,
+        reason: &str,
+        pick: impl Fn(&RoomHandle) -> bool,
+    ) {
+        let rooms: Vec<RoomHandle> = lock(&self.inner.rooms)
+            .values()
+            .filter(|r| pick(r))
+            .cloned()
+            .collect();
+        for room in rooms {
+            room.revoke(None, user, code, reason, true);
+        }
     }
 
     /// Closes (4401) every connection of an account that no longer exists or may no longer sign
     /// in, or whose sessions all ended (password changed or reset, signed out everywhere).
     pub async fn drop_account(&self, user: &Id) {
+        self.drop_account_with(user, close::SIGN_IN, "sign in again")
+            .await;
+    }
+
+    /// [`Hub::drop_account`] with another close code and reason (4410 `reconnect` when it is not
+    /// certain the sessions ended: see [`crate::state::Committed`]).
+    pub async fn drop_account_with(&self, user: &Id, code: u16, reason: &str) {
         self.record(format!("drop_account {user}"));
-        let n = self.close_where(close::SIGN_IN, "sign in again", |e| e.user == *user);
+        let n = self.close_where(code, reason, true, |e| e.user == *user);
+        self.release_detached(user, code, reason, |_| true);
         metrics::dropped(DropCause::Account, n);
     }
 
     /// Closes (4401) every connection made with the session of this token hash (it was ended).
     pub async fn drop_session(&self, token_hash: &str) {
+        self.drop_session_with(token_hash, close::SIGN_IN, "sign in again")
+            .await;
+    }
+
+    /// [`Hub::drop_session`] with another close code and reason.
+    pub async fn drop_session_with(&self, token_hash: &str, code: u16, reason: &str) {
         self.record("drop_session".to_owned());
-        let n = self.close_where(close::SIGN_IN, "sign in again", |e| {
-            e.token_hash == token_hash
-        });
+        // (One session: the other clients of the account keep their detached locks.)
+        let n = self.close_where(code, reason, false, |e| e.token_hash == token_hash);
         metrics::dropped(DropCause::Session, n);
     }
 
@@ -474,11 +575,16 @@ impl Hub {
     pub async fn drop_user(&self, store: &dyn Store, user: &Id, org: &Id) {
         self.record(format!("drop_user {user} {org}"));
         let settled: Vec<(ConnId, Id, ProjectRole)> = {
-            let mut registry = lock(&self.inner.registry);
+            let mut guard = lock(&self.inner.registry);
+            let registry = &mut *guard;
             let mut out = Vec::new();
-            for (conn, entry) in registry.entries.iter_mut().filter(|(_, e)| e.user == *user) {
+            let theirs: Vec<ConnId> = registry.of(user).collect();
+            for conn in theirs {
+                let Some(entry) = registry.entries.get_mut(&conn) else {
+                    continue;
+                };
                 match &entry.settled {
-                    Some((project, role)) => out.push((*conn, project.clone(), *role)),
+                    Some((project, role)) => out.push((conn, project.clone(), *role)),
                     None => entry.recheck = true,
                 }
             }
@@ -520,14 +626,36 @@ impl Hub {
             let mut n = 0;
             for conn in &changed {
                 if let Some(entry) = registry.entries.get_mut(conn) {
-                    revoked.extend(entry.revoke(*conn, close::ACCESS_CHANGED, reason));
+                    revoked.extend(entry.revoke(*conn, close::ACCESS_CHANGED, reason, false));
                     n += 1;
                 }
             }
             (n, revoked)
         };
-        tell_rooms(revoked, close::ACCESS_CHANGED, reason);
+        tell_rooms(revoked, close::ACCESS_CHANGED, reason, false);
         metrics::dropped(DropCause::Access, n);
+        // In the open documents of the organisation where the user may no longer edit, their
+        // locks that wait detached go (whether or not they are connected there).
+        let rooms: Vec<RoomHandle> = lock(&self.inner.rooms)
+            .values()
+            .filter(|r| r.org() == org)
+            .cloned()
+            .collect();
+        let mut cannot_edit: HashMap<Id, bool> = HashMap::new();
+        for room in rooms {
+            let project = room.project().clone();
+            if !cannot_edit.contains_key(&project) {
+                let role = match store.project_by_id(&project).await {
+                    Ok(Some(p)) => role_in_project(store, user, &p).await.unwrap_or(None),
+                    _ => None,
+                };
+                let lost = role.is_none_or(|r| r == ProjectRole::Viewer);
+                cannot_edit.insert(project.clone(), lost);
+            }
+            if cannot_edit.get(&project).copied().unwrap_or(true) {
+                room.revoke(None, user, close::ACCESS_CHANGED, reason, true);
+            }
+        }
     }
 
     /// Closes every connection to a document (4404, telling the clients why) and unloads its room
@@ -535,7 +663,7 @@ impl Hub {
     /// refused because the document is gone).
     pub async fn close_document(&self, doc: &Id, reason: &str) {
         self.record(format!("close_document {doc}"));
-        let n = self.close_where(close::GONE, reason, |e| e.doc == *doc);
+        let n = self.close_where(close::GONE, reason, false, |e| e.doc == *doc);
         metrics::dropped(DropCause::Document, n);
         let room = lock(&self.inner.rooms).remove(doc);
         if let Some(room) = room {
@@ -685,9 +813,65 @@ mod tests {
             recheck: false,
             room: None,
             revoked: None,
+            superseded: false,
+            taking_over: None,
         };
         let printed = format!("{entry:?}");
         assert!(printed.contains("u.c"), "{printed}");
         assert!(!printed.contains("5ecre7hash"), "{printed}");
+    }
+
+    fn connecting<'a>(
+        conn: ConnId,
+        user: &'a Id,
+        doc: &'a Id,
+        client: &'a Arc<str>,
+    ) -> Connecting<'a> {
+        Connecting {
+            conn,
+            user,
+            doc,
+            client,
+            token_hash: "h",
+            outbox: Outbox::new(1024),
+        }
+    }
+
+    #[test]
+    fn at_the_limit_one_take_over_at_a_time_passes() {
+        let hub = Hub::new();
+        let (user, doc) = ("u".to_owned(), "d".to_owned());
+        let (desk, laptop): (Arc<str>, Arc<str>) = (Arc::from("u.desk"), Arc::from("u.laptop"));
+        let _a = hub.register(connecting(1, &user, &doc, &desk), 2).unwrap();
+        let _b = hub
+            .register(connecting(2, &user, &doc, &laptop), 2)
+            .unwrap();
+        // A new client: refused.
+        let other: Arc<str> = Arc::from("u.phone");
+        assert!(matches!(
+            hub.register(connecting(3, &user, &doc, &other), 2),
+            Err(RegisterError::TooMany)
+        ));
+        // The desk again takes over its connection; a second at the same time does not.
+        let first = hub.register(connecting(4, &user, &doc, &desk), 2).unwrap();
+        assert!(matches!(
+            hub.register(connecting(5, &user, &doc, &desk), 2),
+            Err(RegisterError::TooMany)
+        ));
+        assert_eq!(
+            hub.connections_of(&user),
+            3,
+            "the limit passed by one at most"
+        );
+        // The take-over never joined: the desk may try again.
+        drop(first);
+        assert_eq!(hub.connections_of(&user), 2);
+        let _again = hub.register(connecting(6, &user, &doc, &desk), 2).unwrap();
+        // Another document is not a take-over.
+        let elsewhere = "e".to_owned();
+        assert!(matches!(
+            hub.register(connecting(7, &user, &elsewhere, &laptop), 2),
+            Err(RegisterError::TooMany)
+        ));
     }
 }

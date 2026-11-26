@@ -123,13 +123,23 @@ impl Room {
         }
         // Dead locks go before anyone's are taken up again (or handed to a replacement).
         self.expire_locks();
+        // The room's name for the connection: its own id, or, when it takes over a live
+        // connection of the same client, that connection's (see `Room::take_over`).
+        let mut key = req.conn;
+        let mut inherited = None;
         if let Some(old) = self.by_client.get(&req.client).copied() {
-            // Popped first: its leaving is not announced.
-            self.remove_conn(
-                old,
-                Some((close::REPLACED, "connected again from the same client")),
-                false,
-            );
+            if self.live_conn(old).is_some() {
+                inherited = self.take_over(old, req.conn);
+                key = old;
+            } else {
+                // Closed already (its access ended, or it broke a limit): its work is not
+                // inherited. Popped first: its leaving is not announced.
+                self.remove_conn(
+                    old,
+                    Some((close::REPLACED, "connected again from the same client")),
+                    false,
+                );
+            }
         }
         let read_only = if req.role == ProjectRole::Viewer {
             Some("you have view access to this project".to_owned())
@@ -158,6 +168,15 @@ impl Room {
         // Locks this client kept through a disconnect are its again (or released, if it may
         // now only look); a replaced connection's locks simply stay.
         let (back, released) = self.locks_at_join(&req.client, read_only.is_some());
+        let (replies, parked, parked_bytes, busy) = inherited.unwrap_or_default();
+        let inherited = replies
+            .iter()
+            .filter_map(|r| match r {
+                Reply::Waiting(ticket) => Some(*ticket),
+                Reply::Ready(_) => None,
+            })
+            .collect();
+        let resume = !busy && !parked.is_empty();
         let conn = Conn {
             client: req.client.clone(),
             user: req.user,
@@ -165,10 +184,10 @@ impl Room {
             colour,
             read_only,
             outbox: req.outbox,
-            replies: VecDeque::new(),
-            parked: VecDeque::new(),
-            parked_bytes: 0,
-            busy: false,
+            replies,
+            parked,
+            parked_bytes,
+            busy,
             heard: req.heard,
             presence: None,
             draft: None,
@@ -176,6 +195,7 @@ impl Room {
             lock_rate: Bucket::default(),
             joined: self.next_join,
             expires: req.session_expires,
+            inherited,
         };
         self.next_expiry = self.next_expiry.min(req.session_expires);
         self.idle_since = None;
@@ -209,11 +229,14 @@ impl Room {
         }
         self.recent.set_complete(&req.client, req.ids_complete);
         self.recent.trim();
-        self.by_client.insert(req.client, req.conn);
-        self.conns.insert(req.conn, conn);
+        self.by_client.insert(req.client, key);
+        self.conns.insert(key, conn);
+        if resume {
+            self.ready.push_back(key);
+        }
         self.publish_online();
         let internal = self.internal.clone();
-        let conn_id = req.conn;
+        let conn_id = key;
         tokio::spawn(async move {
             // A panic while building it is reported like any failure: the connection is closed.
             let result = match AssertUnwindSafe(welcome.build()).catch_unwind().await {
@@ -240,14 +263,55 @@ impl Room {
         }
     }
 
+    /// A new connection (`socket`) of the same client takes over the live connection the room
+    /// knows as `old`: `old` is closed (4409) and its socket's messages are ignored from now on,
+    /// and the newcomer goes on under the room's name `old`. So everything of the client still in
+    /// the works under that name (answers awaited, parked messages, changes being judged, looked
+    /// up, checked or written) is the successor's: it gets their answers, in order, ahead of its
+    /// own later ones. Answers what is carried over: the answers awaited, the parked messages and
+    /// their bytes, and whether a message is still in the works.
+    fn take_over(
+        &mut self,
+        old: ConnId,
+        socket: ConnId,
+    ) -> Option<(
+        VecDeque<Reply>,
+        VecDeque<super::change::Incoming>,
+        usize,
+        bool,
+    )> {
+        let c = self.conns.remove(&old)?;
+        // Releases it made that still wait to be announced go now.
+        self.flush_lock_news(old);
+        c.outbox
+            .close(close::REPLACED, "connected again from the same client");
+        // The socket that served the name `old` until now is retired.
+        let previous = self
+            .aliases
+            .iter()
+            .find(|(_, k)| **k == old)
+            .map_or(old, |(s, _)| *s);
+        self.aliases.remove(&previous);
+        self.retired.insert(previous);
+        if socket != old {
+            self.aliases.insert(socket, old);
+        }
+        // (Its name now belongs to a connection that keeps up.)
+        self.slow.retain(|s| *s != old);
+        Some((c.replies, c.parked, c.parked_bytes, c.busy))
+    }
+
     /// Takes a connection out of the room, closing it (with `close`, or a normal close), and tells
     /// the others it left when `announce`; its locks then wait for it (detached). Only a connection
     /// replaced by a new one of the same client is removed without `announce`: its locks pass to the
-    /// new one.
+    /// new one. A connection the hub closed because its access ended (4401, 4403, 4404) has its
+    /// locks released at once instead, whatever removes it (its `Leave` or the hub's `Revoked`,
+    /// in either order): a user whose access ended must not go on blocking others.
     pub(super) fn remove_conn(&mut self, conn: ConnId, close: Option<(u16, &str)>, announce: bool) {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
+        let revoked = c.outbox.close_code().is_some_and(close::ends_access);
         if self.conns.is_empty() {
             self.idle_since = Some(self.state.clock.now());
         }
@@ -273,9 +337,11 @@ impl Room {
                 client_id: c.client.clone(),
             });
             self.broadcast(&left, &[]);
-            if registered {
-                self.locks_at_leave(&c.client);
-            }
+        }
+        if registered && revoked {
+            self.locks_at_revoke(&c.client);
+        } else if registered && announce {
+            self.locks_at_leave(&c.client);
         }
     }
 }

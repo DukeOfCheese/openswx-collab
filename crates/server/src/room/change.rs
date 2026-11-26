@@ -757,6 +757,13 @@ impl Room {
             return;
         };
         match seen {
+            // A connection that took over this client's connection inherited its answer for this
+            // change: its first resend is answered by that (once).
+            Some(Seen::Tentative(ticket) | Seen::Checking(ticket))
+                if c.inherited.remove(&ticket) =>
+            {
+                return;
+            }
             Some(Seen::Durable(seq)) => return self.accept_again(conn, &change.change_id, seq),
             Some(Seen::Tentative(ticket)) => {
                 // Still being written: answered with the change itself, when it is.

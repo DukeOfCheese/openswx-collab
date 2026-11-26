@@ -333,8 +333,18 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
             }
             // The room was ending at that moment: open it again.
             Ok(Err(JoinError::Gone(back))) => request = *back,
-            Ok(Err(JoinError::Lost)) | Err(_) => {
+            Ok(Err(JoinError::Lost)) => {
                 outbox.close(close::MOVED, "reconnect");
+                drop(registration);
+                return drain(stream).await;
+            }
+            Err(_) => {
+                state.room_hooks.after_join_timeout.pass().await;
+                outbox.close(close::MOVED, "reconnect");
+                // The room may have taken the join just as the wait ran out: no reader will ever
+                // tell it the connection went, so it is told now (nothing, if it never joined).
+                let gone = room.clone();
+                tokio::spawn(async move { gone.leave(conn).await });
                 drop(registration);
                 return drain(stream).await;
             }

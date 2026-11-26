@@ -48,6 +48,14 @@
 //! flight and idle for `room_idle` seconds writes a final snapshot (if it has changes since the
 //! last), leaves the hub, and ends. A join that reaches a room which has begun to end is handed
 //! back to the joiner, which opens the document again.
+//!
+//! A connection the hub closed because its access ended (4401, 4403, 4404) has its locks released
+//! at once, whichever of its `Leave` and the hub's `Revoked` reaches the room first; the hub's
+//! `Revoked` also releases the account's locks that already wait detached. A new connection of the
+//! same client that takes over a live one (4409) goes on under the old one's name in the room:
+//! everything of that client still in the works (answers awaited, parked messages, changes being
+//! judged, looked up, checked or written) is answered to the successor, in order, ahead of its own
+//! later work.
 
 mod change;
 pub mod conn;
@@ -109,6 +117,11 @@ pub mod close {
     pub const REPLACED: u16 = 4409;
     /// The document moved or was reloaded: reconnect (and resend what was not acknowledged).
     pub const MOVED: u16 = 4410;
+    /// Whether a close with `code` means the connection's access ended (its locks are released at
+    /// once rather than kept for the grace period).
+    pub fn ends_access(code: u16) -> bool {
+        matches!(code, SIGN_IN | ACCESS_CHANGED | GONE)
+    }
     /// The account has as many document connections open as it may
     /// (`max_connections_per_user`): close one first. Not 4408 (`TOO_SLOW`), which a client
     /// answers by reconnecting at once; reconnecting does not help here.
@@ -164,6 +177,13 @@ pub struct Hooks {
     pub after_commit: Arc<Gate>,
     /// How long a handshake waits for a room to take its join ([`JOIN_WAIT`]).
     pub join_wait: Duration,
+    /// Shut: a handshake whose join wait ran out stops here before it closes the connection.
+    pub after_join_timeout: Arc<Gate>,
+    /// Milliseconds the hub's `Revoked` waits before it is sent (0: sent at once), to force the
+    /// connection's `Leave` to arrive first.
+    pub revoke_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Which of a revoked connection's `Revoked` and `Leave` reached its room first.
+    pub revoke_order: Arc<RevokeOrder>,
     /// How long a snapshot may take ([`SNAPSHOT_WAIT`]).
     pub snapshot_wait: Duration,
 }
@@ -225,6 +245,17 @@ impl Gate {
             changed.await;
         }
     }
+}
+
+/// Counts which message of a revoked connection reached its room first (see
+/// [`Hooks::revoke_order`]).
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct RevokeOrder {
+    /// The hub's `Revoked` found the connection still there.
+    pub revoked_first: AtomicUsize,
+    /// The connection's `Leave` had removed it already.
+    pub leave_first: AtomicUsize,
 }
 
 /// Rooms tests stop dead (see [`Hooks::stall`]).
@@ -294,6 +325,9 @@ impl Default for Hooks {
             stall: Arc::default(),
             after_commit: Arc::default(),
             join_wait: JOIN_WAIT,
+            after_join_timeout: Arc::default(),
+            revoke_delay_ms: Arc::default(),
+            revoke_order: Arc::default(),
             snapshot_wait: SNAPSHOT_WAIT,
         }
     }
@@ -473,12 +507,15 @@ pub enum RoomCmd {
     /// The hub's sweeper: a tick, then the room unloads itself if it may (see the module
     /// documentation).
     Sweep,
-    /// The hub revoked a connection's access (it has closed its outbox with `code` already): the
-    /// room removes it at once and releases its locks.
+    /// The hub revoked access (it has closed the connection's outbox with `code` already): the
+    /// room removes the connection `conn` (if any) at once, releasing its locks, and when
+    /// `user_wide` the locks of `user` that wait detached here too.
     Revoked {
-        conn: ConnId,
+        conn: Option<ConnId>,
+        user: Id,
         code: u16,
         reason: String,
+        user_wide: bool,
     },
     /// Stop: wait (briefly) for the journal's answers to changes in flight, close every connection
     /// with `code`, write a final snapshot if `snapshot` and there is anything new, then answer
@@ -525,6 +562,10 @@ pub struct RoomHandle {
     control: mpsc::Sender<RoomCmd>,
     frames: mpsc::Sender<RoomCmd>,
     shared: Arc<Shared>,
+    /// The document's organisation and project.
+    org: Id,
+    project: Id,
+    hooks: Arc<Hooks>,
 }
 
 impl RoomHandle {
@@ -549,6 +590,16 @@ impl RoomHandle {
             _ => &self.control,
         };
         channel.send(cmd).await.map_err(|e| Box::new(e.0))
+    }
+
+    /// The document's organisation.
+    pub fn org(&self) -> &Id {
+        &self.org
+    }
+
+    /// The document's project.
+    pub fn project(&self) -> &Id {
+        &self.project
     }
 
     /// Whether the room has begun to unload (idle): it takes no more joins.
@@ -582,12 +633,33 @@ impl RoomHandle {
     /// its outbox with `code`): the room removes it at once and releases its locks. Taken even
     /// while the room judges a big change or waits for the journal; if the room's queue is full it
     /// is sent from a task of its own.
-    pub fn revoke(&self, conn: ConnId, code: u16, reason: &str) {
+    ///
+    /// With no `conn`, only the user's detached locks (when `user_wide`) are released: the hub
+    /// tells every room the account's access may have ended in, not only those it is connected to.
+    pub fn revoke(
+        &self,
+        conn: Option<ConnId>,
+        user: &Id,
+        code: u16,
+        reason: &str,
+        user_wide: bool,
+    ) {
         let cmd = RoomCmd::Revoked {
             conn,
+            user: user.clone(),
             code,
             reason: reason.to_owned(),
+            user_wide,
         };
+        let delay = self.hooks.revoke_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            let control = self.control.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let _ = control.send(cmd).await;
+            });
+            return;
+        }
         if let Err(mpsc::error::TrySendError::Full(cmd)) = self.control.try_send(cmd) {
             let control = self.control.clone();
             tokio::spawn(async move {
@@ -830,6 +902,9 @@ struct Conn {
     joined: u64,
     /// When its session expires (clock seconds).
     expires: f64,
+    /// The tickets of the answers it inherited from the connection it took over (a first resend
+    /// of one of those changes is answered by that answer).
+    inherited: std::collections::HashSet<change::Ticket>,
 }
 
 impl Conn {
@@ -935,6 +1010,11 @@ struct Room {
     /// Restores found unchanged against a tentative head, waiting for that head's seq to become
     /// durable before they are answered.
     held_unchanged: Vec<(Seq, change::Item)>,
+    /// Sockets that took over a connection of their client, and the room's name for it (the
+    /// name of the connection taken over).
+    aliases: HashMap<ConnId, ConnId>,
+    /// Sockets taken over: their messages are ignored until their `Leave`.
+    retired: std::collections::HashSet<ConnId>,
     /// Undos whose target's seq is being checked (a journal duplicate), by that change's ticket.
     undo_waiting: HashMap<change::Ticket, Vec<(ConnId, Arc<oswx_core::Change>, usize)>>,
     /// Since when nobody has been connected (clock seconds); `None` while someone is.
@@ -977,6 +1057,8 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
     let (frames_tx, frames_rx) = mpsc::channel(FRAMES_QUEUE);
     let (internal_tx, internal_rx) = mpsc::unbounded_channel();
     let journal = change::pump(state.journal.clone(), internal_tx.clone());
+    let (org, project) = (init.org.clone(), init.project.clone());
+    let hooks = state.room_hooks.clone();
     let id = next_room_id();
     let shared = Arc::new(Shared::default());
     let room = Room {
@@ -1017,6 +1099,8 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         rebuilds: rebuild::Rebuilds::default(),
         undo_waiting: HashMap::new(),
         held_unchanged: Vec::new(),
+        aliases: HashMap::new(),
+        retired: std::collections::HashSet::new(),
         idle_since: Some(state.clock.now()),
         next_expiry: f64::INFINITY,
         snapshot_failing: false,
@@ -1029,6 +1113,9 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         control: control_tx,
         frames: frames_tx,
         shared,
+        org,
+        project,
+        hooks,
     }
 }
 
@@ -1158,15 +1245,28 @@ impl Room {
                     let _ = answer.send(JoinAnswer::Taken);
                 }
             }
-            RoomCmd::Leave(conn) => self.remove_conn(conn, None, true),
+            RoomCmd::Leave(socket) => {
+                // (The last message of a socket: what the room keeps about it goes.)
+                if self.retired.remove(&socket) {
+                    return;
+                }
+                let conn = self.aliases.remove(&socket).unwrap_or(socket);
+                self.remove_conn(conn, None, true);
+            }
             RoomCmd::Frame { conn, msg, size } => {
-                self.on_frame(conn, change::Incoming::Msg(*msg, size));
+                if let Some(conn) = self.key(conn) {
+                    self.on_frame(conn, change::Incoming::Msg(*msg, size));
+                }
             }
             RoomCmd::Malformed {
                 conn,
                 code,
                 message,
-            } => self.on_frame(conn, change::Incoming::Malformed(code, message)),
+            } => {
+                if let Some(conn) = self.key(conn) {
+                    self.on_frame(conn, change::Incoming::Malformed(code, message));
+                }
+            }
             RoomCmd::ServerChange(sc) => {
                 // A room nobody is connected to is idle from its last change by REST.
                 if self.conns.is_empty() {
@@ -1180,7 +1280,13 @@ impl Room {
             }
             RoomCmd::Tick => self.on_tick(),
             RoomCmd::Sweep => self.on_sweep(),
-            RoomCmd::Revoked { conn, code, reason } => self.revoke(conn, code, &reason),
+            RoomCmd::Revoked {
+                conn,
+                user,
+                code,
+                reason,
+                user_wide,
+            } => self.revoke(conn, &user, code, &reason, user_wide),
             RoomCmd::Close {
                 code,
                 reason,
@@ -1271,16 +1377,49 @@ impl Room {
     /// are discarded; see [`Room::live_conn`]), the others hear `peer.left` once, and its locks are
     /// released now rather than kept for the grace period: a revoked user must not go on blocking
     /// others. (An ordinary disconnect keeps its locks for the grace period.)
-    fn revoke(&mut self, conn: ConnId, code: u16, reason: &str) {
-        let Some(c) = self.conns.get(&conn) else {
-            return;
-        };
-        c.outbox.close_now(code, reason);
-        let client = c.client.clone();
-        if self.by_client.get(&client) == Some(&conn) {
-            self.locks_at_revoke(&client);
+    ///
+    /// The user's locks that already wait detached in this room (a client of theirs that went away
+    /// a moment before) are released too. Whichever of the connection's `Leave` and this arrives
+    /// first, the locks go at once: `remove_conn` releases them for a connection closed with an
+    /// access code.
+    fn revoke(
+        &mut self,
+        socket: Option<ConnId>,
+        user: &Id,
+        code: u16,
+        reason: &str,
+        user_wide: bool,
+    ) {
+        if let Some(socket) = socket {
+            let found = self.key(socket).filter(|c| self.conns.contains_key(c));
+            let order = &self.state.room_hooks.revoke_order;
+            match found {
+                Some(conn) => {
+                    order.revoked_first.fetch_add(1, Ordering::Relaxed);
+                    if let Some(c) = self.conns.get(&conn) {
+                        c.outbox.close_now(code, reason);
+                    }
+                    self.remove_conn(conn, None, true);
+                }
+                None => {
+                    order.leave_first.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-        self.remove_conn(conn, None, true);
+        if user_wide && close::ends_access(code) {
+            self.release_detached_of(user);
+        }
+    }
+
+    /// The room's name for a connection's socket: the socket's own id, or the name of the
+    /// connection it took over (see `take_over`); `None` for a socket that was taken over (its
+    /// messages are ignored).
+    fn key(&self, socket: ConnId) -> Option<ConnId> {
+        match self.aliases.get(&socket) {
+            Some(conn) => Some(*conn),
+            None if self.retired.contains(&socket) => None,
+            None => Some(socket),
+        }
     }
 
     fn on_frame(&mut self, conn: ConnId, incoming: change::Incoming) {

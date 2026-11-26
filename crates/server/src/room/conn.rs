@@ -115,6 +115,8 @@ struct State {
     held: bool,
     /// The close frame to send once the queue is written (or at once, when aborting).
     close: Option<(u16, String)>,
+    /// The code the connection was last closed with (kept after the close frame is sent).
+    closed_with: Option<u16>,
     life: Life,
 }
 
@@ -145,6 +147,7 @@ impl Outbox {
                 in_flight: None,
                 held: true,
                 close: None,
+                closed_with: None,
                 life: Life::Open,
             }),
             wake: Notify::new(),
@@ -204,6 +207,7 @@ impl Outbox {
         }
         s.life = Life::Closing;
         s.close = Some((code, reason.to_owned()));
+        s.closed_with = Some(code);
         drop(s);
         self.life.send_replace(Life::Closing);
         self.wake.notify_one();
@@ -219,9 +223,15 @@ impl Outbox {
         s.queue.clear();
         s.queued = 0;
         s.close = Some((code, reason.to_owned()));
+        s.closed_with = Some(code);
         drop(s);
         self.life.send_replace(Life::Aborting);
         self.wake.notify_one();
+    }
+
+    /// The close code the server closed the connection with, if it did.
+    pub fn close_code(&self) -> Option<u16> {
+        self.lock().closed_with
     }
 
     /// Whether the connection is closing or closed.
