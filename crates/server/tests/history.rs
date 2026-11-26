@@ -656,6 +656,33 @@ async fn what_a_revert_is_refused_for() {
 }
 
 #[tokio::test]
+async fn a_revert_does_not_silently_undo_a_restore_or_another_revert() {
+    let (server, world) = world().await;
+    let (bob, _) = editor(&server, &world, "bob@example.com", "Bob").await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    assert_eq!(a.change(vec![set_depth(20)], vec![], vec![]).await.seq(), 1);
+    // A restore (a server-made change) writes the same path after change 1.
+    assert_eq!(
+        restore(&server, &doc, &bob, json!({"seq": 0})).await,
+        (200, json!({"seq": 2}))
+    );
+    let stale = b.revert(1).await;
+    assert_eq!(stale.code(), "stale");
+    assert_eq!(depth(&content(&server, &doc, &bob, "").await), 10);
+
+    // Two reverts that touch one path: the older one is stale once the newer has landed.
+    event(&mut a, 2).await;
+    assert_eq!(a.change(vec![set_depth(30)], vec![], vec![]).await.seq(), 3);
+    assert_eq!(a.change(vec![set_depth(40)], vec![], vec![]).await.seq(), 4);
+    assert_eq!(b.revert(4).await.seq(), 5);
+    assert_eq!(b.revert(3).await.code(), "stale");
+    assert_eq!(b.revert(4).await.code(), "already_reverted");
+    assert_eq!(depth(&content(&server, &doc, &bob, "").await), 30);
+}
+
+#[tokio::test]
 async fn reverting_inserts_and_removals() {
     let (server, world) = world().await;
     let (bob, _) = editor(&server, &world, "bob@example.com", "Bob").await;

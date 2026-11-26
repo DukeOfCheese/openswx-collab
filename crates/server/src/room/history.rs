@@ -29,10 +29,9 @@
 //! (off the task, the connection's later messages waiting) and submits it as a change the server
 //! makes for the requester (`author` the requester, no client id in the journal): judged under the
 //! server's client id with no id-prefix check (a revert of a removal puts the original ids back;
-//! a revert of an insert removes them), `stale` if any client has written what it writes since
-//! the reverted change (the server's own changes — restores, other reverts — share one client id
-//! in the conflict index and so do not make each other stale), and `locked` by locks other
-//! clients hold on it (the requester's own do not count). Failures answer `change.revert.result {ok: false, code, message}` with `read_only`,
+//! a revert of an insert removes them), `stale` if anything has written what it writes since the
+//! reverted change (a client, or the server itself: a restore, another revert), and `locked` by
+//! locks other clients hold on it (the requester's own do not count). Failures answer `change.revert.result {ok: false, code, message}` with `read_only`,
 //! `not_found`, `already_reverted`, `stale`, `locked`, `server_error` (or another refusal's code);
 //! success `{ok: true, seq, ops}`. The requester gets no change event for it; everyone else does.
 
