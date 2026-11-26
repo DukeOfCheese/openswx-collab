@@ -537,6 +537,30 @@ async fn a_record_breaking_a_column_limit_is_refused_before_it_is_queued() {
         }],
     }];
     cases.push(r);
+    // More parts to lock than a change may choose, more rows than an assembly may have.
+    let mut r = simple(&a, 1, ea);
+    r.extra = vec![Extra::AssemblyRefs {
+        rows: Vec::new(),
+        chosen: (0..=oswx_server::assemblies::MAX_CHOSEN_PARTS)
+            .map(|n| ChosenPart {
+                component_id: format!("c{n}"),
+                part_id: format!("{n:032x}"),
+            })
+            .collect(),
+    }];
+    cases.push(r);
+    let mut r = simple(&a, 1, ea);
+    r.extra = vec![Extra::AssemblyRefs {
+        rows: (0..=oswx_server::journal::MAX_ASSEMBLY_ROWS)
+            .map(|n| AssemblyRef {
+                component_id: format!("c{n}"),
+                part_id: a.clone(),
+                seq: 0,
+            })
+            .collect(),
+        chosen: Vec::new(),
+    }];
+    cases.push(r);
     for r in cases {
         assert!(
             matches!(

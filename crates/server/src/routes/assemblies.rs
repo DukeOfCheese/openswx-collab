@@ -68,11 +68,25 @@ async fn references(
         .into_iter()
         .collect();
     let access = Access::of(store, &user.id, &project.org_id).await?;
-    let mut shown: HashMap<Id, Shown> = HashMap::new();
-    for part in store.parts_by_ids(&ids).await? {
-        if access.opens(&part.org_id, &part.project_id) {
-            let versions = store.versions(&part.id).await?;
-            shown.insert(part.id.clone(), Shown { part, versions });
+    // A bounded number of reads whatever the number of components: the parts, then the versions
+    // of those the caller can open, each in batches.
+    let mut shown: HashMap<Id, Shown> = store
+        .parts_by_ids(&ids)
+        .await?
+        .into_iter()
+        .filter(|p| access.opens(&p.org_id, &p.project_id))
+        .map(|part| {
+            let shown = Shown {
+                part,
+                versions: Vec::new(),
+            };
+            (shown.part.id.clone(), shown)
+        })
+        .collect();
+    let openable: Vec<Id> = shown.keys().cloned().collect();
+    for v in store.versions_of(&openable).await? {
+        if let Some(s) = shown.get_mut(&v.document_id) {
+            s.versions.push(v);
         }
     }
     let out = rows
@@ -115,18 +129,20 @@ async fn used_in(
     let (doc, project, _) =
         require_document(store, &user.id, &document_id, ProjectRole::Viewer).await?;
     let access = Access::of(store, &user.id, &project.org_id).await?;
+    // Every reference to the part in one read, grouped by assembly.
+    let mut by_assembly: HashMap<Id, Vec<Value>> = HashMap::new();
+    for r in store.refs_to_part(&doc.id).await? {
+        by_assembly
+            .entry(r.assembly_id)
+            .or_default()
+            .push(json!({"component": r.component_id, "seq": r.seq}));
+    }
     let mut out = Vec::new();
     for asm in store.assemblies_using(&doc.id).await? {
         if !access.opens(&asm.org_id, &asm.project_id) {
             continue;
         }
-        let components: Vec<Value> = store
-            .assembly_refs(&asm.id)
-            .await?
-            .into_iter()
-            .filter(|r| r.part_id == doc.id)
-            .map(|r| json!({"component": r.component_id, "seq": r.seq}))
-            .collect();
+        let components = by_assembly.remove(&asm.id).unwrap_or_default();
         out.push(json!({
             "document": {"id": asm.id, "name": asm.name, "project_id": asm.project_id},
             "components": components,

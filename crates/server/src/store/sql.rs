@@ -225,9 +225,10 @@ pub const DELETE_PROJECT_MEMBER: &str =
 /// [`super::Tx::project_document_ids`].
 pub const PROJECT_DOCUMENT_IDS: &str = "SELECT id FROM documents WHERE project_id = $1 ORDER BY id";
 
-/// [`super::Tx::mark_project_documents_deleted`].
-pub const MARK_PROJECT_DOCUMENTS_DELETED: &str =
-    "UPDATE documents SET deleted_at = $2 WHERE project_id = $1 AND deleted_at IS NULL";
+/// [`super::Tx::mark_project_documents_deleted`], first statement: the documents to mark, in the
+/// order they are marked (then [`MARK_DOCUMENT_DELETED`] for each).
+pub const PROJECT_LIVE_DOCUMENT_IDS: &str =
+    "SELECT id FROM documents WHERE project_id = $1 AND deleted_at IS NULL ORDER BY id";
 
 // ------------------------------------------------------------------ documents
 
@@ -441,6 +442,15 @@ pub const ASSEMBLIES_USING_PROJECT: &str = "SELECT d.id, d.name, d.project_id, p
      WHERE d.deleted_at IS NULL AND d.project_id <> $1 AND d.id IN \
      (SELECT r.assembly_id FROM assembly_refs r JOIN documents part ON part.id = r.part_id \
      WHERE part.project_id = $1) ORDER BY d.name, d.id";
+
+/// [`super::Store::versions_of`], completed by [`in_list`] (the order is the caller's).
+pub const VERSIONS_OF: &str = "SELECT v.id, v.document_id, v.seq, v.name, v.note, v.author_id, \
+     u.name AS author_name, v.created_at FROM versions v LEFT JOIN users u ON u.id = v.author_id \
+     WHERE v.document_id IN ";
+
+/// [`super::Store::refs_to_part`].
+pub const REFS_TO_PART: &str = "SELECT assembly_id, component_id, part_id, seq FROM assembly_refs \
+     WHERE part_id = $1 ORDER BY assembly_id, component_id";
 
 /// [`super::Store::pinned_before`].
 pub const PINNED_BEFORE: &str = "SELECT assembly_id, component_id FROM assembly_refs \

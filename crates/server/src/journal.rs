@@ -69,6 +69,11 @@ const MAX_CHANGE_ID: usize = 64;
 const MAX_COMMAND: usize = 100;
 const MAX_ID: usize = 32;
 const MAX_COMPONENT_ID: usize = 200;
+/// The most rows one `Extra::AssemblyRefs` may write: far more components than an assembly
+/// anyone edits live has (a change over it is refused, and its sender told to try again).
+pub const MAX_ASSEMBLY_ROWS: usize = 100_000;
+/// The most parts one `Extra::AssemblyRefs` may lock, as the room allows a change to choose.
+const MAX_CHOSEN: usize = crate::assemblies::MAX_CHOSEN_PARTS;
 
 /// Why a record was not made durable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -273,13 +278,16 @@ fn check(r: &Record) -> Result<(), String> {
     } else if r.extra.iter().any(|e| match e {
         Extra::SetRevertedBy { seq } => !fits(*seq),
         Extra::AssemblyRefs { rows, chosen } => {
-            rows.iter().any(|a| {
-                chars(&a.component_id) > MAX_COMPONENT_ID
-                    || chars(&a.part_id) > MAX_ID
-                    || !fits(a.seq)
-            }) || chosen
-                .iter()
-                .any(|c| chars(&c.component_id) > MAX_COMPONENT_ID || chars(&c.part_id) > MAX_ID)
+            rows.len() > MAX_ASSEMBLY_ROWS
+                || chosen.len() > MAX_CHOSEN
+                || rows.iter().any(|a| {
+                    chars(&a.component_id) > MAX_COMPONENT_ID
+                        || chars(&a.part_id) > MAX_ID
+                        || !fits(a.seq)
+                })
+                || chosen.iter().any(|c| {
+                    chars(&c.component_id) > MAX_COMPONENT_ID || chars(&c.part_id) > MAX_ID
+                })
         }
     }) {
         Some("an extra write breaks a limit")
@@ -521,7 +529,11 @@ async fn with_extra(
             Extra::AssemblyRefs { rows, chosen } => {
                 // Every part the change newly chose must still be there: its row is locked (on
                 // PostgreSQL; SQLite has one writer), so a deletion either committed before this
-                // (refused here) or waits and then sees this reference.
+                // (refused here) or waits and then sees this reference. Part rows are always locked
+                // in ascending id order, each once (`crate::assemblies`, "Lock order").
+                let mut chosen: Vec<&ChosenPart> = chosen.iter().collect();
+                chosen.sort_by(|a, b| a.part_id.cmp(&b.part_id));
+                chosen.dedup_by(|a, b| a.part_id == b.part_id);
                 for c in chosen {
                     if !sp.lock_live_document(&c.part_id).await? {
                         return refused(RefusedWhy::PartGone {

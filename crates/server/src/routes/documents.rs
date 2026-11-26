@@ -487,6 +487,8 @@ async fn insert_document(
     }
     tx.insert_document(document).await?;
     tx.insert_snapshot(snapshot).await?;
+    // (In ascending part id order, as `chosen_parts` sorts them: the lock order rule of
+    // `crate::assemblies`.)
     for c in &references.chosen {
         if !tx.lock_live_document(&c.part_id).await? {
             return Err(ApiError::Unprocessable(assemblies::no_part(&c.component_id)).into());

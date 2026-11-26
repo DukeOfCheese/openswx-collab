@@ -554,6 +554,8 @@ pub struct FlakyStore {
     /// How many times `replace_assembly_refs` ran (in a transaction or savepoint).
     ref_writes: Arc<AtomicUsize>,
     fail_part_reads: AtomicBool,
+    /// How many [`Store`] calls were made (each goes through `inner`; transactions count once).
+    calls: AtomicUsize,
 }
 
 impl FlakyStore {
@@ -582,7 +584,13 @@ impl FlakyStore {
             parts_gate: Arc::default(),
             ref_writes: Arc::new(AtomicUsize::new(0)),
             fail_part_reads: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many [`Store`] calls (reads, and `begin`) were made so far.
+    pub fn store_calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     /// How many times an assembly's references were rewritten.
@@ -692,6 +700,7 @@ impl FlakyStore {
 
     /// The store this one delegates to.
     fn inner(&self) -> Arc<dyn Store> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1042,6 +1051,14 @@ impl Store for FlakyStore {
 
     async fn pinned_before(&self, part_id: &str, seq: i64) -> anyhow::Result<Vec<PinnedComponent>> {
         self.inner().pinned_before(part_id, seq).await
+    }
+
+    async fn versions_of(&self, ids: &[Id]) -> anyhow::Result<Vec<VersionWithAuthor>> {
+        self.inner().versions_of(ids).await
+    }
+
+    async fn refs_to_part(&self, part_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>> {
+        self.inner().refs_to_part(part_id).await
     }
 }
 

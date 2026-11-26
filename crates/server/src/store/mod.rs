@@ -731,6 +731,14 @@ pub trait Store: Send + Sync + 'static {
     /// The assemblies, not deleted, whose components use a part, by name then id.
     async fn assemblies_using(&self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>>;
 
+    /// The named versions of these documents, by document id, then newest seq first (then newest
+    /// first), as [`Store::versions`] orders one document's. Read in batches, however many ids.
+    async fn versions_of(&self, ids: &[Id]) -> anyhow::Result<Vec<VersionWithAuthor>>;
+
+    /// Every component reference to a part (of any assembly, deleted ones included), by assembly
+    /// then component.
+    async fn refs_to_part(&self, part_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>>;
+
     /// The components pinned to a state of a part before `seq`, by assembly then component.
     async fn pinned_before(&self, part_id: &str, seq: i64) -> anyhow::Result<Vec<PinnedComponent>>;
 }
@@ -890,7 +898,9 @@ pub trait Tx: Send {
     /// The ids of every document in a project, deleted ones included.
     async fn project_document_ids(&mut self, project_id: &str) -> anyhow::Result<Vec<Id>>;
 
-    /// Marks every document of a project that is not yet deleted as deleted at `now`.
+    /// Marks every document of a project that is not yet deleted as deleted at `now`, one row at
+    /// a time in ascending id order: part rows are always locked in ascending id order
+    /// ([`crate::assemblies`], "Lock order").
     async fn mark_project_documents_deleted(
         &mut self,
         project_id: &str,

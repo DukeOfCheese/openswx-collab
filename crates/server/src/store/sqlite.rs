@@ -526,6 +526,14 @@ impl Store for SqliteStore {
         q::assemblies_using(&mut *self.reader().await?, part_id).await
     }
 
+    async fn versions_of(&self, ids: &[Id]) -> Result<Vec<VersionWithAuthor>> {
+        q::versions_of(&mut *self.reader().await?, ids).await
+    }
+
+    async fn refs_to_part(&self, part_id: &str) -> Result<Vec<AssemblyRefRow>> {
+        q::refs_to_part(&mut *self.reader().await?, part_id).await
+    }
+
     async fn pinned_before(&self, part_id: &str, seq: i64) -> Result<Vec<PinnedComponent>> {
         q::pinned_before(&mut *self.reader().await?, part_id, seq).await
     }
@@ -1460,11 +1468,14 @@ mod q {
         project_id: &str,
         now: f64,
     ) -> Result<()> {
-        sqlx::query(sql::MARK_PROJECT_DOCUMENTS_DELETED)
+        // One row at a time, in ascending id order (the lock order rule of `crate::assemblies`).
+        let ids: Vec<Id> = sqlx::query_scalar(sql::PROJECT_LIVE_DOCUMENT_IDS)
             .bind(project_id)
-            .bind(now)
-            .execute(c)
+            .fetch_all(&mut *c)
             .await?;
+        for id in ids {
+            mark_document_deleted(&mut *c, &id, now).await?;
+        }
         Ok(())
     }
 
@@ -1937,6 +1948,40 @@ mod q {
             out.extend(query.fetch_all(&mut *c).await?);
         }
         Ok(out)
+    }
+
+    pub async fn versions_of(
+        c: &mut SqliteConnection,
+        ids: &[Id],
+    ) -> Result<Vec<VersionWithAuthor>> {
+        let mut out: Vec<VersionWithAuthor> = Vec::new();
+        for chunk in ids.chunks(IDS_PER_QUERY) {
+            let text = sql::in_list(sql::VERSIONS_OF, chunk.len());
+            let mut query = sqlx::query_as::<_, VersionWithAuthor>(&text);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(&mut *c).await?);
+        }
+        // As `sql::VERSIONS` orders one document's (newest seq, then newest, then id).
+        out.sort_by(|a, b| {
+            a.document_id
+                .cmp(&b.document_id)
+                .then(b.seq.cmp(&a.seq))
+                .then(b.created_at.total_cmp(&a.created_at))
+                .then(a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    pub async fn refs_to_part(
+        c: &mut SqliteConnection,
+        part_id: &str,
+    ) -> Result<Vec<AssemblyRefRow>> {
+        Ok(sqlx::query_as(sql::REFS_TO_PART)
+            .bind(part_id)
+            .fetch_all(c)
+            .await?)
     }
 
     pub async fn assemblies_using(

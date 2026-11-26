@@ -33,6 +33,13 @@
 //!
 //! The `assembly_refs` table keeps, per assembly, `(component, part, seq)` for every component. It
 //! is rewritten (whole) with the record of a change that alters that set, and only then.
+//!
+//! # Lock order
+//!
+//! **Part rows are always locked in ascending id order**, each once: by the journal's check of the
+//! parts a record chose, by assembly creation (both through [`chosen_parts`], which sorts), and by
+//! a project's deletion ([`crate::store::Tx::mark_project_documents_deleted`]). So two transactions
+//! locking some of the same part rows (on PostgreSQL) never wait for each other in a cycle.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -193,17 +200,20 @@ impl RefChange {
     }
 }
 
-/// The distinct parts of `chosen`, each with the first component choosing it.
+/// The distinct parts of `chosen`, each with the first component choosing it, **in ascending part
+/// id order**: the order part rows are locked in (see the module's "Lock order").
 pub fn chosen_parts(chosen: &[(Arc<str>, Pin)]) -> Vec<ChosenPart> {
     let mut seen = HashSet::new();
-    chosen
+    let mut out: Vec<ChosenPart> = chosen
         .iter()
         .filter(|(_, p)| seen.insert(p.part.clone()))
         .map(|(id, p)| ChosenPart {
             part_id: p.part.to_string(),
             component_id: id.to_string(),
         })
-        .collect()
+        .collect();
+    out.sort_by(|a, b| a.part_id.cmp(&b.part_id));
+    out
 }
 
 /// The pins of the components an operation list inserts into `components`, by component id: what
@@ -420,6 +430,30 @@ mod tests {
         assert!(pin_of("c1", &label).unwrap_err().contains("version name"));
         let long = value(json!({"id": "c1", "ref": {"document": "a".repeat(33), "seq": 1}}));
         assert_eq!(pin_of("c1", &long), Err(no_part("c1")));
+    }
+
+    #[test]
+    fn chosen_parts_come_once_each_in_ascending_id_order() {
+        let pin = |part: &str| Pin {
+            part: Arc::from(part),
+            seq: 0,
+        };
+        let chosen = [
+            (Arc::from("c1"), pin("p3")),
+            (Arc::from("c2"), pin("p1")),
+            (Arc::from("c3"), pin("p3")),
+            (Arc::from("c4"), pin("p2")),
+        ];
+        let got: Vec<(String, String)> = chosen_parts(&chosen)
+            .into_iter()
+            .map(|c| (c.part_id, c.component_id))
+            .collect();
+        let want = [("p1", "c2"), ("p2", "c4"), ("p3", "c1")];
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(p, c)| ((*p).to_owned(), (*c).to_owned()))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]

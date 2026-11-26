@@ -1439,6 +1439,10 @@ async fn reference_update_reaches_only_open_assemblies_pinned_to_an_older_state(
             components: vec!["c1".into()],
         }
     );
+    // The part's own room hears `version.created` after every `reference.update` was sent: the
+    // announcing step is done by then.
+    let created: VersionCreated = p.expect().await;
+    assert_eq!(created.name, "Rev 1");
     let heard = n.drain().await;
     assert!(
         !heard
@@ -1449,5 +1453,211 @@ async fn reference_update_reaches_only_open_assemblies_pinned_to_an_older_state(
     assert!(
         server.state.hub.loaded(&closed).is_none(),
         "not opened for it"
+    );
+}
+
+// ------------------------------------------------------------------ v2: bounded reads
+
+#[tokio::test]
+async fn references_and_used_in_read_the_store_a_bounded_number_of_times() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    // 300 parts at state 3, each with a version there (rows written directly: only their rows
+    // matter here).
+    let parts: Vec<String> = (0..300).map(|n| format!("{n:032x}")).collect();
+    let docs: Vec<String> = parts
+        .iter()
+        .map(|id| {
+            format!(
+                "('{id}', '{}', 'P{id}', 'part', 3, '{}', 0, 0)",
+                world.project, world.admin_id
+            )
+        })
+        .collect();
+    server
+        .sql(&format!(
+            "INSERT INTO documents (id, project_id, name, kind, head_seq, created_by, created_at, \
+             updated_at) VALUES {}",
+            docs.join(", ")
+        ))
+        .await;
+    let versions: Vec<String> = parts
+        .iter()
+        .map(|id| {
+            format!(
+                "('v{}', '{id}', 3, 'Rev 3', '', '{}', 1)",
+                &id[1..],
+                world.admin_id
+            )
+        })
+        .collect();
+    server
+        .sql(&format!(
+            "INSERT INTO versions (id, document_id, seq, name, note, author_id, created_at) \
+             VALUES {}",
+            versions.join(", ")
+        ))
+        .await;
+    // 600 components over them.
+    let components: Vec<Json> = (0..600)
+        .map(|n| component(&format!("c{n:03}"), &parts[n % 300], 0, None))
+        .collect();
+    let asm = make_ok(&server, &world, assembly(components, vec![]), "Big").await;
+    let before = flaky.store_calls();
+    let got = refs(&server, &asm, &world.admin).await;
+    let reads = flaky.store_calls() - before;
+    assert_eq!(got.len(), 600);
+    assert_eq!(got["c000"]["update_available"], true);
+    assert_eq!(got["c000"]["latest_version"]["name"], "Rev 3");
+    assert_eq!(got["c599"]["changes_since_pinned"], 3);
+    assert!(reads <= 12, "{reads} store calls for 600 components");
+    // Thirty assemblies use one part: one read for all their references.
+    for n in 0..30 {
+        make_ok(
+            &server,
+            &world,
+            assembly(vec![component("k1", &parts[0], 0, None)], vec![]),
+            &format!("A{n:02}"),
+        )
+        .await;
+    }
+    let before = flaky.store_calls();
+    let (status, used) = server
+        .get(
+            &format!("/api/documents/{}/used-in", parts[0]),
+            Some(&world.admin),
+        )
+        .await;
+    let reads = flaky.store_calls() - before;
+    assert_eq!(status, 200);
+    assert_eq!(used.as_array().unwrap().len(), 31);
+    assert_eq!(
+        used[0]["components"],
+        json!([{"component": "k1", "seq": 0}])
+    );
+    assert_eq!(used[30]["document"]["name"], "Big");
+    assert_eq!(used[30]["components"].as_array().unwrap().len(), 2);
+    assert!(reads <= 12, "{reads} store calls for 31 assemblies");
+}
+
+// ------------------------------------------------------------------ v2: connections
+
+#[tokio::test]
+async fn a_takeover_while_the_parts_are_checked_gets_the_answer() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let part = world.document(&server, None, None, None).await;
+    let asm = make_ok(&server, &world, assembly(vec![], vec![]), "Rover").await;
+    let desk = Hello::client("assembly-desk");
+    let mut a = Live::connect_with(&server, &asm, &world.admin, desk.clone()).await;
+    flaky.parts_gate.shut();
+    let id = a.new_id();
+    let change = a.make_change(0, vec![add_component(component(&id, &part, 0, None))]);
+    a.send_change(&change).await;
+    flaky.parts_gate.until_waiting(1).await;
+    // The same client connects again: its old socket is replaced, its work is the new one's.
+    let mut b = Live::connect_with(&server, &asm, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    flaky.parts_gate.open();
+    assert_eq!(b.outcome(&change.change_id).await.seq(), 1);
+    table_matches(&server, &asm, &world.admin).await;
+    assert_eq!(table(&server, &asm).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_revocation_while_the_parts_are_checked_writes_nothing() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let (bob, bob_id) = bob(&server, &world).await;
+    let part = world.document(&server, None, None, None).await;
+    let asm = make_ok(&server, &world, assembly(vec![], vec![]), "Rover").await;
+    let mut b = Live::connect(&server, &asm, &bob).await;
+    flaky.parts_gate.shut();
+    let id = b.new_id();
+    let change = b.make_change(0, vec![add_component(component(&id, &part, 0, None))]);
+    b.send_change(&change).await;
+    flaky.parts_gate.until_waiting(1).await;
+    server.state.hub.drop_account(&bob_id).await;
+    assert_eq!(b.closed().await.0, 4401);
+    flaky.parts_gate.open();
+    // The check comes back to a room that no longer works for him: nothing is written.
+    let mut a = Live::connect(&server, &asm, &world.admin).await;
+    a.drain().await;
+    assert_eq!(
+        a.change(vec![set(&["note"], json!("x"))], vec![], vec![])
+            .await
+            .seq(),
+        1
+    );
+    let (_, got) = server
+        .get(&format!("/api/documents/{asm}/content"), Some(&world.admin))
+        .await;
+    assert_eq!(got["content"]["components"], json!([]));
+    assert!(table(&server, &asm).await.is_empty());
+}
+
+// ------------------------------------------------------------------ v2: the re-judge corner
+
+#[tokio::test]
+async fn a_change_a_rejudge_cannot_check_is_answered_server_error_and_can_be_sent_again() {
+    // A long batch window: the two changes below are written in one batch.
+    let (server, flaky) = TestServer::start_flaky_journal(
+        |_| {},
+        |store| {
+            oswx_server::journal::JournalWriter::start(
+                store.clone(),
+                oswx_server::journal::MAX_BATCH,
+                std::time::Duration::from_millis(500),
+            )
+        },
+    )
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let first = world.document(&server, None, Some("First"), None).await;
+    let second = world.document(&server, None, Some("Second"), None).await;
+    for part in [&first, &second] {
+        let mut p = Live::connect(&server, part, &world.admin).await;
+        assert_eq!(p.change(vec![set_depth(12)], vec![], vec![]).await.seq(), 1);
+    }
+    let asm = make_ok(
+        &server,
+        &world,
+        assembly(vec![component("c1", &first, 0, None)], vec![]),
+        "Rover",
+    )
+    .await;
+    let mut a = Live::connect(&server, &asm, &world.admin).await;
+    // One change points c1 at Second (checked: Second at 0); the next sets only its seq (checked:
+    // Second at 1, on the head the room judged it on).
+    let repoint = a.make_change(0, vec![repin("c1", &second, 0)]);
+    let seq_only = a.make_change(0, vec![set(&["components", "c1", "ref", "seq"], json!(1))]);
+    // ... but the journal refuses the first: judged again without it, the second would pin First
+    // at 1, which it was never checked for.
+    flaky.refuse_change_once(&repoint.change_id);
+    a.send_change(&repoint).await;
+    a.send_change(&seq_only).await;
+    a.outcome(&repoint.change_id).await;
+    assert_eq!(
+        a.outcome(&seq_only.change_id).await.code(),
+        RejectCode::ServerError
+    );
+    // A change depending on it, sent now, is refused: the room remembers the id as refused.
+    let mut dependent = a.make_change(0, vec![move_component("c1", 2.0)]);
+    dependent.depends = vec![seq_only.change_id.clone()];
+    a.send_change(&dependent).await;
+    assert_eq!(
+        a.outcome(&dependent.change_id).await.code(),
+        RejectCode::Dependency
+    );
+    // Sent again, the same change is judged afresh (and checked: First has state 1).
+    assert_eq!(a.resend(&seq_only).await.seq(), 1);
+    // Once accepted, what depends on it goes in.
+    let mut after = a.make_change(1, vec![move_component("c1", 3.0)]);
+    after.depends = vec![seq_only.change_id.clone()];
+    a.send_change(&after).await;
+    assert_eq!(a.outcome(&after.change_id).await.seq(), 2);
+    assert_eq!(
+        table(&server, &asm).await,
+        vec![("c1".to_owned(), first.clone(), 1)]
     );
 }
