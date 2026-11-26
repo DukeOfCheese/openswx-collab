@@ -819,3 +819,53 @@ fn the_servers_changes_still_keep_names_unique_and_staleness_is_asked_for() {
     let a = decide_server(&h, &restore, &Rules::openswx(), false).unwrap();
     assert_eq!(a.seq, 2);
 }
+
+#[test]
+fn a_server_change_checked_for_staleness_sees_earlier_server_changes() {
+    let depth = &["features", "f1", "params", "depth"];
+    // The server writes f1's depth at seq 1 (a restore).
+    let h = adopt(
+        decide_server(
+            &head(),
+            &change("restore", 0, vec![set(depth, 5)]),
+            &Rules::openswx(),
+            false,
+        )
+        .unwrap(),
+    );
+    // A later server change made on base 0 (a revert of something older) writing it too is stale:
+    // the earlier server write is not "its own".
+    let revert = change("revert", 0, vec![set(depth, 0)]);
+    let refused = decide_server(&h, &revert, &Rules::openswx(), true);
+    let Err(Refusal::Stale(conflicts)) = refused else {
+        panic!("expected a conflict with the earlier server change: {refused:?}")
+    };
+    assert_eq!((conflicts[0].seq, &*conflicts[0].by), (1, SERVER_CLIENT));
+    // Without the check it lands, and it is still recorded under the server's client id.
+    let a = decide_server(&h, &revert, &Rules::openswx(), false).unwrap();
+    let h = adopt(a);
+    let later = change("later", 1, vec![set(depth, 7)]);
+    let Err(Refusal::Stale(conflicts)) = decide_for(&h, "u1.c1", &later, &never) else {
+        panic!("a client sees the server's write")
+    };
+    assert_eq!((conflicts[0].seq, &*conflicts[0].by), (2, SERVER_CLIENT));
+    // A client's own earlier writes still never conflict with its later ones.
+    let mine = adopt(
+        decide_for(
+            &head(),
+            "u1.c1",
+            &change("m1", 0, vec![set(depth, 1)]),
+            &never,
+        )
+        .unwrap(),
+    );
+    assert!(
+        decide_for(
+            &mine,
+            "u1.c1",
+            &change("m2", 0, vec![set(depth, 2)]),
+            &never
+        )
+        .is_ok()
+    );
+}

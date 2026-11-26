@@ -132,12 +132,17 @@ pub fn decide(
     undo: Option<&[Op]>,
     rules: &Rules,
 ) -> Result<Accepted, Refusal> {
-    judge(head, client, change, known, undo, rules, true, true)
+    judge(head, client, client, change, known, undo, rules, true, true)
 }
 
 /// The client id under which the index records a change the server made (a restore, a revert from
 /// history). A real client is `<user id>.<client id>`, which never starts with `~`.
 pub const SERVER_CLIENT: &str = "~server";
+
+/// The identity a server-made change is checked for staleness as: one that matches no writer (real
+/// clients never start with `~`, and the server records under [`SERVER_CLIENT`]), so that every
+/// earlier write after its base counts, the server's own included.
+const CHECK_AS_NOBODY: &str = "~check";
 
 /// Decide a change the server makes itself (a restore, a revert from history), recorded in the
 /// index under [`SERVER_CLIENT`].
@@ -146,7 +151,8 @@ pub const SERVER_CLIENT: &str = "~server";
 /// their original ids, whoever made them and however long ago they were removed. The document's
 /// `rules` (unique names) still apply, and so do the shape checks. `depends` and `undo_of` are not
 /// consulted. Staleness (conflicts in the index after `change.base`, and a base below the index's
-/// floor) is checked only when `check_stale`.
+/// floor) is checked only when `check_stale`, and then against every write after the base, the
+/// server's own earlier changes included (a revert from history does not silently undo a restore).
 pub fn decide_server(
     head: &Head,
     change: &Change,
@@ -154,9 +160,11 @@ pub fn decide_server(
     check_stale: bool,
 ) -> Result<Accepted, Refusal> {
     let client: ClientId = Arc::from(SERVER_CLIENT);
+    let check_as: ClientId = Arc::from(CHECK_AS_NOBODY);
     judge(
         head,
         &client,
+        &check_as,
         change,
         &|_| Known::Accepted,
         None,
@@ -166,12 +174,14 @@ pub fn decide_server(
     )
 }
 
-/// [`decide`] and [`decide_server`]: `check_stale` judges the index; `client_ids` holds new ids to
-/// the client's prefix (and consults `depends`).
+/// [`decide`] and [`decide_server`]: `client` is who the change is recorded under (and, with
+/// `client_ids`, whose prefix new ids must have and whose `depends` are consulted); `check_as` is
+/// whose own earlier writes do not conflict when `check_stale` judges the index.
 #[allow(clippy::too_many_arguments)]
 fn judge(
     head: &Head,
     client: &ClientId,
+    check_as: &ClientId,
     change: &Change,
     known: &dyn Fn(&str) -> Known,
     undo: Option<&[Op]>,
@@ -205,7 +215,7 @@ fn judge(
     if check_stale {
         let conflicts = head
             .index
-            .check(change.base, client, &writes, &removed, &change.reads);
+            .check(change.base, check_as, &writes, &removed, &change.reads);
         if !conflicts.is_empty() {
             return Err(Refusal::Stale(conflicts));
         }
