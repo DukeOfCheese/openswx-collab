@@ -123,24 +123,6 @@ impl Room {
         }
         // Dead locks go before anyone's are taken up again (or handed to a replacement).
         self.expire_locks();
-        // The room's name for the connection: its own id, or, when it takes over a live
-        // connection of the same client, that connection's (see `Room::take_over`).
-        let mut key = req.conn;
-        let mut inherited = None;
-        if let Some(old) = self.by_client.get(&req.client).copied() {
-            if self.live_conn(old).is_some() {
-                inherited = self.take_over(old, req.conn);
-                key = old;
-            } else {
-                // Closed already (its access ended, or it broke a limit): its work is not
-                // inherited. Popped first: its leaving is not announced.
-                self.remove_conn(
-                    old,
-                    Some((close::REPLACED, "connected again from the same client")),
-                    false,
-                );
-            }
-        }
         let read_only = if req.role == ProjectRole::Viewer {
             Some("you have view access to this project".to_owned())
         } else if let Some(theirs) = self
@@ -157,6 +139,31 @@ impl Room {
         } else {
             None
         };
+        // The room's name for the connection: its own id, or, when it takes over a live
+        // connection of the same client, that connection's (see `Room::take_over`). It inherits
+        // the old connection's work only with the very access that work was sent with: the same
+        // role, and not read-only. Otherwise everything of the old connection not yet handed to
+        // the journal is discarded, as for a revocation (what was handed over completes), and it
+        // starts clean: a client that resends is answered under its access now.
+        let mut key = req.conn;
+        let mut inherited = None;
+        if let Some(old) = self.by_client.get(&req.client).copied() {
+            let same_access =
+                read_only.is_none() && self.live_conn(old).is_some_and(|c| c.role == req.role);
+            if same_access {
+                inherited = self.take_over(old, req.conn);
+                key = old;
+            } else {
+                // Closed already (its access ended, or it broke a limit), or its access is not
+                // the newcomer's: its work is not inherited. Popped first: its leaving is not
+                // announced.
+                self.remove_conn(
+                    old,
+                    Some((close::REPLACED, "connected again from the same client")),
+                    false,
+                );
+            }
+        }
         let same_user = self.conns.values().find(|c| c.user == req.user);
         let colour = match same_user {
             Some(c) => c.colour.clone(),
@@ -169,13 +176,11 @@ impl Room {
         // now only look); a replaced connection's locks simply stay.
         let (back, released) = self.locks_at_join(&req.client, read_only.is_some());
         let (replies, parked, parked_bytes, busy) = inherited.unwrap_or_default();
-        let inherited = replies
-            .iter()
-            .filter_map(|r| match r {
-                Reply::Waiting(ticket) => Some(*ticket),
-                Reply::Ready(_) => None,
-            })
-            .collect();
+        let inherited = if key == req.conn {
+            std::collections::HashSet::new()
+        } else {
+            self.recent.unsettled_of(&req.client)
+        };
         let resume = !busy && !parked.is_empty();
         let conn = Conn {
             client: req.client.clone(),
@@ -196,6 +201,7 @@ impl Room {
             joined: self.next_join,
             expires: req.session_expires,
             inherited,
+            role: req.role,
         };
         self.next_expiry = self.next_expiry.min(req.session_expires);
         self.idle_since = None;
@@ -293,6 +299,7 @@ impl Room {
             .map_or(old, |(s, _)| *s);
         self.aliases.remove(&previous);
         self.retired.insert(previous);
+        self.served.insert(previous, old);
         if socket != old {
             self.aliases.insert(socket, old);
         }
@@ -312,6 +319,9 @@ impl Room {
             return;
         };
         let revoked = c.outbox.close_code().is_some_and(close::ends_access);
+        // What pointed at this name goes with it.
+        self.served.retain(|_, name| *name != conn);
+        self.voided.retain(|_, to| *to != conn);
         if self.conns.is_empty() {
             self.idle_since = Some(self.state.clock.now());
         }

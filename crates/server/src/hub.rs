@@ -645,14 +645,19 @@ impl Hub {
         for room in rooms {
             let project = room.project().clone();
             if !cannot_edit.contains_key(&project) {
-                let role = match store.project_by_id(&project).await {
-                    Ok(Some(p)) => role_in_project(store, user, &p).await.unwrap_or(None),
-                    _ => None,
+                // A role that cannot be read releases nothing (connections were closed above, which
+                // fails closed; detached locks simply expire with the grace period).
+                let lost = match store.project_by_id(&project).await {
+                    Ok(Some(p)) => match role_in_project(store, user, &p).await {
+                        Ok(role) => role.is_none_or(|r| r == ProjectRole::Viewer),
+                        Err(_) => false,
+                    },
+                    Ok(None) => true,
+                    Err(_) => false,
                 };
-                let lost = role.is_none_or(|r| r == ProjectRole::Viewer);
                 cannot_edit.insert(project.clone(), lost);
             }
-            if cannot_edit.get(&project).copied().unwrap_or(true) {
+            if cannot_edit.get(&project).copied().unwrap_or(false) {
                 room.revoke(None, user, close::ACCESS_CHANGED, reason, true);
             }
         }

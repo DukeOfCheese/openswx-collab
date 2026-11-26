@@ -117,6 +117,12 @@ const MAX_COMMAND: usize = 100;
 const MAX_MESSAGE: usize = 300;
 /// What the sender of a change that could not be written is told.
 const NOT_STORED: &str = "the server could not store the change; try again";
+/// What a connection is told for a change it inherited from the connection it took over, when the
+/// access that change was sent with ended before it reached the journal. `server_error` ("try
+/// again"), not `read_only`: the successor may still be allowed to edit, and its resend is judged
+/// under its own access now.
+pub(super) const VOIDED: &str =
+    "the access this change was sent with has ended; send it again if you still may";
 /// What the sender of a change whose parts could not be checked is told.
 const NOT_CHECKED: &str = "the server could not check the parts this change uses; try again";
 
@@ -152,6 +158,17 @@ pub(super) struct Recent {
 }
 
 impl Recent {
+    /// The change ids of `client` decided but not yet durable (tentative, or being checked).
+    pub(super) fn unsettled_of(&self, client: &ClientId) -> HashSet<Arc<str>> {
+        self.map
+            .iter()
+            .filter(|((c, _), seen)| {
+                c == client && matches!(seen, Seen::Tentative(_) | Seen::Checking(_))
+            })
+            .map(|((_, id), _)| id.clone())
+            .collect()
+    }
+
     /// Empty memory keeping at most `max` durable entries.
     pub(super) fn new(max: usize) -> Self {
         Self {
@@ -756,14 +773,13 @@ impl Room {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
         };
+        // A connection that took over this client's connection inherited the answer for this
+        // change: its first resend is answered by that, once, whether the change is still being
+        // written or became durable meanwhile (the inherited answer went out then).
+        if seen.is_some() && c.inherited.remove(&change.change_id) {
+            return;
+        }
         match seen {
-            // A connection that took over this client's connection inherited its answer for this
-            // change: its first resend is answered by that (once).
-            Some(Seen::Tentative(ticket) | Seen::Checking(ticket))
-                if c.inherited.remove(&ticket) =>
-            {
-                return;
-            }
             Some(Seen::Durable(seq)) => return self.accept_again(conn, &change.change_id, seq),
             Some(Seen::Tentative(ticket)) => {
                 // Still being written: answered with the change itself, when it is.
@@ -819,8 +835,11 @@ impl Room {
             result,
         } = lookup;
         self.unpark(conn);
-        if self.closing.is_some() || self.live_conn(conn).is_none() {
+        if self.closing.is_some() {
             return;
+        }
+        if self.live_conn(conn).is_none() {
+            return self.void_change(conn, &change.change_id);
         }
         match result {
             Ok(Some(seq)) => {
@@ -1095,7 +1114,7 @@ impl Room {
         if let Some(conn) = item.conn() {
             self.unpark(conn);
             if self.live_conn(conn).is_none() {
-                return;
+                return self.void_item(conn, item);
             }
         }
         if self.closing.is_some() {
@@ -1186,7 +1205,7 @@ impl Room {
             Some(conn) => {
                 self.unpark(conn);
                 if self.live_conn(conn).is_none() {
-                    return;
+                    return self.void_item(conn, item);
                 }
             }
             None => self.paused = self.paused.saturating_sub(1),
@@ -1269,7 +1288,7 @@ impl Room {
         if let Some(conn) = item.conn() {
             self.unpark(conn);
             if self.live_conn(conn).is_none() {
-                return;
+                return self.void_item(conn, item);
             }
         }
         if self.closing.is_some() {
@@ -1318,15 +1337,63 @@ impl Room {
 
     // ------------------------------------------------------------------ writing
 
+    /// Work of a connection name the room no longer works for, coming back: dropped, unless it was
+    /// inherited by a successor whose inheritance was voided (see `Room::void_inherited`), which
+    /// is told the change was not written (and goes on with its parked messages).
+    pub(super) fn void_change(&mut self, conn: ConnId, change_id: &Arc<str>) {
+        let Some(to) = self.voided.get(&conn).copied() else {
+            return;
+        };
+        self.unpark(to);
+        if self.live_conn(to).is_some() {
+            self.reject(to, change_id, RejectCode::ServerError, VOIDED);
+        }
+    }
+
+    /// [`Room::void_change`] for an item (a revert is answered `change.revert.result`).
+    pub(super) fn void_item(&mut self, conn: ConnId, item: Item) {
+        let Some(to) = self.voided.get(&conn).copied() else {
+            return;
+        };
+        self.unpark(to);
+        if self.live_conn(to).is_none() {
+            return;
+        }
+        match item.origin {
+            Origin::Revert { request_id, .. } => {
+                let frame = self.revert_result(request_id, Err(("server_error", VOIDED)));
+                self.reply(to, frame);
+            }
+            _ => self.reject(to, &item.change.change_id, RejectCode::ServerError, VOIDED),
+        }
+    }
+
+    /// Renames the connection `from` to `to` in the answers waited for in the pipeline.
+    pub(super) fn rename_waiters(&mut self, from: ConnId, to: ConnId) {
+        for p in &mut self.pending {
+            for w in &mut p.item.waiters {
+                if *w == from {
+                    *w = to;
+                }
+            }
+        }
+        for waiting in self.checking.values_mut() {
+            for w in waiting.iter_mut() {
+                if *w == from {
+                    *w = to;
+                }
+            }
+        }
+    }
+
     /// Makes an accepted change tentative and hands its record to the journal.
     fn adopt(&mut self, mut item: Item, d: Decision) {
         // The last gate before the journal: nothing is written for a connection whose access
         // ended (see `Room::live_conn`).
-        if item
-            .conn()
-            .is_some_and(|conn| self.live_conn(conn).is_none())
+        if let Some(conn) = item.conn()
+            && self.live_conn(conn).is_none()
         {
-            return;
+            return self.void_item(conn, item);
         }
         let seq = d.accepted.seq;
         debug_assert_eq!(seq, self.tentative.seq + 1, "decided on the tentative head");
@@ -1789,11 +1856,15 @@ impl Room {
         for p in rest {
             let mut item = p.item;
             // A change of a connection whose access ended since is not written again (it was not
-            // durable: see `Room::live_conn`); its sender hears nothing more.
+            // durable: see `Room::live_conn`). Its sender hears nothing more; a successor that
+            // inherited it and then lost that inheritance (see `Room::void_inherited`) is told.
             if item
                 .conn()
                 .is_some_and(|conn| self.live_conn(conn).is_none())
             {
+                if item.waiters.iter().any(|w| self.live_conn(*w).is_some()) {
+                    self.answer_refused(item, RejectCode::ServerError, VOIDED, Vec::new(), None);
+                }
                 continue;
             }
             // A duplicate refusal is the other record's fault (and should not happen at all: see

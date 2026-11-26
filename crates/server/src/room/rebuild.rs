@@ -124,7 +124,14 @@ impl Room {
             result,
         } = lookup;
         self.unpark(conn);
-        if self.closing.is_some() || self.live_conn(conn).is_none() {
+        if self.closing.is_some() {
+            return;
+        }
+        if self.live_conn(conn).is_none() {
+            // (A report is not answered; a successor whose inheritance was voided goes on.)
+            if let Some(to) = self.voided.get(&conn).copied() {
+                self.unpark(to);
+            }
             return;
         }
         let info = result.unwrap_or_else(|e| {
