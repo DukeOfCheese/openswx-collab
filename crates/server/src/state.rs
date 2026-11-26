@@ -18,7 +18,7 @@ use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
 use crate::routes::lifecycle::Exports;
 use crate::sessions::Sessions;
-use crate::store::{SqliteStore, Store, Tx, new_id};
+use crate::store::{PgStore, SqliteStore, Store, Tx, new_id};
 
 /// The server's shared state. Cloning is cheap: every field is shared.
 #[derive(Clone)]
@@ -250,7 +250,7 @@ impl AppState {
     }
 
     /// The state of a running server: the database `settings.database_url` names (opened, and its
-    /// schema brought up to date as [`SqliteStore::open`] does), the blob storage
+    /// schema brought up to date as [`SqliteStore::open`] and [`PgStore::open`] do), the blob storage
     /// `settings.storage_url` names (a folder, [`LocalBlobs`]; S3 is refused until Task 17), mail
     /// through the operator's SMTP server ([`SmtpMailer`]) and the real Google and GitHub
     /// ([`HttpProviders`]).
@@ -259,8 +259,14 @@ impl AppState {
             Database::Sqlite(_) => {
                 Arc::new(SqliteStore::open(&settings.database_url, settings.auto_migrate).await?)
             }
-            // TASK 16: open the PostgreSQL store here.
-            Database::Postgres(_) => bail!("this build cannot open PostgreSQL databases yet"),
+            Database::Postgres(_) => Arc::new(
+                PgStore::open(
+                    &settings.database_url,
+                    settings.auto_migrate,
+                    settings.database_pool,
+                )
+                .await?,
+            ),
         };
         let blobs: Arc<dyn Blobs> = match settings.storage()? {
             Storage::Local(folder) => Arc::new(LocalBlobs::new(folder)?),

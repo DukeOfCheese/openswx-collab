@@ -53,6 +53,9 @@ use crate::store::{AssemblyRefRow, AssemblyUse, Document, Folder, SnapshotRow, n
 pub const MAX_DOCUMENT_BODY: usize = 8 << 20;
 /// The most distinct blob references one document may hold.
 pub const MAX_BLOB_REFS: usize = 4096;
+/// The longest id a component of a new assembly may have (the `assembly_refs.component_id`
+/// column).
+const COMPONENT_ID_MAX: usize = 200;
 /// The `?folder=` value that lists the documents at the top of the project.
 pub const ROOT_FOLDER: &str = "root";
 /// What naming a folder that is not in the project answers (422; it never says whether the folder
@@ -319,6 +322,15 @@ async fn create(
         // empty, by now).
         let chosen = assemblies::chosen_in(&doc).map_err(ApiError::Unprocessable)?;
         let rows = assemblies::rows(&doc);
+        // (What the `assembly_refs` table takes: the journal holds live changes to the same.)
+        if rows.iter().any(|r| {
+            r.component_id.contains('\0') || r.component_id.chars().count() > COMPONENT_ID_MAX
+        }) {
+            return Err(ApiError::Unprocessable(format!(
+                "a component id is at most {COMPONENT_ID_MAX} characters, without the zero \
+                 character"
+            )));
+        }
         Ok((doc, refs, chosen, rows))
     })
     .await??;
@@ -379,7 +391,7 @@ async fn create(
             return Err(err);
         }
         Err(InsertError::Commit(err, role)) => {
-            settle_commit_error(&state, &document.id, &key, err).await?;
+            settle_commit_error(&state, &document, &key, err).await?;
             role
         }
     };
@@ -404,30 +416,65 @@ async fn forget_snapshot(state: &AppState, key: &str) {
 }
 
 /// After `commit()` reported an error, which may have come after the commit took effect (a
-/// connection lost during `COMMIT`): reads the document back. Absent: the creation did not
-/// happen, the snapshot file is removed, 500. Present: it did, and the request succeeds. If the
-/// read fails too, the file is kept (an orphan file is harmless; a row without its file is not)
-/// and the answer is 500.
+/// connection lost during `COMMIT`), or even before it does (on PostgreSQL a commit whose answer
+/// was not waited for can still land): finds out which. Present: the document was created, and
+/// the request succeeds. Absent for good: the snapshot file is removed, 500. If that cannot be
+/// told, the file is kept (an orphan file is harmless; a row without its file is not) and the
+/// answer is 500.
+///
+/// "Absent" is not taken from a read alone. The creation's transaction is made to have ended
+/// first: a second transaction inserts the same document row, which on PostgreSQL waits for an
+/// unfinished transaction that inserted that id (and then fails on the key if it committed), and
+/// on SQLite waits its turn behind it. Only when that insert goes in (and is rolled back) is the
+/// document known never to appear.
 async fn settle_commit_error(
     state: &AppState,
-    document: &str,
+    document: &Document,
     key: &str,
     err: anyhow::Error,
 ) -> Result<(), ApiError> {
-    match state.store.document_by_id(document).await {
+    let took_effect = |err: &anyhow::Error| {
+        tracing::warn!("a commit reported an error but took effect: {err:#}");
+    };
+    let unsettled = |why: anyhow::Error| {
+        tracing::error!(
+            "could not tell whether document {} was created ({why:#}); keeping its snapshot {key}",
+            document.id
+        );
+    };
+    match state.store.document_by_id(&document.id).await {
         Ok(Some(_)) => {
-            tracing::warn!("a commit reported an error but took effect: {err:#}");
+            took_effect(&err);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(read) => {
+            unsettled(read);
+            return Err(ApiError::Internal(err));
+        }
+    }
+    let probe = async {
+        let mut tx = state.store.begin().await?;
+        match tx.insert_document(document).await {
+            Ok(()) => {
+                tx.rollback().await?;
+                anyhow::Ok(false)
+            }
+            Err(taken) if crate::store::is_unique_violation(&taken) => Ok(true),
+            Err(other) => Err(other),
+        }
+    };
+    match probe.await {
+        Ok(true) => {
+            took_effect(&err);
             Ok(())
         }
-        Ok(None) => {
+        Ok(false) => {
             forget_snapshot(state, key).await;
             Err(ApiError::Internal(err))
         }
-        Err(read) => {
-            tracing::error!(
-                "could not tell whether document {document} was created ({read:#}); keeping its \
-                 snapshot {key}"
-            );
+        Err(why) => {
+            unsettled(why);
             Err(ApiError::Internal(err))
         }
     }

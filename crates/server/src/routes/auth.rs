@@ -85,6 +85,9 @@ pub(crate) fn router() -> Router<AppState> {
 
 /// 422 when `value` is longer than `max` characters.
 pub(crate) fn max_len(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
+    if value.contains('\0') {
+        return Err(ApiError::Unprocessable(crate::error::ZERO_CHARACTER.into()));
+    }
     if value.chars().count() > max {
         return Err(ApiError::Unprocessable(format!(
             "{field} must be at most {max} characters"
@@ -112,7 +115,11 @@ pub(crate) async fn start_session(
         user_id: user_id.to_owned(),
         created_at: now,
         expires_at: now + f64::from(settings.session_days) * 86400.0,
-        label: label.chars().take(LABEL_MAX).collect(),
+        label: label
+            .chars()
+            .filter(|c| *c != '\0')
+            .take(LABEL_MAX)
+            .collect(),
     })
     .await?;
     Ok(token)
@@ -232,7 +239,14 @@ async fn register(
         created_at: now,
         deleted_at: None,
     };
-    tx.insert_user(&user).await?;
+    if let Err(e) = tx.insert_user(&user).await {
+        // Two registrations with one address at once: the second finds it taken only here.
+        return Err(if crate::store::is_unique_violation(&e) {
+            ApiError::Conflict(EMAIL_TAKEN.into())
+        } else {
+            e.into()
+        });
+    }
     let accepted = match &invite {
         Some(invite) => {
             Some(accept_invite(&mut *tx, invite, approval.as_ref(), &user.id, now).await?)

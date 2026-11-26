@@ -8,7 +8,10 @@
 //! Every query is added the same way, in five places:
 //!
 //! 1. **SQL text**: a `pub const` in [`sql`]. Portable SQL only (`$1, $2, …` placeholders, no
-//!    dialect functions), so the PostgreSQL store runs the same text.
+//!    dialect functions), so both stores run the same text. A statement that locks rows (see
+//!    "Isolation and locks" below) goes in [`sql`]'s `dialects!` list instead, with its text for
+//!    each database. Text is ordered `COLLATE "C"` on PostgreSQL (the migration declares every
+//!    text column so), which is the byte order SQLite sorts in.
 //! 2. **Row type** (for a query that returns rows): a plain struct in this file deriving
 //!    `sqlx::FromRow`, one field per selected column, same names. The derive generates the row
 //!    mapping for both databases at build time without a database. Column types map one way only:
@@ -24,12 +27,12 @@
 //!    Arguments are borrowed (`&str`, `&[u8]`); ids are [`Id`]; times come from
 //!    [`crate::Clock::now`], passed in by the caller (the store never reads the system time); new ids
 //!    come from [`new_id`].
-//! 4. **SQLite body**: one `async fn` in `sqlite.rs`'s `q` module taking `&mut SqliteConnection`,
-//!    which binds the arguments with `sqlx::query(sql::X).bind(..)` / `query_as::<_, Row>` /
-//!    `query_scalar`. The trait impls are one line each, calling it with a reader connection
-//!    (`Store`) or the transaction's connection, always through `self.conn()` (`Tx`), which keeps
-//!    the re-entrancy guard on the task using the transaction. (PostgreSQL, from Task 16, mirrors
-//!    this in `postgres.rs` with `PgConnection`.)
+//! 4. **Body**, once for both databases, in `shared.rs` (`store_impl!`, which `sqlite.rs` and
+//!    `postgres.rs` each expand for their connection type): one `async fn` in its `q` module
+//!    taking `&mut $Conn`, which binds the arguments with `sqlx::query(sql::X).bind(..)` /
+//!    `query_as::<_, Row>` / `query_scalar`; and the trait impls, one line each, calling it with
+//!    a reader connection (`Store`) or the transaction's connection, always through `self.conn()`
+//!    (`Tx`), which on SQLite keeps the re-entrancy guard on the task using the transaction.
 //!
 //!    An `INSERT` lists every column and binds a value for each. The `DEFAULT`s in the schema exist
 //!    for imports and hand-written rows, not for handlers: the handler decides every value.
@@ -65,28 +68,125 @@
 //! ```
 //!
 //! Rules:
-//! - Only one write transaction runs at a time (SQLite has one writer; the store queues the others),
-//!   so keep transactions short and never `.await` anything slow (network, blobs, other rooms)
-//!   inside one.
-//! - Never call [`Store::begin`] while the same task holds a [`Tx`], directly or in a helper: it
-//!   would wait for itself. The store refuses it at once with "begin() called while this task holds
-//!   a transaction; use savepoint()". Pass the `Tx` to the helper, or use a savepoint. (One false
-//!   positive: two independent transactional futures joined in one task with `join!`/`select!` get
-//!   that error instead of queueing; spawn them as tasks. See `sqlite.rs`.)
+//! - On SQLite only one write transaction runs at a time (the store queues the others), and on
+//!   PostgreSQL a transaction holds row locks others wait for, so keep transactions short and
+//!   never `.await` anything slow (network, blobs, other rooms) inside one.
+//! - Never call [`Store::begin`] while the same task holds a [`Tx`], directly or in a helper: on
+//!   SQLite it would wait for itself, and the store refuses it at once with "begin() called while
+//!   this task holds a transaction; use savepoint()"; on PostgreSQL the two transactions can wait
+//!   for each other's locks. Pass the `Tx` to the helper, or use a savepoint. (One false
+//!   positive on SQLite: two independent transactional futures joined in one task with
+//!   `join!`/`select!` get that error instead of queueing; spawn them as tasks. See `sqlite.rs`.)
+//! - A statement that fails ends the transaction on PostgreSQL (every later statement in it is
+//!   refused): never go on after an error, except by rolling back a savepoint the statement ran
+//!   in. Statements that may meet a taken key say `ON CONFLICT … DO NOTHING` and answer `false`.
 //! - [`Store`] methods only read. A write is a [`Tx`] method, never a "single statement" `Store`
 //!   method that takes the writer behind the caller's back.
 //! - A [`Store`] read made while holding a [`Tx`] does not see the transaction's uncommitted writes.
 //!   If it must, the read belongs on [`Tx`].
+//!
+//! # Isolation and locks
+//!
+//! SQLite runs one write transaction at a time, so a transaction there can check something and
+//! then write, and nothing changes in between. PostgreSQL runs them side by side, at **READ
+//! COMMITTED** (the store sets it on every connection): each statement sees what was committed
+//! when it started, and a statement that has to wait for another transaction's row lock goes on
+//! with the row as that transaction left it. The server's transactions are written for exactly
+//! that ("mark the part deleted, which waits for a journal batch that locked its row, *then* ask
+//! whether an assembly uses it"). Under REPEATABLE READ or SERIALIZABLE that second statement
+//! would instead fail, and the whole request would have to run again, which handlers (their
+//! checks, hooks and replies spread around the transaction) are not built for.
+//!
+//! What the single writer gave for free is kept by taking a lock before the check. The lock
+//! methods of [`Tx`] end in `FOR UPDATE` on PostgreSQL and are plain reads on SQLite
+//! ([`sql::postgres`], [`sql::sqlite`]):
+//!
+//! | checked, then written | protected by |
+//! |---|---|
+//! | no account yet → the first is the server admin (password and provider registration) | [`Tx::user_count`] takes the accounts lock when it counts none, and counts again |
+//! | the last active admin stays; an organisation keeps an owner (account deletion) | [`Tx::lock_accounts`], [`Tx::lock_user`], then [`Tx::lock_org`] on each of its organisations |
+//! | an address has one account | the unique index; the route answers its 409 on [`is_unique_violation`] |
+//! | a provider identity signs in to one account | the primary key; a sign-in tries again, a link answers its 409 |
+//! | an account keeps a way in (removing a provider), links an identity once | [`Tx::lock_user`] |
+//! | members ≤ what the seat hook approved (accepting an invite, any route) | [`Tx::lock_org`] before the count |
+//! | an organisation keeps an owner (role change, removal) | [`Tx::lock_org`] (in `recheck_org`) |
+//! | a role in a project is given once; the folder tree has no cycle and a bounded depth; every other check a route makes in an organisation, project or document before writing | [`Tx::lock_org`] (in `recheck_org`, `recheck_project`, `recheck_document`): transactions that change one organisation run one at a time |
+//! | an invite, a reset link, a sign-in state or code is used once | one `UPDATE … WHERE unused` / `DELETE … RETURNING` |
+//! | a version name is unique in its document; a change id is written once | `ON CONFLICT DO NOTHING` |
+//! | a document has one lease row | `ON CONFLICT DO NOTHING` ([`Tx::insert_room_lease`]), then the row that is there is taken |
+//! | a journal row is the next of its document, written under the lease's epoch | the journal locks the document's row and its lease row before it reads either ([`Tx::lock_documents`], [`Tx::lock_room_lease`]) |
+//! | a part an assembly newly uses is not deleted, and a deleted part has no user | [`Tx::lock_live_document`] against the deletion's own update of the row |
+//!
+//! ## Lock order
+//!
+//! A transaction that takes more than one of these takes them in this order, and several of one
+//! kind in ascending id order, so that no two transactions wait for each other:
+//!
+//! 1. the accounts lock ([`Tx::lock_accounts`], or [`Tx::user_count`] counting none);
+//! 2. account rows ([`Tx::lock_user`]);
+//! 3. organisation rows ([`Tx::lock_org`]);
+//! 4. document rows ([`Tx::lock_documents`], [`Tx::lock_live_document`],
+//!    [`Tx::mark_project_documents_deleted`], [`Tx::move_folder_documents`], or changing one);
+//! 5. room lease rows ([`Tx::lock_room_lease`], [`Tx::take_room_lease`]);
+//! 6. everything else (journal rows, references, versions, memberships, folders, sessions …):
+//!    rows no transaction holds while it waits for a lock above.
+//!
+//! So a deletion that cascades (a project, an organisation) first locks every document row it
+//! will remove, in id order ([`Tx::lock_documents`]), and the journal first locks the rows of
+//! every document its batch writes to and every part its assembly changes chose. Account and
+//! document rows are locked `FOR NO KEY UPDATE`: a row that merely refers to them (a session, a
+//! journal row, a lease) can be inserted meanwhile, which keeps those inserts out of the order.
+//!
+//! Should two transactions wait for each other all the same, PostgreSQL ends one of them after a
+//! second (`40P01`). Nothing is retried inside the server: a REST request is answered 409
+//! [`crate::error::TRY_AGAIN`] ([`is_conflict`]) and can be sent again; a journal batch answers
+//! every record `Unknown` and its rooms reload from the store.
 
+pub mod postgres;
+mod shared;
 pub mod sql;
 pub mod sqlite;
 
 use async_trait::async_trait;
 
+pub use postgres::{PgStore, PgTx};
 pub use sqlite::{SqliteStore, SqliteTx};
 
 /// A database id: 32 lower-case hex characters.
 pub type Id = String;
+
+/// The database's own error inside `err`, if that is what it is.
+fn database_error(err: &anyhow::Error) -> Option<&dyn sqlx::error::DatabaseError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .and_then(sqlx::Error::as_database_error)
+}
+
+/// Whether `err` is the database refusing a row because a unique key is taken (PostgreSQL's
+/// `23505`, SQLite's `SQLITE_CONSTRAINT_UNIQUE` and `_PRIMARYKEY`): on PostgreSQL, where
+/// transactions run side by side, what a check made earlier in the transaction could not see.
+/// The transaction is over (PostgreSQL refuses every further statement in it); drop it.
+pub fn is_unique_violation(err: &anyhow::Error) -> bool {
+    database_error(err).is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+}
+
+/// Whether `err` is PostgreSQL refusing a text value that holds the zero character (`22021`),
+/// which its text cannot store or even be asked about. SQLite takes such text; the routes refuse
+/// it in what they store ([`crate::error::ZERO_CHARACTER`]) so that both databases hold the same,
+/// and this tells the rest (a lookup by such an id) apart from a failure of the server.
+pub fn is_zero_character(err: &anyhow::Error) -> bool {
+    database_error(err).is_some_and(|e| e.code().as_deref() == Some("22021"))
+}
+
+/// Whether `err` is the database ending a transaction because of another one: a unique key taken
+/// at the same moment ([`is_unique_violation`]), a deadlock (`40P01`) or a serialization failure
+/// (`40001`). Nothing was written; the same request can be made again. Routes answer it with 409
+/// ([`crate::error::TRY_AGAIN`]) unless they have an answer of their own for the case.
+pub fn is_conflict(err: &anyhow::Error) -> bool {
+    database_error(err).is_some_and(|e| {
+        e.is_unique_violation() || matches!(e.code().as_deref(), Some("40P01" | "40001"))
+    })
+}
 
 /// A new random id: 32 lower-case hex characters (a v4 UUID without dashes, as the Python server's
 /// `uuid4().hex`).
@@ -602,7 +702,8 @@ pub trait Store: Send + Sync + 'static {
     /// Which migrations the database has had, against the ones this binary carries.
     async fn schema_status(&self) -> anyhow::Result<SchemaStatus>;
 
-    /// Opens a write transaction. It waits while another one is open; see the module documentation.
+    /// Opens a write transaction (on SQLite it waits while another one is open); see the module
+    /// documentation.
     async fn begin(&self) -> anyhow::Result<Box<dyn Tx>>;
 
     /// How many accounts exist, deleted and disabled ones included (the registration mode).
@@ -859,7 +960,9 @@ pub trait Tx: Send {
     async fn savepoint(&mut self) -> anyhow::Result<Box<dyn Tx + '_>>;
 
     /// [`Store::user_count`], serialised with this transaction's writes (registration decides who
-    /// becomes the server admin from it).
+    /// becomes the server admin from it): when there is no account yet, the accounts lock
+    /// ([`Tx::lock_accounts`]) is taken and they are counted again, so of two transactions that
+    /// would each make the first account, the second counts the first's.
     async fn user_count(&mut self) -> anyhow::Result<u64>;
 
     /// [`Store::user_by_id`], seeing this transaction's writes.
@@ -1098,6 +1201,12 @@ pub trait Tx: Send {
     /// document already has a row with the same `client_id` and `change_id`.
     async fn insert_change(&mut self, change: &NewChange<'_>) -> anyhow::Result<bool>;
 
+    /// Adds journal rows in one statement (several, for more rows than a statement takes) and
+    /// answers how many went in: fewer than `changes.len()` when some were left out as
+    /// [`Tx::insert_change`] leaves one out. Which ones is not said; a caller that must know
+    /// undoes the transaction and inserts them one at a time.
+    async fn insert_changes(&mut self, changes: &[NewChange<'_>]) -> anyhow::Result<u64>;
+
     /// Sets a document's head seq and when its content last changed.
     async fn set_document_head(
         &mut self,
@@ -1149,6 +1258,26 @@ pub trait Tx: Send {
     /// this transaction.
     async fn lock_live_document(&mut self, id: &str) -> anyhow::Result<bool>;
 
+    /// Until the transaction ends, no other transaction that calls this goes on: for decisions
+    /// that count accounts (who is the first, and so the server admin; whether an admin is the
+    /// last). See "Locks" in the module documentation.
+    async fn lock_accounts(&mut self) -> anyhow::Result<()>;
+
+    /// Locks an account's row until the transaction ends and answers whether it exists: for
+    /// decisions about what one account has (its last way to sign in).
+    async fn lock_user(&mut self, id: &str) -> anyhow::Result<bool>;
+
+    /// Locks an organisation's row until the transaction ends and answers whether it exists.
+    /// Every transaction that changes something in an organisation after checking something in it
+    /// (a role, a count of members or owners, the folder tree) takes this first, so such
+    /// transactions run one after another per organisation, as all transactions do on SQLite.
+    async fn lock_org(&mut self, id: &str) -> anyhow::Result<bool>;
+
+    /// Locks these documents' rows (the ones that exist) until the transaction ends, in ascending
+    /// id order whatever the order given: before a transaction changes or deletes several
+    /// document rows.
+    async fn lock_documents(&mut self, ids: &[Id]) -> anyhow::Result<()>;
+
     /// [`Store::assemblies_using`], seeing this transaction's writes.
     async fn assemblies_using(&mut self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>>;
 
@@ -1174,7 +1303,10 @@ pub trait Tx: Send {
     /// row).
     async fn lock_room_lease(&mut self, document_id: &str) -> anyhow::Result<Option<i64>>;
 
-    async fn insert_room_lease(&mut self, lease: &RoomLease) -> anyhow::Result<()>;
+    /// Adds a document's lease row; `false` (nothing written, the transaction still usable) when
+    /// it already has one: two rooms opening a document for the first time, or its first write
+    /// racing its first room. The caller then takes or locks the row that is there.
+    async fn insert_room_lease(&mut self, lease: &RoomLease) -> anyhow::Result<bool>;
 
     /// Gives a document's existing lease to `node_id` until `expires_at` under the next epoch, and
     /// answers that epoch (`None`: no row).

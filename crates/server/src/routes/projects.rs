@@ -150,6 +150,9 @@ async fn delete_project(
     let mut tx = state.store.begin().await?;
     recheck_project(&mut *tx, &user.id, &project.id, ProjectRole::Owner).await?;
     let documents = tx.project_document_ids(&project.id).await?;
+    // Every document row the deletion removes (the deleted ones too) is locked in ascending id
+    // order before any is touched: the lock order of `crate::store`.
+    tx.lock_documents(&documents).await?;
     // As for one document: mark them deleted first, then look for users outside the project, in one
     // transaction.
     tx.mark_project_documents_deleted(&project.id, state.clock.now())

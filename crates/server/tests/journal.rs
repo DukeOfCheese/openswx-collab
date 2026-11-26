@@ -941,8 +941,8 @@ async fn damage_to_a_snapshot_or_the_journal_is_a_distinct_error() {
     }]);
     server
         .sql(&format!(
-            "UPDATE changes SET ops = X'{}' WHERE document_id = '{stale_op}' AND seq = 3",
-            hex::encode(&bad)
+            "UPDATE changes SET ops = {} WHERE document_id = '{stale_op}' AND seq = 3",
+            common::blob_literal(&bad)
         ))
         .await;
     assert!(matches!(
@@ -953,7 +953,8 @@ async fn damage_to_a_snapshot_or_the_journal_is_a_distinct_error() {
     let damaged = journaled(&server, &world, "Damaged", 2).await;
     server
         .sql(&format!(
-            "UPDATE changes SET paths = X'c1' WHERE document_id = '{damaged}' AND seq = 2"
+            "UPDATE changes SET paths = {} WHERE document_id = '{damaged}' AND seq = 2",
+            common::blob_literal(&[0xc1])
         ))
         .await;
     assert!(matches!(
@@ -1177,4 +1178,258 @@ fn refusals_read_as_before() {
         JournalError::Refused(RefusedWhy::Lease).to_string(),
         "the journal refused the change: lease"
     );
+}
+
+// ------------------------------------------------------------------ Task 16: leases under concurrency
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_writers_with_different_epochs_cannot_both_write() {
+    let (server, _flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "D").await;
+    // Two rooms of one document, each with a journal writer of its own (as two nodes have) and
+    // the epoch its acquisition gave it.
+    let old = new_journal(&server.state.store);
+    let new = new_journal(&server.state.store);
+    let first = lease(&server, &doc).await;
+    assert_eq!(old.append(simple(&doc, 1, first)).await, Ok(()));
+    let second = lease(&server, &doc).await;
+    assert_eq!(second, first + 1);
+    let stale = |seq: u64| Record {
+        change_id: Some(format!("stale{seq}")),
+        ..simple(&doc, seq, first)
+    };
+    // The writer that lost the lease is refused from then on: alone ...
+    assert_eq!(old.append(stale(2)).await, refused(RefusedWhy::Lease));
+    // ... and racing the holder for the same seq, each in a transaction of its own.
+    for seq in 2..22 {
+        let (lost, held) = tokio::join!(
+            old.append(stale(seq)),
+            new.append(simple(&doc, seq, second))
+        );
+        assert_eq!(lost, refused(RefusedWhy::Lease), "seq {seq}");
+        assert_eq!(held, Ok(()), "seq {seq}");
+    }
+    let rows = store(&server)
+        .changes_between(&doc, 0, i64::MAX, 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 21);
+    assert_eq!(rows[0].epoch, first as i64);
+    assert!(
+        rows[1..]
+            .iter()
+            .all(|r| r.epoch == second as i64
+                && !r.change_id.as_deref().unwrap().starts_with("stale"))
+    );
+    assert_eq!(head_seq(&server, &doc).await, 21);
+    // The holder's own epoch moving on stops it too (a room loaded twice in one process).
+    let third = lease(&server, &doc).await;
+    assert_eq!(
+        new.append(simple(&doc, 22, second)).await,
+        refused(RefusedWhy::Lease)
+    );
+    assert_eq!(new.append(simple(&doc, 22, third)).await, Ok(()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_in_the_middle_of_a_stream_cuts_it_at_one_point() {
+    let (server, _flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "D").await;
+    let writer = new_journal(&server.state.store);
+    let first = lease(&server, &doc).await;
+    // 300 records in a row from the old holder, while the lease is taken from under it.
+    let mut receipts = Vec::new();
+    for seq in 1..=150 {
+        receipts.push(writer.submit(simple(&doc, seq, first)).await);
+    }
+    let taking = {
+        let (store, doc) = (server.state.store.clone(), doc.clone());
+        tokio::spawn(async move { acquire(store.as_ref(), &doc, "other", 1000.0, 60.0).await })
+    };
+    for seq in 151..=300 {
+        receipts.push(writer.submit(simple(&doc, seq, first)).await);
+    }
+    assert_eq!(taking.await.unwrap().unwrap(), first + 1);
+    let mut outcomes = Vec::new();
+    for receipt in receipts {
+        outcomes.push(receipt.outcome().await);
+    }
+    // Written up to some point, refused for the lease from there on: never one after a refusal.
+    let written = outcomes.iter().take_while(|o| o.is_ok()).count();
+    assert!(
+        outcomes[written..]
+            .iter()
+            .all(|o| *o == refused(RefusedWhy::Lease)),
+        "{:?}",
+        &outcomes[written..]
+    );
+    assert_eq!(head_seq(&server, &doc).await, written as i64);
+    assert_eq!(row_count(&server, &doc).await, written);
+    // And whatever it sends after the takeover is refused.
+    assert_eq!(
+        writer.append(simple(&doc, written as u64 + 1, first)).await,
+        refused(RefusedWhy::Lease)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rooms_opening_a_new_document_at_once_each_get_an_epoch_of_their_own() {
+    let (server, _flaky, world) = setup().await;
+    for round in 0..5 {
+        let doc = new_doc(&server, &world, &format!("D{round}")).await;
+        let mut tasks = FuturesUnordered::new();
+        for node in 0..6 {
+            let (store, doc) = (server.state.store.clone(), doc.clone());
+            tasks.push(tokio::spawn(async move {
+                acquire(store.as_ref(), &doc, &format!("node{node}"), 1000.0, 60.0).await
+            }));
+        }
+        let mut epochs = Vec::new();
+        while let Some(taken) = tasks.next().await {
+            epochs.push(taken.unwrap().expect("every acquisition gets the lease"));
+        }
+        epochs.sort_unstable();
+        assert_eq!(epochs, [1, 2, 3, 4, 5, 6], "round {round}");
+        let row = store(&server).room_lease(&doc).await.unwrap().unwrap();
+        assert_eq!(row.epoch, 6);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_write_racing_the_first_acquisition_is_settled_by_the_lease_row() {
+    let (server, _flaky, world) = setup().await;
+    let writer = new_journal(&server.state.store);
+    for round in 0..10 {
+        let doc = new_doc(&server, &world, &format!("D{round}")).await;
+        // A write under epoch 0 (a document nobody acquired) and a room's first acquisition.
+        let (written, taken) = tokio::join!(
+            writer.append(simple(&doc, 1, 0)),
+            acquire(store(&server), &doc, "node", 1000.0, 60.0)
+        );
+        assert_eq!(
+            taken.expect("the acquisition gets the lease"),
+            1,
+            "round {round}"
+        );
+        // Before the acquisition it is written; after it, refused. Never an error.
+        match written {
+            Ok(()) => assert_eq!(head_seq(&server, &doc).await, 1),
+            Err(why) => {
+                assert_eq!(Err(why), refused(RefusedWhy::Lease), "round {round}");
+                assert_eq!(head_seq(&server, &doc).await, 0);
+            }
+        }
+        let row = store(&server).room_lease(&doc).await.unwrap().unwrap();
+        assert_eq!((row.epoch, row.node_id.as_str()), (1, "node"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_goes_in_with_one_insert_and_a_duplicate_in_it_costs_only_itself() {
+    let (server, flaky, world) = setup().await;
+    let (a, b) = (
+        new_doc(&server, &world, "A").await,
+        new_doc(&server, &world, "B").await,
+    );
+    let (ea, eb) = (lease(&server, &a).await, lease(&server, &b).await);
+    let writer = slow_writer(&server);
+    writer.append(simple(&a, 1, ea)).await.unwrap();
+    // One batch: two documents' records, one of them a change id the journal already has.
+    let again = Record {
+        change_id: Some("c1".into()),
+        ..simple(&a, 2, ea)
+    };
+    let begins = flaky.begins();
+    let receipts = [
+        writer.submit(simple(&b, 1, eb)).await,
+        writer.submit(again).await,
+        writer.submit(simple(&b, 2, eb)).await,
+        writer.submit(simple(&a, 3, ea)).await,
+    ];
+    let mut outcomes = Vec::new();
+    for receipt in receipts {
+        outcomes.push(receipt.outcome().await);
+    }
+    assert_eq!(
+        outcomes,
+        [
+            Ok(()),
+            refused(RefusedWhy::Duplicate),
+            Ok(()),
+            refused(RefusedWhy::OutOfOrder)
+        ]
+    );
+    // The insert of all four left one out, so the batch was written again record by record.
+    assert_eq!(flaky.begins() - begins, 2);
+    assert_eq!(flaky.duplicate_inserts(), 1);
+    assert_eq!(
+        (head_seq(&server, &a).await, head_seq(&server, &b).await),
+        (1, 2)
+    );
+    assert_eq!(
+        (row_count(&server, &a).await, row_count(&server, &b).await),
+        (1, 2)
+    );
+    // Without a duplicate: one transaction.
+    let begins = flaky.begins();
+    let receipts = [
+        writer.submit(simple(&a, 2, ea)).await,
+        writer.submit(simple(&b, 3, eb)).await,
+        writer.submit(simple(&a, 3, ea)).await,
+    ];
+    for receipt in receipts {
+        assert_eq!(receipt.outcome().await, Ok(()));
+    }
+    assert_eq!(flaky.begins() - begins, 1);
+    assert_eq!(
+        (head_seq(&server, &a).await, head_seq(&server, &b).await),
+        (3, 3)
+    );
+}
+
+#[tokio::test]
+async fn a_record_with_the_zero_character_is_refused_alone() {
+    let (server, _flaky, world) = setup().await;
+    let doc = new_doc(&server, &world, "D").await;
+    let epoch = lease(&server, &doc).await;
+    let writer = slow_writer(&server);
+    let bad_command = Record {
+        command: "te\0st".into(),
+        ..simple(&doc, 1, epoch)
+    };
+    let bad_change_id = Record {
+        change_id: Some("c\0".into()),
+        ..simple(&doc, 1, epoch)
+    };
+    let bad_client = Record {
+        client_id: Some("u.\0".into()),
+        ..simple(&doc, 1, epoch)
+    };
+    // One batch: the three are refused before they reach the database, the fourth is written.
+    let receipts = [
+        writer.submit(bad_command).await,
+        writer.submit(bad_change_id).await,
+        writer.submit(bad_client).await,
+        writer.submit(simple(&doc, 1, epoch)).await,
+    ];
+    let mut outcomes = Vec::new();
+    for receipt in receipts {
+        outcomes.push(receipt.outcome().await);
+    }
+    let invalid = refused(RefusedWhy::Invalid(
+        "text must not contain the zero character".into(),
+    ));
+    assert_eq!(
+        outcomes,
+        [invalid.clone(), invalid.clone(), invalid, Ok(())]
+    );
+    assert_eq!(head_seq(&server, &doc).await, 1);
+    // Asking for such a change answers nothing, on either database.
+    let s = store(&server);
+    assert_eq!(
+        s.change_seq_by_client(&doc, "u.c", "c\0").await.unwrap(),
+        None
+    );
+    assert_eq!(s.undo_target(&doc, "u.\0", "c1").await.unwrap(), None);
+    assert_eq!(s.recent_change_ids(&doc, "u.\0", 10).await.unwrap(), []);
 }

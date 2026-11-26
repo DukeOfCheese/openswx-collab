@@ -39,7 +39,10 @@
 //! **Part rows are always locked in ascending id order**, each once: by the journal's check of the
 //! parts a record chose, by assembly creation (both through [`chosen_parts`], which sorts), and by
 //! a project's deletion ([`crate::store::Tx::mark_project_documents_deleted`]). So two transactions
-//! locking some of the same part rows (on PostgreSQL) never wait for each other in a cycle.
+//! locking some of the same part rows (on PostgreSQL) never wait for each other in a cycle. The
+//! same holds for every document row, an assembly's own included: the journal locks the rows of
+//! all the documents and chosen parts of a batch in id order before it writes, and a deletion the
+//! rows of everything it removes ([`crate::store`], "Lock order").
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -110,7 +113,7 @@ pub fn pin_of(id: &str, component: &Value) -> Result<Pin, String> {
             ));
         }
     }
-    if part.chars().count() > MAX_PART_ID {
+    if part.chars().count() > MAX_PART_ID || part.contains('\0') {
         // (No document has such an id.)
         return Err(no_part(id));
     }

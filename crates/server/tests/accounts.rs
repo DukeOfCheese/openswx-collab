@@ -805,3 +805,126 @@ async fn passwords_and_session_tokens_are_never_logged() {
         &second,
     ]);
 }
+
+// ------------------------------------------------------------------ Task 16: PostgreSQL
+
+/// Two registrations with one address, both past every check before either commits (on SQLite
+/// the second waits for the first's transaction instead): one account, and the other is told
+/// the address is taken, not "server error".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_registrations_with_one_address_at_once_make_one_account() {
+    let (server, flaky) = TestServer::start_flaky(|s| s.open_registration = true).await;
+    server.register("first@example.com").await;
+    flaky.commit_gate.shut();
+    let http = reqwest::Client::new();
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let r = http
+            .post(server.url("/api/auth/register"))
+            .json(&json!({"email": "ada@example.com", "password": PASSWORD}));
+        tasks.push(tokio::spawn(async move {
+            let r = r.send().await.unwrap();
+            (r.status(), r.json::<Value>().await.unwrap())
+        }));
+    }
+    flaky.commit_gate.until_waiting(1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    flaky.commit_gate.open();
+    let mut answers = Vec::new();
+    for t in tasks {
+        answers.push(t.await.unwrap());
+    }
+    answers.sort_by_key(|(status, _)| *status);
+    assert_eq!(answers[0].0, StatusCode::CREATED, "{answers:?}");
+    assert_eq!(
+        answers[1],
+        (
+            StatusCode::CONFLICT,
+            json!({"detail": "there is already an account with this email address"})
+        )
+    );
+    assert_eq!(server.state.store.user_count().await.unwrap(), 2);
+}
+
+/// Two first registrations, both past the count of accounts before either commits (on SQLite the
+/// second waits for the first's transaction instead): one becomes the admin, and the other, who
+/// then counts the first, needs an invite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_registrations_that_both_count_nobody_make_one_admin() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    flaky.commit_gate.shut();
+    let http = reqwest::Client::new();
+    let mut tasks = Vec::new();
+    for i in 0..2 {
+        let r = http
+            .post(server.url("/api/auth/register"))
+            .json(&json!({"email": format!("p{i}@example.com"), "password": PASSWORD}));
+        tasks.push(tokio::spawn(
+            async move { r.send().await.unwrap().status() },
+        ));
+    }
+    flaky.commit_gate.until_waiting(1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    flaky.commit_gate.open();
+    let mut codes = Vec::new();
+    for t in tasks {
+        codes.push(t.await.unwrap());
+    }
+    codes.sort();
+    assert_eq!(codes, [StatusCode::CREATED, StatusCode::FORBIDDEN]);
+    assert_eq!(server.state.store.user_count().await.unwrap(), 1);
+    let admins: i64 = server
+        .scalar("SELECT COUNT(*) FROM users WHERE is_server_admin")
+        .await;
+    assert_eq!(admins, 1);
+}
+
+#[tokio::test]
+async fn text_with_the_zero_character_is_refused_not_a_server_error() {
+    let server = TestServer::start_with(|s| s.open_registration = true).await;
+    let zero = json!({"detail": "text must not contain the zero character"});
+    for body in [
+        json!({"email": "a\u{0}b@example.com", "password": PASSWORD}),
+        json!({"email": "ada@example.com", "password": PASSWORD, "name": "A\u{0}da"}),
+    ] {
+        let (status, answer) = server.post("/api/auth/register", None, body).await;
+        assert_eq!(
+            (status, answer),
+            (StatusCode::UNPROCESSABLE_ENTITY, zero.clone())
+        );
+    }
+    let (token, _) = server.register("ada@example.com").await;
+    let (status, answer) = server
+        .patch("/api/me", Some(&token), json!({"name": "\u{0}"}))
+        .await;
+    assert_eq!(
+        (status, answer),
+        (StatusCode::UNPROCESSABLE_ENTITY, zero.clone())
+    );
+    let (status, answer) = server
+        .post("/api/orgs", Some(&token), json!({"name": "Org\u{0}"}))
+        .await;
+    assert_eq!((status, answer), (StatusCode::UNPROCESSABLE_ENTITY, zero));
+    // A session label keeps the rest; an id nobody has is not found (SQLite) or refused
+    // (PostgreSQL, which cannot be asked about such text), never a server error.
+    let (status, _) = server
+        .post(
+            "/api/auth/login",
+            None,
+            json!({"email": "ada@example.com", "password": PASSWORD, "label": "lap\u{0}top"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for path in [
+        "/api/orgs/a%00b/members",
+        "/api/projects/%00/documents",
+        "/api/documents/%00",
+    ] {
+        let (status, body) = server.get(path, Some(&token)).await;
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}: {status} {body}"
+        );
+    }
+    assert_eq!(server.state.store.user_count().await.unwrap(), 1);
+}

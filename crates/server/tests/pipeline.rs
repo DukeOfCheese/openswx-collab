@@ -505,15 +505,21 @@ async fn the_index_is_pruned_before_a_snapshot_and_a_reload_judges_the_same() {
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     for n in 0..25 {
-        a.change(vec![var(&format!("v{n}"), n)], vec![], vec![])
+        let seq = a
+            .change(vec![var(&format!("v{n}"), n)], vec![], vec![])
             .await
             .seq();
+        if seq % 5 == 0 {
+            // Each snapshot is waited for, so that the next is due five changes after it whatever
+            // time the store takes to write one (the last is then of seq 25).
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while server.room_status(&doc).await.snapshot_seq < seq {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while server.room_status(&doc).await.snapshot_seq < 25 {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert_eq!(server.room_status(&doc).await.snapshot_seq, 25);
     let memory = server.room(&doc).durable_head().await.unwrap();
     assert_eq!(memory.index.floor(), 20, "pruned to 25 - 5");
     // A change on a base below the floor is too old now.

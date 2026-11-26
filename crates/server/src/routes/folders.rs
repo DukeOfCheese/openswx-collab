@@ -211,14 +211,18 @@ async fn recheck_folder(
     folder: &str,
     need: ProjectRole,
 ) -> Result<Folder, ApiError> {
-    let folder = tx
+    let project_id = tx
         .folder_by_id(folder)
         .await?
-        .ok_or(ApiError::NotFound(NO_SUCH_FOLDER))?;
-    recheck_project(tx, user, &folder.project_id, need)
+        .ok_or(ApiError::NotFound(NO_SUCH_FOLDER))?
+        .project_id;
+    recheck_project(tx, user, &project_id, need)
         .await
         .map_err(as_folder_error)?;
-    Ok(folder)
+    // As it is now that the organisation is locked (a folder never changes project).
+    tx.folder_by_id(folder)
+        .await?
+        .ok_or(ApiError::NotFound(NO_SUCH_FOLDER))
 }
 
 #[derive(Debug, Deserialize)]

@@ -149,12 +149,17 @@ fn decide_org(role: Option<OrgRole>, need: OrgRole) -> Result<OrgRole, ApiError>
 
 /// [`require_org`] read again inside a transaction, so that a change made with it is refused (with
 /// the same answer) if the caller's role was lowered or taken away since the first check.
+///
+/// The organisation's row is locked first ([`Tx::lock_org`]), so whatever the transaction goes on
+/// to read in the organisation (its owners, its members, a folder tree) stays as read until it
+/// ends: transactions that change an organisation run one at a time.
 pub async fn recheck_org(
     tx: &mut dyn Tx,
     user: &str,
     org: &str,
     need: OrgRole,
 ) -> Result<OrgRole, ApiError> {
+    tx.lock_org(org).await?;
     let role = match tx.org_member(org, user).await? {
         Some(m) => Some(parse_role(&m.role)?),
         None => None,
@@ -230,13 +235,21 @@ fn decide_project(
 /// [`require_project`] read again inside a transaction, so that a change made with it is refused
 /// (with the same answer) if the project went or the caller's role was lowered since the first
 /// check.
+///
+/// The project's organisation is locked first, as [`recheck_org`] locks it.
 pub async fn recheck_project(
     tx: &mut dyn Tx,
     user: &str,
     project: &str,
     need: ProjectRole,
 ) -> Result<(Project, ProjectRole), ApiError> {
-    let found = tx.project_by_id(project).await?;
+    let mut found = tx.project_by_id(project).await?;
+    if let Some(p) = &found {
+        // Which organisation to lock is read first (a project never changes organisation); the
+        // project is then read again, as it is once the transactions before this one have ended.
+        tx.lock_org(&p.org_id).await?;
+        found = tx.project_by_id(project).await?;
+    }
     let mut role = None;
     if let Some(p) = &found
         && let Some(m) = tx.org_member(&p.org_id, user).await?
@@ -283,20 +296,25 @@ pub async fn require_document(
 
 /// [`require_document`] read again inside a transaction, so that a change made with it is refused
 /// (with the same answer) if the document was deleted or the caller's role lowered since.
+///
+/// The document's organisation is locked first, as [`recheck_org`] locks it.
 pub async fn recheck_document(
     tx: &mut dyn Tx,
     user: &str,
     document: &str,
     need: ProjectRole,
 ) -> Result<(Document, Project, ProjectRole), ApiError> {
-    let doc = tx
-        .document_by_id(document)
-        .await?
-        .filter(|d| d.deleted_at.is_none())
-        .ok_or(ApiError::NotFound(NO_SUCH_DOCUMENT))?;
-    let (project, role) = recheck_project(tx, user, &doc.project_id, need)
+    let live = |doc: Option<Document>| {
+        doc.filter(|d| d.deleted_at.is_none())
+            .ok_or(ApiError::NotFound(NO_SUCH_DOCUMENT))
+    };
+    // Which project (a document never changes project), and through it which organisation to
+    // lock; the document is then read again, as it is under that lock.
+    let project_id = live(tx.document_by_id(document).await?)?.project_id;
+    let (project, role) = recheck_project(tx, user, &project_id, need)
         .await
         .map_err(as_document_error)?;
+    let doc = live(tx.document_by_id(document).await?)?;
     Ok((doc, project, role))
 }
 

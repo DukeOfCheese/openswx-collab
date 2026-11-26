@@ -176,10 +176,7 @@ fn error(back: &Back) -> &str {
 }
 
 async fn count(server: &TestServer, sql: &str) -> i64 {
-    sqlx::query_scalar(sql)
-        .fetch_one(&mut *server.db().reader().await.unwrap())
-        .await
-        .unwrap()
+    server.scalar(sql).await
 }
 
 // ------------------------------------------------------------------ ported from test_accounts.py
@@ -1187,12 +1184,28 @@ async fn a_store_error_after_the_state_is_taken_still_goes_back_to_the_app() {
     .await;
     server.providers.person("ada", "ada@example.com");
     let (admin, _) = server.register("bob@example.com").await;
-    server
-        .sql(
-            "CREATE TRIGGER no_codes BEFORE INSERT ON login_codes \
-             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
-        )
-        .await;
+    // Every insert of a login code fails in the database, each database in its own words.
+    if common::on_postgres() {
+        server
+            .sql(
+                "CREATE FUNCTION no_codes() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN RAISE EXCEPTION 'refused by the test'; END $$",
+            )
+            .await;
+        server
+            .sql(
+                "CREATE TRIGGER no_codes BEFORE INSERT ON login_codes \
+                 FOR EACH ROW EXECUTE FUNCTION no_codes()",
+            )
+            .await;
+    } else {
+        server
+            .sql(
+                "CREATE TRIGGER no_codes BEFORE INSERT ON login_codes \
+                 BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+            )
+            .await;
+    }
     // a sign-in
     let (back, _) = oauth(&server, "google", "ada", None).await;
     assert_eq!(error(&back), "server_error");
@@ -1527,4 +1540,107 @@ async fn states_codes_verifiers_tokens_and_addresses_are_never_logged() {
         &token,
         "at-provider-code",
     ]);
+}
+
+// ------------------------------------------------------------------ Task 16: PostgreSQL
+
+/// One person, two browsers, a first sign-in in both at the same moment: both transactions find
+/// no account and make one. The second meets the first's address (or identity) at its insert,
+/// and tries again: it signs in to the account the first made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_sign_ins_of_one_person_at_once_make_one_account() {
+    let server = TestServer::start_with(|s| {
+        google(s);
+        s.open_registration = true;
+    })
+    .await;
+    server.register("first@example.com").await;
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    for round in 0..8 {
+        let who = format!("p{round}");
+        server.providers.person(&who, &format!("{who}@example.com"));
+        let mut states = Vec::new();
+        for _ in 0..2 {
+            let r = start(&server, "google", &params).await;
+            states.push(query(&location(&r))["state"][0].clone());
+        }
+        let one = [("code", who.as_str()), ("state", states[0].as_str())];
+        let two = [("code", who.as_str()), ("state", states[1].as_str())];
+        let (a, b) = tokio::join!(
+            callback(&server, "google", &one),
+            callback(&server, "google", &two)
+        );
+        for r in [a, b] {
+            let back = query(&location(&r));
+            assert!(back.contains_key("code"), "round {round}: {back:?}");
+        }
+        assert_eq!(
+            count(
+                &server,
+                &format!("SELECT COUNT(*) FROM users WHERE email = '{who}@example.com'")
+            )
+            .await,
+            1,
+            "round {round}"
+        );
+    }
+    assert_eq!(
+        count(&server, "SELECT COUNT(*) FROM oauth_identities").await,
+        8
+    );
+}
+
+/// Two first sign-ins through a provider, both past the count of accounts before either inserts
+/// its account (on SQLite, and with the accounts lock, the second waits for the first instead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_sign_ins_that_both_count_nobody_make_one_admin() {
+    let (server, flaky) = TestServer::start_flaky(google).await;
+    server.providers.person("ada", "ada@example.com");
+    server.providers.person("bob", "bob@example.com");
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    let mut states = Vec::new();
+    for _ in 0..2 {
+        let r = start(&server, "google", &params).await;
+        states.push(query(&location(&r))["state"][0].clone());
+    }
+    let server = Arc::new(server);
+    let back = |who: &'static str, state: String| {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let r = callback(
+                &server,
+                "google",
+                &[("code", who), ("state", state.as_str())],
+            )
+            .await;
+            query(&location(&r))
+        })
+    };
+    // Each is held just before it inserts its account, having counted the accounts.
+    flaky.user_gate.shut();
+    let (a, b) = (
+        back("ada", states[0].clone()),
+        back("bob", states[1].clone()),
+    );
+    flaky.user_gate.until_waiting(1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    flaky.user_gate.open();
+    let mut outcomes: Vec<String> = Vec::new();
+    for task in [a, b] {
+        let back = task.await.unwrap();
+        outcomes.push(if back.contains_key("code") {
+            "code".to_owned()
+        } else {
+            error(&back).to_owned()
+        });
+    }
+    outcomes.sort();
+    assert_eq!(outcomes, ["code", "invite_required"]);
+    assert_eq!(
+        count(&server, "SELECT COUNT(*) FROM users WHERE is_server_admin").await,
+        1
+    );
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM users").await, 1);
 }

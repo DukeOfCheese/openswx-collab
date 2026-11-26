@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::{TestServer, Token, World, part, world};
+use common::{TestServer, Token, World, on_postgres, part, world};
 use oswx_server::blobs::{Blobs, ByteStream, PutOutcome};
 use oswx_server::ext::{Extensions, Quota};
 use oswx_server::snapshot::{decode, snapshot_key};
@@ -1156,4 +1156,60 @@ async fn a_creation_body_must_be_declared_as_json() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert!(r.json::<Value>().await.unwrap()["detail"].is_string());
+}
+
+// ------------------------------------------------------------------ Task 16: PostgreSQL
+
+/// On PostgreSQL a commit whose answer was not waited for can still take effect afterwards. The
+/// document must not be told apart from one that was never created by a read made too early: its
+/// snapshot would be removed, and the row would then appear without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_that_lands_after_its_error_keeps_its_snapshot() {
+    if !on_postgres() {
+        eprintln!(
+            "skipped on SQLite: a commit cannot be made slow inside SQLite, and nothing else can \
+             write while one runs"
+        );
+        return;
+    }
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let w = World::new(&server).await.unwrap();
+    // Committing a new document takes a second and a half in the database ...
+    server
+        .sql(
+            "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN PERFORM pg_sleep(1.5); RETURN NULL; END $$",
+        )
+        .await;
+    server
+        .sql(
+            "CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON documents \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_commit()",
+        )
+        .await;
+    // ... and the server stops waiting for it after 200 ms.
+    flaky.give_up_on_commits_after(Some(std::time::Duration::from_millis(200)));
+    let (status, doc) = create(
+        &server,
+        &w,
+        &w.admin,
+        json!({"name": "X", "content": part()}),
+    )
+    .await;
+    flaky.give_up_on_commits_after(None);
+    // The creation is seen to have taken effect, and is answered as the success it is.
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let id = doc["id"].as_str().unwrap();
+    let docs = server
+        .state
+        .store
+        .documents_in_project(&w.project)
+        .await
+        .unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].id, id);
+    // The row has its snapshot: the document opens.
+    let (status, body) = content(&server, id, &w.admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["content"], stored_part());
 }

@@ -189,8 +189,13 @@ async fn delete_account(
     .await?;
 
     let mut tx = state.store.begin().await?;
-    // TASK 16: lock the account's row and its organisations' rows (FOR UPDATE) before counting
-    // owners and admins; SQLite's single writer already serialises this.
+    // What is counted below (admins, the owners of its organisations) is locked first, in the
+    // lock order of `crate::store`: the accounts, this account, its organisations by id.
+    tx.lock_accounts().await?;
+    tx.lock_user(&current.id).await?;
+    for org in tx.user_org_ids(&current.id).await? {
+        tx.lock_org(&org).await?;
+    }
     let Some(me) = tx.user_by_id(&current.id).await?.filter(User::active) else {
         return Err(ApiError::Unauthorized);
     };
@@ -414,9 +419,10 @@ async fn delete_org(
     if renamed {
         return Err(ApiError::Unprocessable(TYPE_THE_NAME.into()));
     }
-    // TASK 16: the cascade locks the organisation's document rows in no particular order; take
-    // them in ascending id order first (the lock order rule of `crate::assemblies`).
+    // The cascade would lock the organisation's document rows in no particular order: they are
+    // locked in ascending id order first (the lock order of `crate::store`).
     let documents = tx.org_document_ids(&org.id).await?;
+    tx.lock_documents(&documents).await?;
     let members = tx.org_member_ids(&org.id).await?;
     tx.delete_org(&org.id).await?;
 

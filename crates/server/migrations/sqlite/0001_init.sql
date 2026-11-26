@@ -1,7 +1,7 @@
 -- The schema of the collaboration server, version 1.
 --
 -- Kept in step with ../postgres/0001_init.sql: the two files differ only where the dialects must
--- (BLOB here, BYTEA there). Types are spelled so that both databases accept them and the row mapping
+-- (BLOB here, BYTEA there; COLLATE "C" there, which is how SQLite compares text anyway). Types are spelled so that both databases accept them and the row mapping
 -- is the same on both: VARCHAR/TEXT -> String, BIGINT -> i64, DOUBLE PRECISION (epoch seconds) -> f64,
 -- BOOLEAN -> bool (SQLite stores 0/1), BLOB/BYTEA (MessagePack) -> Vec<u8>, JSON as TEXT.
 --
@@ -162,6 +162,8 @@ CREATE TABLE changes (
 );
 -- A joining client's latest change ids, newest first, without sorting the document's history.
 CREATE INDEX ix_changes_client_seq ON changes (document_id, client_id, seq);
+-- An account's own changes in journal order, a page at a time (its export).
+CREATE INDEX ix_changes_author ON changes (author_id, document_id, seq);
 
 CREATE TABLE snapshots (
     document_id VARCHAR(32) NOT NULL REFERENCES documents (id) ON DELETE CASCADE,

@@ -29,14 +29,22 @@ pub async fn acquire(
     let epoch = match tx.take_room_lease(doc, node_id, expires_at).await? {
         Some(epoch) => epoch,
         None => {
-            tx.insert_room_lease(&RoomLease {
+            let first = RoomLease {
                 document_id: doc.to_owned(),
                 node_id: node_id.to_owned(),
                 epoch: 1,
                 expires_at,
-            })
-            .await?;
-            1
+            };
+            if tx.insert_room_lease(&first).await? {
+                1
+            } else {
+                // Another transaction gave the document its lease row while this one looked (two
+                // rooms opening it at once, on PostgreSQL): that row is there now, and is taken
+                // like any other, under the next epoch.
+                tx.take_room_lease(doc, node_id, expires_at)
+                    .await?
+                    .context("the document's lease row went while it was being taken")?
+            }
         }
     };
     tx.commit().await.context("taking a room lease")?;

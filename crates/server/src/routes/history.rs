@@ -330,6 +330,9 @@ async fn create_version(
     )
     .await?;
     let name = clean_name(&body.name)?;
+    if body.note.contains('\0') {
+        return Err(ApiError::Unprocessable(crate::error::ZERO_CHARACTER.into()));
+    }
     if body.note.chars().count() > NOTE_MAX {
         return Err(ApiError::Unprocessable(format!(
             "note must be at most {NOTE_MAX} characters"

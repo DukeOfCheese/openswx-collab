@@ -678,9 +678,15 @@ async fn sign_in_code(
     challenge: &str,
 ) -> Result<Back, ApiError> {
     for attempt in 1..=SEAT_ATTEMPTS {
-        match sign_in_once(state, provider, identity, invite_hash, challenge, attempt).await? {
-            Attempt::Done(back) => return Ok(back),
-            Attempt::Again => {}
+        match sign_in_once(state, provider, identity, invite_hash, challenge, attempt).await {
+            Ok(Attempt::Done(back)) => return Ok(back),
+            Ok(Attempt::Again) => {}
+            // Another sign-in made the same account, or attached the same identity, at the same
+            // moment (the database refused this one's row, which `?` turned into 409 "try
+            // again"): the next try finds what the other made.
+            Err(ApiError::Conflict(why))
+                if attempt < SEAT_ATTEMPTS && why == crate::error::TRY_AGAIN => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(Back::error("not_allowed"))
@@ -861,6 +867,7 @@ async fn create_account(
         name => name,
     }
     .chars()
+    .filter(|c| *c != '\0')
     .take(NAME_MAX)
     .collect();
     let user = User {
@@ -992,8 +999,11 @@ async fn link_finish(
     let now = state.clock.now();
     max_len("code", &body.code, TOKEN_MAX)?;
     check_verifier(&body.code_verifier)?;
+    let code_hash = token_hash(&body.code);
     let mut tx = state.store.begin().await?;
-    let Some(code) = tx.take_login_code(&token_hash(&body.code)).await? else {
+    // One at a time per account: a second link of the same identity finds the first.
+    tx.lock_user(&current.id).await?;
+    let Some(code) = tx.take_login_code(&code_hash).await? else {
         return Err(ApiError::BadRequest(LINK_CODE_INVALID.into()));
     };
     if code.expires_at < now {
@@ -1013,12 +1023,24 @@ async fn link_finish(
     };
     let new = owner.is_none();
     if new {
-        tx.insert_oauth_identity(&OAuthIdentity {
+        let identity = OAuthIdentity {
             provider: provider.clone(),
             subject,
             user_id: current.id.clone(),
-        })
-        .await?;
+        };
+        match tx.insert_oauth_identity(&identity).await {
+            Ok(()) => {}
+            // Another account attached the identity at the same moment: answered as if it had been
+            // found attached, with the code used up (in a transaction of its own; this one is
+            // undone).
+            Err(e) if crate::store::is_unique_violation(&e) => {
+                drop(tx);
+                let mut tx = state.store.begin().await?;
+                tx.take_login_code(&code_hash).await?;
+                return used_up(&state, tx, ApiError::Conflict(IDENTITY_TAKEN.into())).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     if code.link_email.as_deref() == Some(account.email.as_str()) && !account.email_verified {
         // The provider vouches for the very address the account has.
@@ -1090,7 +1112,9 @@ async fn unlink(
     )
     .await?;
     let mut tx = state.store.begin().await?;
-    // Read in the transaction: two removals at once cannot take away the last way in.
+    // Read in the transaction, with the account's row locked: two removals at once cannot take
+    // away the last way in.
+    tx.lock_user(&current.id).await?;
     let Some(user) = tx.user_by_id(&current.id).await? else {
         return Err(ApiError::Unauthorized);
     };

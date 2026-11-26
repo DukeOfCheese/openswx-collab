@@ -374,7 +374,7 @@ fn subject(value: Option<&Value>) -> Result<String, OAuthError> {
         Some(Value::Number(n)) if n.is_u64() || n.is_i64() => n.to_string(),
         _ => return Err(OAuthError::Unreachable),
     };
-    if subject.is_empty() || subject.chars().count() > MAX_SUBJECT {
+    if subject.is_empty() || subject.contains('\0') || subject.chars().count() > MAX_SUBJECT {
         return Err(OAuthError::Unreachable);
     }
     Ok(subject)

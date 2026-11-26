@@ -5,9 +5,15 @@
 //! that arrives, keeps collecting until it has `max_batch` records or `max_wait` has passed since
 //! the first, and writes the batch in **one transaction**:
 //!
-//! - per document in the batch, the room lease row is locked and its epoch compared with each
-//!   record's; a record carrying another epoch is `Refused(Lease)` (a document without a lease
-//!   row gets one, at epoch 0, only for records of epoch 0: a document nobody has acquired yet);
+//! - first the rows of every document the batch will touch (the records' documents and the parts
+//!   their assembly changes chose) are locked, in ascending id order: the lock order of
+//!   [`crate::store`], which keeps this transaction and a deletion from waiting for each other;
+//! - per document in the batch, in ascending id order, the room lease row is locked (`SELECT …
+//!   FOR UPDATE` on PostgreSQL) and its epoch compared with each record's; a record carrying
+//!   another epoch is `Refused(Lease)` (a document without a lease row gets one, at epoch 0, only
+//!   for records of epoch 0: a document nobody has acquired yet). The lock is held until the
+//!   commit, so a lease cannot move on between the comparison and the write: a writer that lost
+//!   its lease cannot write;
 //! - the document's records are inserted in order, each having to be the next seq
 //!   (`seq == head_seq + 1`, `parent_seq == head_seq`); one that is not is `Refused(OutOfOrder)`,
 //!   and since a refused record does not move the head, the records after it in the batch
@@ -19,6 +25,13 @@
 //! - a record carrying [`Extra`] writes runs in its own savepoint, and a failure there refuses that
 //!   record only (and, through the seq check, the ones after it);
 //! - `documents.head_seq` and `updated_at` are updated once per document.
+//!
+//! The rows go in with **one multi-row insert per batch**: every document's records up to its
+//! first one with [`Extra`] writes (which, and the ones after it, are inserted one at a time,
+//! each depending on the one before). If that insert leaves a row out (a duplicate, which rooms
+//! normally catch first), which one is not known and the rows after it of its document went in
+//! out of order: the transaction is rolled back and the batch written again one record at a
+//! time, as described above.
 //!
 //! Any error from `begin`, from a statement outside a savepoint, or from `commit`, or a batch that
 //! takes longer than [`BATCH_TIMEOUT`], gives **every** record of the batch
@@ -38,11 +51,12 @@
 //! the work one change may cost (`Index::check`, large decodes) belongs where changes are judged,
 //! in the room (Task 9).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use anyhow::Context;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -253,7 +267,26 @@ impl JournalWriter {
 fn check(r: &Record) -> Result<(), String> {
     let chars = |s: &str| s.chars().count();
     let fits = |n: u64| i64::try_from(n).is_ok();
-    let bad = if r.seq == 0 || !fits(r.seq) || !fits(r.parent_seq) || !fits(r.epoch) {
+    // PostgreSQL's text cannot hold the zero character: one such record would fail its batch.
+    let zero = |s: &str| s.contains('\0');
+    let zero_in = |s: &Option<String>| s.as_deref().is_some_and(zero);
+    let bad = if zero(&r.document)
+        || zero(&r.author)
+        || zero(&r.command)
+        || zero_in(&r.client_id)
+        || zero_in(&r.change_id)
+        || r.extra.iter().any(|e| match e {
+            Extra::SetRevertedBy { .. } => false,
+            Extra::AssemblyRefs { rows, chosen } => {
+                rows.iter()
+                    .any(|a| zero(&a.component_id) || zero(&a.part_id))
+                    || chosen
+                        .iter()
+                        .any(|c| zero(&c.component_id) || zero(&c.part_id))
+            }
+        }) {
+        Some("text must not contain the zero character")
+    } else if r.seq == 0 || !fits(r.seq) || !fits(r.parent_seq) || !fits(r.epoch) {
         Some("seq, parent_seq and epoch must be positive 63-bit numbers")
     } else if r.undo_of.is_some_and(|s| !fits(s)) || r.reverts.is_some_and(|s| !fits(s)) {
         Some("undo_of and reverts must be 63-bit numbers")
@@ -371,87 +404,182 @@ async fn write(store: &dyn Store, batch: Vec<Pending>, timeout: Duration) {
     }
 }
 
-/// The batch's transaction. An `Err` is an error outside any savepoint: nothing is known.
+/// Writes the batch: with one insert for all it can, or, when that insert left a row out, again
+/// one record at a time. An `Err` is an error outside any savepoint: nothing is known.
 async fn write_batch(
     store: &dyn Store,
     records: &[Record],
 ) -> anyhow::Result<Vec<Result<(), JournalError>>> {
+    // The records of each document, in submission order; documents in ascending id order.
+    let mut of_doc: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, r) in records.iter().enumerate() {
+        of_doc.entry(r.document.as_str()).or_default().push(i);
+    }
+    if let Some(results) = write_transaction(store, records, &of_doc, true).await? {
+        return Ok(results);
+    }
+    write_transaction(store, records, &of_doc, false)
+        .await?
+        .context("a batch written one record at a time has no insert to leave a row out")
+}
+
+/// Why a record cannot be the next of its document, if it cannot.
+fn not_next(lease: Option<i64>, head: i64, r: &Record) -> Option<RefusedWhy> {
+    if lease != Some(int(r.epoch)) {
+        Some(RefusedWhy::Lease)
+    } else if int(r.seq) != head + 1 || int(r.parent_seq) != head {
+        Some(RefusedWhy::OutOfOrder)
+    } else {
+        None
+    }
+}
+
+/// A document of the batch once its lease row is locked.
+struct Open<'a> {
+    doc: &'a str,
+    /// The lease epoch (`None`: no lease row, and the batch could not make one).
+    lease: Option<i64>,
+    /// The head, counting the records accepted so far.
+    head: i64,
+    /// When the last accepted record was made.
+    updated_at: Option<f64>,
+    /// The records still to be inserted one at a time.
+    rest: &'a [usize],
+}
+
+/// The batch's transaction. `together`: every document's records before its first one with extra
+/// writes go in with one insert, and `None` is answered (after a rollback) if that insert left a
+/// row out. Otherwise every record is inserted on its own.
+async fn write_transaction(
+    store: &dyn Store,
+    records: &[Record],
+    of_doc: &BTreeMap<&str, Vec<usize>>,
+    together: bool,
+) -> anyhow::Result<Option<Vec<Result<(), JournalError>>>> {
     let refused = |why: RefusedWhy| Err(JournalError::Refused(why));
     let mut results: Vec<Result<(), JournalError>> =
         vec![Err(JournalError::Unknown); records.len()];
-    // The records of each document, in submission order; documents in order of first appearance.
-    let mut docs: Vec<&str> = Vec::new();
-    let mut of_doc: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, r) in records.iter().enumerate() {
-        of_doc
-            .entry(r.document.as_str())
-            .or_insert_with(|| {
-                docs.push(r.document.as_str());
-                Vec::new()
-            })
-            .push(i);
-    }
 
     let mut tx = store.begin().await?;
-    for doc in docs {
-        let indices = &of_doc[doc];
-        let refuse_all = |results: &mut Vec<Result<(), JournalError>>, why: RefusedWhy| {
-            for &i in indices {
-                results[i] = refused(why.clone());
-            }
-        };
+    // Every document row this transaction will lock, in ascending id order before anything else.
+    let mut rows: Vec<String> = of_doc.keys().map(|doc| (*doc).to_owned()).collect();
+    for extra in records.iter().flat_map(|r| &r.extra) {
+        if let Extra::AssemblyRefs { chosen, .. } = extra {
+            rows.extend(chosen.iter().map(|c| c.part_id.clone()));
+        }
+    }
+    tx.lock_documents(&rows).await?;
+
+    let mut open: Vec<Open<'_>> = Vec::with_capacity(of_doc.len());
+    let mut bulk: Vec<usize> = Vec::new();
+    for (&doc, indices) in of_doc {
         let first_epoch = records[indices[0]].epoch;
-        let lease = match tx.lock_room_lease(doc).await? {
-            Some(epoch) => Some(epoch),
-            None if first_epoch == 0 => {
-                // A document nobody acquired yet: its first writer, at epoch 0, creates the row;
-                // the first `lease::acquire` then moves it to epoch 1. The document is checked
-                // first, so that a missing one never reaches the insert (whose foreign key would
-                // fail the whole batch).
-                if tx.document_by_id(doc).await?.is_none() {
-                    refuse_all(&mut results, RefusedWhy::NoDocument);
-                    continue;
-                }
-                tx.insert_room_lease(&RoomLease {
-                    document_id: doc.to_owned(),
-                    node_id: String::new(),
-                    epoch: 0,
-                    expires_at: 0.0,
-                })
-                .await?;
-                Some(0)
+        let Some((lease, mut head)) = lock_lease(tx.as_mut(), doc, first_epoch).await? else {
+            for &i in indices {
+                results[i] = refused(RefusedWhy::NoDocument);
             }
-            None => None,
-        };
-        // The head is read only now, with the lease row held: on PostgreSQL a batch that waited on
-        // that lock for another writer's transaction must not use a head read before it waited.
-        let Some(document) = tx.document_by_id(doc).await? else {
-            refuse_all(&mut results, RefusedWhy::NoDocument);
             continue;
         };
-        let mut head = document.head_seq;
+        let plain = if together {
+            indices
+                .iter()
+                .position(|&i| !records[i].extra.is_empty())
+                .unwrap_or(indices.len())
+        } else {
+            0
+        };
         let mut updated_at = None;
-        for &i in indices {
+        for &i in &indices[..plain] {
             let r = &records[i];
-            let result = if lease != Some(int(r.epoch)) {
-                refused(RefusedWhy::Lease)
-            } else if int(r.seq) != head + 1 || int(r.parent_seq) != head {
-                refused(RefusedWhy::OutOfOrder)
-            } else {
-                insert(tx.as_mut(), r).await?
+            match not_next(lease, head, r) {
+                Some(why) => results[i] = refused(why),
+                None => {
+                    bulk.push(i);
+                    head += 1;
+                    updated_at = Some(r.created_at);
+                }
+            }
+        }
+        open.push(Open {
+            doc,
+            lease,
+            head,
+            updated_at,
+            rest: &indices[plain..],
+        });
+    }
+    if !bulk.is_empty() {
+        let rows: Vec<NewChange<'_>> = bulk.iter().map(|&i| change_row(&records[i])).collect();
+        if tx.insert_changes(&rows).await? != u64::try_from(rows.len())? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        for &i in &bulk {
+            results[i] = Ok(());
+        }
+    }
+    for document in &mut open {
+        for &i in document.rest {
+            let r = &records[i];
+            let result = match not_next(document.lease, document.head, r) {
+                Some(why) => refused(why),
+                None => insert(tx.as_mut(), r).await?,
             };
             if result.is_ok() {
-                head += 1;
-                updated_at = Some(r.created_at);
+                document.head += 1;
+                document.updated_at = Some(r.created_at);
             }
             results[i] = result;
         }
-        if let Some(updated_at) = updated_at {
-            tx.set_document_head(doc, head, updated_at).await?;
+        if let Some(updated_at) = document.updated_at {
+            tx.set_document_head(document.doc, document.head, updated_at)
+                .await?;
         }
     }
     tx.commit().await?;
-    Ok(results)
+    Ok(Some(results))
+}
+
+/// Locks the lease row of `doc` and answers its epoch and the document's head (`None`: there is
+/// no such document). A document without a lease row gets one, at epoch 0, only for a batch whose
+/// first record of it carries epoch 0.
+async fn lock_lease(
+    tx: &mut dyn Tx,
+    doc: &str,
+    first_epoch: u64,
+) -> anyhow::Result<Option<(Option<i64>, i64)>> {
+    let lease = match tx.lock_room_lease(doc).await? {
+        Some(epoch) => Some(epoch),
+        None if first_epoch == 0 => {
+            // A document nobody acquired yet: its first writer, at epoch 0, creates the row;
+            // the first `lease::acquire` then moves it to epoch 1. The document is checked
+            // first, so that a missing one never reaches the insert (whose foreign key would
+            // fail the whole batch).
+            if tx.document_by_id(doc).await?.is_none() {
+                return Ok(None);
+            }
+            let first = RoomLease {
+                document_id: doc.to_owned(),
+                node_id: String::new(),
+                epoch: 0,
+                expires_at: 0.0,
+            };
+            if tx.insert_room_lease(&first).await? {
+                Some(0)
+            } else {
+                // A room acquired the document meanwhile (on PostgreSQL): its row is the one to
+                // go by, and these records, written under epoch 0, are refused.
+                tx.lock_room_lease(doc).await?
+            }
+        }
+        None => None,
+    };
+    // The head is read only now, with the lease row held: on PostgreSQL a batch that waited on
+    // that lock for another writer's transaction must not use a head read before it waited.
+    let Some(document) = tx.document_by_id(doc).await? else {
+        return Ok(None);
+    };
+    Ok(Some((lease, document.head_seq)))
 }
 
 /// The row of a record, borrowing its strings and bytes.

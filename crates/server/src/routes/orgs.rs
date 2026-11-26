@@ -80,6 +80,9 @@ pub(crate) fn router() -> Router<AppState> {
 /// A name as given, without the spaces around it: 422 if it is longer than [`NAME_MAX`]
 /// characters, or empty once trimmed.
 pub(crate) fn clean_name(name: &str) -> Result<String, ApiError> {
+    if name.contains('\0') {
+        return Err(ApiError::Unprocessable(crate::error::ZERO_CHARACTER.into()));
+    }
     if name.chars().count() > NAME_MAX {
         return Err(ApiError::Unprocessable(format!(
             "name must be at most {NAME_MAX} characters"
@@ -708,12 +711,13 @@ pub(crate) async fn accept_invite(
     user: &str,
     now: f64,
 ) -> Result<Accepted, ApiError> {
+    let org = &invite.org_id;
+    // The organisation's row is locked before its members are counted: of two people joining at
+    // once the second counts the first, and cannot take a seat the hook did not approve.
+    tx.lock_org(org).await?;
     if !tx.claim_invite(&invite.id, user).await? {
         return Err(ApiError::NotFound(INVITE_JUST_USED));
     }
-    let org = &invite.org_id;
-    // TASK 16: lock the organisation's row (FOR UPDATE) before counting; SQLite's single writer
-    // already serialises this.
     let (role, joined) = match tx.org_member(org, user).await? {
         Some(member) => (parse_role(&member.role)?, false),
         None => {

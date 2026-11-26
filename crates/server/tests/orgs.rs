@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use common::{LogCapture, PASSWORD, TestServer, Token, World, world};
+use common::{LogCapture, PASSWORD, TestServer, Token, World, new_journal, world};
 use oswx_server::ext::{Event, Extensions, Quota};
 use oswx_server::hub::Hub;
 use oswx_server::mail::{Mailer, MemoryMailer};
@@ -1600,10 +1600,7 @@ async fn the_organisation_queries_read_back_what_they_wrote() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let deleted_at: Option<f64> = sqlx::query_scalar("SELECT deleted_at FROM documents")
-        .fetch_one(&mut *server.db().reader().await.unwrap())
-        .await
-        .unwrap();
+    let deleted_at: Option<f64> = server.scalar("SELECT deleted_at FROM documents").await;
     assert_eq!(deleted_at, Some(99.0));
     let mut tx = store.begin().await.unwrap();
     tx.delete_project(&"1".repeat(32)).await.unwrap();
@@ -1615,10 +1612,7 @@ async fn the_organisation_queries_read_back_what_they_wrote() {
             .unwrap()
             .is_none()
     );
-    let documents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
-        .fetch_one(&mut *server.db().reader().await.unwrap())
-        .await
-        .unwrap();
+    let documents: i64 = server.scalar("SELECT COUNT(*) FROM documents").await;
     assert_eq!(documents, 0, "the documents went with the project");
     // (ending on a request gives the writer connection time to go back to its pool before the
     // server is dropped)
@@ -1940,4 +1934,100 @@ async fn a_role_lost_after_the_first_check_still_refuses_the_change() {
             .1,
         json!([])
     );
+}
+
+// ------------------------------------------------------------------ Task 16: PostgreSQL
+
+/// Runs `a` and `b` at once with every commit held until the first of them reaches it and the
+/// other has had half a second to catch up: without a lock both are then past their checks.
+async fn both_before_either_commits<A, B, T>(flaky: &common::FlakyStore, a: A, b: B) -> (T, T)
+where
+    A: std::future::Future<Output = T> + Send + 'static,
+    B: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    flaky.commit_gate.shut();
+    let (a, b) = (tokio::spawn(a), tokio::spawn(b));
+    flaky.commit_gate.until_waiting(1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    flaky.commit_gate.open();
+    (a.await.unwrap(), b.await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_people_joining_at_once_cannot_both_take_the_last_seat() {
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.open_registration = true,
+        new_journal,
+        |s| s.ext = Arc::new(TwoSeats),
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let (_, for_bob) = invite(&server, &w, json!({})).await;
+    let (_, for_cy) = invite(&server, &w, json!({})).await;
+    let (bob, _) = server.register("bob@example.com").await;
+    let (cy, _) = server.register("cy@example.com").await;
+    let server = Arc::new(server);
+    let join = |token: Token, invite: &Value| {
+        let (server, invite) = (server.clone(), invite["token"].as_str().unwrap().to_owned());
+        async move { accept(&server, &token, &invite).await }
+    };
+    // Both were approved for the one free seat before their transactions began.
+    let (a, b) = both_before_either_commits(&flaky, join(bob, &for_bob), join(cy, &for_cy)).await;
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "{a:?} {b:?}"
+    );
+    assert_eq!(
+        server.state.store.org_member_count(&w.org).await.unwrap(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_owners_demoting_each_other_at_once_leave_an_owner() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let w = World::new(&server).await.unwrap();
+    let (bob, bob_id) = w.editor(&server, "bob@example.com").await;
+    let member = |user: &str| format!("/api/orgs/{}/members/{user}", w.org);
+    let (s, _) = server
+        .patch(&member(&bob_id), Some(&w.admin), json!({"role": "owner"}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let server = Arc::new(server);
+    let demote = |by: Token, path: String| {
+        let server = server.clone();
+        async move {
+            server
+                .patch(&path, Some(&by), json!({"role": "admin"}))
+                .await
+        }
+    };
+    let (a, b) = both_before_either_commits(
+        &flaky,
+        demote(w.admin.clone(), member(&bob_id)),
+        demote(bob, member(&w.admin_id)),
+    )
+    .await;
+    // Whoever came second finds one owner left, or is no owner any more.
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses[0], StatusCode::OK, "{a:?} {b:?}");
+    assert!(
+        statuses[1] == StatusCode::CONFLICT || statuses[1] == StatusCode::FORBIDDEN,
+        "{a:?} {b:?}"
+    );
+    let owners = server
+        .state
+        .store
+        .org_members(&w.org)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == "owner")
+        .count();
+    assert_eq!(owners, 1);
 }

@@ -1,4 +1,9 @@
 //! The test harness: a real server per test on a free port, mirroring the Python `conftest.py`.
+//!
+//! Every test runs against SQLite in its own temporary directory, or, when
+//! `OSWX_TEST_DATABASE_URL` names a PostgreSQL database (`tools/test_postgres_rust.py` starts one),
+//! against PostgreSQL: each test server then gets a schema of its own in that database
+//! ([`PgSchema`]), dropped when the test ends, so tests run side by side as they do on SQLite.
 #![allow(dead_code)] // each test file uses part of the harness
 
 mod live;
@@ -23,9 +28,9 @@ use oswx_server::sessions::Sessions;
 use oswx_server::store::{
     AssemblyRefRow, AssemblyUse, AuthoredChange, ChangeEventRow, ChangeRow, ChangeSize, Document,
     Folder, HistoryRow, Id, Invite, LoginCode, Member, Membership, NewChange, OAuthIdentity,
-    OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PinnedComponent, Project,
-    ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore,
-    Store, Tx, UndoTarget, User, Version, VersionWithAuthor,
+    OAuthState, Org, OrgMember, OrgSummary, PartRow, PasswordReset, PgStore, PinnedComponent,
+    Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow,
+    SqliteStore, Store, Tx, UndoTarget, User, Version, VersionWithAuthor,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -46,11 +51,14 @@ pub struct TestServer {
     /// in something else).
     pub providers: Arc<FakeProviders>,
     /// The test database, for statements of the test's own ([`TestServer::sql`]).
-    db: SqliteStore,
+    db: TestDb,
     /// What `state.store` is, so that `restart` can put the reopened database in its place.
     store_kind: StoreKind,
     /// The database and storage live here; kept across `restart`.
     dir: Arc<TempDir>,
+    /// On PostgreSQL: the test's schema, kept across `restart` and dropped with the last server on
+    /// it (declared after `db`, whose connections `Drop` closes first).
+    schema: Option<Arc<PgSchema>>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -76,17 +84,181 @@ fn test_settings(dir: &Path) -> Settings {
     }
 }
 
-/// Opens the database the settings name. This is the one place that decides what a test runs
-/// against: SQLite at `settings.database_url`, or PostgreSQL with an emptied schema when
-/// `OSWX_TEST_DATABASE_URL` is set.
-async fn open_store(settings: &Settings) -> SqliteStore {
-    if std::env::var_os("OSWX_TEST_DATABASE_URL").is_some() {
-        // TASK 16: open PgStore on an emptied schema here.
-        panic!("OSWX_TEST_DATABASE_URL is set, but the PostgreSQL store arrives in Task 16");
+/// The environment variable that names the PostgreSQL database the tests run against.
+const PG_ENV: &str = "OSWX_TEST_DATABASE_URL";
+/// How many connections one test server's PostgreSQL pool holds at most: a few hundred tests,
+/// many at once, share one database server's `max_connections`.
+const PG_POOL: u32 = 4;
+
+/// Whether the tests run against PostgreSQL (`OSWX_TEST_DATABASE_URL` is set) rather than SQLite.
+pub fn on_postgres() -> bool {
+    std::env::var_os(PG_ENV).is_some_and(|url| !url.is_empty())
+}
+
+/// `bytes` as a literal in a statement of the test's own ([`TestServer::sql`]), in the words of
+/// the database the tests run against.
+pub fn blob_literal(bytes: &[u8]) -> String {
+    if on_postgres() {
+        format!("decode('{}', 'hex')", hex::encode(bytes))
+    } else {
+        format!("X'{}'", hex::encode(bytes))
     }
-    SqliteStore::open(&settings.database_url, settings.auto_migrate)
-        .await
-        .expect("the test database opens")
+}
+
+/// A schema of its own in the test PostgreSQL database: created empty, dropped (with everything
+/// in it) when the last handle goes.
+pub struct PgSchema {
+    /// The database as `OSWX_TEST_DATABASE_URL` names it.
+    admin: String,
+    name: String,
+    /// The database URL whose connections work in this schema.
+    pub url: String,
+}
+
+impl PgSchema {
+    pub async fn create() -> Self {
+        use sqlx::Connection as _;
+        let given = std::env::var(PG_ENV).expect("OSWX_TEST_DATABASE_URL is set");
+        let admin = match oswx_server::config::parse_database_url(&given) {
+            Ok(oswx_server::config::Database::Postgres(url)) => url,
+            _ => panic!("OSWX_TEST_DATABASE_URL must be a PostgreSQL URL"),
+        };
+        let name = format!("t_{}", oswx_server::store::new_id());
+        let mut conn = sqlx::PgConnection::connect(&admin)
+            .await
+            .expect("the test PostgreSQL database answers");
+        sqlx::query(&format!("CREATE SCHEMA {name}"))
+            .execute(&mut conn)
+            .await
+            .expect("the test's schema is created");
+        let _ = conn.close().await;
+        let mut url = url::Url::parse(&admin).expect("a URL");
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={name}"));
+        Self {
+            admin,
+            name,
+            url: url.into(),
+        }
+    }
+}
+
+impl Drop for PgSchema {
+    fn drop(&mut self) {
+        // (`Drop` cannot await, and the test's runtime is busy running this.)
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime to drop the schema");
+                let dropping = async {
+                    use sqlx::Connection as _;
+                    let mut conn = sqlx::PgConnection::connect(&self.admin).await?;
+                    sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.name))
+                        .execute(&mut conn)
+                        .await?;
+                    conn.close().await
+                };
+                let dropped = rt.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(20), dropping).await
+                });
+                if !matches!(dropped, Ok(Ok(()))) {
+                    eprintln!("the test schema {} was not dropped", self.name);
+                }
+            });
+        });
+    }
+}
+
+/// The database a test server runs on, as the test itself reaches it.
+#[derive(Clone)]
+pub enum TestDb {
+    Sqlite(SqliteStore),
+    Postgres(PgStore),
+}
+
+impl TestDb {
+    /// The database as the server uses it.
+    pub fn store(&self) -> Arc<dyn Store> {
+        match self {
+            Self::Sqlite(db) => Arc::new(db.clone()),
+            Self::Postgres(db) => Arc::new(db.clone()),
+        }
+    }
+
+    pub async fn health(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Sqlite(db) => db.health().await,
+            Self::Postgres(db) => db.health().await,
+        }
+    }
+
+    pub async fn close(&self) {
+        match self {
+            Self::Sqlite(db) => db.close().await,
+            Self::Postgres(db) => db.close().await,
+        }
+    }
+
+    /// Runs one statement in a transaction of its own.
+    pub async fn execute(&self, statement: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Sqlite(db) => {
+                let mut tx = db.begin_tx().await?;
+                sqlx::query(statement).execute(tx.conn()).await?;
+                tx.commit_tx().await
+            }
+            Self::Postgres(db) => {
+                let mut tx = db.begin_tx().await?;
+                sqlx::query(statement).execute(tx.conn()).await?;
+                tx.commit_tx().await
+            }
+        }
+    }
+
+    /// The one value a query answers.
+    pub async fn scalar<T>(&self, query: &str) -> T
+    where
+        T: Send
+            + Unpin
+            + for<'r> sqlx::Decode<'r, sqlx::Sqlite>
+            + sqlx::Type<sqlx::Sqlite>
+            + for<'r> sqlx::Decode<'r, sqlx::Postgres>
+            + sqlx::Type<sqlx::Postgres>,
+    {
+        match self {
+            Self::Sqlite(db) => sqlx::query_scalar(query)
+                .fetch_one(&mut *db.reader().await.expect("a connection"))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}")),
+            Self::Postgres(db) => sqlx::query_scalar(query)
+                .fetch_one(&mut *db.reader().await.expect("a connection"))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}")),
+        }
+    }
+}
+
+/// Opens the database the settings name. This is the one place that decides what a test runs
+/// against: SQLite at `settings.database_url`, or the PostgreSQL schema it names.
+async fn open_store(settings: &Settings) -> TestDb {
+    match settings.database().expect("a database URL") {
+        oswx_server::config::Database::Sqlite(_) => TestDb::Sqlite(
+            SqliteStore::open(&settings.database_url, settings.auto_migrate)
+                .await
+                .expect("the test database opens"),
+        ),
+        oswx_server::config::Database::Postgres(_) => TestDb::Postgres(
+            PgStore::open(
+                &settings.database_url,
+                settings.auto_migrate,
+                settings.database_pool,
+            )
+            .await
+            .expect("the test database opens"),
+        ),
+    }
 }
 
 /// Opens the blob storage the settings name: a folder in the test's temporary directory.
@@ -122,10 +294,18 @@ impl TestServer {
     ) -> Self {
         let dir = Arc::new(TempDir::new().expect("a temporary directory"));
         let mut s = test_settings(dir.path());
+        let schema = if on_postgres() {
+            let schema = PgSchema::create().await;
+            s.database_url.clone_from(&schema.url);
+            s.database_pool = PG_POOL;
+            Some(Arc::new(schema))
+        } else {
+            None
+        };
         settings(&mut s);
         let db = open_store(&s).await;
         let blobs = open_blobs(&s);
-        let plain: Arc<dyn Store> = Arc::new(db.clone());
+        let plain: Arc<dyn Store> = db.store();
         let mut app_state = AppState::new(s, plain.clone(), blobs);
         let providers = Arc::new(FakeProviders::default());
         app_state.oauth = providers.clone();
@@ -139,7 +319,7 @@ impl TestServer {
         } else {
             StoreKind::Custom
         };
-        Self::serve(app_state, providers, db, store_kind, dir).await
+        Self::serve(app_state, providers, db, store_kind, dir, schema).await
     }
 
     /// Starts with the test settings changed by `settings` and the store wrapped in a [`FlakyStore`],
@@ -184,12 +364,23 @@ impl TestServer {
     /// Runs one statement of the test's own against the test database, in its own transaction
     /// (to set up rows no route can make yet).
     pub async fn sql(&self, statement: &str) {
-        let mut tx = self.db.begin_tx().await.expect("a transaction");
-        sqlx::query(statement)
-            .execute(tx.conn())
+        self.db
+            .execute(statement)
             .await
             .unwrap_or_else(|e| panic!("{statement}: {e}"));
-        Box::new(tx).commit().await.expect("the statement commits");
+    }
+
+    /// The one value a query of the test's own answers.
+    pub async fn scalar<T>(&self, query: &str) -> T
+    where
+        T: Send
+            + Unpin
+            + for<'r> sqlx::Decode<'r, sqlx::Sqlite>
+            + sqlx::Type<sqlx::Sqlite>
+            + for<'r> sqlx::Decode<'r, sqlx::Postgres>
+            + sqlx::Type<sqlx::Postgres>,
+    {
+        self.db.scalar(query).await
     }
 
     /// Stops the server and starts it again on the same database file and storage, as a new process
@@ -203,7 +394,7 @@ impl TestServer {
         state.hub = Hub::default();
         state.sessions = Sessions::default();
         let db = open_store(&state.settings).await;
-        let reopened: Arc<dyn Store> = Arc::new(db.clone());
+        let reopened: Arc<dyn Store> = db.store();
         match &self.store_kind {
             StoreKind::Plain => state.store = reopened,
             StoreKind::Flaky(flaky) => flaky.set_inner(reopened),
@@ -218,6 +409,7 @@ impl TestServer {
             db,
             self.store_kind.clone(),
             self.dir.clone(),
+            self.schema.clone(),
         )
         .await
     }
@@ -225,9 +417,10 @@ impl TestServer {
     async fn serve(
         state: AppState,
         providers: Arc<FakeProviders>,
-        db: SqliteStore,
+        db: TestDb,
         store_kind: StoreKind,
         dir: Arc<TempDir>,
+        schema: Option<Arc<PgSchema>>,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -251,6 +444,7 @@ impl TestServer {
             db,
             store_kind,
             dir,
+            schema,
             stop: Some(stop),
             task: Some(task),
         }
@@ -275,7 +469,7 @@ impl TestServer {
     }
 
     /// The test database as this server opened it.
-    pub fn db(&self) -> &SqliteStore {
+    pub fn db(&self) -> &TestDb {
         &self.db
     }
 
@@ -569,6 +763,14 @@ pub struct FlakyStore {
     commit_delay: Arc<Mutex<Duration>>,
     /// Shut: every top-level `commit` parks here (before it commits) until opened.
     pub commit_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every `insert_user` parks here (a registration has then counted the accounts).
+    pub user_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every `set_document_head` parks here (the journal has then locked and written what a
+    /// batch writes, and not yet committed).
+    pub head_gate: Arc<oswx_server::room::Gate>,
+    /// How long a top-level `commit` is waited for before an error is reported in its place
+    /// (the commit itself goes on in the database).
+    commit_patience: Arc<Mutex<Option<Duration>>>,
     /// Shut: every [`Store::parts_by_ids`] parks here, after it has read its answer, until opened.
     pub parts_gate: Arc<oswx_server::room::Gate>,
     /// Shut: reads of a change by seq and of an undo target park here until opened.
@@ -604,6 +806,9 @@ impl FlakyStore {
             preload_delay: Mutex::new(Duration::ZERO),
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
             commit_gate: Arc::default(),
+            head_gate: Arc::default(),
+            user_gate: Arc::default(),
+            commit_patience: Arc::default(),
             parts_gate: Arc::default(),
             history_gate: Arc::default(),
             ref_writes: Arc::new(AtomicUsize::new(0)),
@@ -717,6 +922,16 @@ impl FlakyStore {
         self.hang_commit.store(hang, Ordering::SeqCst);
     }
 
+    /// Stops waiting for every transaction's `commit` after `patience` and reports an error in
+    /// its place, as a request whose database answer did not come in time: the commit was sent,
+    /// and may still take effect afterwards. `None`: wait for it again.
+    pub fn give_up_on_commits_after(&self, patience: Option<Duration>) {
+        *self
+            .commit_patience
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = patience;
+    }
+
     /// How many transactions [`Store::begin`] has opened so far.
     pub fn begins(&self) -> usize {
         self.begins.load(Ordering::SeqCst)
@@ -799,6 +1014,9 @@ impl Store for FlakyStore {
             duplicate_inserts: self.duplicate_inserts.clone(),
             commit_delay: self.commit_delay.clone(),
             commit_gate: self.commit_gate.clone(),
+            head_gate: self.head_gate.clone(),
+            user_gate: self.user_gate.clone(),
+            commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
         }))
     }
@@ -1156,6 +1374,9 @@ pub struct FlakyTx<'a> {
     duplicate_inserts: Arc<AtomicUsize>,
     commit_delay: Arc<Mutex<Duration>>,
     commit_gate: Arc<oswx_server::room::Gate>,
+    head_gate: Arc<oswx_server::room::Gate>,
+    user_gate: Arc<oswx_server::room::Gate>,
+    commit_patience: Arc<Mutex<Option<Duration>>>,
     ref_writes: Arc<AtomicUsize>,
 }
 
@@ -1181,7 +1402,16 @@ impl Tx for FlakyTx<'_> {
             .commit_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        self.inner.commit().await?;
+        let patience = *self
+            .commit_patience
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match patience {
+            None => self.inner.commit().await?,
+            Some(patience) => tokio::time::timeout(patience, self.inner.commit())
+                .await
+                .map_err(|_| anyhow::anyhow!("the flaky store stopped waiting for a commit"))??,
+        }
         pause(delay).await;
         Ok(())
     }
@@ -1212,6 +1442,9 @@ impl Tx for FlakyTx<'_> {
             duplicate_inserts,
             commit_delay,
             commit_gate: self.commit_gate.clone(),
+            head_gate: self.head_gate.clone(),
+            user_gate: self.user_gate.clone(),
+            commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
         }))
     }
@@ -1229,6 +1462,7 @@ impl Tx for FlakyTx<'_> {
     }
 
     async fn insert_user(&mut self, user: &User) -> anyhow::Result<()> {
+        self.user_gate.pass().await;
         self.inner.insert_user(user).await
     }
 
@@ -1568,12 +1802,29 @@ impl Tx for FlakyTx<'_> {
         Ok(inserted)
     }
 
+    async fn insert_changes(&mut self, changes: &[NewChange<'_>]) -> anyhow::Result<u64> {
+        // A change this store was told to refuse is refused by `insert_change`: while one is
+        // waiting, nothing goes in together (as when a row was left out), and the journal writes
+        // the batch again one record at a time.
+        let waiting = self
+            .refuse_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+            || self.refuse_server_change.load(Ordering::SeqCst);
+        if waiting {
+            return Ok(0);
+        }
+        self.inner.insert_changes(changes).await
+    }
+
     async fn set_document_head(
         &mut self,
         id: &str,
         head_seq: i64,
         updated_at: f64,
     ) -> anyhow::Result<()> {
+        self.head_gate.pass().await;
         self.inner.set_document_head(id, head_seq, updated_at).await
     }
 
@@ -1627,6 +1878,22 @@ impl Tx for FlakyTx<'_> {
         self.inner.lock_live_document(id).await
     }
 
+    async fn lock_accounts(&mut self) -> anyhow::Result<()> {
+        self.inner.lock_accounts().await
+    }
+
+    async fn lock_user(&mut self, id: &str) -> anyhow::Result<bool> {
+        self.inner.lock_user(id).await
+    }
+
+    async fn lock_org(&mut self, id: &str) -> anyhow::Result<bool> {
+        self.inner.lock_org(id).await
+    }
+
+    async fn lock_documents(&mut self, ids: &[Id]) -> anyhow::Result<()> {
+        self.inner.lock_documents(ids).await
+    }
+
     async fn assemblies_using(&mut self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>> {
         self.inner.assemblies_using(part_id).await
     }
@@ -1655,7 +1922,7 @@ impl Tx for FlakyTx<'_> {
         self.inner.lock_room_lease(document_id).await
     }
 
-    async fn insert_room_lease(&mut self, lease: &RoomLease) -> anyhow::Result<()> {
+    async fn insert_room_lease(&mut self, lease: &RoomLease) -> anyhow::Result<bool> {
         self.inner.insert_room_lease(lease).await
     }
 

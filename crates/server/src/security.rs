@@ -200,7 +200,7 @@ pub fn clean_email(s: &str) -> Result<String, ApiError> {
 }
 
 fn is_email(e: &str) -> bool {
-    let plain = |c: char| c != '@' && !is_space(c);
+    let plain = |c: char| c != '@' && c != '\0' && !is_space(c);
     let Some((local, rest)) = e.split_once('@') else {
         return false;
     };

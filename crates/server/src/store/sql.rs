@@ -1,7 +1,12 @@
 //! SQL text shared by the SQLite and PostgreSQL stores: `$n` placeholders and nothing dialect
-//! specific. Statements that cannot be portable (the catalogue queries) live with their store.
+//! specific.
 //!
 //! One constant per query, named after the [`super::Store`] / [`super::Tx`] method that runs it.
+//!
+//! The statements the two databases cannot share are at the end of this file, each under one name
+//! in [`sqlite`] and in [`postgres`]: the catalogue queries, and the row locks (`SELECT … FOR
+//! UPDATE` on PostgreSQL; a plain read on SQLite, whose one write transaction at a time already
+//! excludes every other writer). Nothing else in the server knows which database it runs on.
 
 /// [`super::Store::health`].
 pub const HEALTH: &str = "SELECT 1";
@@ -369,6 +374,35 @@ pub const INSERT_CHANGE: &str = concat!(
      ON CONFLICT (document_id, client_id, change_id) DO NOTHING"
 );
 
+/// How many rows one [`insert_changes`] statement carries at most: 18 parameters a row, far below
+/// SQLite's 32,766 and PostgreSQL's 65,535 parameters a statement.
+pub const CHANGES_PER_INSERT: usize = 512;
+
+/// [`super::Tx::insert_changes`]: [`INSERT_CHANGE`] for `rows` rows in one statement (`rows >= 1`;
+/// at most [`CHANGES_PER_INSERT`]). Rows whose `(document_id, client_id, change_id)` is taken are
+/// left out; the statement's row count says how many went in.
+pub fn insert_changes(rows: usize) -> String {
+    const COLUMNS: usize = 18;
+    let mut text = String::from(concat!(
+        "INSERT INTO changes (",
+        change_columns!(),
+        ") VALUES "
+    ));
+    for row in 0..rows.max(1) {
+        text.push_str(if row == 0 { "(" } else { ", (" });
+        for column in 1..=COLUMNS {
+            if column > 1 {
+                text.push_str(", ");
+            }
+            text.push('$');
+            text.push_str(&(row * COLUMNS + column).to_string());
+        }
+        text.push(')');
+    }
+    text.push_str(" ON CONFLICT (document_id, client_id, change_id) DO NOTHING");
+    text
+}
+
 /// [`super::Store::changes_between`].
 pub const CHANGES_BETWEEN: &str = concat!(
     "SELECT ",
@@ -405,11 +439,6 @@ pub const HISTORY: &str = "SELECT c.seq, c.author_id, u.name AS author_name, c.c
      c.change_id, c.created_at, c.command, c.ops, c.reverts, c.reverted_by, c.broke \
      FROM changes c LEFT JOIN users u ON u.id = c.author_id \
      WHERE c.document_id = $1 AND c.seq < $2 AND c.seq > $3 ORDER BY c.seq DESC LIMIT $4";
-
-/// [`super::Tx::change_broke`]: an update that changes nothing, so that the row stays locked until
-/// the transaction ends (PostgreSQL), answering the column.
-pub const CHANGE_BROKE: &str = "UPDATE changes SET broke = broke \
-     WHERE document_id = $1 AND seq = $2 RETURNING broke";
 
 /// [`super::Tx::set_change_broke`].
 pub const SET_CHANGE_BROKE: &str =
@@ -461,6 +490,10 @@ pub const INSERT_ASSEMBLY_REF: &str = "INSERT INTO assembly_refs (assembly_id, c
 pub const ASSEMBLY_REFS: &str = "SELECT assembly_id, component_id, part_id, seq FROM assembly_refs \
      WHERE assembly_id = $1 ORDER BY component_id";
 
+/// [`super::Tx::lock_documents`], completed by [`in_list`] and then the dialect's
+/// `IN_ID_ORDER_LOCKED`: the rows are locked in ascending id order.
+pub const LOCK_DOCUMENTS: &str = "SELECT id FROM documents WHERE id IN ";
+
 /// [`super::Store::parts_by_ids`], completed by [`in_list`] with one placeholder per id.
 pub const PARTS_BY_IDS: &str = "SELECT d.id, d.project_id, p.org_id, d.name, d.kind, d.head_seq, \
      d.deleted_at FROM documents d JOIN projects p ON p.id = d.project_id WHERE d.id IN ";
@@ -498,11 +531,6 @@ pub const REFS_TO_PART: &str = "SELECT assembly_id, component_id, part_id, seq F
 pub const PINNED_BEFORE: &str = "SELECT assembly_id, component_id FROM assembly_refs \
      WHERE part_id = $1 AND seq < $2 ORDER BY assembly_id, component_id";
 
-/// [`super::Tx::lock_live_document`]: an update that changes nothing, so that the row stays locked
-/// until the transaction ends (PostgreSQL), and matches only a document that is not deleted.
-pub const LOCK_LIVE_DOCUMENT: &str =
-    "UPDATE documents SET deleted_at = deleted_at WHERE id = $1 AND deleted_at IS NULL";
-
 /// [`super::Store::snapshot_at_or_before`]: the highest seq not above `$2`, then the highest epoch.
 pub const SNAPSHOT_AT_OR_BEFORE: &str = "SELECT document_id, epoch, seq, key, size, created_at \
      FROM snapshots WHERE document_id = $1 AND seq <= $2 ORDER BY seq DESC, epoch DESC LIMIT 1";
@@ -517,15 +545,10 @@ pub const SNAPSHOT_ROW: &str = "SELECT document_id, epoch, seq, key, size, creat
 pub const ROOM_LEASE: &str =
     "SELECT document_id, node_id, epoch, expires_at FROM room_leases WHERE document_id = $1";
 
-/// [`super::Tx::insert_room_lease`].
+/// [`super::Tx::insert_room_lease`]: nothing when the document already has a lease row (on
+/// PostgreSQL the statement first waits for a transaction that is inserting one).
 pub const INSERT_ROOM_LEASE: &str = "INSERT INTO room_leases (document_id, node_id, epoch, \
-     expires_at) VALUES ($1, $2, $3, $4)";
-
-/// [`super::Tx::lock_room_lease`]: an update that changes nothing, so that the row is locked
-/// until the transaction ends (PostgreSQL; SQLite's write transaction already excludes every other
-/// writer), answering the epoch.
-pub const LOCK_ROOM_LEASE: &str =
-    "UPDATE room_leases SET epoch = epoch WHERE document_id = $1 RETURNING epoch";
+     expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (document_id) DO NOTHING";
 
 /// [`super::Tx::take_room_lease`]: the next epoch, for `$2` until `$3`.
 pub const TAKE_ROOM_LEASE: &str = "UPDATE room_leases SET node_id = $2, epoch = epoch + 1, \
@@ -599,3 +622,83 @@ pub const CHANGES_BY_AUTHOR: &str = "SELECT document_id, seq, created_at, comman
 /// [`super::Store::versions_by_author`]: by id, from just after `$2`.
 pub const VERSIONS_BY_AUTHOR: &str = "SELECT id, document_id, seq, name, note, author_id, \
      created_at FROM versions WHERE author_id = $1 AND id > $2 ORDER BY id LIMIT $3";
+
+// ------------------------------------------------------------------ what the dialects do not share
+
+/// Declares each statement under one name in [`sqlite`] and in [`postgres`], with its text for
+/// each.
+macro_rules! dialects {
+    ($($(#[$doc:meta])* $name:ident: $sqlite:expr, $postgres:expr;)*) => {
+        /// The statements with SQLite's text. One write transaction runs at a time there, so a
+        /// "lock" is a plain read.
+        pub mod sqlite {
+            $($(#[$doc])* pub const $name: &str = $sqlite;)*
+        }
+        /// The statements with PostgreSQL's text.
+        pub mod postgres {
+            $($(#[$doc])* pub const $name: &str = $postgres;)*
+        }
+    };
+}
+
+dialects! {
+    /// Whether sqlx's migration record exists (a count: 0 or 1).
+    MIGRATION_RECORD_EXISTS:
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations'";
+
+    /// How many tables there are besides the database's own and the migration record (on
+    /// PostgreSQL: in the schema in use).
+    OTHER_TABLES:
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name <> '_sqlx_migrations'",
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+         AND table_name <> '_sqlx_migrations'";
+
+    /// [`crate::store::Tx::lock_accounts`]: on PostgreSQL an advisory lock held until the transaction
+    /// ends (the key is the bytes of `oswxacct`).
+    LOCK_ACCOUNTS:
+        "SELECT 1",
+        "SELECT pg_advisory_xact_lock(8030893919445410676)";
+
+    /// [`crate::store::Tx::lock_user`]. `NO KEY`: a row that only refers to the account (a session, a
+    /// membership) can still be inserted meanwhile.
+    LOCK_USER:
+        "SELECT id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE";
+
+    /// [`crate::store::Tx::lock_org`].
+    LOCK_ORG:
+        "SELECT id FROM orgs WHERE id = $1",
+        "SELECT id FROM orgs WHERE id = $1 FOR UPDATE";
+
+    /// What follows [`LOCK_DOCUMENTS`](super::LOCK_DOCUMENTS)'s id list. `NO KEY`: rows that only
+    /// refer to the document (a journal row, a snapshot, a lease) can still be inserted meanwhile.
+    IN_ID_ORDER_LOCKED:
+        " ORDER BY id",
+        " ORDER BY id FOR NO KEY UPDATE";
+
+    /// [`crate::store::Tx::move_folder_documents`], first statement: the documents in the folder, locked
+    /// in ascending id order before they are updated together.
+    LOCK_FOLDER_DOCUMENTS:
+        "SELECT id FROM documents WHERE folder_id = $1 ORDER BY id",
+        "SELECT id FROM documents WHERE folder_id = $1 ORDER BY id FOR NO KEY UPDATE";
+
+    /// [`crate::store::Tx::lock_live_document`]: matches only a document that is not deleted (on
+    /// PostgreSQL, as it is once any transaction that was changing the row has ended).
+    LOCK_LIVE_DOCUMENT:
+        "SELECT id FROM documents WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id FROM documents WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE";
+
+    /// [`crate::store::Tx::lock_room_lease`], answering the epoch.
+    LOCK_ROOM_LEASE:
+        "SELECT epoch FROM room_leases WHERE document_id = $1",
+        "SELECT epoch FROM room_leases WHERE document_id = $1 FOR UPDATE";
+
+    /// [`crate::store::Tx::change_broke`], answering the column.
+    CHANGE_BROKE:
+        "SELECT broke FROM changes WHERE document_id = $1 AND seq = $2",
+        "SELECT broke FROM changes WHERE document_id = $1 AND seq = $2 FOR UPDATE";
+}

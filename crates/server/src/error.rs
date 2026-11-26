@@ -91,9 +91,29 @@ impl ApiError {
     }
 }
 
+/// What a request is told whose text holds the zero character (U+0000), which PostgreSQL cannot
+/// store: refused on both databases, so that they hold the same.
+pub const ZERO_CHARACTER: &str = "text must not contain the zero character";
+
+/// What a request is told when the database ended its transaction in favour of another one.
+pub const TRY_AGAIN: &str = "another request changed the same thing at the same moment; try again";
+
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
+    /// 500, except for an error by which the database says that two transactions got in each
+    /// other's way ([`crate::store::is_conflict`]): nothing was written, and the client may send the
+    /// request again, so that is 409 [`TRY_AGAIN`]; and for PostgreSQL refusing the zero character
+    /// in a value no route checked for it (an id in a path, say), which is the request's fault:
+    /// 422 [`ZERO_CHARACTER`].
     fn from(err: E) -> Self {
-        Self::Internal(err.into())
+        let err = err.into();
+        if crate::store::is_zero_character(&err) {
+            return Self::Unprocessable(ZERO_CHARACTER.into());
+        }
+        if crate::store::is_conflict(&err) {
+            tracing::warn!("a request lost to a concurrent one: {err:#}");
+            return Self::Conflict(TRY_AGAIN.into());
+        }
+        Self::Internal(err)
     }
 }
 

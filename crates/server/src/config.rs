@@ -68,6 +68,9 @@ pub enum Storage {
 #[derive(Clone, PartialEq)]
 pub struct Settings {
     pub database_url: String,
+    /// The most connections the server holds to a PostgreSQL database (SQLite has its own fixed
+    /// few).
+    pub database_pool: u32,
     pub storage_url: String,
     /// For S3-compatible stores (MinIO), e.g. `http://minio:9000`.
     pub s3_endpoint: String,
@@ -120,6 +123,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             database_url: "sqlite+aiosqlite:///./data/collab.db".into(),
+            database_pool: crate::store::postgres::DEFAULT_POOL,
             storage_url: "./data/storage".into(),
             s3_endpoint: String::new(),
             public_url: "http://localhost:8787".into(),
@@ -160,6 +164,7 @@ impl Settings {
         let e = Env(env);
         let mut s = Self::default();
         e.string("DATABASE_URL", &mut s.database_url);
+        e.positive_whole("DATABASE_POOL", &mut s.database_pool)?;
         e.string("STORAGE_URL", &mut s.storage_url);
         e.string("S3_ENDPOINT", &mut s.s3_endpoint);
         e.string("PUBLIC_URL", &mut s.public_url);
@@ -304,6 +309,7 @@ impl fmt::Debug for Settings {
         }
         f.debug_struct("Settings")
             .field("database_url", &redact_url_password(&self.database_url))
+            .field("database_pool", &self.database_pool)
             .field("storage_url", &self.storage_url)
             .field("s3_endpoint", &self.s3_endpoint)
             .field("public_url", &self.public_url)
@@ -711,6 +717,19 @@ mod tests {
         assert_eq!(s.oauth_providers(), ["google", "github"]);
         let half = read(&[("GOOGLE_CLIENT_ID", "g"), ("GITHUB_CLIENT_SECRET", "s")]);
         assert!(half.oauth_providers().is_empty());
+    }
+
+    #[test]
+    fn the_database_pool_is_ten_connections_unless_set() {
+        assert_eq!(read(&[]).database_pool, 10);
+        assert_eq!(read(&[("DATABASE_POOL", " 32 ")]).database_pool, 32);
+        for bad in ["0", "-1", "many", ""] {
+            assert_eq!(
+                refused(&[("DATABASE_POOL", bad)]).var,
+                "OSWX_COLLAB_DATABASE_POOL",
+                "{bad}"
+            );
+        }
     }
 
     #[test]

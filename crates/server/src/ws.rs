@@ -142,6 +142,10 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     else {
         return;
     };
+    if client_id.contains('\0') {
+        // (No database text holds the zero character; the client id is part of journal rows.)
+        return refuse(socket, "bad_hello", bad_hello, close::BAD_HELLO).await;
+    }
     if protocol != PROTOCOL_VERSION {
         let message = format!("this server speaks protocol {PROTOCOL_VERSION}; update openswx");
         return refuse(socket, "protocol", &message, close::PROTOCOL).await;

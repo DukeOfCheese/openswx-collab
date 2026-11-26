@@ -1719,3 +1719,74 @@ async fn a_takeover_while_the_parts_are_checked_is_answered_once_when_resent() {
         .await;
     assert_eq!(got["seq"], 1);
 }
+
+// ------------------------------------------------------------------ Task 16: the lock order
+
+/// A change that makes an assembly use a part locks two document rows (the part's, and the
+/// assembly's own for its head); deleting their project locks the same two. Both take them in
+/// ascending id order, whichever of the two documents has the lower id, so neither waits for the
+/// other in a cycle (which PostgreSQL would end by failing one of them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_deletion_and_an_assembly_change_never_wait_for_each_other() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let server = std::sync::Arc::new(server);
+    // Both orders of the two ids: the assembly's row below the part's, and above it.
+    let mut below = false;
+    let mut above = false;
+    let mut round = 0;
+    while !(below && above) {
+        round += 1;
+        assert!(
+            round <= 40,
+            "forty pairs of random ids were all ordered one way"
+        );
+        let project = project(&server, &world, &format!("P{round}")).await;
+        let (status, body) = make(
+            &server,
+            assembly(vec![], vec![]),
+            "Rover",
+            &world.admin,
+            &project,
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let asm = body["id"].as_str().unwrap().to_owned();
+        let part = part_in(&server, &world.admin, &project, "Hinge").await;
+        if (asm < part && below) || (asm > part && above) {
+            continue;
+        }
+        below |= asm < part;
+        above |= asm > part;
+
+        let mut a = Live::connect(&server, &asm, &world.admin).await;
+        // The journal has locked what its batch needs and written it; before its commit ...
+        flaky.head_gate.shut();
+        let id = a.new_id();
+        let change = a.make_change(0, vec![add_component(component(&id, &part, 0, None))]);
+        a.send_change(&change).await;
+        flaky.head_gate.until_waiting(1).await;
+        // ... the project's deletion starts, and has to wait for it.
+        let deleting = {
+            let (server, admin, path) = (
+                server.clone(),
+                world.admin.clone(),
+                format!("/api/projects/{project}"),
+            );
+            tokio::spawn(async move { delete(&server, &path, &admin).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !deleting.is_finished(),
+            "the deletion waits for the journal"
+        );
+        flaky.head_gate.open();
+        // Both end well: the change was written, then the project went.
+        assert_eq!(a.outcome(&change.change_id).await.seq(), 1, "round {round}");
+        let (status, body) = tokio::time::timeout(WAIT, deleting)
+            .await
+            .expect("the deletion ends")
+            .unwrap();
+        assert_eq!(status, 204, "round {round}: {body}");
+    }
+}

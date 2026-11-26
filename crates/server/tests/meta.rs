@@ -8,7 +8,6 @@ use axum::Router;
 use axum::routing::post;
 use common::TestServer;
 use oswx_server::ext::Extensions;
-use oswx_server::store::Store;
 use oswx_server::{ApiError, ApiJson, AppState};
 use reqwest::StatusCode;
 use serde::Deserialize;
