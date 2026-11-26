@@ -571,6 +571,8 @@ pub struct FlakyStore {
     pub commit_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every [`Store::parts_by_ids`] parks here, after it has read its answer, until opened.
     pub parts_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: reads of a change by seq and of an undo target park here until opened.
+    pub history_gate: Arc<oswx_server::room::Gate>,
     /// How many times `replace_assembly_refs` ran (in a transaction or savepoint).
     ref_writes: Arc<AtomicUsize>,
     fail_part_reads: AtomicBool,
@@ -603,6 +605,7 @@ impl FlakyStore {
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
             commit_gate: Arc::default(),
             parts_gate: Arc::default(),
+            history_gate: Arc::default(),
             ref_writes: Arc::new(AtomicUsize::new(0)),
             fail_part_reads: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
@@ -938,6 +941,7 @@ impl Store for FlakyStore {
         document_id: &str,
         seq: i64,
     ) -> anyhow::Result<Option<ChangeRow>> {
+        self.history_gate.pass().await;
         self.inner().change_by_seq(document_id, seq).await
     }
 
@@ -1005,6 +1009,7 @@ impl Store for FlakyStore {
         client_id: &str,
         change_id: &str,
     ) -> anyhow::Result<Option<UndoTarget>> {
+        self.history_gate.pass().await;
         self.log_lookup("undo target asked");
         let delay = *self
             .lookup_delay
