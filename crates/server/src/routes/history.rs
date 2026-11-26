@@ -52,7 +52,7 @@ use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery};
 use crate::ext::{Event, emit};
 use crate::hub::OpenError;
 use crate::record::decode_ops;
-use crate::room::{LockRule, ServerChangeError, ServerChangeOptions};
+use crate::room::{Landed, LockRule, ServerChangeError, ServerChangeOptions};
 use crate::routes::orgs::clean_name;
 use crate::security::ProjectRole;
 use crate::snapshot::{LoadError, state_at};
@@ -195,7 +195,9 @@ async fn history(
     )
     .await?;
     // The page stops before the row that would pass the byte budget (one row at least); the sizes
-    // are read first, without the operations, so no more than the budget is ever loaded.
+    // are read first, without the operations, so no more than the budget is ever loaded. The
+    // budget counts stored (MessagePack) operation bytes: the JSON rendering can be several times
+    // larger.
     let sizes = state
         .store
         .change_sizes(
@@ -346,30 +348,29 @@ async fn create_version(
         )));
     }
     tx.commit().await?;
+    // After the commit, run to the end even if the client goes away: the hub, then the event.
+    let created = oswx_core::wire::ServerMsg::VersionCreated {
+        id: version.id.clone(),
+        name: version.name.clone(),
+        seq: u64::try_from(seq).unwrap_or_default(),
+    };
+    let event = Event::VersionCreated {
+        org: project.org_id,
+        project: project.id,
+        document: doc.id.clone(),
+        version: version.id.clone(),
+        by: user.id,
+    };
+    let after = state.clone();
     state
-        .hub
-        .notify(
-            &doc.id,
-            oswx_core::wire::ServerMsg::VersionCreated {
-                id: version.id.clone(),
-                name: version.name.clone(),
-                seq: u64::try_from(seq).unwrap_or_default(),
-            },
-        )
+        .after_commit(async move {
+            after.hub.notify(&doc.id, created).await;
+            // TASK 13: every open assembly with components pinned to an older state of this part
+            // hears `reference.update {document, components}` (ids only), as the Python
+            // `where_pinned_older`.
+            emit(&after.ext, event).await;
+        })
         .await;
-    // TASK 13: every open assembly with components pinned to an older state of this part hears
-    // `reference.update {document, components}` (ids only), as the Python `where_pinned_older`.
-    emit(
-        &state.ext,
-        Event::VersionCreated {
-            org: project.org_id,
-            project: project.id,
-            document: doc.id,
-            version: version.id.clone(),
-            by: user.id,
-        },
-    )
-    .await;
     Ok((
         StatusCode::CREATED,
         ApiJson(version_out(&version, &author_name)),
@@ -397,17 +398,17 @@ async fn delete_version(
         return Err(ApiError::NotFound("no such version"));
     }
     tx.commit().await?;
-    emit(
-        &state.ext,
-        Event::VersionDeleted {
-            org: project.org_id,
-            project: project.id,
-            document: doc.id,
-            version: version_id,
-            by: user.id,
-        },
-    )
-    .await;
+    let event = Event::VersionDeleted {
+        org: project.org_id,
+        project: project.id,
+        document: doc.id,
+        version: version_id,
+        by: user.id,
+    };
+    let ext = state.ext.clone();
+    state
+        .after_commit(async move { emit(&ext, event).await })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -508,20 +509,22 @@ async fn restore(
             .restore(target, &command, &user.id, &author_name, options)
             .await
         {
-            // Nothing differed: the head's seq, nothing written.
-            Ok(new_seq) if new_seq <= head.seq => return Ok(ApiJson(json!({"seq": new_seq}))),
-            Ok(new_seq) => {
-                emit(
-                    &state.ext,
-                    Event::DocumentRestored {
-                        org: project.org_id,
-                        project: project.id,
-                        document: doc.id,
-                        seq: new_seq,
-                        by: user.id,
-                    },
-                )
-                .await;
+            // Nothing differed: the document was the target as of this durable seq; nothing was
+            // written, so there is no event. (The answer has the same shape either way.)
+            Ok(Landed::Unchanged(seq)) => return Ok(ApiJson(json!({"seq": seq}))),
+            Ok(Landed::Written(new_seq)) => {
+                // After the durable answer, run to the end even if the client goes away.
+                let event = Event::DocumentRestored {
+                    org: project.org_id,
+                    project: project.id,
+                    document: doc.id,
+                    seq: new_seq,
+                    by: user.id,
+                };
+                let ext = state.ext.clone();
+                state
+                    .after_commit(async move { emit(&ext, event).await })
+                    .await;
                 return Ok(ApiJson(json!({"seq": new_seq})));
             }
             Err(ServerChangeError::Locked(conflicts)) => {

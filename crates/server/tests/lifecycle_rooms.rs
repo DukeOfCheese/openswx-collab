@@ -512,6 +512,13 @@ async fn a_request_dropped_after_its_commit_still_closes_connections() {
     let path = format!("/api/documents/{doomed}");
     dropped_after_commit(&server, reqwest::Method::DELETE, &path, &world.admin, None).await;
     assert_eq!(gone.closed().await.0, 4404);
+    // A named version: the open room still hears of it.
+    let mut watcher = Live::connect(&server, &doc, &world.admin).await;
+    let path = format!("/api/documents/{doc}/versions");
+    let body = Some(json!({"name": "Dropped"}));
+    dropped_after_commit(&server, reqwest::Method::POST, &path, &world.admin, body).await;
+    let heard: VersionCreated = watcher.expect().await;
+    assert_eq!(heard.name, "Dropped");
 
     let recorded = server.state.hub.recorded();
     for call in [

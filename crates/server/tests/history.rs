@@ -1680,6 +1680,120 @@ async fn a_restore_puts_back_an_item_removed_while_it_waited() {
     assert_eq!(content(&server, &doc, &world.admin, "?seq=3").await, target);
 }
 
+/// Keeps every event.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<Json>>);
+
+#[async_trait::async_trait]
+impl oswx_server::ext::Extensions for Recorder {
+    async fn on_event(&self, event: &oswx_server::ext::Event) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(serde_json::to_value(event).unwrap());
+    }
+}
+
+impl Recorder {
+    fn restores(&self) -> Vec<Json> {
+        let events = self.0.lock().unwrap();
+        events
+            .iter()
+            .filter(|e| e["type"] == "document_restored")
+            .cloned()
+            .collect()
+    }
+}
+
+/// A server whose journal waits `ms` before writing each batch, with a flaky store and an event
+/// recorder.
+async fn slow_journal_server(
+    ms: u64,
+) -> (TestServer, Arc<FlakyStore>, Arc<Recorder>, World, String) {
+    let recorder = Arc::new(Recorder::default());
+    let ext = recorder.clone();
+    let (server, flaky) = TestServer::start_flaky_full(
+        |_| {},
+        move |store| {
+            oswx_server::journal::JournalWriter::start(
+                store.clone(),
+                oswx_server::journal::MAX_BATCH,
+                std::time::Duration::from_millis(ms),
+            )
+        },
+        move |s| s.ext = ext,
+    )
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    (server, flaky, recorder, world, doc)
+}
+
+/// Two restores to the same state sent at once ("a double click"); each answer with the
+/// document's head seq in the store at the moment it came.
+async fn double_restore(server: &TestServer, doc: &str, token: &str) -> Vec<(u16, Json, i64)> {
+    let one = |body: Json| {
+        let (base, token, doc) = (server.base.clone(), token.to_owned(), doc.to_owned());
+        let store = server.state.store.clone();
+        tokio::spawn(async move {
+            let r = reqwest::Client::new()
+                .post(format!("{base}/api/documents/{doc}/restore"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let head = store.document_by_id(&doc).await.unwrap().unwrap().head_seq;
+            let status = r.status().as_u16();
+            (status, r.json::<Json>().await.unwrap(), head)
+        })
+    };
+    let (a, b) = (one(json!({"seq": 0})), one(json!({"seq": 0})));
+    vec![a.await.unwrap(), b.await.unwrap()]
+}
+
+#[tokio::test]
+async fn a_restore_that_finds_the_target_being_written_answers_once_it_is_durable() {
+    let (server, _flaky, recorder, world, doc) = slow_journal_server(500).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(a.change(vec![set_depth(20)], vec![], vec![]).await.seq(), 1);
+    let answers = double_restore(&server, &doc, &world.admin).await;
+    // Both are told seq 2, and only once it is durable; one restore was written, so one event.
+    for (status, body, head) in &answers {
+        assert_eq!((*status, body.clone()), (200, json!({"seq": 2})));
+        assert!(*head >= 2, "answered before seq 2 was durable: {answers:?}");
+    }
+    let events = recorder.restores();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["seq"], 2);
+    let (_, page) = history(&server, &doc, &world.admin, "").await;
+    assert_eq!(seqs(&page), [2, 1]);
+}
+
+#[tokio::test]
+async fn when_the_restore_being_waited_for_is_refused_the_other_one_is_written() {
+    let (server, flaky, recorder, world, doc) = slow_journal_server(500).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(a.change(vec![set_depth(20)], vec![], vec![]).await.seq(), 1);
+    flaky.refuse_server_change_once();
+    let mut answers = double_restore(&server, &doc, &world.admin).await;
+    answers.sort_by_key(|(status, _, _)| *status);
+    // The first written is refused by the journal (500); the other is not told a seq that was
+    // never written: it is judged again and written itself.
+    assert_eq!(
+        (answers[0].0, answers[0].1.clone()),
+        (200, json!({"seq": 2}))
+    );
+    assert_eq!(answers[1].0, 500);
+    assert!(answers[0].2 >= 2);
+    let events = recorder.restores();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        depth(&content(&server, &doc, &world.admin, "?seq=2").await),
+        10
+    );
+}
+
 #[tokio::test]
 async fn presence_goes_on_while_a_restore_is_judged() {
     let hooks = oswx_server::room::Hooks {

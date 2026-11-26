@@ -265,7 +265,8 @@ impl Stall {
 
 /// The most stored operation bytes (the journal's `ops` column) one history page or one welcome's
 /// catch-up carries: a page stops before the row that would pass it (but always holds one row),
-/// and a catch-up that would pass it sends the document instead.
+/// and a catch-up that would pass it sends the document instead. It counts stored (MessagePack)
+/// bytes: a page's JSON rendering can be several times larger.
 pub const PAGE_BYTES: u64 = 16 << 20;
 
 /// The most change ids a room remembers, whatever its snapshots; past it the oldest are forgotten
@@ -303,6 +304,24 @@ pub enum ServerChangeError {
     Locked(Vec<oswx_core::Conflict>),
 }
 
+/// How a change the server made landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// It was written as this seq (durable).
+    Written(Seq),
+    /// A restore whose target the document already was, as of this durable seq: nothing written.
+    Unchanged(Seq),
+}
+
+impl Landed {
+    /// The seq it answers either way.
+    pub fn seq(self) -> Seq {
+        match self {
+            Landed::Written(seq) | Landed::Unchanged(seq) => seq,
+        }
+    }
+}
+
 /// A change the server makes itself, waiting for the room.
 pub struct ServerChange {
     pub ops: Vec<oswx_core::Op>,
@@ -313,7 +332,7 @@ pub struct ServerChange {
     pub author: Id,
     pub author_name: String,
     pub options: ServerChangeOptions,
-    pub reply: oneshot::Sender<Result<Seq, ServerChangeError>>,
+    pub reply: oneshot::Sender<Result<Landed, ServerChangeError>>,
 }
 
 /// How a change the server makes is judged.
@@ -597,6 +616,7 @@ impl RoomHandle {
     ) -> Result<Seq, ServerChangeError> {
         self.submit(ops, None, command, author, author_name, options)
             .await
+            .map(Landed::seq)
     }
 
     /// Puts the document back to `target` as one change the server makes (a restore). The
@@ -604,7 +624,9 @@ impl RoomHandle {
     /// against the very head they are applied to: the document at the answered seq is exactly
     /// `target`. Every change that became tentative before the restore was judged is overwritten
     /// by it; changes judged after it apply on top. When the head is `target` already, nothing is
-    /// written and the head's seq is answered. Locks are judged at the same moment.
+    /// written: [`Landed::Unchanged`] with that head's seq, answered only once it is durable (if
+    /// the journal refuses one of the changes it waits for, the restore is judged again, as any
+    /// change decided after a refused one is). Locks are judged at the same moment.
     pub async fn restore(
         &self,
         target: oswx_core::Value,
@@ -612,7 +634,7 @@ impl RoomHandle {
         author: &str,
         author_name: &str,
         options: ServerChangeOptions,
-    ) -> Result<Seq, ServerChangeError> {
+    ) -> Result<Landed, ServerChangeError> {
         self.submit(
             Vec::new(),
             Some(target),
@@ -632,7 +654,7 @@ impl RoomHandle {
         author: &str,
         author_name: &str,
         options: ServerChangeOptions,
-    ) -> Result<Seq, ServerChangeError> {
+    ) -> Result<Landed, ServerChangeError> {
         let (reply, answer) = oneshot::channel();
         let change = ServerChange {
             ops,
@@ -871,6 +893,9 @@ struct Room {
     undone: Bounded<Seq>,
     /// What does not rebuild, and what blaming needs.
     rebuilds: rebuild::Rebuilds,
+    /// Restores found unchanged against a tentative head, waiting for that head's seq to become
+    /// durable before they are answered.
+    held_unchanged: Vec<(Seq, change::Item)>,
     /// Undos whose target's seq is being checked (a journal duplicate), by that change's ticket.
     undo_waiting: HashMap<change::Ticket, Vec<(ConnId, Arc<oswx_core::Change>, usize)>>,
     /// Since when nobody has been connected (clock seconds); `None` while someone is.
@@ -951,6 +976,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         undone: Bounded::default(),
         rebuilds: rebuild::Rebuilds::default(),
         undo_waiting: HashMap::new(),
+        held_unchanged: Vec::new(),
         idle_since: Some(state.clock.now()),
         next_expiry: f64::INFINITY,
         snapshot_failing: false,

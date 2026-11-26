@@ -288,7 +288,7 @@ pub(super) struct Reverts {
 pub(super) enum Origin {
     Conn(ConnId),
     Server {
-        reply: oneshot::Sender<Result<Seq, ServerChangeError>>,
+        reply: oneshot::Sender<Result<super::Landed, ServerChangeError>>,
         /// Refuse it as stale if someone changed what it writes since its base.
         check_stale: bool,
         /// Which locks refuse it.
@@ -1330,7 +1330,7 @@ impl Room {
     fn answer_accepted(&mut self, item: Item, seq: Seq) {
         match item.origin {
             Origin::Server { reply, .. } => {
-                let _ = reply.send(Ok(seq));
+                let _ = reply.send(Ok(super::Landed::Written(seq)));
             }
             Origin::Conn(conn) => {
                 let frame = self.encode(&ServerMsg::Accepted {
@@ -1386,9 +1386,28 @@ impl Room {
     }
 
     /// A restore whose target is the head it was judged against: answered with that head's seq.
+    /// Answered once that head is durable: held while changes are still being written.
     fn unchanged(&mut self, item: Item) {
-        if let Origin::Server { reply, .. } = item.origin {
-            let _ = reply.send(Ok(self.tentative.seq));
+        if self.pending.is_empty() {
+            if let Origin::Server { reply, .. } = item.origin {
+                let _ = reply.send(Ok(super::Landed::Unchanged(self.durable.seq)));
+            }
+        } else {
+            self.held_unchanged.push((self.tentative.seq, item));
+        }
+    }
+
+    /// Answers the held unchanged restores whose head is durable now.
+    fn release_unchanged(&mut self) {
+        let durable = self.durable.seq;
+        let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_unchanged)
+            .into_iter()
+            .partition(|(at, _)| *at <= durable);
+        self.held_unchanged = held;
+        for (at, item) in ready {
+            if let Origin::Server { reply, .. } = item.origin {
+                let _ = reply.send(Ok(super::Landed::Unchanged(at)));
+            }
         }
     }
 
@@ -1475,6 +1494,7 @@ impl Room {
             &p.item.change.command,
         );
         self.answer_accepted(p.item, seq);
+        self.release_unchanged();
         metrics::change_accepted();
         self.maybe_snapshot();
     }
@@ -1489,6 +1509,9 @@ impl Room {
         if front.seq != seq {
             return self.lose("the journal answered out of order");
         }
+        // Restores found unchanged against a head that included the discarded changes: judged
+        // again, after the changes judged again below, as any change decided after a refused one.
+        let held = std::mem::take(&mut self.held_unchanged);
         self.generation += 1;
         self.tentative = self.durable.clone();
         self.tentative_version += 1;
@@ -1600,6 +1623,9 @@ impl Room {
                 Err(NotTaken::Refused(refusal)) => self.refuse_item(item, refusal),
                 Err(NotTaken::Unchanged) => self.unchanged(item),
             }
+        }
+        for (_, item) in held.into_iter().rev() {
+            self.server_queue.push_front(item);
         }
         if let Some(user) = misbehaving {
             let theirs: Vec<ConnId> = self

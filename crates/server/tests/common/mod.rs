@@ -536,6 +536,7 @@ pub struct FlakyStore {
     hang_commit: Arc<AtomicBool>,
     begins: AtomicUsize,
     refuse_change: Arc<Mutex<Option<String>>>,
+    refuse_server_change: Arc<AtomicBool>,
     change_lookups: AtomicUsize,
     lookup_delay: Mutex<Duration>,
     duplicate_inserts: Arc<AtomicUsize>,
@@ -561,6 +562,7 @@ impl FlakyStore {
             hang_commit: Arc::new(AtomicBool::new(false)),
             begins: AtomicUsize::new(0),
             refuse_change: Arc::new(Mutex::new(None)),
+            refuse_server_change: Arc::new(AtomicBool::new(false)),
             change_lookups: AtomicUsize::new(0),
             lookup_delay: Mutex::new(Duration::ZERO),
             duplicate_inserts: Arc::new(AtomicUsize::new(0)),
@@ -570,6 +572,12 @@ impl FlakyStore {
             preload_delay: Mutex::new(Duration::ZERO),
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
         }
+    }
+
+    /// Makes the next journal insert of a change the server made (no change id) insert nothing:
+    /// the journal refuses that record.
+    pub fn refuse_server_change_once(&self) {
+        self.refuse_server_change.store(true, Ordering::SeqCst);
     }
 
     /// Makes the next journal insert of a change with this `change_id` insert nothing, as if the
@@ -728,6 +736,7 @@ impl Store for FlakyStore {
             commit_then_fail: self.commit_then_fail.clone(),
             hang_commit: self.hang_commit.clone(),
             refuse_change: self.refuse_change.clone(),
+            refuse_server_change: self.refuse_server_change.clone(),
             duplicate_inserts: self.duplicate_inserts.clone(),
             commit_delay: self.commit_delay.clone(),
         }))
@@ -1007,6 +1016,7 @@ pub struct FlakyTx<'a> {
     commit_then_fail: Arc<AtomicBool>,
     hang_commit: Arc<AtomicBool>,
     refuse_change: Arc<Mutex<Option<String>>>,
+    refuse_server_change: Arc<AtomicBool>,
     duplicate_inserts: Arc<AtomicUsize>,
     commit_delay: Arc<Mutex<Duration>>,
 }
@@ -1059,6 +1069,7 @@ impl Tx for FlakyTx<'_> {
             commit_then_fail,
             hang_commit,
             refuse_change,
+            refuse_server_change: self.refuse_server_change.clone(),
             duplicate_inserts,
             commit_delay,
         }))
@@ -1357,6 +1368,9 @@ impl Tx for FlakyTx<'_> {
                 *refuse = None;
                 return Ok(false);
             }
+        }
+        if change.change_id.is_none() && self.refuse_server_change.swap(false, Ordering::SeqCst) {
+            return Ok(false);
         }
         let inserted = self.inner.insert_change(change).await?;
         if !inserted {
