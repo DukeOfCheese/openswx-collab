@@ -251,7 +251,9 @@ async fn a_big_change_is_judged_off_the_room_task_and_lands_like_any_other() {
 async fn scale_check_one_hundred_editors() {
     const CLIENTS: usize = 100;
     const SECONDS: u64 = 10;
-    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    // (Every client is the same account: above the default 64 connections per account.)
+    let (server, flaky) =
+        TestServer::start_flaky(|s| s.max_connections_per_user = CLIENTS + 1).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     // What the run costs the database, for comparing runs: transactions (all of them) and journal
