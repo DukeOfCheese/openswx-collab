@@ -1490,97 +1490,6 @@ fn slow_journal(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_inherits_the_changes_its_predecessor_had_in_the_journal() {
-    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
-    let world = World::new(&server).await.unwrap();
-    let doc = world.document(&server, None, None, None).await;
-    let desk = Hello::client("takeover-desk");
-    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
-    // The journal refuses the first change; the second waits behind it.
-    let first = a.make_change(0, vec![set(&["variables", "x"], json!(1))]);
-    flaky.refuse_change_once(&first.change_id);
-    a.send_change(&first).await;
-    let second = a.make_change(0, vec![set_depth(7)]);
-    a.send_change(&second).await;
-    let deadline = Instant::now() + WAIT;
-    while server.room_status(&doc).await.tentative < 2 {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // The same client reconnects (its old socket replaced) and sends the second change again.
-    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
-    assert_eq!(a.closed().await.0, 4409);
-    b.send_change(&second).await;
-    // The refused record makes the room judge the second again: its new owner is answered.
-    assert_eq!(b.outcome(&second.change_id).await.seq(), 1);
-    // And what B sends later is answered too.
-    assert_eq!(edit(&mut b, 9).await, 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_is_answered_for_a_big_change_its_predecessor_sent() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1500),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
-    let world = World::new(&server).await.unwrap();
-    let doc = world.document(&server, None, None, None).await;
-    let desk = Hello::client("takeover-big");
-    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
-    let ops = (0..300)
-        .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
-        .collect();
-    let big = a.make_change(0, ops);
-    a.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
-    assert_eq!(a.closed().await.0, 4409);
-    assert_eq!(
-        b.outcome(&big.change_id).await.seq(),
-        1,
-        "the successor is answered"
-    );
-    assert_eq!(edit(&mut b, 3).await, 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_whose_access_then_ends_writes_nothing() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1500),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
-    let world = World::new(&server).await.unwrap();
-    let (desk_token, _) = editor(&server, &world, "bob@example.com").await;
-    let laptop_token = server.login("bob@example.com", PASSWORD).await;
-    let doc = world.document(&server, None, None, None).await;
-    let desk = Hello::client("takeover-gone");
-    let mut a = Live::connect_with(&server, &doc, &desk_token, desk.clone()).await;
-    let big = a.make_change(0, big_ops());
-    a.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // The same client, signed in with another session, takes over (the same role: it inherits).
-    let mut b = Live::connect_with(&server, &doc, &laptop_token, desk).await;
-    assert_eq!(a.closed().await.0, 4409);
-    // The session the change was sent with ends: what was inherited from it goes.
-    let (status, _) = server
-        .post("/api/auth/logout", Some(&desk_token), json!({}))
-        .await;
-    assert_eq!(status, 204);
-    match b.outcome(&big.change_id).await {
-        Outcome::Rejected { code, .. } => {
-            assert_eq!(code, oswx_core::wire::RejectCode::ServerError);
-        }
-        other => panic!("not written, and said so: {other:?}"),
-    }
-    assert_eq!(content(&server, &doc, &world.admin).await["seq"], 0);
-    // The successor, whose own session is live, stays and may send it again.
-    assert!(alive(&mut b).await);
-    assert_eq!(b.resend(&big).await.seq(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_join_taken_just_as_its_wait_ran_out_leaves_no_ghost() {
     let hooks = Arc::new(Hooks {
         join_wait: Duration::from_millis(300),
@@ -1869,38 +1778,6 @@ async fn no_answer_within(live: &mut Live, change_id: &str, wait: Duration) -> b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_inherited_change_is_answered_once_even_when_resent_after_it_is_durable() {
-    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
-    let world = World::new(&server).await.unwrap();
-    let doc = world.document(&server, None, None, None).await;
-    let desk = Hello::client("once-desk");
-    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
-    let change = a.make_change(0, vec![set_depth(4)]);
-    a.send_change(&change).await;
-    let deadline = Instant::now() + WAIT;
-    while server.room_status(&doc).await.tentative == 0 {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // The same client reconnects: it inherits the answer, which comes once the change is durable.
-    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
-    assert_eq!(a.closed().await.0, 4409);
-    assert_eq!(b.outcome(&change.change_id).await.seq(), 1);
-    // Its resend (sent before it had the answer, say) arrives after: no second answer.
-    b.send_change(&change).await;
-    assert!(no_answer_within(&mut b, &change.change_id, Duration::from_millis(500)).await);
-    // And a takeover's resend while the change is still being written is answered once too.
-    let mut c_first =
-        Live::connect_with(&server, &doc, &world.admin, Hello::client("once-two")).await;
-    let next = c_first.make_change(1, vec![set_depth(5)]);
-    c_first.send_change(&next).await;
-    let mut c = Live::connect_with(&server, &doc, &world.admin, Hello::client("once-two")).await;
-    c.send_change(&next).await;
-    assert_eq!(c.outcome(&next.change_id).await.seq(), 2);
-    assert!(no_answer_within(&mut c, &next.change_id, Duration::from_millis(500)).await);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_user_whose_role_did_not_change_keeps_their_detached_locks_and_connection() {
     let (server, world) = world().await;
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
@@ -2045,4 +1922,359 @@ async fn a_replaced_connection_that_passes_nothing_on_keeps_its_clients_locks() 
         mine.granted.is_empty(),
         "the lock was not released: {mine:?}"
     );
+}
+
+// ------------------------------------------------------------------ fix round 4: takeovers start clean
+
+/// How many journal rows of `doc` carry the change id `id`.
+async fn rows_with(server: &TestServer, doc: &str, id: &str) -> usize {
+    server
+        .state
+        .store
+        .changes_between(doc, 0, i64::MAX, 100_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.change_id.as_deref() == Some(id))
+        .count()
+}
+
+/// How many `change` events for `seq` `live` has been sent so far.
+async fn events_for(live: &mut Live, seq: Seq) -> usize {
+    live.drain().await;
+    live.seen
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::Change(ev) if ev.seq == seq))
+        .count()
+}
+
+/// The successor resends `change`: it is answered `accepted` exactly once, the journal holds it
+/// once, and the observer saw it once. Answers its seq.
+async fn resent_once(
+    server: &TestServer,
+    doc: &str,
+    successor: &mut Live,
+    observer: &mut Live,
+    change: &oswx_core::Change,
+) -> Seq {
+    let seq = successor.resend(change).await.seq();
+    assert!(
+        no_answer_within(successor, &change.change_id, Duration::from_millis(500)).await,
+        "one answer"
+    );
+    assert_eq!(
+        rows_with(server, doc, &change.change_id).await,
+        1,
+        "written once"
+    );
+    assert_eq!(events_for(observer, seq).await, 1, "others hear of it once");
+    assert_eq!(
+        events_for(successor, seq).await,
+        0,
+        "never its own change back"
+    );
+    seq
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resend_after_a_chain_of_takeovers_is_answered_once_and_never_echoed() {
+    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("chain-desk");
+    // P1 sends C, which is being written, and goes away.
+    let mut p1 = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let c = p1.make_change(0, vec![set_depth(4)]);
+    p1.send_change(&c).await;
+    let deadline = Instant::now() + WAIT;
+    while server.room_status(&doc).await.tentative == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    p1.close().await;
+    // P2 connects and is replaced by P3 before it resends anything.
+    let mut p2 = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let mut p3 = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(p2.closed().await.0, 4409);
+    assert_eq!(
+        resent_once(&server, &doc, &mut p3, &mut observer, &c).await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_of_takeovers_each_resending_gets_one_answer_per_live_send() {
+    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("chain-each");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let c = a.make_change(0, vec![set_depth(5)]);
+    a.send_change(&c).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    assert_eq!(a.closed().await.0, 4409);
+    b.send_change(&c).await;
+    let mut last = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(b.closed().await.0, 4409);
+    assert_eq!(
+        resent_once(&server, &doc, &mut last, &mut observer, &c).await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_change_waits_behind_another_is_answered_once() {
+    let hooks = Hooks {
+        judge_delay: Duration::from_millis(1000),
+        ..Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("parked-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let big = a.make_change(0, big_ops());
+    a.send_change(&big).await;
+    // Parked behind the big one (judged off the task).
+    let small = a.make_change(0, vec![set_depth(6)]);
+    a.send_change(&small).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(
+        resent_once(&server, &doc, &mut b, &mut observer, &big).await,
+        1
+    );
+    assert_eq!(
+        resent_once(&server, &doc, &mut b, &mut observer, &small).await,
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_change_is_judged_off_the_task_is_answered_once() {
+    let hooks = Hooks {
+        judge_delay: Duration::from_millis(1000),
+        ..Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("judged-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let big = a.make_change(0, big_ops());
+    a.send_change(&big).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The successor resends at once, while the old copy is still being judged: the old copy is
+    // dropped when it comes back, the resend is judged afresh.
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(
+        resent_once(&server, &doc, &mut b, &mut observer, &big).await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_change_is_looked_up_is_answered_once() {
+    let hooks = Hooks {
+        max_remembered: 1,
+        ..Hooks::default()
+    };
+    let (server, flaky) =
+        TestServer::start_flaky_full(|_| {}, new_journal, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let desk = Hello::client("lookup-desk");
+    let mut first = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    assert_eq!(edit(&mut first, 1).await, 1);
+    assert_eq!(edit(&mut first, 2).await, 2);
+    first.close().await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    flaky.lookup_delay(Duration::from_millis(1000));
+    let change = a.make_change(2, vec![set_depth(9)]);
+    a.send_change(&change).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(
+        resent_once(&server, &doc, &mut b, &mut observer, &change).await,
+        3
+    );
+    flaky.lookup_delay(Duration::ZERO);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_changes_blobs_are_checked_is_answered_once() {
+    let (server, blobs) = TestServer::start_blobs(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let body = b"another stored shape";
+    let sha = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(body))
+    };
+    let r = reqwest::Client::new()
+        .put(server.url(&format!("/api/projects/{}/blobs/{sha}", world.project)))
+        .bearer_auth(&world.admin)
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("blob-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    blobs.exists_delay(Duration::from_millis(1000));
+    let change = a.make_change(
+        0,
+        vec![set(
+            &["variables", "brep"],
+            json!({"$blob": sha, "len": body.len()}),
+        )],
+    );
+    a.send_change(&change).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(
+        resent_once(&server, &doc, &mut b, &mut observer, &change).await,
+        1
+    );
+    blobs.exists_delay(Duration::ZERO);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_change_waits_to_be_judged_again_is_answered_once_per_send() {
+    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("rejudge-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let first = a.make_change(0, vec![set(&["variables", "x"], json!(1))]);
+    flaky.refuse_change_once(&first.change_id);
+    a.send_change(&first).await;
+    let second = a.make_change(0, vec![set_depth(7)]);
+    a.send_change(&second).await;
+    let deadline = Instant::now() + WAIT;
+    while server.room_status(&doc).await.tentative < 2 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    // The second is resent while it waits: the refusal of the first makes the room judge it
+    // again; its sender is gone, so the waiting resend is told it was not stored (once) ...
+    b.send_change(&second).await;
+    assert_eq!(
+        b.outcome(&second.change_id).await.code(),
+        oswx_core::wire::RejectCode::ServerError
+    );
+    assert!(no_answer_within(&mut b, &second.change_id, Duration::from_millis(300)).await);
+    // ... and sent again, it is judged afresh and written once; so is the first.
+    let s2 = resent_once(&server, &doc, &mut b, &mut observer, &second).await;
+    let s1 = resent_once(&server, &doc, &mut b, &mut observer, &first).await;
+    assert_eq!((s2, s1), (1, 2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_changes_seq_is_checked_is_answered_once() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("checked-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let x = a.make_change(0, vec![set_depth(20)]);
+    assert_eq!(a.resend(&x).await.seq(), 1);
+    // The room forgets X; sent again it reaches the journal, which says duplicate, and its seq
+    // is looked up (slowly).
+    server.room(&doc).forget_change_ids().await;
+    flaky.lookup_delay_once(Duration::from_millis(1000));
+    let mut again = x.clone();
+    again.base = 1;
+    a.send_change(&again).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(b.resend(&again).await, Outcome::Accepted(1));
+    assert!(no_answer_within(&mut b, &x.change_id, Duration::from_millis(500)).await);
+    assert_eq!(rows_with(&server, &doc, &x.change_id).await, 1);
+    assert_eq!(events_for(&mut observer, 1).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_change_is_written_is_answered_once_and_not_echoed() {
+    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut observer = Live::connect(&server, &doc, &world.admin).await;
+    let desk = Hello::client("written-desk");
+    let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
+    let c = a.make_change(0, vec![set_depth(8)]);
+    a.send_change(&c).await;
+    let deadline = Instant::now() + WAIT;
+    while server.room_status(&doc).await.tentative == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    // B does not resend yet: the change becomes durable; B gets no live event for it.
+    let deadline = Instant::now() + WAIT;
+    while server.room_status(&doc).await.seq == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        events_for(&mut b, 1).await,
+        0,
+        "its own change is not echoed"
+    );
+    // Its resend is answered from memory, once.
+    assert_eq!(
+        resent_once(&server, &doc, &mut b, &mut observer, &c).await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_takeover_revoking_the_new_one_writes_nothing_and_the_old_one_changes_nothing() {
+    let hooks = Hooks {
+        judge_delay: Duration::from_millis(1000),
+        ..Hooks::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let (desk_token, bob_id) = editor(&server, &world, "bob@example.com").await;
+    let laptop_token = server.login("bob@example.com", PASSWORD).await;
+    let doc = world.document(&server, None, None, None).await;
+    let desk = Hello::client("revoke-after");
+    // The old socket's session ends after the takeover: the new connection is not touched.
+    let mut a = Live::connect_with(&server, &doc, &desk_token, desk.clone()).await;
+    let mut b = Live::connect_with(&server, &doc, &laptop_token, desk.clone()).await;
+    assert_eq!(a.closed().await.0, 4409);
+    let (status, _) = server
+        .post("/api/auth/logout", Some(&desk_token), json!({}))
+        .await;
+    assert_eq!(status, 204);
+    assert!(alive(&mut b).await, "the new connection is unaffected");
+    assert_eq!(edit(&mut b, 3).await, 1);
+    // A change in the works, a takeover, then the new connection loses its access: nothing more.
+    let big = b.make_change(1, big_ops());
+    b.send_change(&big).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut c = Live::connect_with(&server, &doc, &laptop_token, desk).await;
+    assert_eq!(b.closed().await.0, 4409);
+    c.send_change(&big).await;
+    server.state.hub.drop_account(&bob_id).await;
+    assert_eq!(c.closed().await.0, 4401);
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert_eq!(content(&server, &doc, &world.admin).await["seq"], 1);
 }

@@ -1543,28 +1543,6 @@ async fn references_and_used_in_read_the_store_a_bounded_number_of_times() {
 // ------------------------------------------------------------------ v2: connections
 
 #[tokio::test]
-async fn a_takeover_while_the_parts_are_checked_gets_the_answer() {
-    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
-    let world = World::new(&server).await.unwrap();
-    let part = world.document(&server, None, None, None).await;
-    let asm = make_ok(&server, &world, assembly(vec![], vec![]), "Rover").await;
-    let desk = Hello::client("assembly-desk");
-    let mut a = Live::connect_with(&server, &asm, &world.admin, desk.clone()).await;
-    flaky.parts_gate.shut();
-    let id = a.new_id();
-    let change = a.make_change(0, vec![add_component(component(&id, &part, 0, None))]);
-    a.send_change(&change).await;
-    flaky.parts_gate.until_waiting(1).await;
-    // The same client connects again: its old socket is replaced, its work is the new one's.
-    let mut b = Live::connect_with(&server, &asm, &world.admin, desk).await;
-    assert_eq!(a.closed().await.0, 4409);
-    flaky.parts_gate.open();
-    assert_eq!(b.outcome(&change.change_id).await.seq(), 1);
-    table_matches(&server, &asm, &world.admin).await;
-    assert_eq!(table(&server, &asm).await.len(), 1);
-}
-
-#[tokio::test]
 async fn a_revocation_while_the_parts_are_checked_writes_nothing() {
     let (server, flaky) = TestServer::start_flaky(|_| {}).await;
     let world = World::new(&server).await.unwrap();
@@ -1706,4 +1684,38 @@ async fn a_demoted_client_reconnecting_inherits_nothing_whose_parts_are_checked(
     assert_eq!(got["content"]["components"], json!([]));
     assert_eq!(b.resend(&change).await.code(), RejectCode::ReadOnly);
     assert!(table(&server, &asm).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_while_the_parts_are_checked_is_answered_once_when_resent() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let part = world.document(&server, None, None, None).await;
+    let asm = make_ok(&server, &world, assembly(vec![], vec![]), "Rover").await;
+    let desk = Hello::client("assembly-desk");
+    let mut a = Live::connect_with(&server, &asm, &world.admin, desk.clone()).await;
+    flaky.parts_gate.shut();
+    let id = a.new_id();
+    let change = a.make_change(0, vec![add_component(component(&id, &part, 0, None))]);
+    a.send_change(&change).await;
+    flaky.parts_gate.until_waiting(1).await;
+    // The same client connects again: the old socket is replaced and its copy is dropped when
+    // the check comes back; the new one resends and is answered once.
+    let mut b = Live::connect_with(&server, &asm, &world.admin, desk).await;
+    assert_eq!(a.closed().await.0, 4409);
+    b.send_change(&change).await;
+    flaky.parts_gate.open();
+    assert_eq!(b.outcome(&change.change_id).await.seq(), 1);
+    assert!(
+        b.try_recv(std::time::Duration::from_millis(500))
+            .await
+            .is_none_or(|m| !matches!(m, ServerMsg::Accepted { .. } | ServerMsg::Rejected { .. })),
+        "one answer"
+    );
+    table_matches(&server, &asm, &world.admin).await;
+    assert_eq!(table(&server, &asm).await.len(), 1);
+    let (_, got) = server
+        .get(&format!("/api/documents/{asm}/content"), Some(&world.admin))
+        .await;
+    assert_eq!(got["seq"], 1);
 }
