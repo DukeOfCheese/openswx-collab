@@ -49,6 +49,7 @@ async fn bucket_with(prefix: &str, tune: impl FnOnce(&mut S3Tuning)) -> Bucket {
     let storage = TestStorage::S3 {
         blobs: blobs.clone(),
         fake: Some(fake.clone()),
+        config: Arc::new(fake.config(prefix)),
     };
     Bucket {
         fake,
@@ -150,19 +151,25 @@ async fn a_bucket_keeps_the_storage_contract_under_a_prefix() {
     assert!(b.fake.object_file("some/prefixed/docs/1/s").is_file());
 }
 
-/// The same suite against the endpoint `OSWX_TEST_S3_URL` names (MinIO in CI). Skipped when it
-/// is not set.
+/// The same suite against the endpoint `OSWX_TEST_S3_URL` names (Garage in CI). Skipped when it
+/// is not set. There the suite sees unfinished multipart uploads through `ListMultipartUploads`.
 #[tokio::test]
 async fn a_real_s3_endpoint_keeps_the_storage_contract() {
     let Some(config) = real_s3() else {
         eprintln!("skipped: {} is not set", common::S3_ENV);
         return;
     };
-    let blobs = Arc::new(S3Blobs::open(config).await.expect("the bucket can be used"));
+    let blobs = Arc::new(
+        S3Blobs::open(config.clone())
+            .await
+            .expect("the bucket can be used"),
+    );
     let storage = TestStorage::S3 {
         blobs: blobs.clone(),
         fake: None,
+        config: Arc::new(config),
     };
+    assert_eq!(storage.stored_under("").await, Vec::<String>::new());
     blobs_contract(blobs.as_ref(), &storage, 20 * MIB + 3).await;
 
     // More than one page of a listing, removed in more than one batch.
@@ -383,10 +390,48 @@ async fn a_store_that_does_not_answer_fails_a_lookup_within_its_bound() {
     assert!(b.blobs.exists(&key).await.unwrap());
 }
 
+/// With the tuning a server runs with: a store that does not answer fails a change's blob check
+/// after five seconds, not after the minute one request may take.
 #[tokio::test]
-async fn the_server_wide_lookup_bound_is_five_seconds() {
-    assert_eq!(S3Tuning::default().lookup_timeout, Duration::from_secs(5));
-    assert_eq!(oswx_server::blobs::LOOKUP_TIMEOUT, Duration::from_secs(5));
+async fn a_lookup_fails_after_five_seconds_with_the_tuning_a_server_runs_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeS3::start(dir.path()).await;
+    let mut config = fake.config("");
+    config.tuning = S3Tuning::default();
+    let blobs = S3Blobs::new(config).unwrap();
+    fake.inject(ALWAYS, Fault::Hang, Seen::is_head);
+    let started = Instant::now();
+    let checked = missing_blobs(&blobs, "org1", ["0".repeat(64), "1".repeat(64)]).await;
+    let took = started.elapsed();
+    assert!(checked.is_err(), "a blob was called missing or present");
+    assert!(
+        took >= Duration::from_millis(4500) && took < Duration::from_secs(9),
+        "the lookups took {took:?}"
+    );
+}
+
+/// The request the harness signs by hand (for a real endpoint's unfinished uploads) is one the
+/// store takes as signed: the fake checks the signature before it says it has no such listing.
+#[tokio::test]
+async fn the_hand_signed_listing_of_unfinished_uploads_is_properly_signed() {
+    let b = bucket_with("some/prefix", |_| {}).await;
+    let right = common::list_uploads(&b.fake.config("some/prefix"))
+        .await
+        .unwrap();
+    let mut wrong = b.fake.config("some/prefix");
+    wrong.secret_access_key = "not/the/secret".into();
+    let wrong = common::list_uploads(&wrong).await.unwrap();
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    assert_ne!(
+        right.status(),
+        StatusCode::FORBIDDEN,
+        "the signature was refused"
+    );
+    let asked = b.fake.seen();
+    assert!(
+        asked[0].query.contains("uploads") && asked[0].query.contains("prefix=some%2Fprefix%2F"),
+        "{asked:?}"
+    );
 }
 
 #[tokio::test]
@@ -456,12 +501,33 @@ async fn a_large_blob_goes_up_in_bounded_parts_and_shows_only_when_complete() {
     let b = bucket_with("", small_parts).await;
     let data = noise(4 * PART + 100_000, 4);
     let key = blob_key("org1", &sha_of(&data));
-    let outcome = b
-        .blobs
-        .put_stream(&key, chunked(&data, 100_000), u64::MAX)
-        .await
-        .unwrap();
+    // The body is fed by hand, and held back just before its end.
+    let (feed, body) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(1);
+    let body: ByteStream = stream::unfold(body, |mut body| async move {
+        body.recv().await.map(|item| (item, body))
+    })
+    .boxed();
+    let uploading = {
+        let (blobs, key) = (b.blobs.clone(), key.clone());
+        tokio::spawn(async move { blobs.put_stream(&key, body, u64::MAX).await })
+    };
+    for chunk in data.chunks(100_000) {
+        feed.send(Ok(Bytes::copy_from_slice(chunk))).await.unwrap();
+    }
+    // Three whole parts are at the store, and nothing is visible under the address.
+    assert!(
+        eventually(|| b.fake.parts_held() >= 3).await,
+        "no parts went up"
+    );
+    assert!(!b.fake.object_file(&key).exists());
+    assert!(!b.blobs.exists(&key).await.unwrap());
+    assert!(b.blobs.get_stream(&key).await.unwrap().is_none());
+    assert_eq!(b.fake.count(Seen::completes_upload), 0);
+    // The body ends (well): now it is.
+    drop(feed);
+    let outcome = uploading.await.unwrap().unwrap();
     assert_eq!(outcome.sha256, sha_of(&data));
+    assert!(b.blobs.exists(&key).await.unwrap());
 
     let seen = b.fake.seen();
     assert_eq!(b.fake.count(Seen::starts_upload), 1);
@@ -475,14 +541,7 @@ async fn a_large_blob_goes_up_in_bounded_parts_and_shows_only_when_complete() {
         parts[0], 1,
         "the first part, which holds the length, goes once the body has ended: {parts:?}"
     );
-    // Nothing was visible before the upload was completed, and nothing is left of it.
-    let completed = seen.iter().position(Seen::completes_upload).unwrap();
-    assert!(
-        seen[..completed]
-            .iter()
-            .all(|r| !r.is_head() && !r.is_get())
-    );
-    assert_eq!(b.fake.parts_held(), 0);
+    assert_eq!(b.fake.parts_held(), 0, "nothing is left of the upload");
 
     // At most the first part, the one being filled and two on their way, and a chunk.
     let held = b.blobs.peak_buffered();

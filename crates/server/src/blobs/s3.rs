@@ -359,9 +359,13 @@ impl S3Blobs {
             .delete(&path)
             .await
             .map_err(|e| wrong("removing", e))?;
-        self.probe()
-            .await
-            .with_context(|| format!("the S3 bucket {} cannot be listed", self.bucket))?;
+        self.probe().await.with_context(|| {
+            format!(
+                "the S3 bucket {} cannot be listed (on AWS the key needs s3:ListBucket for \
+                     that)",
+                self.bucket
+            )
+        })?;
         match self.quick.head(&path).await {
             // (`Ok`: a store that still shows what was just removed. Nothing to object to.)
             Ok(_) | Err(StoreError::NotFound { .. }) => Ok(()),

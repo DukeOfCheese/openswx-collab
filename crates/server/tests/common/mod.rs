@@ -296,13 +296,17 @@ pub enum TestStorage {
     S3 {
         blobs: Arc<S3Blobs>,
         fake: Option<Arc<FakeS3>>,
+        /// How `blobs` reaches its bucket (to ask a real endpoint for its unfinished uploads).
+        config: Arc<oswx_server::blobs::S3Config>,
     },
 }
 
 impl TestStorage {
     /// Every key in storage that starts with `prefix`, sorted. In a folder that includes temporary
-    /// files (`.tmp-...`); on the fake S3, one `.unfinished-upload/<n>` for every part of a
-    /// multipart upload that was neither completed nor aborted (when `prefix` is empty).
+    /// files (`.tmp-...`); on S3, one `.unfinished-upload/<n>` for what is left of multipart
+    /// uploads that were neither completed nor aborted (when `prefix` is empty): on the fake, one
+    /// for every part it holds; on a real endpoint, one for every upload under the storage's own
+    /// key prefix that `ListMultipartUploads` answers.
     pub async fn stored_under(&self, prefix: &str) -> Vec<String> {
         let mut keys = match self {
             Self::Local(root) => {
@@ -324,9 +328,18 @@ impl TestStorage {
                 }
                 keys
             }
-            Self::S3 { blobs, fake } => {
+            Self::S3 {
+                blobs,
+                fake,
+                config,
+            } => {
                 let mut keys = blobs.keys().await.expect("the test bucket lists its keys");
-                let parts = fake.as_ref().map_or(0, |f| f.parts_held());
+                let parts = match fake {
+                    Some(fake) => fake.parts_held(),
+                    None => unfinished_uploads(config)
+                        .await
+                        .expect("the test bucket lists its unfinished uploads"),
+                };
                 keys.extend((0..parts).map(|n| format!(".unfinished-upload/{n}")));
                 keys
             }
@@ -352,8 +365,17 @@ async fn open_blobs(settings: &Settings, dir: &Path) -> (Arc<dyn Blobs>, TestSto
             (fake.config(""), Some(fake))
         }
     };
-    let blobs = Arc::new(S3Blobs::open(config).await.expect("the test bucket works"));
-    (blobs.clone(), TestStorage::S3 { blobs, fake })
+    let blobs = Arc::new(
+        S3Blobs::open(config.clone())
+            .await
+            .expect("the test bucket works"),
+    );
+    let storage = TestStorage::S3 {
+        blobs: blobs.clone(),
+        fake,
+        config: Arc::new(config),
+    };
+    (blobs, storage)
 }
 
 impl TestServer {

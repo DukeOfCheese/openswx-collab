@@ -250,8 +250,9 @@ async fn streamed_blobs(blobs: &dyn Blobs, storage: &TestStorage, big: usize) {
     let back = read_back(blobs, &large_key).await.unwrap();
     assert!(back == large, "the large blob came back changed");
 
-    // Two uploads of one blob at once: both succeed and the blob is intact.
-    let twice = noise(3 * MIB, 9);
+    // Two uploads of one blob at once: both succeed and the blob is intact. (`big` is more than
+    // a part on S3: two multipart uploads of one key, each completed.)
+    let twice = noise(big + 1, 9);
     let twice_key = blob_key("org1", &sha_of(&twice));
     let (a, b) = tokio::join!(
         blobs.put_stream(&twice_key, chunked(&twice, 64_000), u64::MAX),

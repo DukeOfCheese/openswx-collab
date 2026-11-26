@@ -370,7 +370,7 @@ fn stall_after(body: Body, limit: usize) -> Body {
 // ------------------------------------------------------------------ a real endpoint
 
 /// The environment variable that names a real S3 endpoint to run the storage tests against
-/// (`http://127.0.0.1:9000` for a local MinIO). With it go `OSWX_TEST_S3_BUCKET` (which must
+/// (`http://127.0.0.1:3900` for a local Garage). With it go `OSWX_TEST_S3_BUCKET` (which must
 /// exist; `oswx-test` if unset), `OSWX_TEST_S3_ACCESS_KEY`, `OSWX_TEST_S3_SECRET_KEY`,
 /// `OSWX_TEST_S3_REGION` (`us-east-1` if unset) and `OSWX_TEST_S3_PATH_STYLE` (`false` puts the
 /// bucket in the host name; in the path if unset).
@@ -378,6 +378,62 @@ pub const S3_ENV: &str = "OSWX_TEST_S3_URL";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// How many multipart uploads that were neither completed nor aborted the bucket holds under
+/// `config.prefix`: a signed `ListMultipartUploads` (the storage's own S3 client has no call for
+/// it). For a real endpoint; the fake does not implement the listing ([`FakeS3::parts_held`]
+/// looks at its files instead). At most the first page (1,000 uploads) is counted.
+pub async fn unfinished_uploads(config: &S3Config) -> Result<usize, String> {
+    let response = list_uploads(config).await?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("ListMultipartUploads answered {status}"));
+    }
+    Ok(body.matches("<Upload>").count())
+}
+
+/// Sends a signed `ListMultipartUploads` for `config`'s bucket and prefix.
+pub async fn list_uploads(config: &S3Config) -> Result<reqwest::Response, String> {
+    use object_store::aws::{AwsAuthorizer, AwsCredential};
+    use object_store::client::{HttpRequest, HttpRequestBody};
+
+    let bucket = if config.path_style {
+        format!("{}/{}", config.endpoint, config.bucket)
+    } else {
+        match config.endpoint.split_once("://") {
+            Some((scheme, rest)) => format!("{scheme}://{}.{rest}/", config.bucket),
+            None => return Err("the endpoint has no scheme".into()),
+        }
+    };
+    let mut url = url::Url::parse(&bucket).map_err(|e| e.to_string())?;
+    let prefix = if config.prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", config.prefix)
+    };
+    url.query_pairs_mut()
+        .append_pair("prefix", &prefix)
+        .append_pair("uploads", "");
+    let credential = AwsCredential {
+        key_id: config.access_key_id.clone(),
+        secret_key: config.secret_access_key.clone(),
+        token: None,
+    };
+    let mut signed: HttpRequest = axum::http::Request::builder()
+        .method("GET")
+        .uri(url.as_str())
+        .body(HttpRequestBody::empty())
+        .map_err(|e| e.to_string())?;
+    AwsAuthorizer::new(&credential, "s3", &config.region).authorize(&mut signed, None);
+    let mut request = reqwest::Client::new().get(url);
+    for (name, value) in signed.headers() {
+        if name != "host" {
+            request = request.header(name.as_str(), value.as_bytes());
+        }
+    }
+    request.send().await.map_err(|e| e.to_string())
 }
 
 /// The real endpoint `OSWX_TEST_S3_URL` names, with everything under a prefix of this call's own
