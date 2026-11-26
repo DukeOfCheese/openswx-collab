@@ -16,8 +16,8 @@ use common::*;
 use futures_util::stream::{self, StreamExt};
 use oswx_server::blobs::{Blobs, ByteStream, PutOutcome, blob_key};
 use oswx_server::clock::Clock;
+use oswx_server::export::Exports;
 use oswx_server::ext::{Event, Extensions};
-use oswx_server::routes::lifecycle::Exports;
 use oswx_server::security::token_hash;
 use oswx_server::store::Id;
 use reqwest::{Method, StatusCode, header};
@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const DELETED: &str = "Deleted user";
+const MINUTE: Duration = Duration::from_secs(60);
+const HOUR: Duration = Duration::from_secs(3600);
 
 // ------------------------------------------------------------------ helpers
 
@@ -947,7 +949,7 @@ async fn your_own_data_export() {
 
 #[tokio::test]
 async fn your_own_data_export_is_read_a_page_at_a_time_and_misses_nothing() {
-    let (server, _) = with_export_blobs(Exports::new(2, Duration::from_secs(60), 2)).await;
+    let (server, _) = with_export_blobs(Exports::new(2, MINUTE, HOUR, 2)).await;
     let world = World::new(&server).await.unwrap();
     let one = world.document(&server, None, Some("One"), None).await;
     let two = world.document(&server, None, Some("Two"), None).await;
@@ -1142,7 +1144,7 @@ async fn an_export_of_an_open_document_has_its_latest_durable_change() {
 
 #[tokio::test]
 async fn an_export_reads_history_a_page_at_a_time_and_finds_blobs_only_history_names() {
-    let (server, _) = with_export_blobs(Exports::new(2, Duration::from_secs(60), 2)).await;
+    let (server, _) = with_export_blobs(Exports::new(2, MINUTE, HOUR, 2)).await;
     let world = World::new(&server).await.unwrap();
     let body = b"only the history knows this one".to_vec();
     let sha = upload(&server, &world.project, &world.admin, &body).await;
@@ -1322,7 +1324,7 @@ async fn an_export_of_a_64_mb_blob_never_holds_the_blob() {
 
 #[tokio::test]
 async fn only_so_many_exports_run_at_once() {
-    let (server, blobs) = with_export_blobs(Exports::new(1, Duration::from_secs(60), 500)).await;
+    let (server, blobs) = with_export_blobs(Exports::new(1, MINUTE, HOUR, 500)).await;
     let world = World::new(&server).await.unwrap();
     let body = b"held back".to_vec();
     let sha = upload(&server, &world.project, &world.admin, &body).await;
@@ -1334,23 +1336,21 @@ async fn only_so_many_exports_run_at_once() {
             None,
         )
         .await;
+    let (bob, _) = world.editor(&server, "bob@example.com").await;
     blobs.hold();
     let first = export(&server, &world.org, Some(&world.admin)).await;
     assert_eq!(first.status(), 200);
     assert!(eventually(|| blobs.reads_started() == 1).await);
-    // One is running: the next is refused, whichever kind it is, and holds nothing.
-    let r = export(&server, &world.org, Some(&world.admin)).await;
-    assert_eq!(r.status(), 429);
+    // One is running: the next, someone else's, is refused and holds nothing.
     assert_eq!(
-        r.json::<Value>().await.unwrap(),
-        json!({"detail": "too many exports are running; try again in a moment"})
+        server.get("/api/me/export", Some(&bob)).await,
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"detail": "too many exports are running; try again in a moment"})
+        )
     );
-    assert_eq!(
-        server.get("/api/me/export", Some(&world.admin)).await.0,
-        429
-    );
+    assert_eq!(server.state.exports.running(), 1);
     // Someone who may not export is told so, not that the server is busy.
-    let (bob, _) = world.editor(&server, "bob@example.com").await;
     assert_eq!(export(&server, &world.org, Some(&bob)).await.status(), 403);
 
     blobs.release();
@@ -1373,7 +1373,7 @@ async fn only_so_many_exports_run_at_once() {
 
 #[tokio::test]
 async fn a_client_that_goes_away_frees_its_export() {
-    let (server, blobs) = with_export_blobs(Exports::new(1, Duration::from_secs(60), 500)).await;
+    let (server, blobs) = with_export_blobs(Exports::new(1, MINUTE, HOUR, 500)).await;
     let world = World::new(&server).await.unwrap();
     let body = b"never sent".to_vec();
     let sha = upload(&server, &world.project, &world.admin, &body).await;
@@ -1403,7 +1403,8 @@ async fn a_client_that_goes_away_frees_its_export() {
 #[tokio::test]
 async fn a_client_that_stops_reading_an_export_loses_it() {
     const LEN: u64 = 32 << 20;
-    let (server, blobs) = with_export_blobs(Exports::new(1, Duration::from_millis(300), 500)).await;
+    let (server, blobs) =
+        with_export_blobs(Exports::new(1, Duration::from_millis(300), HOUR, 500)).await;
     let world = World::new(&server).await.unwrap();
     let sha = blobs.make_up(&world.org, LEN);
     world
@@ -1449,7 +1450,7 @@ async fn a_client_that_stops_reading_an_export_loses_it() {
 
 #[tokio::test]
 async fn an_export_that_fails_part_way_is_cut_short_and_logged() {
-    let (server, blobs) = with_export_blobs(Exports::new(1, Duration::from_secs(60), 500)).await;
+    let (server, blobs) = with_export_blobs(Exports::new(1, MINUTE, HOUR, 500)).await;
     let world = World::new(&server).await.unwrap();
     let sha = blobs.make_up(&world.org, 4 << 20);
     world
@@ -1905,7 +1906,7 @@ async fn organisation_deletion_refuses_what_it_should_not_trust() {
     };
     let no_such = json!({"detail": "no such organisation"});
 
-    // wrong types, sizes and shapes: 422, before anything is looked up
+    // wrong types, sizes and shapes, and names that are not the organisation's: 422
     for body in [
         json!({}),
         json!({"current_password": PASSWORD}),
@@ -2046,5 +2047,407 @@ async fn deleting_an_organisation_tells_the_extensions_with_ids_only() {
     assert_eq!(
         recorder.events()[0],
         json!({"type": "org_deleted", "org": world.org, "by": world.admin_id})
+    );
+}
+
+#[tokio::test]
+async fn an_export_of_a_document_whose_early_journal_is_gone_holds_what_is_left() {
+    let mut handle = None;
+    let server = TestServer::start_custom(
+        |s| s.snapshot_every = 5,
+        |s| {
+            let blobs = Arc::new(ExportBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+            s.exports = Arc::new(Exports::new(2, MINUTE, HOUR, 2));
+        },
+    )
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    for n in 1..=12 {
+        assert_eq!(edit(&mut a, n).await, n as u64);
+    }
+    let mut snap = 0;
+    for _ in 0..250 {
+        snap = server.room_status(&doc).await.snapshot_seq;
+        if snap >= 10 {
+            break;
+        }
+        pause(Duration::from_millis(20)).await;
+    }
+    assert!((10..=12).contains(&snap), "a snapshot at {snap}");
+    // (Two more changes, so that there is journal after the snapshot wherever it was taken.)
+    for n in 13..=14 {
+        assert_eq!(edit(&mut a, n).await, n as u64);
+    }
+    // The journal before the snapshot goes (a gap several pages wide): the document still loads,
+    // and its export holds the rows that exist.
+    server
+        .sql(&format!(
+            "DELETE FROM changes WHERE document_id = '{doc}' AND seq <= {snap}"
+        ))
+        .await;
+    let mut z = export_zip(&server, &world.org, &world.admin).await;
+    let base = format!("projects/{}/{doc}", world.project);
+    let d = entry_json(&mut z, &format!("{base}/document.json"));
+    assert_eq!(d["seq"], 14);
+    assert_eq!(d["content"]["features"][1]["params"]["depth"], 14);
+    let seqs: Vec<u64> = entry_lines(&mut z, &format!("{base}/history.jsonl"))
+        .iter()
+        .map(|l| l["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, ((snap + 1)..=14).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn an_account_has_one_export_at_a_time() {
+    let (server, blobs) = with_export_blobs(Exports::new(3, MINUTE, HOUR, 500)).await;
+    let world = World::new(&server).await.unwrap();
+    let body = b"held back".to_vec();
+    let sha = upload(&server, &world.project, &world.admin, &body).await;
+    world
+        .document(
+            &server,
+            Some(part_with_blob(&sha, body.len() as u64)),
+            None,
+            None,
+        )
+        .await;
+    let (bob, _) = world.editor(&server, "bob@example.com").await;
+    blobs.hold();
+    let first = export(&server, &world.org, Some(&world.admin)).await;
+    assert_eq!(first.status(), 200);
+    assert!(eventually(|| blobs.reads_started() == 1).await);
+    // The server has places left, but this account has its one: either kind is refused.
+    let mine =
+        json!({"detail": "you have an export running already; try again when it has finished"});
+    let r = export(&server, &world.org, Some(&world.admin)).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.json::<Value>().await.unwrap(), mine);
+    assert_eq!(
+        server.get("/api/me/export", Some(&world.admin)).await,
+        (StatusCode::TOO_MANY_REQUESTS, mine)
+    );
+    assert_eq!(
+        server.state.exports.running(),
+        1,
+        "a refusal takes no place"
+    );
+    // Someone else is not held up.
+    assert_eq!(server.get("/api/me/export", Some(&bob)).await.0, 200);
+    blobs.release();
+    first.bytes().await.expect("the first export finishes");
+    export_zip(&server, &world.org, &world.admin).await;
+}
+
+#[tokio::test]
+async fn a_client_that_reads_a_little_now_and_then_is_cut_off_at_the_time_limit() {
+    const LEN: u64 = 32 << 20;
+    // No single write waits long (the client keeps reading), but the export may take 600 ms.
+    let limits = Exports::new(1, MINUTE, Duration::from_millis(600), 500);
+    let (server, blobs) = with_export_blobs(limits).await;
+    let world = World::new(&server).await.unwrap();
+    let sha = blobs.make_up(&world.org, LEN);
+    world
+        .document(&server, Some(part_with_blob(&sha, LEN)), None, None)
+        .await;
+    let logs = LogCapture::start();
+    let started = std::time::Instant::now();
+    let mut slow = export(&server, &world.org, Some(&world.admin)).await;
+    assert_eq!(slow.status(), 200);
+    let mut got = 0u64;
+    let ended = loop {
+        match slow.chunk().await {
+            Ok(Some(chunk)) => got += chunk.len() as u64,
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+        pause(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the export went on after its time limit ({got} bytes so far)"
+        );
+    };
+    assert!(
+        ended.is_err(),
+        "the response ended cleanly after {got} bytes"
+    );
+    assert!(got < LEN && blobs.pulled() < LEN);
+    assert!(eventually(|| server.state.exports.running() == 0).await);
+    assert_eq!(
+        blobs.outstanding.load(Ordering::SeqCst),
+        0,
+        "nothing is kept"
+    );
+    assert!(logs.text().contains("took longer than"), "{}", logs.text());
+    logs.assert_never_logged(&["Robotics", "ada@example.com", "Ada"]);
+    // The account's place is free too.
+    assert_eq!(
+        server.get("/api/me/export", Some(&world.admin)).await.0,
+        200
+    );
+}
+
+#[tokio::test]
+async fn exports_are_not_to_be_cached_and_head_starts_none() {
+    let (server, recorder) = recording().await;
+    let world = World::new(&server).await.unwrap();
+    world.document(&server, None, None, None).await;
+    let http = reqwest::Client::new();
+    let paths = [
+        "/api/me/export".to_owned(),
+        format!("/api/orgs/{}/export", world.org),
+    ];
+    lock(&recorder.events).clear();
+    for path in &paths {
+        // HEAD would have to make the export to know its headers: it is not offered.
+        let r = http
+            .head(server.url(path))
+            .bearer_auth(&world.admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 405, "{path}");
+        for method in [Method::POST, Method::PUT] {
+            let r = http
+                .request(method, server.url(path))
+                .bearer_auth(&world.admin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 405, "{path}");
+        }
+    }
+    pause(Duration::from_millis(100)).await;
+    assert!(recorder.events().is_empty(), "{:?}", recorder.events());
+    assert_eq!(server.state.exports.running(), 0);
+    for path in &paths {
+        let r = http
+            .get(server.url(path))
+            .bearer_auth(&world.admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store", "{path}");
+        r.bytes().await.unwrap();
+    }
+    assert_eq!(recorder.event_types(), ["account_exported", "org_exported"]);
+}
+
+#[tokio::test]
+async fn names_in_the_organisation_never_reach_the_names_in_the_zip() {
+    let (server, world) = world().await;
+    let admin = Some(world.admin.as_str());
+    let hostile = [
+        "../x",
+        "C:\\x",
+        "/etc/passwd",
+        "a\u{1}b\tc",
+        "..",
+        "x/../../y",
+    ];
+    let body = b"a blob".to_vec();
+    let sha = upload(&server, &world.project, &world.admin, &body).await;
+    let mut documents = Vec::new();
+    for name in hostile {
+        let (status, project) = server
+            .post(
+                &format!("/api/orgs/{}/projects", world.org),
+                admin,
+                json!({"name": name}),
+            )
+            .await;
+        assert_eq!(status, 201, "{name:?}: {project}");
+        let project = project["id"].as_str().unwrap().to_owned();
+        let (status, folder) = server
+            .post(
+                &format!("/api/projects/{project}/folders"),
+                admin,
+                json!({"name": name}),
+            )
+            .await;
+        assert_eq!(status, 201, "{name:?}: {folder}");
+        let (status, doc) = server
+            .post(
+                &format!("/api/projects/{project}/documents"),
+                admin,
+                json!({"name": name, "folder_id": folder["id"],
+                       "content": part_with_blob(&sha, body.len() as u64)}),
+            )
+            .await;
+        assert_eq!(status, 201, "{name:?}: {doc}");
+        let doc = doc["id"].as_str().unwrap().to_owned();
+        let (status, _) = server
+            .post(
+                &format!("/api/documents/{doc}/versions"),
+                admin,
+                json!({"name": name}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        documents.push((project, doc, name));
+    }
+    let (status, _) = server
+        .patch(
+            &format!("/api/orgs/{}", world.org),
+            admin,
+            json!({"name": "../../org"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let mut z = export_zip(&server, &world.org, &world.admin).await;
+    let is_id = |s: &str, n: usize| {
+        s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let all = names(&z);
+    assert_eq!(all.len(), 2 + 3 * hostile.len());
+    for name in &all {
+        let parts: Vec<&str> = name.split('/').collect();
+        let fine = match parts.as_slice() {
+            ["organisation.json"] => true,
+            ["blobs", sha] => is_id(sha, 64),
+            ["projects", project, doc, file] => {
+                is_id(project, 32)
+                    && is_id(doc, 32)
+                    && ["document.json", "history.jsonl", "versions.json"].contains(file)
+            }
+            _ => false,
+        };
+        assert!(fine, "an entry named {name:?}");
+        assert!(!name.contains("..") && !name.contains('\\') && !name.starts_with('/'));
+        assert!(name.is_ascii() && !name.bytes().any(|b| b.is_ascii_control()));
+    }
+    // The names are inside, where they are data.
+    for (project, doc, name) in documents {
+        let d = entry_json(&mut z, &format!("projects/{project}/{doc}/document.json"));
+        assert_eq!(d["name"], name);
+        let v = entry_json(&mut z, &format!("projects/{project}/{doc}/versions.json"));
+        assert_eq!(v[0]["name"], name);
+    }
+    assert_eq!(entry_json(&mut z, "organisation.json")["name"], "../../org");
+}
+
+/// The organisation is deleted, as a request of its own; answers its status.
+fn deleting(server: &TestServer, world: &World) -> tokio::task::JoinHandle<StatusCode> {
+    let url = server.url(&format!("/api/orgs/{}", world.org));
+    let token = world.admin.clone();
+    tokio::spawn(async move {
+        reqwest::Client::new()
+            .delete(url)
+            .bearer_auth(token)
+            .json(&robotics())
+            .send()
+            .await
+            .expect("an answer")
+            .status()
+    })
+}
+
+/// Asserts that nothing of `doc` is left in the database: no row, and no journal row.
+async fn nothing_left_of(server: &TestServer, doc: &str) {
+    let store = &server.state.store;
+    assert!(store.document_by_id(doc).await.unwrap().is_none());
+    let rows = store.changes_between(doc, 0, i64::MAX, 100).await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "journal rows of a deleted document: {rows:?}"
+    );
+    assert!(store.latest_snapshot(doc).await.unwrap().is_none());
+    assert!(server.state.hub.loaded(doc).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_being_written_when_its_organisation_is_deleted_leaves_no_row() {
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let (bob, _) = world.editor(&server, "bob@example.com").await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    assert_eq!(edit(&mut b, 1).await, 1);
+    // Bob's next change is held at the journal's commit; the deletion arrives meanwhile.
+    flaky.commit_gate.shut();
+    let change = b.make_change(1, vec![set_depth(2)]);
+    b.send_change(&change).await;
+    tokio::time::timeout(Duration::from_secs(10), flaky.commit_gate.until_waiting(1))
+        .await
+        .expect("the change is being written");
+    let deletion = deleting(&server, &world);
+    // (Long enough for the deletion to reach its own transaction or its commit.)
+    pause(Duration::from_millis(500)).await;
+    flaky.commit_gate.open();
+    assert_eq!(deletion.await.unwrap(), 204);
+    // Whichever of the two was written first, Bob ends up closed and no row is left.
+    assert_eq!(b.closed().await.0, 4404);
+    nothing_left_of(&server, &doc).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_sent_between_the_deletions_commit_and_the_close_is_written_nowhere() {
+    let (server, _flaky) = TestServer::start_flaky(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let (bob, _) = world.editor(&server, "bob@example.com").await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut b = Live::connect(&server, &doc, &bob).await;
+    assert_eq!(edit(&mut b, 1).await, 1);
+    // The deletion commits, and is held before it closes anything: the room is still open.
+    let gate = server.state.room_hooks.after_commit.clone();
+    gate.shut();
+    let deletion = deleting(&server, &world);
+    tokio::time::timeout(Duration::from_secs(10), gate.until_waiting(1))
+        .await
+        .expect("the deletion committed");
+    assert!(
+        server
+            .state
+            .store
+            .document_by_id(&doc)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(server.state.hub.loaded(&doc).is_some());
+    // Bob, still connected, sends changes into the room of a document that is gone.
+    for depth in [2, 3] {
+        let change = b.make_change(1, vec![set_depth(depth)]);
+        b.send_change(&change).await;
+    }
+    pause(Duration::from_millis(300)).await;
+    nothing_left_of_rows(&server, &doc).await;
+    gate.open();
+    assert_eq!(deletion.await.unwrap(), 204);
+    // The room could not store them and said so; then Bob is closed. No row was written.
+    assert_eq!(
+        b.closed().await,
+        (4404, "the organisation was deleted".to_owned())
+    );
+    assert!(
+        b.seen
+            .iter()
+            .all(|m| matches!(m, oswx_core::wire::ServerMsg::Rejected { .. })),
+        "{:?}",
+        b.seen
+    );
+    nothing_left_of(&server, &doc).await;
+    match Live::try_connect(&server, &doc, &bob, Hello::default()).await {
+        Ok(_) => panic!("a deleted document opened"),
+        Err(refused) => assert_eq!(refused.close, Some(4404), "{refused:?}"),
+    }
+}
+
+/// Asserts that the journal has no row of `doc`.
+async fn nothing_left_of_rows(server: &TestServer, doc: &str) {
+    let rows = server
+        .state
+        .store
+        .changes_between(doc, 0, i64::MAX, 100)
+        .await
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "journal rows of a deleted document: {rows:?}"
     );
 }

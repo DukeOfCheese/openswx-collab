@@ -847,6 +847,17 @@ pub trait Store: Send + Sync + 'static {
         limit: i64,
     ) -> anyhow::Result<Vec<ChangeSize>>;
 
+    /// The seq and stored operation size of a document's journal rows with `after < seq <= upto`,
+    /// oldest first, at most `limit` (without reading the operations): the next rows that exist,
+    /// whatever seqs the journal lacks.
+    async fn change_sizes_after(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeSize>>;
+
     /// A document's journal rows with `after < seq < before`, newest first, at most `limit`, with
     /// their authors' names.
     async fn history(

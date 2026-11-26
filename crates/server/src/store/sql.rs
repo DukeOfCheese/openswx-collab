@@ -434,6 +434,11 @@ pub const UNDO_TARGET: &str = "SELECT seq, inverse, reverted_by FROM changes \
 pub const CHANGE_SIZES: &str = "SELECT seq, CAST(LENGTH(ops) AS BIGINT) AS size FROM changes \
      WHERE document_id = $1 AND seq < $2 AND seq > $3 ORDER BY seq DESC LIMIT $4";
 
+/// [`super::Store::change_sizes_after`]: oldest first, `after < seq <= upto`, the stored size of
+/// each row's `ops` (read without the bytes).
+pub const CHANGE_SIZES_AFTER: &str = "SELECT seq, CAST(LENGTH(ops) AS BIGINT) AS size FROM changes \
+     WHERE document_id = $1 AND seq > $2 AND seq <= $3 ORDER BY seq LIMIT $4";
+
 /// [`super::Store::history`]: newest first, `after < seq < before`.
 pub const HISTORY: &str = "SELECT c.seq, c.author_id, u.name AS author_name, c.client_id, \
      c.change_id, c.created_at, c.command, c.ops, c.reverts, c.reverted_by, c.broke \

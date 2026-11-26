@@ -1251,6 +1251,18 @@ impl Store for FlakyStore {
             .await
     }
 
+    async fn change_sizes_after(
+        &self,
+        document_id: &str,
+        after: i64,
+        upto: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChangeSize>> {
+        self.inner()
+            .change_sizes_after(document_id, after, upto, limit)
+            .await
+    }
+
     async fn history(
         &self,
         document_id: &str,

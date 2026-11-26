@@ -314,6 +314,17 @@ macro_rules! store_impl {
                 .await
             }
 
+            async fn change_sizes_after(
+                &self,
+                document_id: &str,
+                after: i64,
+                upto: i64,
+                limit: i64,
+            ) -> Result<Vec<ChangeSize>> {
+                let mut c = self.reader().await?;
+                q::change_sizes_after(&mut c, document_id, after, upto, limit).await
+            }
+
             async fn history(
                 &self,
                 document_id: &str,
@@ -1947,6 +1958,22 @@ macro_rules! store_impl {
                     .bind(document_id)
                     .bind(before)
                     .bind(after)
+                    .bind(limit)
+                    .fetch_all(c)
+                    .await?)
+            }
+
+            pub async fn change_sizes_after(
+                c: &mut $Conn,
+                document_id: &str,
+                after: i64,
+                upto: i64,
+                limit: i64,
+            ) -> Result<Vec<ChangeSize>> {
+                Ok(sqlx::query_as(sql::CHANGE_SIZES_AFTER)
+                    .bind(document_id)
+                    .bind(after)
+                    .bind(upto)
                     .bind(limit)
                     .fetch_all(c)
                     .await?)
