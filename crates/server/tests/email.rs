@@ -256,7 +256,46 @@ async fn reset_tokens_and_passwords_are_never_logged() {
     confirm(&server, &token, "short").await;
     confirm(&server, &token, "the new secret").await;
     confirm(&server, &token, "the new secret").await;
+    let text = logs.text();
+    assert!(
+        text.contains("password reset link sent")
+            && text.contains("password set through a reset link"),
+        "the capture works: the reset handlers' lines are there: {text}"
+    );
     logs.assert_never_logged(&[&token, &session, PASSWORD, "the new secret"]);
+}
+
+#[tokio::test]
+async fn a_password_change_voids_the_reset_links_sent_before_it() {
+    let (server, mailer) = TestServer::start_mailing(|_| {}).await;
+    let (session, _) = server.register("ada@example.com").await;
+    reset(&server, "ada@example.com").await;
+    let (_, token) = link_in(&mailer.sent()[0].text);
+    let (s, _) = server
+        .patch(
+            "/api/me",
+            Some(&session),
+            json!({"password": "changed it myself", "current_password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    // whoever reads the old mail cannot undo the change
+    assert_eq!(
+        confirm(&server, &token, "the thief's own").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    server.login("ada@example.com", "changed it myself").await;
+    // a rename alone leaves a link alone
+    reset(&server, "ada@example.com").await;
+    let (_, token) = link_in(&mailer.sent()[1].text);
+    let (s, _) = server
+        .patch("/api/me", Some(&session), json!({"name": "Ada"}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        confirm(&server, &token, "a new one!").await.0,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

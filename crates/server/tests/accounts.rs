@@ -721,6 +721,26 @@ async fn the_name_and_password_change_by_patch() {
 }
 
 #[tokio::test]
+async fn a_patch_answers_the_account_as_it_now_is() {
+    let server = TestServer::start().await;
+    let (token, id) = server.register("ada@example.com").await;
+    let (s, me) = server
+        .patch(
+            "/api/me",
+            Some(&token),
+            json!({"name": " Ada L ", "password": "a new password", "current_password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        me,
+        json!({"id": id, "email": "ada@example.com", "name": "Ada L", "is_server_admin": true})
+    );
+    assert_eq!(server.get("/api/me", Some(&token)).await.1, me);
+    server.login("ada@example.com", "a new password").await;
+}
+
+#[tokio::test]
 async fn an_account_without_a_password_sets_one_only_soon_after_signing_in() {
     let server = start_at_t0(|_| {}).await;
     let (token, id) = server.register("ada@example.com").await;

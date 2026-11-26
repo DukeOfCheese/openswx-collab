@@ -23,6 +23,7 @@ pub mod history;
 pub mod meta;
 pub mod orgs;
 pub mod projects;
+pub mod reset_page;
 
 use std::time::Duration;
 

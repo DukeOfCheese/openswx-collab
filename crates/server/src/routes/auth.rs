@@ -14,22 +14,15 @@
 //! in `X-Forwarded-For`, as uvicorn does by default for the Python server.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, FromRequestParts, State};
-use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
-};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::access::CurrentUser;
 use crate::config::Settings;
@@ -38,6 +31,7 @@ use crate::ext::{Event, emit};
 use crate::mail::{reset_text, send_logged};
 use crate::routes::meta::{Registration, registration_for};
 use crate::routes::orgs::{accept_invite, approve_invite, find_invite};
+use crate::routes::reset_page::reset_page;
 use crate::security::{
     RateLimit, check_password_len, clean_email, hash_password, new_token, token_hash, verify_dummy,
     verify_password,
@@ -46,20 +40,20 @@ use crate::state::{AppState, Committed};
 use crate::store::{PasswordReset, Session, Tx, User, new_id};
 
 /// The longest email address accepted (the column's size).
-const EMAIL_MAX: usize = 320;
+pub(crate) const EMAIL_MAX: usize = 320;
 /// The longest account name (the column's size).
-const NAME_MAX: usize = 200;
+pub(crate) const NAME_MAX: usize = 200;
 /// The longest session label kept; longer ones are cut, as the Python server does.
 const LABEL_MAX: usize = 200;
-/// The longest invite or reset token accepted (real ones are 43 characters).
-const TOKEN_MAX: usize = 256;
+/// The longest invite, reset token or login code accepted (real ones are 43 characters).
+pub(crate) const TOKEN_MAX: usize = 256;
 /// The longest password accepted where one is only checked, never set (sign-in, the current
 /// password): longer than any password this server sets, short enough to bound the work.
-const CHECKED_PASSWORD_MAX: usize = 1024;
+pub(crate) const CHECKED_PASSWORD_MAX: usize = 1024;
 /// How recent a sign-in must be to stand in for the password of an account that has none.
 const RECENT_SIGN_IN_SECS: f64 = 600.0;
 
-const INVITE_ONLY: &str =
+pub(crate) const INVITE_ONLY: &str =
     "this server is invite-only: ask an organisation owner for an invite link";
 const EMAIL_TAKEN: &str = "there is already an account with this email address";
 const RESET_ANSWER: &str = "if there is an account for this address, a link is on its way";
@@ -90,7 +84,7 @@ pub(crate) fn router() -> Router<AppState> {
 }
 
 /// 422 when `value` is longer than `max` characters.
-fn max_len(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
+pub(crate) fn max_len(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
     if value.chars().count() > max {
         return Err(ApiError::Unprocessable(format!(
             "{field} must be at most {max} characters"
@@ -125,7 +119,7 @@ pub(crate) async fn start_session(
 }
 
 /// The client's address, for the limits (see the module documentation).
-struct ClientAddr(String);
+pub(crate) struct ClientAddr(pub(crate) String);
 
 /// The peer that may speak for the client in `X-Forwarded-For`: uvicorn's default
 /// `forwarded_allow_ips`.
@@ -302,7 +296,8 @@ async fn login(
         }) => verify_password(&body.password, hash).await,
         _ => verify_dummy(&body.password).await,
     };
-    let Some(user) = user.filter(|_| accepted) else {
+    // Checked again here rather than trusting that `verify_dummy` is always false.
+    let Some(user) = user.filter(|u| accepted && u.active()) else {
         limits.login.fail(&key, now);
         return Err(ApiError::WrongCredentials);
     };
@@ -440,6 +435,8 @@ async fn update_me(
         tx.set_user_password(&user.id, Some(hash)).await?;
         tx.delete_other_user_sessions(&user.id, &current.token_hash)
             .await?;
+        // A reset link sent before the change would undo it.
+        tx.delete_user_password_resets(&user.id).await?;
     }
     let changed = password_hash.is_some();
     let (revoker, ext) = (state.clone(), state.ext.clone());
@@ -461,7 +458,12 @@ async fn update_me(
             },
         )
         .await?;
-    Ok(Json(me_out(&load(&state, &current).await?)))
+    let user = User {
+        name: name.map_or(user.name, str::to_owned),
+        password_hash: password_hash.or(user.password_hash),
+        ..user
+    };
+    Ok(Json(me_out(&user)))
 }
 
 // ------------------------------------------------------------------ forgotten passwords
@@ -531,6 +533,7 @@ async fn request_reset(
                 &text,
             )
             .await;
+            tracing::info!(user = %user.id, "password reset link sent");
             let requested = Event::PasswordResetRequested { user: user.id };
             emit(&after.ext, requested).await;
         })
@@ -596,6 +599,7 @@ async fn confirm_reset(
                 revoker.hub.drop_account_with(&revoked, code, reason).await;
             },
             async move {
+                tracing::info!(user = %user.id, "password set through a reset link");
                 let completed = Event::PasswordResetCompleted { user: user.id };
                 emit(&ext, completed).await;
             },
@@ -606,82 +610,10 @@ async fn confirm_reset(
     ))
 }
 
-// ------------------------------------------------------------------ the page a reset link opens
-
-const RESET_STYLE: &str = "body{font:16px system-ui;max-width:28em;margin:4em auto;padding:0 1em}\
-input{width:100%;font:inherit;padding:.4em}button{font:inherit;padding:.4em 1em}";
-
-/// Reads the token from the page's own address (it is never written into the page), checks the two
-/// fields match, and posts them.
-const RESET_SCRIPT: &str = r#"
-const token = decodeURIComponent(location.pathname.split("/").pop() || "");
-document.getElementById("f").onsubmit = async (e) => {
-  e.preventDefault();
-  const m = document.getElementById("m"), p = document.getElementById("p").value;
-  if (p !== document.getElementById("q").value) { m.textContent = "The two passwords differ."; return; }
-  const r = await fetch("/api/auth/password-reset/confirm", {method: "POST",
-    headers: {"content-type": "application/json"}, body: JSON.stringify({token, password: p})});
-  const d = await r.json().catch(() => ({}));
-  m.textContent = r.ok ? d.message : (typeof d.detail === "string" ? d.detail : "That did not work.");
-  if (r.ok) document.getElementById("f").remove();
-};
-"#;
-
-/// The page, the same for every link.
-static RESET_PAGE: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
-<meta name=referrer content=no-referrer><title>Choose a new password</title>
-<style>{RESET_STYLE}</style>
-<body>
-<h1>Choose a new password</h1>
-<form id=f><p><label>New password<br><input id=p type=password minlength=8 maxlength=200 required autocomplete=new-password></label></p>
-<p><label>Again<br><input id=q type=password minlength=8 maxlength=200 required autocomplete=new-password></label></p>
-<p><button>Set password</button></p></form><p id=m role=status></p>
-<script>{RESET_SCRIPT}</script></body>"#
-    )
-});
-
-fn csp_hash(source: &str) -> String {
-    format!(
-        "'sha256-{}'",
-        STANDARD.encode(Sha256::digest(source.as_bytes()))
-    )
-}
-
-/// Nothing but the page's own script and style, requests to this server only, no framing, and no
-/// form submission (if the script does not run, the password never goes into a URL).
-static RESET_CSP: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "default-src 'none'; script-src {}; style-src {}; connect-src 'self'; base-uri 'none'; \
-         form-action 'none'; frame-ancestors 'none'",
-        csp_hash(RESET_SCRIPT),
-        csp_hash(RESET_STYLE)
-    )
-});
-
-/// The page a reset link opens. The token in the address is not read here: the page reads it.
-async fn reset_page() -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    match HeaderValue::from_str(&RESET_CSP) {
-        Ok(csp) => {
-            headers.insert(CONTENT_SECURITY_POLICY, csp);
-        }
-        Err(err) => return ApiError::Internal(err.into()).into_response(),
-    }
-    (headers, RESET_PAGE.as_str()).into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     fn xff(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -721,15 +653,5 @@ mod tests {
         assert_eq!(client_ip(peer("127.0.0.1"), &HeaderMap::new()), "127.0.0.1");
         let long = "x".repeat(10_000);
         assert_eq!(client_ip(peer("127.0.0.1"), &xff(&long)).len(), 64);
-    }
-
-    #[test]
-    fn the_reset_page_policy_allows_exactly_its_own_script_and_style() {
-        let page = RESET_PAGE.as_str();
-        assert!(page.contains(&format!("<script>{RESET_SCRIPT}</script>")));
-        assert!(page.contains(&format!("<style>{RESET_STYLE}</style>")));
-        assert!(!page.contains("style=\""), "no inline style attributes");
-        assert!(RESET_CSP.contains(&csp_hash(RESET_SCRIPT)));
-        assert!(RESET_CSP.starts_with("default-src 'none';"));
     }
 }
