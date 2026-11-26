@@ -269,8 +269,31 @@ async fn a_client_that_never_finishes_its_request_head_is_cut_off() {
             "the connection is still counted as open"
         );
     }
-    // A client that does finish is served as ever.
+    // A client that does finish is served as ever; and when it then keeps its connection open
+    // and asks nothing more, the connection is closed after the same time.
     assert_eq!(server.get("/api/health", None).await.0, 200);
+    let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
+    socket
+        .write_all(
+            b"GET /api/health HTTP/1.1
+Host: x
+
+",
+        )
+        .await
+        .unwrap();
+    let answer = read_until(&mut socket, b"}").await;
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    let started = Instant::now();
+    let more = tokio::time::timeout(WAIT, read_to_end(&mut socket))
+        .await
+        .expect("the idle connection is closed");
+    assert_eq!(more, 0);
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 // ------------------------------------------------------------------ uploads at once

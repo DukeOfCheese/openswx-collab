@@ -577,7 +577,8 @@ fn send_signal(pid: u32, signal: Signal, _dir: &Path) {
         Signal::Terminate => "-TERM",
     };
     let status = Command::new("kill")
-        .args([name, &pid.to_string()])
+        .arg(name)
+        .arg(pid.to_string())
         .status()
         .unwrap();
     assert!(status.success(), "kill {name} {pid}");
