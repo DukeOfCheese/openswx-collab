@@ -67,15 +67,29 @@ pub enum Extra {
     /// Marks the earlier change `seq` of the same document as reverted by this record; refused if it
     /// is already reverted (or missing).
     SetRevertedBy { seq: Seq },
-    /// The assembly's component references after this change, replacing all it had.
-    AssemblyRefs { rows: Vec<AssemblyRef> },
+    /// The assembly's component references after this change, replacing all it had. `chosen` are
+    /// the parts the change newly points components at: each must still exist and not be deleted
+    /// when the record is written (its row is locked), or the record is refused
+    /// ([`crate::journal::RefusedWhy::PartGone`]).
+    AssemblyRefs {
+        rows: Vec<AssemblyRef>,
+        chosen: Vec<ChosenPart>,
+    },
 }
 
-/// A component of an assembly and the part it refers to.
+/// A component of an assembly, the part it refers to and the state of that part it is pinned to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssemblyRef {
     pub component_id: String,
     pub part_id: Id,
+    pub seq: Seq,
+}
+
+/// A part a change newly points a component at (the first such component names it in a refusal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenPart {
+    pub part_id: Id,
+    pub component_id: String,
 }
 
 /// Why a stored form could not be read.

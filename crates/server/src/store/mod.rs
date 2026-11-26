@@ -483,9 +483,40 @@ pub struct NewChange<'a> {
 pub struct AssemblyRefRow {
     pub assembly_id: Id,
     pub component_id: String,
+    /// The part document (no foreign key: the row outlives a part deleted since).
     pub part_id: Id,
-    /// The seq of the change that recorded it.
+    /// The state of the part the component is pinned to.
     pub seq: i64,
+}
+
+/// A document as an assembly's references need it, with its project's organisation
+/// ([`Store::parts_by_ids`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct PartRow {
+    pub id: Id,
+    pub project_id: Id,
+    pub org_id: Id,
+    pub name: String,
+    /// `part` or `assembly`.
+    pub kind: String,
+    pub head_seq: i64,
+    pub deleted_at: Option<f64>,
+}
+
+/// An assembly that uses a part ([`Store::assemblies_using`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct AssemblyUse {
+    pub id: Id,
+    pub name: String,
+    pub project_id: Id,
+    pub org_id: Id,
+}
+
+/// A component pinned to a state of a part ([`Store::pinned_before`]).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct PinnedComponent {
+    pub assembly_id: Id,
+    pub component_id: String,
 }
 
 /// Which node holds a document's room, under which epoch (`room_leases`).
@@ -691,6 +722,17 @@ pub trait Store: Send + Sync + 'static {
 
     /// An assembly's component references, by component id.
     async fn assembly_refs(&self, assembly_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>>;
+
+    /// The documents with these ids (deleted ones included) with their organisations, in no
+    /// particular order; ids that name no document are left out. Read in batches, however many
+    /// ids (the caller bounds them).
+    async fn parts_by_ids(&self, ids: &[Id]) -> anyhow::Result<Vec<PartRow>>;
+
+    /// The assemblies, not deleted, whose components use a part, by name then id.
+    async fn assemblies_using(&self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>>;
+
+    /// The components pinned to a state of a part before `seq`, by assembly then component.
+    async fn pinned_before(&self, part_id: &str, seq: i64) -> anyhow::Result<Vec<PinnedComponent>>;
 }
 
 /// A write transaction (or a savepoint within one). Dropping it without [`Tx::commit`] rolls it
@@ -956,6 +998,22 @@ pub trait Tx: Send {
         assembly_id: &str,
         rows: &[AssemblyRefRow],
     ) -> anyhow::Result<()>;
+
+    /// Locks a document's row until the transaction ends (PostgreSQL; SQLite's write transaction
+    /// already excludes every other writer) and answers whether it exists and is not deleted, as
+    /// `SELECT ... FOR UPDATE` would: a deletion either committed before (`false`) or waits for
+    /// this transaction.
+    async fn lock_live_document(&mut self, id: &str) -> anyhow::Result<bool>;
+
+    /// [`Store::assemblies_using`], seeing this transaction's writes.
+    async fn assemblies_using(&mut self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>>;
+
+    /// The assemblies, not deleted, in other projects than `project_id` whose components use a
+    /// document of that project, by name then id.
+    async fn assemblies_using_project(
+        &mut self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<AssemblyUse>>;
 
     /// [`Store::snapshot_row`], seeing this transaction's writes.
     async fn snapshot_row(

@@ -418,6 +418,39 @@ pub const INSERT_ASSEMBLY_REF: &str = "INSERT INTO assembly_refs (assembly_id, c
 pub const ASSEMBLY_REFS: &str = "SELECT assembly_id, component_id, part_id, seq FROM assembly_refs \
      WHERE assembly_id = $1 ORDER BY component_id";
 
+/// [`super::Store::parts_by_ids`], completed by [`in_list`] with one placeholder per id.
+pub const PARTS_BY_IDS: &str = "SELECT d.id, d.project_id, p.org_id, d.name, d.kind, d.head_seq, \
+     d.deleted_at FROM documents d JOIN projects p ON p.id = d.project_id WHERE d.id IN ";
+
+/// `prefix` followed by `($1, $2, ..., $n)`: an `IN` list of `n` placeholders (`n >= 1`), in
+/// portable SQL.
+pub fn in_list(prefix: &str, n: usize) -> String {
+    let marks: Vec<String> = (1..=n.max(1)).map(|i| format!("${i}")).collect();
+    format!("{prefix}({})", marks.join(", "))
+}
+
+/// [`super::Store::assemblies_using`], [`super::Tx::assemblies_using`].
+pub const ASSEMBLIES_USING: &str = "SELECT d.id, d.name, d.project_id, p.org_id FROM documents d \
+     JOIN projects p ON p.id = d.project_id \
+     WHERE d.deleted_at IS NULL AND d.id IN \
+     (SELECT r.assembly_id FROM assembly_refs r WHERE r.part_id = $1) ORDER BY d.name, d.id";
+
+/// [`super::Tx::assemblies_using_project`].
+pub const ASSEMBLIES_USING_PROJECT: &str = "SELECT d.id, d.name, d.project_id, p.org_id \
+     FROM documents d JOIN projects p ON p.id = d.project_id \
+     WHERE d.deleted_at IS NULL AND d.project_id <> $1 AND d.id IN \
+     (SELECT r.assembly_id FROM assembly_refs r JOIN documents part ON part.id = r.part_id \
+     WHERE part.project_id = $1) ORDER BY d.name, d.id";
+
+/// [`super::Store::pinned_before`].
+pub const PINNED_BEFORE: &str = "SELECT assembly_id, component_id FROM assembly_refs \
+     WHERE part_id = $1 AND seq < $2 ORDER BY assembly_id, component_id";
+
+/// [`super::Tx::lock_live_document`]: an update that changes nothing, so that the row stays locked
+/// until the transaction ends (PostgreSQL), and matches only a document that is not deleted.
+pub const LOCK_LIVE_DOCUMENT: &str =
+    "UPDATE documents SET deleted_at = deleted_at WHERE id = $1 AND deleted_at IS NULL";
+
 /// [`super::Store::snapshot_at_or_before`]: the highest seq not above `$2`, then the highest epoch.
 pub const SNAPSHOT_AT_OR_BEFORE: &str = "SELECT document_id, epoch, seq, key, size, created_at \
      FROM snapshots WHERE document_id = $1 AND seq <= $2 ORDER BY seq DESC, epoch DESC LIMIT 1";

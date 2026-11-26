@@ -14,8 +14,8 @@ use oswx_core::{
     Accepted, Change, ClientId, Head, Known, Op, Path, Pos, Rules, Value, Write, decide,
 };
 use oswx_server::journal::{
-    AssemblyRef, Extra, JournalError, JournalWriter, LoadError, Record, RefusedWhy, SERVER_CLIENT,
-    WriteSnapshotError, load_head, state_at, write_snapshot,
+    AssemblyRef, ChosenPart, Extra, JournalError, JournalWriter, LoadError, Record, RefusedWhy,
+    SERVER_CLIENT, WriteSnapshotError, load_head, state_at, write_snapshot,
 };
 use oswx_server::lease::acquire;
 use oswx_server::record::{encode_ops, encode_paths, encode_reads};
@@ -352,15 +352,17 @@ async fn extra_writes_run_in_their_own_savepoint() {
         refused(RefusedWhy::AlreadyReverted)
     );
 
-    // Assembly references are replaced whole, with the record's seq.
+    // Assembly references are replaced whole, each with the state of the part it is pinned to.
     let refs = |ids: &[(&str, &str)]| Extra::AssemblyRefs {
         rows: ids
             .iter()
             .map(|(c, p)| AssemblyRef {
                 component_id: (*c).into(),
                 part_id: (*p).into(),
+                seq: 7,
             })
             .collect(),
+        chosen: Vec::new(),
     };
     let mut r3 = simple(&a, 3, ea);
     r3.extra = vec![refs(&[("c1", &b), ("c2", &b)])];
@@ -370,7 +372,7 @@ async fn extra_writes_run_in_their_own_savepoint() {
     assert_eq!(writer.append(r4).await, Ok(()));
     let rows = store(&server).assembly_refs(&a).await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0].component_id.as_str(), rows[0].seq), ("c2", 4));
+    assert_eq!((rows[0].component_id.as_str(), rows[0].seq), ("c2", 7));
 }
 
 #[tokio::test]
@@ -521,6 +523,17 @@ async fn a_record_breaking_a_column_limit_is_refused_before_it_is_queued() {
         rows: vec![AssemblyRef {
             component_id: "c".repeat(201),
             part_id: a.clone(),
+            seq: 0,
+        }],
+        chosen: Vec::new(),
+    }];
+    cases.push(r);
+    let mut r = simple(&a, 1, ea);
+    r.extra = vec![Extra::AssemblyRefs {
+        rows: Vec::new(),
+        chosen: vec![ChosenPart {
+            component_id: "c".into(),
+            part_id: "p".repeat(33),
         }],
     }];
     cases.push(r);

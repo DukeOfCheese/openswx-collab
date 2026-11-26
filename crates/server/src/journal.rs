@@ -46,7 +46,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-pub use crate::record::{AssemblyRef, Extra, Record};
+pub use crate::record::{AssemblyRef, ChosenPart, Extra, Record};
 pub use crate::snapshot::{
     LoadError, SERVER_CLIENT, WriteSnapshotError, load_head, state_at, write_snapshot,
 };
@@ -109,6 +109,10 @@ pub enum RefusedWhy {
     /// The document does not exist.
     #[error("no such document")]
     NoDocument,
+    /// `Extra::AssemblyRefs` chose a part that no longer exists or was deleted since the room
+    /// checked it; `component` is the first component pointed at it.
+    #[error("a chosen part is gone")]
+    PartGone { component: String },
 }
 
 type Reply = oneshot::Sender<Result<(), JournalError>>;
@@ -268,9 +272,15 @@ fn check(r: &Record) -> Result<(), String> {
         Some("created_at is not a time")
     } else if r.extra.iter().any(|e| match e {
         Extra::SetRevertedBy { seq } => !fits(*seq),
-        Extra::AssemblyRefs { rows } => rows
-            .iter()
-            .any(|a| chars(&a.component_id) > MAX_COMPONENT_ID || chars(&a.part_id) > MAX_ID),
+        Extra::AssemblyRefs { rows, chosen } => {
+            rows.iter().any(|a| {
+                chars(&a.component_id) > MAX_COMPONENT_ID
+                    || chars(&a.part_id) > MAX_ID
+                    || !fits(a.seq)
+            }) || chosen
+                .iter()
+                .any(|c| chars(&c.component_id) > MAX_COMPONENT_ID || chars(&c.part_id) > MAX_ID)
+        }
     }) {
         Some("an extra write breaks a limit")
     } else {
@@ -508,16 +518,24 @@ async fn with_extra(
                     return refused(RefusedWhy::AlreadyReverted);
                 }
             }
-            Extra::AssemblyRefs { rows } => {
-                // TASK 13: refuse here (a new `RefusedWhy` variant) when a referenced part no
-                // longer exists; this task only replaces the rows.
+            Extra::AssemblyRefs { rows, chosen } => {
+                // Every part the change newly chose must still be there: its row is locked (on
+                // PostgreSQL; SQLite has one writer), so a deletion either committed before this
+                // (refused here) or waits and then sees this reference.
+                for c in chosen {
+                    if !sp.lock_live_document(&c.part_id).await? {
+                        return refused(RefusedWhy::PartGone {
+                            component: c.component_id.clone(),
+                        });
+                    }
+                }
                 let rows: Vec<AssemblyRefRow> = rows
                     .iter()
                     .map(|a| AssemblyRefRow {
                         assembly_id: r.document.clone(),
                         component_id: a.component_id.clone(),
                         part_id: a.part_id.clone(),
-                        seq: row.seq,
+                        seq: int(a.seq),
                     })
                     .collect();
                 sp.replace_assembly_refs(&r.document, &rows).await?;

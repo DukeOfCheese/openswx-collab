@@ -49,10 +49,10 @@ use sqlx::sqlite::{
 use sqlx::{Acquire, Sqlite, Transaction};
 
 use super::{
-    AssemblyRefRow, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder, HistoryRow, Id,
-    Invite, Member, NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
-    ProjectWithRole, RoomLease, SchemaError, SchemaStatus, Session, SnapshotRow, Store, Tx,
-    UndoTarget, User, Version, VersionWithAuthor, sql,
+    AssemblyRefRow, AssemblyUse, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder,
+    HistoryRow, Id, Invite, Member, NewChange, Org, OrgMember, OrgSummary, PartRow, PasswordReset,
+    PinnedComponent, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaError, SchemaStatus,
+    Session, SnapshotRow, Store, Tx, UndoTarget, User, Version, VersionWithAuthor, sql,
 };
 use crate::config::{Database, parse_database_url};
 
@@ -517,6 +517,18 @@ impl Store for SqliteStore {
     async fn assembly_refs(&self, assembly_id: &str) -> Result<Vec<AssemblyRefRow>> {
         q::assembly_refs(&mut *self.reader().await?, assembly_id).await
     }
+
+    async fn parts_by_ids(&self, ids: &[Id]) -> Result<Vec<PartRow>> {
+        q::parts_by_ids(&mut *self.reader().await?, ids).await
+    }
+
+    async fn assemblies_using(&self, part_id: &str) -> Result<Vec<AssemblyUse>> {
+        q::assemblies_using(&mut *self.reader().await?, part_id).await
+    }
+
+    async fn pinned_before(&self, part_id: &str, seq: i64) -> Result<Vec<PinnedComponent>> {
+        q::pinned_before(&mut *self.reader().await?, part_id, seq).await
+    }
 }
 
 /// A top-level transaction's hold on the guard: the holder follows the task using the transaction,
@@ -859,6 +871,18 @@ impl Tx for SqliteTx<'_> {
         rows: &[AssemblyRefRow],
     ) -> Result<()> {
         q::replace_assembly_refs(self.conn(), assembly_id, rows).await
+    }
+
+    async fn lock_live_document(&mut self, id: &str) -> Result<bool> {
+        q::lock_live_document(self.conn(), id).await
+    }
+
+    async fn assemblies_using(&mut self, part_id: &str) -> Result<Vec<AssemblyUse>> {
+        q::assemblies_using(self.conn(), part_id).await
+    }
+
+    async fn assemblies_using_project(&mut self, project_id: &str) -> Result<Vec<AssemblyUse>> {
+        q::assemblies_using_project(self.conn(), project_id).await
     }
 
     async fn snapshot_row(
@@ -1897,6 +1921,62 @@ mod q {
             .bind(assembly_id)
             .fetch_all(c)
             .await?)
+    }
+
+    /// Ids per statement of [`parts_by_ids`] (far below SQLite's and PostgreSQL's limits).
+    const IDS_PER_QUERY: usize = 256;
+
+    pub async fn parts_by_ids(c: &mut SqliteConnection, ids: &[Id]) -> Result<Vec<PartRow>> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(IDS_PER_QUERY) {
+            let text = sql::in_list(sql::PARTS_BY_IDS, chunk.len());
+            let mut query = sqlx::query_as::<_, PartRow>(&text);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(&mut *c).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn assemblies_using(
+        c: &mut SqliteConnection,
+        part_id: &str,
+    ) -> Result<Vec<AssemblyUse>> {
+        Ok(sqlx::query_as(sql::ASSEMBLIES_USING)
+            .bind(part_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn assemblies_using_project(
+        c: &mut SqliteConnection,
+        project_id: &str,
+    ) -> Result<Vec<AssemblyUse>> {
+        Ok(sqlx::query_as(sql::ASSEMBLIES_USING_PROJECT)
+            .bind(project_id)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn pinned_before(
+        c: &mut SqliteConnection,
+        part_id: &str,
+        seq: i64,
+    ) -> Result<Vec<PinnedComponent>> {
+        Ok(sqlx::query_as(sql::PINNED_BEFORE)
+            .bind(part_id)
+            .bind(seq)
+            .fetch_all(c)
+            .await?)
+    }
+
+    pub async fn lock_live_document(c: &mut SqliteConnection, id: &str) -> Result<bool> {
+        let done = sqlx::query(sql::LOCK_LIVE_DOCUMENT)
+            .bind(id)
+            .execute(c)
+            .await?;
+        Ok(done.rows_affected() == 1)
     }
 
     pub async fn snapshot_at_or_before(

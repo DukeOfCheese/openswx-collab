@@ -18,10 +18,10 @@ use oswx_server::journal::{self, JournalWriter};
 use oswx_server::mail::MemoryMailer;
 use oswx_server::sessions::Sessions;
 use oswx_server::store::{
-    AssemblyRefRow, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder, HistoryRow, Id,
-    Invite, Member, NewChange, Org, OrgMember, OrgSummary, PasswordReset, Project, ProjectMember,
-    ProjectWithRole, RoomLease, SchemaStatus, Session, SnapshotRow, SqliteStore, Store, Tx,
-    UndoTarget, User, Version, VersionWithAuthor,
+    AssemblyRefRow, AssemblyUse, ChangeEventRow, ChangeRow, ChangeSize, Document, Folder,
+    HistoryRow, Id, Invite, Member, NewChange, Org, OrgMember, OrgSummary, PartRow, PasswordReset,
+    PinnedComponent, Project, ProjectMember, ProjectWithRole, RoomLease, SchemaStatus, Session,
+    SnapshotRow, SqliteStore, Store, Tx, UndoTarget, User, Version, VersionWithAuthor,
 };
 use oswx_server::{AppState, Settings};
 use reqwest::StatusCode;
@@ -549,6 +549,11 @@ pub struct FlakyStore {
     commit_delay: Arc<Mutex<Duration>>,
     /// Shut: every top-level `commit` parks here (before it commits) until opened.
     pub commit_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every [`Store::parts_by_ids`] parks here, after it has read its answer, until opened.
+    pub parts_gate: Arc<oswx_server::room::Gate>,
+    /// How many times `replace_assembly_refs` ran (in a transaction or savepoint).
+    ref_writes: Arc<AtomicUsize>,
+    fail_part_reads: AtomicBool,
 }
 
 impl FlakyStore {
@@ -574,7 +579,20 @@ impl FlakyStore {
             preload_delay: Mutex::new(Duration::ZERO),
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
             commit_gate: Arc::default(),
+            parts_gate: Arc::default(),
+            ref_writes: Arc::new(AtomicUsize::new(0)),
+            fail_part_reads: AtomicBool::new(false),
         }
+    }
+
+    /// How many times an assembly's references were rewritten.
+    pub fn ref_writes(&self) -> usize {
+        self.ref_writes.load(Ordering::SeqCst)
+    }
+
+    /// Makes [`Store::parts_by_ids`] fail (`true`) or delegate again (`false`).
+    pub fn fail_part_reads(&self, fail: bool) {
+        self.fail_part_reads.store(fail, Ordering::SeqCst);
     }
 
     /// Makes the next journal insert of a change the server made (no change id) insert nothing:
@@ -743,6 +761,7 @@ impl Store for FlakyStore {
             duplicate_inserts: self.duplicate_inserts.clone(),
             commit_delay: self.commit_delay.clone(),
             commit_gate: self.commit_gate.clone(),
+            ref_writes: self.ref_writes.clone(),
         }))
     }
 
@@ -1007,6 +1026,23 @@ impl Store for FlakyStore {
     async fn assembly_refs(&self, assembly_id: &str) -> anyhow::Result<Vec<AssemblyRefRow>> {
         self.inner().assembly_refs(assembly_id).await
     }
+
+    async fn parts_by_ids(&self, ids: &[Id]) -> anyhow::Result<Vec<PartRow>> {
+        if self.fail_part_reads.load(Ordering::SeqCst) {
+            anyhow::bail!("the flaky store was told to fail part reads");
+        }
+        let found = self.inner().parts_by_ids(ids).await;
+        self.parts_gate.pass().await;
+        found
+    }
+
+    async fn assemblies_using(&self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>> {
+        self.inner().assemblies_using(part_id).await
+    }
+
+    async fn pinned_before(&self, part_id: &str, seq: i64) -> anyhow::Result<Vec<PinnedComponent>> {
+        self.inner().pinned_before(part_id, seq).await
+    }
 }
 
 /// [`FlakyStore`]'s transaction (or a savepoint in one). Every [`Tx`] method delegates; add yours
@@ -1024,6 +1060,7 @@ pub struct FlakyTx<'a> {
     duplicate_inserts: Arc<AtomicUsize>,
     commit_delay: Arc<Mutex<Duration>>,
     commit_gate: Arc<oswx_server::room::Gate>,
+    ref_writes: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -1079,6 +1116,7 @@ impl Tx for FlakyTx<'_> {
             duplicate_inserts,
             commit_delay,
             commit_gate: self.commit_gate.clone(),
+            ref_writes: self.ref_writes.clone(),
         }))
     }
 
@@ -1437,7 +1475,23 @@ impl Tx for FlakyTx<'_> {
         assembly_id: &str,
         rows: &[AssemblyRefRow],
     ) -> anyhow::Result<()> {
+        self.ref_writes.fetch_add(1, Ordering::SeqCst);
         self.inner.replace_assembly_refs(assembly_id, rows).await
+    }
+
+    async fn lock_live_document(&mut self, id: &str) -> anyhow::Result<bool> {
+        self.inner.lock_live_document(id).await
+    }
+
+    async fn assemblies_using(&mut self, part_id: &str) -> anyhow::Result<Vec<AssemblyUse>> {
+        self.inner.assemblies_using(part_id).await
+    }
+
+    async fn assemblies_using_project(
+        &mut self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<AssemblyUse>> {
+        self.inner.assemblies_using_project(project_id).await
     }
 
     async fn snapshot_row(
