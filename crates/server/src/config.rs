@@ -1,6 +1,7 @@
 //! Server settings, read from `OSWX_COLLAB_*` environment variables. The names and defaults are the
 //! Python server's (`config.py`); see the parity inventory, section 9.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -28,14 +29,14 @@ pub struct ConfigError {
     /// The environment variable, e.g. `OSWX_COLLAB_SESSION_DAYS`.
     pub var: String,
     /// What it must be, e.g. `a whole number`.
-    pub expected: &'static str,
+    pub expected: Cow<'static, str>,
 }
 
 impl ConfigError {
-    fn new(name: &str, expected: &'static str) -> Self {
+    fn new(name: &str, expected: impl Into<Cow<'static, str>>) -> Self {
         Self {
             var: format!("{PREFIX}{name}"),
-            expected,
+            expected: expected.into(),
         }
     }
 }
@@ -419,8 +420,11 @@ impl Settings {
         if s.max_connections > oswx_core::wire::MAX_PEER_LIST {
             return Err(ConfigError::new(
                 "MAX_CONNECTIONS",
-                "at most 65536 (a client refuses a document's peer list of more peers than that, \
-                 and every connection can be in one document)",
+                format!(
+                    "at most {} (a client refuses a document's peer list of more peers than \
+                     that, and every connection can be in one document)",
+                    oswx_core::wire::MAX_PEER_LIST
+                ),
             ));
         }
         e.whole(
@@ -547,7 +551,7 @@ impl Settings {
         }
         let other = |var: &str, expected: &'static str| ConfigError {
             var: var.to_owned(),
-            expected,
+            expected: expected.into(),
         };
         match (
             self.s3_access_key_id.is_empty(),
