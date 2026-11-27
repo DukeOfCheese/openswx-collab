@@ -40,10 +40,11 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   in `presence.batch`. For a client that does not read fast enough, peer, presence and draft frames are
   dropped instead of closing it, and it is then sent `peer.list` (every peer as now, the recipient
   included, no drafts, presence up to 1 MiB; the rest follows). A reader that stops reading altogether is
-  closed (4408): at most 30 s + 4 MiB / 16 KiB/s after its socket last finished a write, plus the time
-  of anything it was handed since. A draft may arrive up to a tick after the change that ends it.
-- New close codes: 4410 (the document was reloaded or moved: reconnect and resend) and 4429 (too many
-  document connections for the account). A connection may have at most 2,000 unanswered changes (4408).
+  closed (4408): at most 30 s + 4 MiB / 16 KiB/s (under 5 minutes) after it stopped taking frames, plus
+  the time of anything it was handed since. A draft may arrive up to a tick after the change that ends it.
+- New close codes: 4410 (the document was reloaded or moved, or its room stopped unexpectedly: reconnect
+  and resend) and 4429 (too many document connections for the account). A connection may have at most
+  2,000 unanswered changes (4408).
   A client frame may hold at most 1,000,000 values; only a `change` may be longer than 512 KiB. Messages
   waiting behind one of the connection's own that the server is still working on: at most 1,024, or
   4 × `max_change_bytes` (4408).
@@ -83,7 +84,8 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   (at most 64 waiting, 10 s each; then 503 "the server is busy; try again"). On PostgreSQL a request that
   loses to another, or waits 5 s for its lock, answers 409 "try again"; one that finds no connection, 503.
 - Deleting a project or an organisation is two steps: it is gone for everyone at once, and its rows and
-  files are removed in the background, a chunk at a time, resuming after a restart.
+  files are removed in the background, a chunk at a time, resuming after a restart; what cannot be
+  removed yet, or listed, is tried again later, waiting twice as long after each failure.
 - Email is sent after the commit; `emailed: false` in an invite's answer may also mean "still on its way".
 - Sessions and roles are dropped on the event that ends them (sign-out, password change, role change,
   deletion) as well as by a 30 s check; a session that expires while connected closes and releases its
@@ -100,6 +102,8 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   server-owned.
 
 #### Security
+- A `$blob` reference in a change that is not a SHA-256 is refused `missing_blob` before any storage
+  lookup, and the document's room does not remember it.
 - Every REST body and WebSocket field has a type and a size limit; requests have time limits from head to
   answer, bodies a minimum rate, uploads a memory budget and a duration limit; connections are limited in
   all and per address (a full server replaces idle and never-finished connections, and keeps a reserve

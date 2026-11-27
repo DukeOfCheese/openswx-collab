@@ -68,9 +68,10 @@ server plan (1b), the import/docs plan (1c) and the client project. Nothing here
   4408. So is one that stays behind on the soft messages while it reads nothing at all for 30 s
   beyond the time a 16 KiB/s link would take to read everything it was sent, presence and drafts
   included (a slow link taking a big welcome, change or batch of drafts is not closed for it). That
-  time is never more than 256 s (4 MiB at 16 KiB/s) past the last write the socket finished, so a
-  client that read a busy session quickly and then froze is closed at most 30 s + 4 MiB / 16 KiB/s
-  after it stopped taking frames (plus the time of anything it was handed since).
+  time is never more than 256 s (4 MiB at 16 KiB/s) after it stopped taking frames, plus the time of
+  what it was handed since, so a client that read a busy session quickly and then froze is closed at
+  most 30 s + 4 MiB / 16 KiB/s (under 5 minutes) after it stopped taking frames (plus the time of
+  anything it was handed since).
 - Until a `peer.list` arrives, a client that fell behind may get `lock.changed` / `lock.result`
   frames naming a `client_id` it was never told about (a `peer.joined` it missed) or one that has
   left (a `peer.left` it missed): show the lock anyway, with the name the lock carries, and do not

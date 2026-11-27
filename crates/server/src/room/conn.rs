@@ -38,10 +38,17 @@
 //! long beyond [`super::Hooks::frozen_after`] before it is taken for frozen. Each time a flush
 //! returns, what is left is cut to the time the slowest link takes over
 //! [`MAX_UNREAD_AFTER_FLUSH`] (4 MiB, 256 seconds at 16 KiB a second); frames still being written
-//! keep their full time. So a client that stops reading is taken for frozen at most
-//! `frozen_after + 4 MiB / 16 KiB/s` after its last flush returned (plus the time of what it was
-//! handed since). It holds nothing more meanwhile: its queues keep their limits, and a frame that
-//! must arrive still closes it when they are broken.
+//! keep their full time. So the allowance is never more than 256 s after the client stopped
+//! taking frames (its last flush returned), plus the time of what it was handed since, and a
+//! client that stops reading is taken for frozen at most `frozen_after + 4 MiB / 16 KiB/s` (under
+//! 5 minutes at the defaults) after it stopped taking frames, plus the time of what it was handed
+//! since. It holds nothing more meanwhile: its queues keep their limits, and a frame that must
+//! arrive still closes it when they are broken.
+//!
+//! A connection already closing gracefully ([`Outbox::close`]: its queued frames, then the close
+//! frame) is never taken for frozen: a client that stops reading then is ended by the server's
+//! socket write timeout (`write_timeout`, 60 s by default), which closes any connection whose
+//! client takes nothing for that long.
 //!
 //! The reader decodes frames (on the blocking pool when they are large) and hands messages to the
 //! room; malformed ones are answered in their turn through the room. Every frame read counts as
@@ -391,7 +398,8 @@ impl Outbox {
     /// it handed the socket in `after`, and `after` has also passed since a link of
     /// [`SLOWEST_READER`] would have read every frame it was handed, soft or not: a client that
     /// stopped reading (a frame stuck on its socket), not one on a slow link taking a big frame
-    /// (a welcome, a change) or a full batch of drafts.
+    /// (a welcome, a change) or a full batch of drafts. Never for a connection already closing
+    /// (the server's `write_timeout` ends one whose client stops reading then).
     pub fn is_frozen(&self, now: Instant, after: Duration) -> bool {
         let s = self.lock();
         let long_ago = |at: Option<Instant>| at.is_some_and(|at| now >= at + after);
@@ -1191,14 +1199,48 @@ mod tests {
         }
         assert!(outbox.is_behind());
         let cap = Duration::from_secs_f64(MAX_UNREAD_AFTER_FLUSH as f64 / SLOWEST_READER as f64);
-        // It still has the cap's time to read what the socket's buffers took.
+        // It still has the whole cap's time to read what the socket's buffers took.
+        let ms = Duration::from_millis(1);
         assert!(
-            !outbox.is_frozen(flushed + cap / 2 + after, after),
+            !outbox.is_frozen(flushed + cap + after - ms, after),
             "within the cap"
         );
         // (The two bytes handed since add next to nothing.)
         let by = Instant::now() + cap + after + Duration::from_millis(5);
         assert!(outbox.is_frozen(by, after), "frozen by now + cap + after");
+    }
+
+    /// A frame handed after the flush keeps its full reading time on top of the cap: the cap
+    /// bounds only what was flushed already.
+    #[test]
+    fn a_frame_handed_after_the_flush_keeps_its_full_time() {
+        let after = Duration::from_secs(30);
+        let outbox = Outbox::new(usize::MAX);
+        outbox.release(frame(64 * 1024 * 1024));
+        assert_eq!(start_writing(&outbox), Some(64 * 1024 * 1024));
+        let flushed = Instant::now();
+        outbox.written();
+        // 8 MiB handed after the flush: 512 s at the slowest link. Then it stops reading.
+        let big = 8 * 1024 * 1024;
+        outbox.push(frame(big));
+        assert_eq!(start_writing(&outbox), Some(big));
+        for _ in 0..=MAX_SOFT {
+            outbox.push_soft(frame(2));
+        }
+        assert!(outbox.is_behind());
+        let cap = Duration::from_secs_f64(MAX_UNREAD_AFTER_FLUSH as f64 / SLOWEST_READER as f64);
+        let big_time = Duration::from_secs(512);
+        assert_eq!(big_time, Outbox::reading_time(big, SLOWEST_READER));
+        let ms = Duration::from_millis(1);
+        assert!(
+            !outbox.is_frozen(flushed + cap + big_time + after - ms, after),
+            "the frame handed since keeps its time"
+        );
+        let by = Instant::now() + cap + big_time + after + Duration::from_millis(5);
+        assert!(
+            outbox.is_frozen(by, after),
+            "frozen by now + cap + 512 s + after"
+        );
     }
 
     #[test]
