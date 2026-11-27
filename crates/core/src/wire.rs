@@ -1231,6 +1231,69 @@ pub fn encode_peer_list(peers: &[&Bytes]) -> Bytes {
     Bytes::from(buf)
 }
 
+/// A peer as `peer.list` carries it (no draft), borrowed from wherever it is kept, for
+/// [`encode_peer_list_within`].
+#[derive(Clone, Copy, Debug)]
+pub struct PeerRef<'a> {
+    pub client_id: &'a str,
+    pub user_id: &'a str,
+    pub name: &'a str,
+    pub colour: &'a str,
+    pub read_only: bool,
+    pub presence: Option<&'a Plain>,
+}
+
+/// A `peer.list` frame of `peers`, encoded from what they borrow (nothing is copied but into the
+/// frame), carrying their presence up to `presence_budget` bytes of it in all: from the first peer
+/// whose presence does not fit, every peer goes without. Answers the frame and how many of the
+/// peers came first, with their presence (those after it that have some went without). With
+/// every presence in, the bytes are those [`encode_server`] writes for the same message.
+pub fn encode_peer_list_within(peers: &[PeerRef<'_>], presence_budget: usize) -> (Bytes, usize) {
+    let mut buf = Vec::with_capacity(64 * peers.len() + 32);
+    map_header(&mut buf, 2);
+    put_str(&mut buf, "t");
+    put_str(&mut buf, "peer.list");
+    put_str(&mut buf, "peers");
+    array_header(&mut buf, peers.len());
+    let mut left = presence_budget;
+    let mut with_presence = peers.len();
+    let mut presence = Vec::new();
+    for (i, p) in peers.iter().enumerate() {
+        presence.clear();
+        if i < with_presence
+            && let Some(data) = p.presence
+        {
+            let _ = rmpv::encode::write_value(&mut presence, data);
+            if presence.len() <= left {
+                left -= presence.len();
+            } else {
+                presence.clear();
+                with_presence = i;
+            }
+        }
+        let pairs = 4 + usize::from(p.read_only) + usize::from(!presence.is_empty());
+        map_header(&mut buf, pairs);
+        for (k, v) in [
+            ("client_id", p.client_id),
+            ("user_id", p.user_id),
+            ("name", p.name),
+            ("colour", p.colour),
+        ] {
+            put_str(&mut buf, k);
+            put_str(&mut buf, v);
+        }
+        if p.read_only {
+            put_str(&mut buf, "read_only");
+            let _ = rmpv::encode::write_value(&mut buf, &Plain::from(true));
+        }
+        if !presence.is_empty() {
+            put_str(&mut buf, "presence");
+            buf.extend_from_slice(&presence);
+        }
+    }
+    (Bytes::from(buf), with_presence)
+}
+
 fn lock_to_wire(l: &Lock) -> Plain {
     map_of(vec![
         ("path", path::to_wire(&l.path)),

@@ -1132,6 +1132,119 @@ async fn a_slow_reader_taking_a_big_frame_while_presence_floods_is_not_frozen() 
     assert!(conn_status(&server, &doc, &slow_id).await.is_some());
 }
 
+/// Big drafts from `flooders` until every one of `readers` is behind at the same time.
+async fn flood_until_all_behind(
+    server: &TestServer,
+    doc: &str,
+    readers: &[String],
+    flooders: &mut [Live],
+) {
+    let pad = "x".repeat(120_000);
+    let deadline = Instant::now() + WAIT * 3;
+    for n in 0.. {
+        for f in flooders.iter_mut() {
+            f.draft(Some(json!({"n": n, "pad": pad}))).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for f in flooders.iter_mut() {
+            f.drain().await;
+        }
+        let mut all = true;
+        for id in readers {
+            let c = conn_status(server, doc, id).await.expect("still there");
+            all &= c.behind;
+        }
+        if all {
+            return;
+        }
+        assert!(Instant::now() < deadline, "they never fell behind together");
+    }
+}
+
+/// The presence of a peer list (encoded), in all.
+fn presence_bytes(peers: &[Peer]) -> usize {
+    peers
+        .iter()
+        .filter_map(|p| p.presence.as_ref())
+        .map(|p| pack(p).len())
+        .sum()
+}
+
+/// Readers behind at once, in a room whose presence comes to more than a peer list carries
+/// (1 MiB): every list is within that (the peers past it come without presence), and every peer's
+/// presence follows the list.
+#[tokio::test]
+async fn readers_behind_at_once_get_lists_within_the_presence_budget_and_the_rest_after() {
+    let hooks = oswx_server::room::Hooks {
+        frozen_after: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(
+        |s| s.max_connections_per_user = 200,
+        |s| s.room_hooks = Arc::new(hooks),
+    )
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut readers = Vec::new();
+    for i in 0..4 {
+        let hello = Hello::client(&format!("slow-reader-{i}"));
+        readers.push(Live::connect_with(&server, &doc, &world.admin, hello).await);
+    }
+    let reader_ids: Vec<String> = readers.iter().map(|r| r.client_id.clone()).collect();
+    // 72 that each leave 16 KB of presence and never read: 1.15 MB in all.
+    let presence = |i: usize| json!({"sitter": i, "pad": "p".repeat(16_000)});
+    let mut want = std::collections::HashMap::new();
+    let mut sitters = Vec::new();
+    for i in 0..72 {
+        let mut s = Live::connect(&server, &doc, &world.admin).await;
+        s.presence(presence(i)).await;
+        want.insert(s.client_id.clone(), plain(presence(i)));
+        sitters.push(s);
+    }
+    let mut flooders = [
+        Live::connect(&server, &doc, &world.admin).await,
+        Live::connect(&server, &doc, &world.admin).await,
+    ];
+    flood_until_all_behind(&server, &doc, &reader_ids, &mut flooders).await;
+    for reader in &mut readers {
+        // What it knows of the sitters' presence since the last list it read.
+        let mut known: Option<std::collections::HashMap<String, Plain>> = None;
+        let mut lists = 0;
+        while known.as_ref() != Some(&want) {
+            match reader.recv().await {
+                ServerMsg::PeerList { peers } => {
+                    lists += 1;
+                    let bytes = presence_bytes(&peers);
+                    assert!(bytes <= 1 << 20, "{bytes} bytes of presence in a list");
+                    let without = peers
+                        .iter()
+                        .filter(|p| want.contains_key(&*p.client_id) && p.presence.is_none())
+                        .count();
+                    assert!(without > 0, "every presence in one list");
+                    known = Some(
+                        peers
+                            .into_iter()
+                            .filter(|p| want.contains_key(&*p.client_id))
+                            .filter_map(|p| p.presence.map(|d| (p.client_id.to_string(), d)))
+                            .collect(),
+                    );
+                }
+                ServerMsg::Presence { client_id, data } => {
+                    if let Some(known) = known.as_mut()
+                        && want.contains_key(&*client_id)
+                    {
+                        known.insert(client_id.to_string(), data);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(lists > 0);
+        assert!(reader.closed.is_none());
+    }
+}
+
 // ------------------------------------------------------------------ storage and database trouble
 
 /// A change sent while the journal cannot commit: nobody is told it was accepted, every client is

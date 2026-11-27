@@ -59,6 +59,7 @@ static LOCKS_DENIED: AtomicU64 = AtomicU64::new(0);
 static PRESENCE_RELAYED: AtomicU64 = AtomicU64::new(0);
 static PRESENCE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static PRESENCE_COALESCED: AtomicU64 = AtomicU64::new(0);
+static PRESENCE_OWED_SENT: AtomicU64 = AtomicU64::new(0);
 static DROPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static ROOMS_LOADED: AtomicU64 = AtomicU64::new(0);
 static ROOMS_UNLOADED: AtomicU64 = AtomicU64::new(0);
@@ -401,6 +402,12 @@ pub fn presence_relayed(n: usize) {
     PRESENCE_RELAYED.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// `n` presence or draft entries went to one connection that caught up after falling behind
+/// (what its `peer.list` did not carry), counted for each connection they went to.
+pub fn presence_owed_sent(n: usize) {
+    PRESENCE_OWED_SENT.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 /// A presence or draft message replaced one of the same connection not yet relayed (only the
 /// latest goes out).
 pub fn presence_coalesced() {
@@ -453,6 +460,8 @@ pub struct Counters {
     pub presence_relayed: u64,
     pub presence_dropped: u64,
     pub presence_coalesced: u64,
+    /// Presence and draft entries sent after a `peer.list`, for each connection they went to.
+    pub presence_owed_sent: u64,
     /// Connections the server closed, by [`DropCause`] (account, session, expired, access,
     /// document).
     pub drops: [u64; 5],
@@ -504,6 +513,7 @@ pub fn counters() -> Counters {
         presence_relayed: get(&PRESENCE_RELAYED),
         presence_dropped: get(&PRESENCE_DROPPED),
         presence_coalesced: get(&PRESENCE_COALESCED),
+        presence_owed_sent: get(&PRESENCE_OWED_SENT),
         drops: std::array::from_fn(|i| get(&DROPS[i])),
         rooms_loaded: get(&ROOMS_LOADED),
         rooms_unloaded: get(&ROOMS_UNLOADED),
@@ -798,6 +808,12 @@ pub fn render(state: &AppState) -> String {
         "presence_coalesced_total",
         "Presence and draft messages replaced by a later one before they were relayed.",
         c.presence_coalesced,
+    );
+    t.counter(
+        "presence_owed_sent_total",
+        "Presence and draft entries sent after a peer list to connections that fell behind \
+         (counted for each connection).",
+        c.presence_owed_sent,
     );
 
     t.gauge(

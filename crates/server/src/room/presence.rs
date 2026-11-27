@@ -19,11 +19,15 @@
 //!
 //! Once a reader behind has written everything it had, it is caught up at the next tick (at most
 //! once a [`super::Hooks::catch_up_every`]): it is sent `peer.list`, everyone as they are now with
-//! their presence but **no draft**. One list is made per tick for every reader caught up in it, so
-//! it names the recipient too (a client skips its own `client_id`), and costs one allocation
-//! however many readers share it; with no drafts it stays small however large they are. The
-//! drafts follow: each peer's current draft as a `draft` frame (made once per draft and shared by
-//! every reader owed it), queued a few at a time while the reader has room to spare
+//! **no draft**, and with their presence up to [`PEER_LIST_PRESENCE`] of it in all (in the order
+//! they joined; the peers past it come without). One list is made per tick for every reader caught
+//! up in it, encoded from what the room holds without copying it first, so it names the recipient
+//! too (a client skips its own `client_id`), and costs one allocation however many readers share
+//! it; it carries the peers' ids and names and at most 1 MiB more, however large their drafts
+//! and presence are. What it left out follows: the presence it had no room for, in frames of up to
+//! [`MAX_LIVE_ENTRIES`] (made once per tick for every reader at the same place), then each peer's
+//! current draft as a `draft` frame (made once per draft and shared by every reader owed it),
+//! queued a few at a time while the reader has room to spare
 //! ([`super::conn::Outbox::push_soft_with_room`]), so that they never make it fall behind again. A
 //! reader that stays behind for [`super::Hooks::frozen_after`] while its socket takes nothing (and
 //! that long after the slowest link would have read what must arrive:
@@ -33,12 +37,13 @@
 //! person, in the order they joined, at most [`MAX_ONLINE`], and how many people in all. It is
 //! updated at every join and leave, so the document list reads it without asking the room.
 
-use std::sync::PoisonError;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use oswx_core::wire::{self, ClientMsg, LiveEntry, Peer, ServerMsg};
+use oswx_core::wire::{self, ClientMsg, LiveEntry, PeerRef};
 use tokio::time::Instant;
 
 use super::conn::{Outbox, Soft};
@@ -56,6 +61,27 @@ pub const LIVE_TICK: Duration = Duration::from_millis(50);
 pub const MAX_LIVE_ENTRIES: usize = 64;
 /// A relayed frame takes no more entries once it has this many bytes of them.
 pub const MAX_LIVE_BYTES: usize = 64 * 1024;
+/// The most bytes of presence one `peer.list` carries: the peers past it (in the order they joined)
+/// come without, and their presence follows the list.
+pub const PEER_LIST_PRESENCE: usize = 1024 * 1024;
+
+/// What a connection that caught up is owed of a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Owed {
+    /// Its presence (the list had no room for it).
+    Presence,
+    /// Its draft (the list carries none).
+    Draft,
+}
+
+/// What connections caught up at one tick are owed, in order; shared by all of them.
+pub(super) type OwedList = Arc<[(ConnId, Owed)]>;
+
+/// Whether `owed` names `conn`'s own presence.
+fn names(owed: &[(ConnId, Owed)], conn: ConnId) -> bool {
+    owed.iter()
+        .any(|&(peer, kind)| peer == conn && kind == Owed::Presence)
+}
 
 /// Whether a message is presence or a draft.
 pub(super) fn is_live(msg: &ClientMsg) -> bool {
@@ -199,8 +225,8 @@ impl Room {
         self.live_sent = now;
         self.relay_live();
         self.catch_up_behind(now);
-        self.send_owed_drafts();
-        // Those still behind, or still owed drafts, are looked at again a tick later.
+        self.send_owed();
+        // Those still behind, or still owed presence or drafts, are looked at again a tick later.
         let again = !self.behind.is_empty() || !self.owing.is_empty();
         self.live_due = again.then_some(now + LIVE_TICK);
     }
@@ -301,12 +327,17 @@ impl Room {
         let outboxes = behind
             .iter()
             .filter_map(|id| conns.get(id).map(|c| (*id, &*c.outbox)));
+        let mut without_presence = Vec::new();
         let done = catch_up_all(
             outboxes,
             now,
             hooks.catch_up_every,
             hooks.frozen_after,
-            || self.peer_list(),
+            || {
+                let (list, without) = self.peer_list();
+                without_presence = without;
+                list
+            },
         );
         self.behind = done.still.into_iter().collect();
         for id in done.frozen {
@@ -318,14 +349,19 @@ impl Room {
         if done.caught_up.is_empty() {
             return;
         }
-        // The peers with a draft, in the order they joined: owed to everyone caught up now.
+        // Owed to everyone caught up now: the presence the list had no room for, then every
+        // draft, each in the order the peers joined.
         let mut drafting: Vec<(&ConnId, &super::Conn)> = self
             .conns
             .iter()
             .filter(|(_, c)| c.draft.is_some())
             .collect();
         drafting.sort_by_key(|(_, c)| c.joined);
-        let owed: std::sync::Arc<[ConnId]> = drafting.into_iter().map(|(id, _)| *id).collect();
+        let owed: OwedList = without_presence
+            .into_iter()
+            .map(|id| (id, Owed::Presence))
+            .chain(drafting.into_iter().map(|(id, _)| (*id, Owed::Draft)))
+            .collect();
         if owed.is_empty() {
             return;
         }
@@ -337,29 +373,45 @@ impl Room {
         }
     }
 
-    /// Everyone as they are now, with their presence and no draft, the recipients included.
-    fn peer_list(&self) -> Bytes {
-        let mut all: Vec<&super::Conn> = self.conns.values().collect();
-        all.sort_by_key(|c| c.joined);
-        let peers = all
-            .into_iter()
-            .map(|c| Peer {
-                client_id: c.client.clone(),
-                user_id: c.user.clone(),
-                name: c.name.clone(),
-                colour: c.colour.clone(),
+    /// Everyone as they are now, the recipients included, with no draft and with their presence
+    /// up to [`PEER_LIST_PRESENCE`] of it (in the order they joined), encoded from what the room
+    /// holds; and the peers past that whose presence it does not carry.
+    fn peer_list(&self) -> (Bytes, Vec<ConnId>) {
+        let mut all: Vec<(&ConnId, &super::Conn)> = self.conns.iter().collect();
+        all.sort_by_key(|(_, c)| c.joined);
+        let peers: Vec<PeerRef<'_>> = all
+            .iter()
+            .map(|(_, c)| PeerRef {
+                client_id: &c.client,
+                user_id: &c.user,
+                name: &c.name,
+                colour: &c.colour,
                 read_only: c.read_only.is_some(),
-                presence: c.presence.clone(),
-                draft: None,
+                presence: c.presence.as_ref(),
             })
             .collect();
-        self.encode(&ServerMsg::PeerList { peers })
+        self.encodes.fetch_add(1, Ordering::Relaxed);
+        let (list, with_presence) = wire::encode_peer_list_within(&peers, PEER_LIST_PRESENCE);
+        let without = all[with_presence..]
+            .iter()
+            .filter(|(_, c)| c.presence.is_some())
+            .map(|(id, _)| **id)
+            .collect();
+        (list, without)
     }
 
-    /// Sends the connections that caught up the drafts they are owed, each peer's as it is now,
-    /// as many as each has room for; the rest at a later tick. A connection that fell behind again
-    /// is owed nothing more (its next catch-up owes it the drafts again).
-    fn send_owed_drafts(&mut self) {
+    /// Sends the connections that caught up what they are owed, each peer's as it is now, as much
+    /// as each has room for; the rest at a later tick. Presence goes in frames of up to
+    /// [`MAX_LIVE_ENTRIES`] ([`MAX_LIVE_BYTES`]), made once per tick for every connection at the
+    /// same place in the same list; each draft as a `draft` frame made once while anyone is owed
+    /// it. A connection that fell behind again is owed nothing more (its next catch-up owes it
+    /// again), and nobody is sent its own.
+    fn send_owed(&mut self) {
+        if self.owing.is_empty() {
+            return;
+        }
+        // Presence frames made this tick: (list, first place) to (the place after, frame, entries).
+        let mut made: HashMap<(usize, usize), (usize, Option<Bytes>, usize)> = HashMap::new();
         for id in self.owing.drain().collect::<Vec<_>>() {
             let Some(c) = self.conns.get_mut(&id) else {
                 continue;
@@ -372,31 +424,37 @@ impl Room {
                 continue;
             }
             let mut sent = 0;
-            while let Some(peer) = owed.get(next) {
-                let frame = match self.conns.get_mut(peer) {
-                    Some(p) if *peer != id && p.draft.is_some() => {
-                        let (client, draft) = (&p.client, &p.draft);
-                        let encodes = &self.encodes;
-                        p.draft_frame
-                            .get_or_insert_with(|| {
-                                encodes.fetch_add(1, Ordering::Relaxed);
-                                wire::encode_live(&[], &[&LiveEntry::new(client, draft.as_ref())])
-                            })
-                            .clone()
+            while let Some(&(peer, kind)) = owed.get(next) {
+                let (frame, after, entries) = match kind {
+                    Owed::Presence => {
+                        let key = (Arc::as_ptr(&owed).cast::<u8>() as usize, next);
+                        match made.get(&key) {
+                            Some((after, frame, n)) if !names(&owed[next..*after], id) => {
+                                (frame.clone(), *after, *n)
+                            }
+                            _ => {
+                                let (after, frame, n) = self.presence_frame(&owed, next, id);
+                                if !names(&owed[next..after], id) {
+                                    made.insert(key, (after, frame.clone(), n));
+                                }
+                                (frame, after, n)
+                            }
+                        }
                     }
-                    // Gone, itself, or no draft any more (it never knew the old one).
-                    _ => {
-                        next += 1;
-                        continue;
-                    }
+                    Owed::Draft => (self.draft_frame(peer, id), next + 1, 1),
+                };
+                let Some(frame) = frame else {
+                    // Gone, itself, or nothing any more (it never knew the old one).
+                    next = after;
+                    continue;
                 };
                 if !outbox.push_soft_with_room(frame) {
                     break;
                 }
-                sent += 1;
-                next += 1;
+                sent += entries;
+                next = after;
             }
-            metrics::presence_relayed(sent);
+            metrics::presence_owed_sent(sent);
             if next < owed.len()
                 && let Some(c) = self.conns.get_mut(&id)
             {
@@ -404,6 +462,70 @@ impl Room {
                 self.owing.insert(id);
             }
         }
+        // Nobody is owed a draft any more: the frames made for them go.
+        if self.owing.is_empty() {
+            for c in self.conns.values_mut() {
+                c.draft_frame = None;
+            }
+        }
+    }
+
+    /// A frame of the presence owed from place `from` of `owed`, as it is now: the entries up to
+    /// the next draft owed, at most [`MAX_LIVE_ENTRIES`] ([`MAX_LIVE_BYTES`]), leaving out `to`'s
+    /// own and those of peers gone. Answers the place after them, the frame (none if every one
+    /// was left out) and how many entries it has.
+    fn presence_frame(
+        &self,
+        owed: &[(ConnId, Owed)],
+        from: usize,
+        to: ConnId,
+    ) -> (usize, Option<Bytes>, usize) {
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        let mut at = from;
+        while let Some(&(peer, Owed::Presence)) = owed.get(at) {
+            if entries.len() >= MAX_LIVE_ENTRIES || (!entries.is_empty() && bytes >= MAX_LIVE_BYTES)
+            {
+                break;
+            }
+            at += 1;
+            if peer == to {
+                continue;
+            }
+            if let Some(p) = self.conns.get(&peer)
+                && let Some(data) = &p.presence
+            {
+                let entry = LiveEntry::new(&p.client, Some(data));
+                bytes += entry.encoded_len();
+                entries.push(entry);
+            }
+        }
+        if entries.is_empty() {
+            return (at, None, 0);
+        }
+        self.encodes.fetch_add(1, Ordering::Relaxed);
+        let refs: Vec<&LiveEntry> = entries.iter().collect();
+        (at, Some(wire::encode_live(&refs, &[])), entries.len())
+    }
+
+    /// `peer`'s draft as it is now, as a `draft` frame for `to` (made once while anyone is owed
+    /// it); none for `to` itself, a peer gone or one with no draft.
+    fn draft_frame(&mut self, peer: ConnId, to: ConnId) -> Option<Bytes> {
+        if peer == to {
+            return None;
+        }
+        let p = self.conns.get_mut(&peer)?;
+        let draft = p.draft.as_ref()?;
+        let client = &p.client;
+        let encodes = &self.encodes;
+        Some(
+            p.draft_frame
+                .get_or_insert_with(|| {
+                    encodes.fetch_add(1, Ordering::Relaxed);
+                    wire::encode_live(&[], &[&LiveEntry::new(client, Some(draft))])
+                })
+                .clone(),
+        )
     }
 
     /// Publishes the online list for [`super::RoomHandle::online`].

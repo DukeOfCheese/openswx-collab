@@ -933,11 +933,12 @@ struct Conn {
     presence_news: Option<oswx_core::wire::LiveEntry>,
     draft_news: Option<oswx_core::wire::LiveEntry>,
     /// Its draft as a `draft` frame, made when a connection that caught up is first owed it, and
-    /// shared by every such connection (forgotten when the draft changes).
+    /// shared by every such connection (forgotten when the draft changes, and once nobody is owed
+    /// drafts).
     draft_frame: Option<Bytes>,
-    /// Since it last caught up: the peers whose drafts it is owed (`peer.list` carries none), and
-    /// how many of them it has been sent.
-    owed: Option<(Arc<[ConnId]>, usize)>,
+    /// Since it last caught up: what it is owed of the peers, in order (the presence `peer.list`
+    /// had no room for, then every draft: it carries none), and how much of it it has been sent.
+    owed: Option<(presence::OwedList, usize)>,
     /// Its allowance of presence and draft messages, and of `lock.acquire`s.
     live_rate: presence::Bucket,
     lock_rate: presence::Bucket,
@@ -1067,7 +1068,7 @@ struct Room {
     live_due: Option<Instant>,
     /// Connections behind on soft frames, to be sent the peers once they have written theirs.
     behind: std::collections::HashSet<ConnId>,
-    /// Connections that caught up and are still owed drafts.
+    /// Connections that caught up and are still owed presence or drafts.
     owing: std::collections::HashSet<ConnId>,
 }
 

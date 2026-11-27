@@ -8,7 +8,7 @@ use common::{load, path, to_plain};
 use oswx_core::wire::{
     LiveEntry, MAX_BATCH_ENTRIES, MAX_CLIENT_ID, MAX_DRAFT, MAX_LIVE_CLIENT_ID, MAX_PEER_LIST,
     MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
-    MAX_USER_ID, encode_live, encode_peer, encode_peer_list,
+    MAX_USER_ID, PeerRef, encode_live, encode_peer, encode_peer_list, encode_peer_list_within,
 };
 use oswx_core::{
     Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, DenyReason, Lock, LockDenied,
@@ -1556,6 +1556,59 @@ fn live_frames_from_encoded_entries_are_the_messages_encode_server_writes() {
         encode_peer_list(&encoded.iter().collect::<Vec<_>>()),
         encode_server(&ServerMsg::PeerList { peers: twenty })
     );
+}
+
+/// A peer list encoded from borrowed peers: the bytes `encode_server` writes when every presence
+/// fits; past the budget, the peers from the first that does not fit go without.
+#[test]
+fn a_peer_list_from_borrowed_peers_carries_presence_within_its_budget() {
+    let mut peers: Vec<Peer> = (0..20).map(|n| peer(&format!("c{n}"))).collect();
+    peers[3].read_only = true;
+    peers[5].presence = None;
+    fn refs(peers: &[Peer]) -> Vec<PeerRef<'_>> {
+        peers
+            .iter()
+            .map(|p| PeerRef {
+                client_id: &p.client_id,
+                user_id: &p.user_id,
+                name: &p.name,
+                colour: &p.colour,
+                read_only: p.read_only,
+                presence: p.presence.as_ref(),
+            })
+            .collect()
+    }
+    let list = ServerMsg::PeerList {
+        peers: peers.clone(),
+    };
+    let (bytes, with) = encode_peer_list_within(&refs(&peers), usize::MAX);
+    assert_eq!(with, 20);
+    assert_eq!(bytes, encode_server(&list));
+    // Room for five presences, a little over: the first five peers carry theirs, the sixth has
+    // none, and the seventh's does not fit.
+    let one = raw(peers[0].presence.as_ref().unwrap()).len();
+    let (bytes, with) = encode_peer_list_within(&refs(&peers), 5 * one + 4);
+    assert_eq!(with, 6, "the seventh peer's presence does not fit");
+    let ServerMsg::PeerList { peers: got } = decode_server(&bytes).unwrap() else {
+        panic!("a peer list");
+    };
+    let mut want = peers.clone();
+    for p in &mut want[6..] {
+        p.presence = None;
+    }
+    assert_eq!(got, want);
+    // Nothing fits: every peer goes without, from the first.
+    let (bytes, with) = encode_peer_list_within(&refs(&peers), one - 1);
+    assert_eq!(with, 0);
+    let ServerMsg::PeerList { peers: got } = decode_server(&bytes).unwrap() else {
+        panic!("a peer list");
+    };
+    assert!(got.iter().all(|p| p.presence.is_none()));
+    assert_eq!(got.len(), 20);
+    // None at all.
+    let (bytes, with) = encode_peer_list_within(&[], 0);
+    assert_eq!(with, 0);
+    assert_eq!(bytes, encode_server(&ServerMsg::PeerList { peers: vec![] }));
 }
 
 #[test]
