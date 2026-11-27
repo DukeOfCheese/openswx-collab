@@ -1,0 +1,1922 @@
+{
+  "server": "openswx-collab-server 0.2.0-dev",
+  "server_env": {
+    "OSWX_COLLAB_MAX_CONNECTIONS_PER_USER": "20000",
+    "OSWX_COLLAB_MAX_CONNECTIONS": "20000"
+  },
+  "port": 8791,
+  "duration": "60s",
+  "postgres": {
+    "server_version": "16.15",
+    "max_connections": "100",
+    "shared_buffers": "128MB",
+    "fsync": "on",
+    "synchronous_commit": "on",
+    "wal_sync_method": "open_datasync",
+    "listen_addresses": "127.0.0.1"
+  },
+  "runs": [
+    {
+      "scenario": "onedoc-10",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10.run1.json",
+      "machine_cpu_percent_before": 0.4,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14561280,
+        "peak": 20963328,
+        "end": 20623360
+      },
+      "server_cpu_s": 0.12,
+      "server_cpu_peak_percent": 5,
+      "server_threads_peak": 27,
+      "machine_cpu_percent": {
+        "mean": 1.3,
+        "max": 5.9
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-10",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10.run2.json",
+      "machine_cpu_percent_before": 0.5,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14483456,
+        "peak": 20795392,
+        "end": 20627456
+      },
+      "server_cpu_s": 0.19,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 26,
+      "machine_cpu_percent": {
+        "mean": 1.2,
+        "max": 8.1
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-10",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10.run3.json",
+      "machine_cpu_percent_before": 0.4,
+      "loadgen_wall_s": 60.6,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14528512,
+        "peak": 20860928,
+        "end": 20660224
+      },
+      "server_cpu_s": 0.25,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 26,
+      "machine_cpu_percent": {
+        "mean": 4.9,
+        "max": 84.7
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-40",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "40",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-40.run1.json",
+      "machine_cpu_percent_before": 3.8,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14573568,
+        "peak": 25120768,
+        "end": 23855104
+      },
+      "server_cpu_s": 0.7,
+      "server_cpu_peak_percent": 9,
+      "server_threads_peak": 27,
+      "machine_cpu_percent": {
+        "mean": 1.9,
+        "max": 6.5
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-40",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "40",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-40.run2.json",
+      "machine_cpu_percent_before": 3.6,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14557184,
+        "peak": 26017792,
+        "end": 24576000
+      },
+      "server_cpu_s": 0.31,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 44,
+      "machine_cpu_percent": {
+        "mean": 2.5,
+        "max": 10.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-40",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "40",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-40.run3.json",
+      "machine_cpu_percent_before": 0.8,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14508032,
+        "peak": 25788416,
+        "end": 24121344
+      },
+      "server_cpu_s": 0.62,
+      "server_cpu_peak_percent": 6,
+      "server_threads_peak": 31,
+      "machine_cpu_percent": {
+        "mean": 2.0,
+        "max": 6.1
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-100",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "100",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-100.run1.json",
+      "machine_cpu_percent_before": 1.7,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14479360,
+        "peak": 32907264,
+        "end": 27275264
+      },
+      "server_cpu_s": 1.72,
+      "server_cpu_peak_percent": 16,
+      "server_threads_peak": 37,
+      "machine_cpu_percent": {
+        "mean": 1.7,
+        "max": 8.2
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-100",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "100",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-100.run2.json",
+      "machine_cpu_percent_before": 1.4,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14536704,
+        "peak": 33267712,
+        "end": 27897856
+      },
+      "server_cpu_s": 1.78,
+      "server_cpu_peak_percent": 11,
+      "server_threads_peak": 37,
+      "machine_cpu_percent": {
+        "mean": 2.0,
+        "max": 5.9
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-100",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "100",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-100.run3.json",
+      "machine_cpu_percent_before": 1.3,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14503936,
+        "peak": 35426304,
+        "end": 29319168
+      },
+      "server_cpu_s": 1.27,
+      "server_cpu_peak_percent": 11,
+      "server_threads_peak": 40,
+      "machine_cpu_percent": {
+        "mean": 2.0,
+        "max": 6.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-200",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "200",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-200.run1.json",
+      "machine_cpu_percent_before": 1.3,
+      "loadgen_wall_s": 61.9,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14524416,
+        "peak": 46170112,
+        "end": 33771520
+      },
+      "server_cpu_s": 6.38,
+      "server_cpu_peak_percent": 26,
+      "server_threads_peak": 38,
+      "machine_cpu_percent": {
+        "mean": 3.8,
+        "max": 17.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-200",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "200",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-200.run2.json",
+      "machine_cpu_percent_before": 1.7,
+      "loadgen_wall_s": 61.9,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14483456,
+        "peak": 43544576,
+        "end": 31809536
+      },
+      "server_cpu_s": 8.03,
+      "server_cpu_peak_percent": 33,
+      "server_threads_peak": 34,
+      "machine_cpu_percent": {
+        "mean": 4.5,
+        "max": 15.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-200",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "200",
+        "--rate",
+        "2",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-200.run3.json",
+      "machine_cpu_percent_before": 7.6,
+      "loadgen_wall_s": 61.9,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14487552,
+        "peak": 45969408,
+        "end": 33677312
+      },
+      "server_cpu_s": 7.31,
+      "server_cpu_peak_percent": 29,
+      "server_threads_peak": 32,
+      "machine_cpu_percent": {
+        "mean": 4.1,
+        "max": 12.9
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-40-conflict",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "40",
+        "--rate",
+        "2",
+        "--features",
+        "20"
+      ],
+      "report": "onedoc-40-conflict.run1.json",
+      "machine_cpu_percent_before": 6.8,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14577664,
+        "peak": 23740416,
+        "end": 22757376
+      },
+      "server_cpu_s": 0.75,
+      "server_cpu_peak_percent": 6,
+      "server_threads_peak": 28,
+      "machine_cpu_percent": {
+        "mean": 5.7,
+        "max": 10.8
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-40-conflict",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "40",
+        "--rate",
+        "2",
+        "--features",
+        "20"
+      ],
+      "report": "onedoc-40-conflict.run2.json",
+      "machine_cpu_percent_before": 6.1,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14569472,
+        "peak": 23183360,
+        "end": 22614016
+      },
+      "server_cpu_s": 0.69,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 24,
+      "machine_cpu_percent": {
+        "mean": 5.6,
+        "max": 9.8
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-40-conflict",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "40",
+        "--rate",
+        "2",
+        "--features",
+        "20"
+      ],
+      "report": "onedoc-40-conflict.run3.json",
+      "machine_cpu_percent_before": 7.1,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14569472,
+        "peak": 23277568,
+        "end": 22577152
+      },
+      "server_cpu_s": 0.66,
+      "server_cpu_peak_percent": 5,
+      "server_threads_peak": 23,
+      "machine_cpu_percent": {
+        "mean": 5.2,
+        "max": 12.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-10-rate20",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "20",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10-rate20.run1.json",
+      "machine_cpu_percent_before": 7.2,
+      "server_died": true,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 1,
+      "server_alive_after": false,
+      "server_log": {
+        "lines": 1,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 1,
+        "samples": [
+          "error: GET /api/server: the server answered 401 Unauthorized: {\"ok\": false, \"error\": \"openswx token needed: send 'Authorization: Bearer <token>' (the token: `openswx token`)\"}"
+        ]
+      },
+      "has_report": false
+    },
+    {
+      "scenario": "onedoc-10-rate20",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "20",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10-rate20.run2.json",
+      "machine_cpu_percent_before": 2.0,
+      "server_died": true,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 1,
+      "server_alive_after": false,
+      "server_log": {
+        "lines": 1,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 1,
+        "samples": [
+          "error: GET /api/server: the server answered 401 Unauthorized: {\"ok\": false, \"error\": \"openswx token needed: send 'Authorization: Bearer <token>' (the token: `openswx token`)\"}"
+        ]
+      },
+      "has_report": false
+    },
+    {
+      "scenario": "onedoc-10-rate20",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "20",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10-rate20.run3.json",
+      "machine_cpu_percent_before": 5.7,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14614528,
+        "peak": 25624576,
+        "end": 24797184
+      },
+      "server_cpu_s": 0.59,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 26,
+      "machine_cpu_percent": {
+        "mean": 5.8,
+        "max": 18.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "manydocs-200x3",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "200",
+        "--editors-per-doc",
+        "3",
+        "--rate",
+        "1"
+      ],
+      "report": "manydocs-200x3.run1.json",
+      "machine_cpu_percent_before": 6.7,
+      "loadgen_wall_s": 62.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14585856,
+        "peak": 79007744,
+        "end": 72458240
+      },
+      "server_cpu_s": 1.72,
+      "server_cpu_peak_percent": 22,
+      "server_threads_peak": 24,
+      "machine_cpu_percent": {
+        "mean": 5.6,
+        "max": 10.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "manydocs-200x3",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "200",
+        "--editors-per-doc",
+        "3",
+        "--rate",
+        "1"
+      ],
+      "report": "manydocs-200x3.run2.json",
+      "machine_cpu_percent_before": 5.9,
+      "loadgen_wall_s": 62.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14524416,
+        "peak": 79732736,
+        "end": 70025216
+      },
+      "server_cpu_s": 1.17,
+      "server_cpu_peak_percent": 9,
+      "server_threads_peak": 25,
+      "machine_cpu_percent": {
+        "mean": 4.5,
+        "max": 11.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "manydocs-200x3",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "200",
+        "--editors-per-doc",
+        "3",
+        "--rate",
+        "1"
+      ],
+      "report": "manydocs-200x3.run3.json",
+      "machine_cpu_percent_before": 5.6,
+      "loadgen_wall_s": 62.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14532608,
+        "peak": 80658432,
+        "end": 74059776
+      },
+      "server_cpu_s": 1.16,
+      "server_cpu_peak_percent": 12,
+      "server_threads_peak": 27,
+      "machine_cpu_percent": {
+        "mean": 4.1,
+        "max": 10.1
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-100kb",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "100000",
+        "--times",
+        "20"
+      ],
+      "report": "open-100kb.run1.json",
+      "machine_cpu_percent_before": 3.0,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14512128,
+        "peak": 18415616,
+        "end": 18415616
+      },
+      "server_cpu_s": 0.05,
+      "server_cpu_peak_percent": 5,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 3.3,
+        "max": 3.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-100kb",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "100000",
+        "--times",
+        "20"
+      ],
+      "report": "open-100kb.run2.json",
+      "machine_cpu_percent_before": 6.5,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14540800,
+        "peak": 18374656,
+        "end": 18374656
+      },
+      "server_cpu_s": 0.05,
+      "server_cpu_peak_percent": 5,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 8.8,
+        "max": 8.8
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-100kb",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "100000",
+        "--times",
+        "20"
+      ],
+      "report": "open-100kb.run3.json",
+      "machine_cpu_percent_before": 5.8,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14532608,
+        "peak": 18505728,
+        "end": 18505728
+      },
+      "server_cpu_s": 0.06,
+      "server_cpu_peak_percent": 6,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 7.6,
+        "max": 7.6
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-1mb",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "1000000",
+        "--times",
+        "20"
+      ],
+      "report": "open-1mb.run1.json",
+      "machine_cpu_percent_before": 8.8,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14520320,
+        "peak": 19345408,
+        "end": 19345408
+      },
+      "server_cpu_s": 0.05,
+      "server_cpu_peak_percent": 5,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 3.5,
+        "max": 3.5
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-1mb",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "1000000",
+        "--times",
+        "20"
+      ],
+      "report": "open-1mb.run2.json",
+      "machine_cpu_percent_before": 2.7,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14479360,
+        "peak": 19685376,
+        "end": 19685376
+      },
+      "server_cpu_s": 0.05,
+      "server_cpu_peak_percent": 5,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 5.5,
+        "max": 5.5
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-1mb",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "1000000",
+        "--times",
+        "20"
+      ],
+      "report": "open-1mb.run3.json",
+      "machine_cpu_percent_before": 3.2,
+      "loadgen_wall_s": 1.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14577664,
+        "peak": 19308544,
+        "end": 19308544
+      },
+      "server_cpu_s": 0.08,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 5.0,
+        "max": 5.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-5mb",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "5000000",
+        "--times",
+        "20"
+      ],
+      "report": "open-5mb.run1.json",
+      "machine_cpu_percent_before": 3.9,
+      "loadgen_wall_s": 2.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14561280,
+        "peak": 23789568,
+        "end": 23789568
+      },
+      "server_cpu_s": 0.16,
+      "server_cpu_peak_percent": 16,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 8.6,
+        "max": 11.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-5mb",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "5000000",
+        "--times",
+        "20"
+      ],
+      "report": "open-5mb.run2.json",
+      "machine_cpu_percent_before": 5.8,
+      "loadgen_wall_s": 2.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14524416,
+        "peak": 24035328,
+        "end": 24035328
+      },
+      "server_cpu_s": 0.08,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 9.2,
+        "max": 12.1
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "open-5mb",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "open",
+        "--doc-bytes",
+        "5000000",
+        "--times",
+        "20"
+      ],
+      "report": "open-5mb.run3.json",
+      "machine_cpu_percent_before": 3.1,
+      "loadgen_wall_s": 2.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14495744,
+        "peak": 23568384,
+        "end": 23568384
+      },
+      "server_cpu_s": 0.06,
+      "server_cpu_peak_percent": 6,
+      "server_threads_peak": 21,
+      "machine_cpu_percent": {
+        "mean": 5.2,
+        "max": 5.6
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-500",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "500"
+      ],
+      "report": "idle-500.run1.json",
+      "machine_cpu_percent_before": 5.5,
+      "loadgen_wall_s": 62.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14524416,
+        "peak": 59150336,
+        "end": 25726976
+      },
+      "server_cpu_s": 2.75,
+      "server_cpu_peak_percent": 30,
+      "server_threads_peak": 29,
+      "machine_cpu_percent": {
+        "mean": 5.3,
+        "max": 12.8
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-500",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "500"
+      ],
+      "report": "idle-500.run2.json",
+      "machine_cpu_percent_before": 6.7,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14512128,
+        "peak": 59031552,
+        "end": 25534464
+      },
+      "server_cpu_s": 2.28,
+      "server_cpu_peak_percent": 23,
+      "server_threads_peak": 32,
+      "machine_cpu_percent": {
+        "mean": 4.8,
+        "max": 16.4
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-500",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "500"
+      ],
+      "report": "idle-500.run3.json",
+      "machine_cpu_percent_before": 6.5,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14540800,
+        "peak": 59510784,
+        "end": 25022464
+      },
+      "server_cpu_s": 1.69,
+      "server_cpu_peak_percent": 23,
+      "server_threads_peak": 29,
+      "machine_cpu_percent": {
+        "mean": 2.4,
+        "max": 9.4
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-1000",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "1000"
+      ],
+      "report": "idle-1000.run1.json",
+      "machine_cpu_percent_before": 0.7,
+      "loadgen_wall_s": 63.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14540800,
+        "peak": 143421440,
+        "end": 30511104
+      },
+      "server_cpu_s": 2.84,
+      "server_cpu_peak_percent": 39,
+      "server_threads_peak": 40,
+      "machine_cpu_percent": {
+        "mean": 2.1,
+        "max": 8.2
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-1000",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "1000"
+      ],
+      "report": "idle-1000.run2.json",
+      "machine_cpu_percent_before": 1.9,
+      "loadgen_wall_s": 63.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14540800,
+        "peak": 142209024,
+        "end": 30511104
+      },
+      "server_cpu_s": 3.31,
+      "server_cpu_peak_percent": 39,
+      "server_threads_peak": 33,
+      "machine_cpu_percent": {
+        "mean": 2.6,
+        "max": 7.2
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-1000",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "1000"
+      ],
+      "report": "idle-1000.run3.json",
+      "machine_cpu_percent_before": 2.3,
+      "loadgen_wall_s": 63.6,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14569472,
+        "peak": 144343040,
+        "end": 29040640
+      },
+      "server_cpu_s": 3.66,
+      "server_cpu_peak_percent": 40,
+      "server_threads_peak": 43,
+      "machine_cpu_percent": {
+        "mean": 5.0,
+        "max": 19.7
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-2000",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "2000"
+      ],
+      "report": "idle-2000.run1.json",
+      "machine_cpu_percent_before": 3.7,
+      "loadgen_wall_s": 68.0,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14553088,
+        "peak": 386973696,
+        "end": 35360768
+      },
+      "server_cpu_s": 12.03,
+      "server_cpu_peak_percent": 228,
+      "server_threads_peak": 52,
+      "machine_cpu_percent": {
+        "mean": 8.0,
+        "max": 26.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-2000",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "2000"
+      ],
+      "report": "idle-2000.run2.json",
+      "machine_cpu_percent_before": 0.7,
+      "loadgen_wall_s": 67.9,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14516224,
+        "peak": 396107776,
+        "end": 37113856
+      },
+      "server_cpu_s": 12.06,
+      "server_cpu_peak_percent": 205,
+      "server_threads_peak": 52,
+      "machine_cpu_percent": {
+        "mean": 4.6,
+        "max": 21.1
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "idle-2000",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "idle",
+        "--connections",
+        "2000"
+      ],
+      "report": "idle-2000.run3.json",
+      "machine_cpu_percent_before": 0.5,
+      "loadgen_wall_s": 68.9,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14487552,
+        "peak": 384581632,
+        "end": 36704256
+      },
+      "server_cpu_s": 11.77,
+      "server_cpu_peak_percent": 140,
+      "server_threads_peak": 49,
+      "machine_cpu_percent": {
+        "mean": 4.7,
+        "max": 24.5
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "target-manydocs-2000x5",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "2000",
+        "--editors-per-doc",
+        "5",
+        "--rate",
+        "0.1"
+      ],
+      "report": "target-manydocs-2000x5.run1.json",
+      "machine_cpu_percent_before": 0.4,
+      "loadgen_wall_s": 73.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14532608,
+        "peak": 500232192,
+        "end": 330629120
+      },
+      "server_cpu_s": 3.84,
+      "server_cpu_peak_percent": 39,
+      "server_threads_peak": 25,
+      "machine_cpu_percent": {
+        "mean": 2.0,
+        "max": 10.6
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "target-manydocs-2000x5",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "2000",
+        "--editors-per-doc",
+        "5",
+        "--rate",
+        "0.1"
+      ],
+      "report": "target-manydocs-2000x5.run2.json",
+      "machine_cpu_percent_before": 0.3,
+      "loadgen_wall_s": 72.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14495744,
+        "peak": 501760000,
+        "end": 332619776
+      },
+      "server_cpu_s": 3.67,
+      "server_cpu_peak_percent": 29,
+      "server_threads_peak": 24,
+      "machine_cpu_percent": {
+        "mean": 2.1,
+        "max": 12.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "target-manydocs-2000x5",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "2000",
+        "--editors-per-doc",
+        "5",
+        "--rate",
+        "0.1"
+      ],
+      "report": "target-manydocs-2000x5.run3.json",
+      "machine_cpu_percent_before": 0.5,
+      "loadgen_wall_s": 72.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14548992,
+        "peak": 505622528,
+        "end": 332705792
+      },
+      "server_cpu_s": 3.52,
+      "server_cpu_peak_percent": 31,
+      "server_threads_peak": 24,
+      "machine_cpu_percent": {
+        "mean": 2.2,
+        "max": 18.0
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "target-manydocs-1000x5",
+      "run": 1,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "1000",
+        "--editors-per-doc",
+        "5",
+        "--rate",
+        "0.1"
+      ],
+      "report": "target-manydocs-1000x5.run1.json",
+      "machine_cpu_percent_before": 0.3,
+      "loadgen_wall_s": 66.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14589952,
+        "peak": 267681792,
+        "end": 190562304
+      },
+      "server_cpu_s": 1.89,
+      "server_cpu_peak_percent": 25,
+      "server_threads_peak": 26,
+      "machine_cpu_percent": {
+        "mean": 1.3,
+        "max": 5.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "target-manydocs-1000x5",
+      "run": 2,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "1000",
+        "--editors-per-doc",
+        "5",
+        "--rate",
+        "0.1"
+      ],
+      "report": "target-manydocs-1000x5.run2.json",
+      "machine_cpu_percent_before": 0.7,
+      "loadgen_wall_s": 66.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14524416,
+        "peak": 266571776,
+        "end": 191303680
+      },
+      "server_cpu_s": 1.95,
+      "server_cpu_peak_percent": 31,
+      "server_threads_peak": 27,
+      "machine_cpu_percent": {
+        "mean": 1.4,
+        "max": 6.5
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "target-manydocs-1000x5",
+      "run": 3,
+      "database": "postgres",
+      "args": [
+        "many-docs",
+        "--docs",
+        "1000",
+        "--editors-per-doc",
+        "5",
+        "--rate",
+        "0.1"
+      ],
+      "report": "target-manydocs-1000x5.run3.json",
+      "machine_cpu_percent_before": 4.3,
+      "loadgen_wall_s": 66.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14491648,
+        "peak": 269561856,
+        "end": 191918080
+      },
+      "server_cpu_s": 2.56,
+      "server_cpu_peak_percent": 37,
+      "server_threads_peak": 24,
+      "machine_cpu_percent": {
+        "mean": 1.4,
+        "max": 5.3
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-10-rate20",
+      "run": 4,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "20",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10-rate20.run4.json",
+      "machine_cpu_percent_before": 4.7,
+      "loadgen_wall_s": 61.5,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14528512,
+        "peak": 24776704,
+        "end": 24469504
+      },
+      "server_cpu_s": 0.27,
+      "server_cpu_peak_percent": 3,
+      "server_threads_peak": 27,
+      "machine_cpu_percent": {
+        "mean": 1.1,
+        "max": 7.2
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    },
+    {
+      "scenario": "onedoc-10-rate20",
+      "run": 5,
+      "database": "postgres",
+      "args": [
+        "one-doc",
+        "--editors",
+        "10",
+        "--rate",
+        "20",
+        "--features",
+        "200"
+      ],
+      "report": "onedoc-10-rate20.run5.json",
+      "machine_cpu_percent_before": 0.5,
+      "loadgen_wall_s": 61.4,
+      "loadgen_exit": 0,
+      "server_rss_bytes": {
+        "before": 14573568,
+        "peak": 24834048,
+        "end": 24522752
+      },
+      "server_cpu_s": 0.27,
+      "server_cpu_peak_percent": 8,
+      "server_threads_peak": 27,
+      "machine_cpu_percent": {
+        "mean": 1.1,
+        "max": 5.9
+      },
+      "server_alive_after": true,
+      "server_log": {
+        "lines": 2,
+        "warnings": 0,
+        "errors": 0,
+        "samples": []
+      },
+      "loadgen_stderr": {
+        "lines": 0,
+        "samples": []
+      },
+      "has_report": true
+    }
+  ]
+}

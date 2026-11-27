@@ -42,7 +42,9 @@ target/release/loadgen --dialect v2 --url http://127.0.0.1:8791     one-doc --ed
 
 Loadgen opens every connection as one account. The Rust server allows an account 64 document connections at
 once (`OSWX_COLLAB_MAX_CONNECTIONS_PER_USER`); the connections beyond that are refused (`too_many_connections`,
-counted under `connect_failed`), so a run with more needs the limit raised on the server.
+counted under `connect_failed`), so a run with more needs the limit raised on the server. A run with more than
+4,096 connections in all also needs `OSWX_COLLAB_MAX_CONNECTIONS` raised (`bench/run_rust.py` raises both to
+20,000).
 
 `bench/run_rust.py` runs the whole set of `bench/results/README.md` this way: a fresh server, database and
 storage folder for every run, each scenario three times, and the server's memory and CPU time measured from

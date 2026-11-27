@@ -44,8 +44,9 @@ LOADGEN = os.path.join(REPO, "target", "release", "loadgen" + EXE)
 PORT = 8791
 
 # One account opens every connection (as in the baseline), so the per-account limit (64 by default) is
-# raised out of the way. Everything else is the server's default.
-SERVER_ENV = {"OSWX_COLLAB_MAX_CONNECTIONS_PER_USER": "20000"}
+# raised out of the way, and so is the server-wide limit (4,096 by default), which only the
+# 10,000-connection target scenario reaches. Everything else is the server's default.
+SERVER_ENV = {"OSWX_COLLAB_MAX_CONNECTIONS_PER_USER": "20000", "OSWX_COLLAB_MAX_CONNECTIONS": "20000"}
 
 # The baseline's scenarios, with its parameters (bench/results/python-0.1.2-sqlite/*.json).
 COMPARISON = [

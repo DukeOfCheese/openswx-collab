@@ -1,0 +1,55 @@
+{
+  "scenario": "many-docs",
+  "params": {
+    "docs": 1000,
+    "editors_per_doc": 5,
+    "features": 20,
+    "rate": 0.1
+  },
+  "dialect": "v2",
+  "server": "openswx-collab 0.2.0-dev (protocol 2)",
+  "database": "sqlite",
+  "loadgen_commit": "b4299cb",
+  "started_at": "2026-11-26T23:42:18Z",
+  "note": "scenario target-manydocs-1000x5 run 1 - rust server 0.2.0-dev on sqlite - server and loadgen on same machine",
+  "host": {
+    "os": "Windows 11 Education",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "cpu_threads": 16,
+    "ram_bytes": 16964685824
+  },
+  "duration_s": 60.3548465,
+  "document_bytes": 2645,
+  "changes_sent": 30000,
+  "accepted": 30000,
+  "rejected": {},
+  "timeouts": 0,
+  "errors": 0,
+  "protocol_errors": 0,
+  "dropped_connections": 0,
+  "close_codes": {},
+  "connect_failed": 0,
+  "latency_kind": "edit",
+  "latency_ms": {
+    "count": 30000,
+    "p50": 3.035,
+    "p90": 5.491,
+    "p99": 22.735,
+    "max": 197.759
+  },
+  "latency_from_schedule_ms": {
+    "count": 30000,
+    "p50": 7.123,
+    "p90": 15.695,
+    "p99": 30.287,
+    "max": 270.079
+  },
+  "latency_note": "latency_ms is service time: from just before an edit is sent until its answer arrives. latency_from_schedule_ms is measured from the slot the edit was scheduled for (a fixed interval per editor), so a stalled server also shows as waiting for the edits queued behind the stall; no slot is skipped. An edit with no answer after 30 s counts as a timeout and enters both as 30000 ms. For `open`, first_open_ms is the first, cold sample and latency_ms covers the remaining ones.",
+  "first_open_ms": null,
+  "welcome_bytes": {
+    "min": 2218,
+    "max": 2744
+  },
+  "accepted_per_s": 497.06033135218064,
+  "server_rss_bytes": null
+}

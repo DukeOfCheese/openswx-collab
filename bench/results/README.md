@@ -1,8 +1,10 @@
 # Load measurements
 
-Two sets, taken on the same machine with the same load generator: the Python server (the baseline, below)
-and [the Rust server on the same scenarios](#rust-server-020-dev-the-same-scenarios), with a side-by-side
-table and what this laptop can say about the proposed targets.
+Three sets, taken on the same machine with the same load generator: the Python server (the baseline, below),
+[the Rust server on the same scenarios](#rust-server-020-dev-the-same-scenarios), with a side-by-side
+table and what this laptop can say about the proposed targets, and
+[the Rust server again after the follow-up](#rust-server-after-task-19b-the-same-scenarios-again), which
+found and removed the causes of the first set's findings (before and after tables there).
 
 # Baseline: Python server 0.1.2 on SQLite
 
@@ -520,3 +522,344 @@ deadline; no warm-up; documents are generated, not real parts. In addition:
 - **The 2,000-connection idle scenario puts all connections on one document**, which is what the baseline
   did; it measures presence relay among 2,000 peers more than it measures idle sockets.
 - `0.2.0-dev` is a development version: these are numbers for commit `9df2410` of the server, not a release.
+
+---
+
+# Rust server after Task 19b: the same scenarios again
+
+The first Rust runs (above) found four things to look into. This section is what was measured to find
+their causes, what changed, and the same runs again with the same script, parameters and settings. The
+reports are in [`rust-0.2.0-dev-19b-sqlite/`](rust-0.2.0-dev-19b-sqlite/) and
+[`rust-0.2.0-dev-19b-postgres/`](rust-0.2.0-dev-19b-postgres/), in the same shape as before; the earlier
+folders are untouched.
+
+## What was measured
+
+| | |
+|---|---|
+| Date | 2026-11-27, 09:46 to 12:19 local time |
+| Machine, OS | the same laptop: i7-11800H, 8 cores / 16 threads, 15.8 GB RAM; Windows 11 Education 10.0.22631 |
+| Server | `openswx-collab-server` 0.2.0-dev, release build of commit `b4299cb` |
+| Loadgen | release build of the same commit, `--dialect v2`. Loadgen itself is unchanged; it decodes the new `presence.batch` and `peer.list` messages through the shared `oswx_core::wire` |
+| PostgreSQL | 16.15 from the same package, the same defaults (`shared_buffers` 128MB, `fsync` on, `synchronous_commit` on) |
+| Server settings | as before (`OSWX_COLLAB_MAX_CONNECTIONS_PER_USER=20000`), plus **`OSWX_COLLAB_MAX_CONNECTIONS=20000`**. That limit (4,096 connections in all by default) was added to the server after the first runs, and the 10,000-connection scenario needs it raised; it changes nothing below 4,096 connections. Both are in `bench/run_rust.py` |
+| Runs | the 13 comparison scenarios x 3 runs on each database, 5 s between runs, as before; the two target scenarios 3 runs each with **240 s** between runs (before: 30 s, and 240 s for two added runs), so that Windows has its outgoing ports back |
+| Also running | the desktop session as before (browser, Discord, Spotify, Defender), and the Claude Code session that started the runs and waited; no build or test ran during them. Machine CPU in the two seconds before a run: 0.3 to 7.2 % |
+
+**Linux:** there is no WSL distribution on this machine (`wsl --list` reports none installed), so no Linux
+numbers were taken. Nothing was installed.
+
+## What the load had found, and what it was
+
+The diagnosis runs below were short (15 to 30 s) one-off runs of loadgen against a fresh server, with the
+server's own `/metrics` and its user and kernel CPU time read with psutil. They are not in the results
+folders; the numbers are quoted here.
+
+1. **Light load slower than Python: proved, the journal's 2 ms wait.** The commit itself took about
+   1.2 ms (timed inside the server on SQLite: begin 0.1 to 0.5 ms, the statements 0.4 to 1.2 ms, the commit
+   about 0.6 ms), while a room waited for each record about 15 ms (the server's `journal_wait_seconds`, mean
+   14.9 ms). The writer waited for more records on a tokio timer, and on Windows a timer of any length fires
+   on the next 15.6 ms clock tick: a wait of 0 us still went through the timer and still gave a p50 of 17 ms;
+   20 ms gave 32 ms. With the timer taken out of the server's writer (a batch is the first record and
+   whatever is queued behind it, no timer at all), `onedoc-10` and `onedoc-40` went to p50 1.6 to 1.9 ms;
+   putting the 2 ms wait back brought 17.1 ms back (20 s runs on SQLite, two rounds).
+   **Is a short wait worth it under load?** The same comparison with 200 editors and with 200 documents x 3:
+   without a wait p50 3.5 and 2.8 ms, p99 10.5 to 17 ms, 1.8 and 2.4 records a batch; with the 2 ms wait
+   (15.6 ms here) p50 14 to 19 ms, p99 26 to 37 ms, 4.3 and 9.7 records a batch, and no less server CPU. So
+   no wait is kept, adaptive or not: under load, batches form from what arrives while the previous one is
+   being written. On Linux a 1 ms timer takes about 1 ms; that was not measured.
+2. **2,000 peers in one document: the kernel, sending one frame per recipient per presence.** In 30 s
+   `idle` runs: 1,000 peers cost the server 1.6 s user + 9.5 s kernel time for 6.5 million frames out;
+   1,500 peers 23 + 242 s for 14.6 million; 2,000 peers 25 + 328 s for 17.3 million, and 197 connections
+   closed as too slow (4408). Twice the frames cost thirty times the CPU, nearly all of it in the kernel
+   (loopback sends to a receiver, loadgen on the same machine, that could not keep up). Encoding was
+   already once per broadcast. After the change (presence and drafts relayed at most every 50 ms, each
+   peer's latest, up to 64 peers to a frame; peer and presence frames dropped for a reader that falls behind
+   instead of closing it, which then gets the peer list; queued frames written with one flush): 1,000 peers
+   0.6 + 1.5 s for 1.0 million frames, 2,000 peers 1.8 + 4.6 s for 3.1 million, nothing closed. Loadgen's own
+   CPU at 2,000 peers went from 117 s to 13 s.
+3. **About 180 KB per connection: proved, mostly the WebSocket read buffer.** Connections that never edit,
+   on 2,000 documents with 1, 3 and 5 connections each, peaked at 344, 1,101 and 1,682 MB: about **167 KB
+   per extra connection**. tungstenite gives every connection a 128 KiB read buffer and fills it with zeros at
+   its first read. With an 8 KiB buffer the same runs peaked at 269, 372 and 463 MB, about **24 KB per
+   connection**. Boxing the large, rare messages of a room's channels (each open document has five, whose
+   memory comes in blocks of 32 messages sized by the largest) brought them to 253, 335 and 422 MB, about
+   **21 KB per connection**. What remains was not broken down further (no heap profiler without downloading
+   one): about 90 to 110 KB per open document of 2.6 KB (1,000 against 2,000 documents with one connection
+   each: the document and its conflict index in memory, the room task and its channels); and per
+   connection the tungstenite write buffer, which keeps the size of the largest frame it ever sent: the
+   welcome, in `idle-2000` up to 261 KB for the last joiners, most of that run's 390 MB. axum's WebSocket
+   gives no way to shrink it.
+4. **First open slower on PostgreSQL: proved, the journal pool's first connection.** Timed inside the
+   server, taking the room lease took 38 to 43 ms, of which `begin` 34 to 37 ms: the journal pool had no
+   connection yet (size 0) and opened one (a new PostgreSQL process, and the password exchange). sqlx's
+   `min_connections` does not help a lazily opened pool (it is kept only after an idle connection has been
+   closed: tried, no change), so the store now opens one connection of each pool when it starts, and the
+   pools keep it. First open on a fresh server: 100 KB 52 to 56 ms before, 16 to 19 ms after; 1 MB 54 to 57
+   before, 22 to 42 after; 5 MB 90 to 109 before, 41 to 64 after. SQLite stays faster (4 to 30 ms).
+
+## Before and after (median runs)
+
+"Before" is the first Rust run set (commit `50cdc48`), "after" this one. Service time in ms. The median run
+is the middle one by service p99 (by peak memory for `idle`), as before; a run without a report sorts last.
+
+#### sqlite
+
+| Scenario | service p50 / p99 before | after | peak RSS MB before | after | server CPU s before | after | failed runs before | after |
+|---|---|---|---|---|---|---|---|---|
+| onedoc-10 | 18.623 / 21.615 | 1.652 / 3.361 | 25 | 35 | 0.16 | 0.16 | 0 of 3 | 0 of 3 |
+| onedoc-40 | 18.431 / 21.935 | 1.695 / 5.071 | 36 | 30 | 0.64 | 0.52 | 0 of 3 | 0 of 3 |
+| onedoc-100 | 19.151 / 34.559 | 2.313 / 9.655 | 49 | 38 | 2.25 | 1.53 | 0 of 3 | 0 of 3 |
+| onedoc-200 | 16.703 / 39.615 | 3.741 / 18.015 | 75 | 49 | 9.03 | 8.2 | 0 of 3 | 0 of 3 |
+| onedoc-40-conflict | 17.071 / 20.463 | 3.095 / 7.619 | 33 | 28 | 0.52 | 0.52 | 0 of 3 | 0 of 3 |
+| onedoc-10-rate20 | 17.535 / 23.663 | 2.887 / 9.543 | 31 | 28 | 0.72 | 0.61 | 0 of 3 | 0 of 3 |
+| manydocs-200x3 | 19.135 / 48.767 | 3.071 / 23.839 | 170 | 84 | 1.52 | 1.53 | 0 of 3 | 0 of 3 |
+| open-100kb | 1.562 / 1.772 | 1.577 / 1.888 | 20 | 20 | 0.05 | 0.05 | 0 of 3 | 0 of 3 |
+| open-1mb | 3.825 / 4.455 | 4.199 / 15.879 | 21 | 21 | 0.05 | 0.05 | 0 of 3 | 0 of 3 |
+| open-5mb | 16.559 / 36.063 | 19.279 / 38.399 | 25 | 25 | 0.11 | 0.08 | 0 of 3 | 0 of 3 |
+| idle-500 | - | - | 116 | 62 | 7.06 | 1.48 | 0 of 3 | 0 of 3 |
+| idle-1000 | - | - | 248 | 151 | 21.06 | 2.89 | 0 of 3 | 0 of 3 |
+| idle-2000 | - | - | 706 | 391 | 693.94 | 15.41 | 1 of 3 | 0 of 3 |
+| target-manydocs-2000x5 | 22.431 / 1165 | 4.021 / 66.303 | 1822 | 532 | 7.8 | 5.34 | 2 of 5 | 0 of 3 |
+| target-manydocs-1000x5 | 18.895 / 40.095 | 2.965 / 23.135 | 909 | 275 | 3.36 | 2.8 | 0 of 3 | 0 of 3 |
+
+#### postgres
+
+| Scenario | service p50 / p99 before | after | peak RSS MB before | after | server CPU s before | after | failed runs before | after |
+|---|---|---|---|---|---|---|---|---|
+| onedoc-10 | 17.167 / 18.847 | 1.844 / 3.379 | 23 | 21 | 0.09 | 0.19 | 0 of 3 | 0 of 3 |
+| onedoc-40 | 17.167 / 19.007 | 1.897 / 3.893 | 32 | 26 | 0.5 | 0.62 | 0 of 3 | 0 of 3 |
+| onedoc-100 | 17.727 / 20.031 | 2.205 / 4.583 | 46 | 33 | 2.58 | 1.78 | 0 of 3 | 0 of 3 |
+| onedoc-200 | 15.711 / 23.167 | 4.199 / 10.463 | 67 | 46 | 8.42 | 7.31 | 0 of 3 | 0 of 3 |
+| onedoc-40-conflict | 17.279 / 18.975 | 2.169 / 4.339 | 28 | 24 | 0.38 | 0.75 | 0 of 3 | 0 of 3 |
+| onedoc-10-rate20 | 17.167 / 18.767 | 2.153 / 4.335 | 26 | 26 | 0.33 | 0.59 | 0 of 3 | 2 of 5 |
+| manydocs-200x3 | 18.671 / 21.919 | 2.775 / 7.147 | 165 | 80 | 1.05 | 1.17 | 0 of 3 | 0 of 3 |
+| open-100kb | 1.952 / 4.021 | 2.277 / 4.755 | 18 | 18 | 0.05 | 0.05 | 0 of 3 | 0 of 3 |
+| open-1mb | 4.243 / 20.655 | 5.455 / 9.271 | 20 | 20 | 0.11 | 0.05 | 0 of 3 | 0 of 3 |
+| open-5mb | 18.223 / 67.967 | 20.063 / 73.727 | 24 | 24 | 0.19 | 0.08 | 0 of 3 | 0 of 3 |
+| idle-500 | - | - | 114 | 59 | 6.53 | 2.75 | 0 of 3 | 0 of 3 |
+| idle-1000 | - | - | 244 | 143 | 21.91 | 2.84 | 0 of 3 | 0 of 3 |
+| idle-2000 | - | - | 699 | 387 | 686.55 | 12.03 | 1 of 3 | 0 of 3 |
+| target-manydocs-2000x5 | 19.839 / 186.239 | 3.155 / 105.471 | 1724 | 500 | 6.45 | 3.84 | 1 of 4 | 0 of 3 |
+| target-manydocs-1000x5 | 18.655 / 21.951 | 2.759 / 6.359 | 900 | 268 | 1.23 | 1.89 | 0 of 3 | 0 of 3 |
+
+The target scenarios before had 5 runs on SQLite and 4 on PostgreSQL (three of them failed for want of
+outgoing ports); after, 3 each, none failed. In `onedoc-10-rate20` on PostgreSQL runs 1 and 2 failed and
+runs 4 and 5 were added (see "Failed runs").
+
+## Python and Rust side by side (after)
+
+| Scenario | Python accepted / rejected | Python service p50 / p99 / max | Python accepted per s (run s) | Python peak RSS MB | Rust sqlite accepted / rejected | Rust sqlite service p50 / p99 / max | Rust sqlite accepted per s (run s) | Rust sqlite peak RSS MB | Rust postgres accepted / rejected | Rust postgres service p50 / p99 / max | Rust postgres accepted per s (run s) | Rust postgres peak RSS MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| onedoc-10 | 1200 / 0 | 5.099 / 9.727 / 12.063 | 20.0 (60) | 103 | 1200 / 0 | 1.652 / 3.361 / 7.063 | 20.0 (60) | 35 | 1200 / 0 | 1.844 / 3.379 / 50.207 | 20.0 (60) | 21 |
+| onedoc-40 | 4800 / 0 | 5.839 / 17.039 / 54.943 | 80.0 (60) | 108 | 4800 / 0 | 1.695 / 5.071 / 9.663 | 80.0 (60) | 30 | 4800 / 0 | 1.897 / 3.893 / 46.623 | 80.1 (60) | 26 |
+| onedoc-100 | 12000 / 0 | 531.967 / 590.335 / 612.863 | 186.6 (64) | 117 | 12000 / 0 | 2.313 / 9.655 / 15.535 | 199.9 (60) | 38 | 12000 / 0 | 2.205 / 4.583 / 49.535 | 200.0 (60) | 33 |
+| onedoc-200 | 24000 / 0 | 1851 / 3152 / 3903 | 104.1 (231) | 133 | 24000 / 0 | 3.741 / 18.015 / 35.839 | 399.9 (60) | 49 | 24000 / 0 | 4.199 / 10.463 / 66.303 | 399.9 (60) | 46 |
+| onedoc-40-conflict | 4770 / 30 | 5.527 / 16.655 / 52.415 | 79.5 (60) | 108 | 4663 / 137 | 3.095 / 7.619 / 13.543 | 77.7 (60) | 28 | 4724 / 76 | 2.169 / 4.339 / 70.335 | 78.7 (60) | 24 |
+| onedoc-10-rate20 | 12000 / 0 | 7.743 / 19.279 / 49.535 | 200.0 (60) | 105 | 12000 / 0 | 2.887 / 9.543 / 15.463 | 200.0 (60) | 28 | 12000 / 0 (2 of 5 runs FAILED) | 2.153 / 4.335 / 54.591 | 200.0 (60) | 26 |
+| manydocs-200x3 | 36000 / 0 | 1637 / 4497 / 19071 | 336.7 (107) | 198 | 36000 / 0 | 3.071 / 23.839 / 52.351 | 599.4 (60) | 84 | 36000 / 0 | 2.775 / 7.147 / 42.207 | 599.6 (60) | 80 |
+| open-100kb | n/a | 3.053 / 4.403 / 4.403 | n/a (0.2) | 97 | n/a | 1.577 / 1.888 / 1.888 | n/a (0.0) | 20 | n/a | 2.277 / 4.755 / 4.755 | n/a (0.1) | 18 |
+| open-1mb | n/a | 6.459 / 7.651 / 7.651 | n/a (0.2) | 98 | n/a | 4.199 / 15.879 / 15.879 | n/a (0.1) | 21 | n/a | 5.455 / 9.271 / 9.271 | n/a (0.2) | 20 |
+| open-5mb | n/a | 22.911 / 41.087 / 41.087 | n/a (0.7) | 108 | n/a | 19.279 / 38.399 / 38.399 | n/a (0.5) | 25 | n/a | 20.063 / 73.727 / 73.727 | n/a (0.6) | 24 |
+| idle-500 | 0 / 0 | - | 0.0 (60) | 170 | 0 / 0 | - | 0.0 (60) | 62 | 0 / 0 | - | 0.0 (60) | 59 |
+| idle-1000 | 0 / 0 | - | 0.0 (60) | 252 | 0 / 0 | - | 0.0 (60) | 151 | 0 / 0 | - | 0.0 (60) | 143 |
+| idle-2000 | 0 / 0 (FAILED: 2000 dropped) | - | 0.0 (60) | 606 | 0 / 0 | - | 0.0 (60) | 391 | 0 / 0 | - | 0.0 (60) | 387 |
+
+## What this says
+
+- **Light load is now faster than Python on this machine.** With 10 or 40 editors p50 is 1.7 to 1.9 ms on
+  both databases (Python 5.1 and 5.8 ms; Rust before 17 to 19 ms), p99 3.4 to 5.1 ms (Python 9.7 and
+  17.0 ms).
+- **Heavy load got faster as well**: 200 editors p50 3.7 / 4.2 ms and p99 18.0 / 10.5 ms (SQLite /
+  PostgreSQL; before 16.7 / 15.7 and 39.6 / 23.2 ms); 200 documents x 3 p99 23.8 / 7.1 ms (before 48.8 /
+  21.9 ms).
+- **2,000 peers in one document now runs clean**: no connection closed in six runs (before, 2 of 6 runs lost
+  28 and 66), 11 to 15 CPU-seconds of server time for the whole run instead of 687 to 706, peak memory 385
+  to 396 MB instead of 646 to 719 MB (Python failed this scenario).
+- **10,000 connections on 2,000 documents**: every run got all its connections and every edit was accepted;
+  peak memory 500 to 532 MB instead of 1.7 to 1.8 GB; p50 3.2 to 4.4 ms.
+- **What did not improve, or got worse.** The proposed 20 ms p99 at 10,000 connections is still missed:
+  p99 46 to 222 ms on SQLite and 54 to 152 ms on PostgreSQL (before 67 to 1,165 and 109 to 1,822 ms). At half
+  that size PostgreSQL meets it (6.2 to 6.5 ms) and SQLite does not (23 to 24 ms). Opening documents is
+  unchanged within the spread (warm p50 1.6 / 4.2 / 19.3 ms on SQLite, 1.6 / 3.8 / 16.6 before).
+  Single-sample maxima are higher in some light PostgreSQL runs (`onedoc-10` max 50 ms against 20 ms
+  before, with p99 3.4 ms): one slow edit per run, not looked into. `onedoc-10` on SQLite peaked at 35 MB
+  against 25 MB before (its other runs: 28 and 35 MB); not looked into.
+- **Still slower than Python**: the first open of a document on PostgreSQL (16 to 64 ms; Python, on
+  SQLite, 15 to 48 ms), and the conflict scenario still refuses more edits than Python (76 to 137 against
+  30; before 118 to 289: the window in which an edit can be overtaken shrank with the service time).
+- **What this laptop cannot tell**: Linux (no WSL distribution here), and the server's cost with the load
+  coming from another machine. Loadgen still shares the CPU and the loopback interface, and at 10,000
+  connections the slow tail may be the server, PostgreSQL's disk writes or loadgen.
+
+## Failed runs
+
+`onedoc-10-rate20` on PostgreSQL, runs 1 and 2: the server could not start (its log has one line), and
+loadgen, connecting to port 8791, was answered `401` "openswx token needed": another program on this machine
+(an openswx application's local server) held the port for those two minutes; nothing listened there
+afterwards. The runs are kept as failed, and runs 4 and 5 were added with the same parameters. They say
+nothing about the collaboration server. No other run failed.
+
+## Every run (after)
+
+#### rust-0.2.0-dev-19b-sqlite (comparison): the median run of each scenario
+
+| Run | connections | changes (sent / accepted / rejected / timeouts / errors / dropped) | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | doc bytes | welcome bytes | first open | RSS MB | server CPU s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| one-doc 10 editors, rate 2, 200 features | 10 | 1200 / 1200 / 0 / 0 / 0 / 0 | 1.652 / 3.361 / 7.063 | 9.383 / 18.143 / 19.023 | 20.0 | 60 | 23370 | 18284-19436 | - | 16 / 35 / 34 | 0.16 |
+| one-doc 40 editors, rate 2, 200 features | 40 | 4800 / 4800 / 0 / 0 / 0 / 0 | 1.695 / 5.071 / 9.663 | 8.535 / 18.431 / 24.063 | 80.0 | 60 | 23370 | 18284-23308 | - | 15 / 30 / 28 | 0.52 |
+| one-doc 100 editors, rate 2, 200 features | 100 | 12000 / 12000 / 0 / 0 / 0 / 0 | 2.313 / 9.655 / 15.535 | 7.787 / 18.703 / 29.263 | 199.9 | 60 | 23370 | 18284-31048 | - | 16 / 38 / 33 | 1.53 |
+| one-doc 200 editors, rate 2, 200 features | 200 | 24000 / 24000 / 0 / 0 / 0 / 0 | 3.741 / 18.015 / 35.839 | 6.127 / 22.639 / 38.591 | 399.9 | 60 | 23370 | 18284-44048 | - | 15 / 49 / 39 | 8.2 |
+| one-doc 40 editors, rate 2, 20 features | 40 | 4800 / 4663 / 137 / 0 / 0 / 0 | 3.095 / 7.619 / 13.543 | 9.447 / 19.919 / 25.791 | 77.7 | 60 | 2645 | 2218-7242 | - | 16 / 28 / 27 | 0.52 |
+| one-doc 10 editors, rate 20, 200 features | 10 | 12000 / 12000 / 0 / 0 / 0 / 0 | 2.887 / 9.543 / 15.463 | 7.371 / 17.663 / 28.079 | 200.0 | 60 | 23370 | 18284-19436 | - | 16 / 28 / 28 | 0.61 |
+| many-docs 200 docs x 3 editors, rate 1 | 600 | 36000 / 36000 / 0 / 0 / 0 / 0 | 3.071 / 23.839 / 52.351 | 6.975 / 29.199 / 54.175 | 599.4 | 60 | 2645 | 2218-2480 | - | 15 / 84 / 77 | 1.53 |
+| open 100 KB x20 | 1 | n/a | 1.577 / 1.888 / 1.888 | - | n/a | 0.0 | 100770 | 97982-97983 | 6.0 | 16 / 20 / 20 | 0.05 |
+| open 1 MB x20 | 1 | n/a | 4.199 / 15.879 / 15.879 | - | n/a | 0.1 | 1000770 | 997982-997983 | 17.4 | 16 / 21 / 21 | 0.05 |
+| open 5 MB x20 | 1 | n/a | 19.279 / 38.399 / 38.399 | - | n/a | 0.5 | 5000770 | 4997982-4997983 | 29.6 | 16 / 25 / 25 | 0.08 |
+| idle 500 connections | 500 | 0 / 0 / 0 / 0 / 0 / 0 | - | - | 0.0 | 60 | 492 | 578-65342 | - | 15 / 62 / 27 | 1.48 |
+| idle 1000 connections | 1000 | 0 / 0 / 0 / 0 / 0 / 0 | - | - | 0.0 | 60 | 492 | 578-130342 | - | 16 / 151 / 32 | 2.89 |
+| idle 2000 connections | 2000 | 0 / 0 / 0 / 0 / 0 / 0 | - | - | 0.0 | 60 | 492 | 578-261342 | - | 16 / 391 / 37 | 15.41 |
+
+#### rust-0.2.0-dev-19b-sqlite (comparison): every run
+
+| Scenario | run | changes (sent / accepted / rejected / timeouts / errors / dropped) | refused connections | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | first open | RSS MB | server CPU s | busiest second, % of a core | machine CPU % before / mean / max | server log warnings / errors | median |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| onedoc-10 | 1 | 1200 / 1200 / 0 / 0 / 0 / 0 | 0 | 1.744 / 4.563 / 50.143 | 9.679 / 18.879 / 64.639 | 20.0 | 60.0 | - | 16 / 24 / 23 | 0.11 | 2 | 1.6 / 2.5 / 46.0 | 0 / 0 |  |
+| onedoc-10 | 2 | 1200 / 1200 / 0 / 0 / 0 / 0 | 0 | 1.774 / 3.307 / 10.839 | 10.303 / 18.399 / 20.015 | 20.0 | 59.9 | - | 16 / 24 / 24 | 0.16 | 5 | 1.3 / 1.8 / 7.4 | 0 / 0 |  |
+| onedoc-10 | 3 | 1200 / 1200 / 0 / 0 / 0 / 0 | 0 | 1.652 / 3.361 / 7.063 | 9.383 / 18.143 / 19.023 | 20.0 | 59.9 | - | 16 / 35 / 34 | 0.16 | 6 | 5.2 / 4.9 / 11.1 | 0 / 0 | x |
+| onedoc-40 | 1 | 4800 / 4800 / 0 / 0 / 0 / 0 | 0 | 1.719 / 5.111 / 11.719 | 8.695 / 18.223 / 24.255 | 80.0 | 60.0 | - | 15 / 42 / 39 | 0.5 | 5 | 8.8 / 2.7 / 9.1 | 0 / 0 |  |
+| onedoc-40 | 2 | 4800 / 4800 / 0 / 0 / 0 / 0 | 0 | 1.695 / 5.071 / 9.663 | 8.535 / 18.431 / 24.063 | 80.0 | 60.0 | - | 15 / 30 / 28 | 0.52 | 6 | 1.1 / 1.4 / 6.5 | 0 / 0 | x |
+| onedoc-40 | 3 | 4800 / 4800 / 0 / 0 / 0 / 0 | 0 | 1.689 / 4.555 / 8.919 | 8.911 / 17.935 / 22.911 | 80.0 | 60.0 | - | 16 / 30 / 28 | 0.53 | 8 | 6.3 / 1.8 / 6.9 | 0 / 0 |  |
+| onedoc-100 | 1 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.313 / 9.655 / 15.535 | 7.787 / 18.703 / 29.263 | 199.9 | 60.0 | - | 16 / 38 / 33 | 1.53 | 12 | 0.8 / 2.0 / 7.2 | 0 / 0 | x |
+| onedoc-100 | 2 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.295 / 10.399 / 19.199 | 7.739 / 18.751 / 30.591 | 199.9 | 60.0 | - | 16 / 39 / 33 | 1.34 | 12 | 2.9 / 1.9 / 7.1 | 0 / 0 |  |
+| onedoc-100 | 3 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.349 / 9.607 / 17.103 | 7.571 / 18.735 / 28.383 | 200.0 | 60.0 | - | 16 / 38 / 33 | 1.88 | 16 | 1.7 / 2.3 / 8.8 | 0 / 0 |  |
+| onedoc-200 | 1 | 24000 / 24000 / 0 / 0 / 0 / 0 | 0 | 3.741 / 18.015 / 35.839 | 6.127 / 22.639 / 38.591 | 399.9 | 60.0 | - | 15 / 49 / 39 | 8.2 | 39 | 2.0 / 3.4 / 7.8 | 0 / 0 | x |
+| onedoc-200 | 2 | 24000 / 24000 / 0 / 0 / 0 / 0 | 0 | 3.489 / 16.559 / 33.407 | 5.583 / 21.903 / 36.991 | 399.9 | 60.0 | - | 16 / 50 / 40 | 7.7 | 37 | 0.9 / 3.4 / 7.8 | 0 / 0 |  |
+| onedoc-200 | 3 | 24000 / 24000 / 0 / 0 / 0 / 0 | 0 | 5.879 / 23.407 / 44.895 | 7.823 / 27.327 / 45.695 | 399.9 | 60.0 | - | 16 / 54 / 42 | 7.41 | 32 | 3.2 / 3.5 / 7.8 | 0 / 0 |  |
+| onedoc-40-conflict | 1 | 4800 / 4788 / 12 / 0 / 0 / 0 | 0 | 3.091 / 6.575 / 16.215 | 8.783 / 19.615 / 26.239 | 79.8 | 60.0 | - | 16 / 27 / 26 | 0.69 | 9 | 2.4 / 2.0 / 6.6 | 0 / 0 |  |
+| onedoc-40-conflict | 2 | 4800 / 4738 / 62 / 0 / 0 / 0 | 0 | 3.097 / 8.479 / 16.575 | 9.471 / 20.079 / 27.919 | 79.0 | 60.0 | - | 16 / 28 / 27 | 0.39 | 5 | 0.8 / 1.3 / 3.4 | 0 / 0 |  |
+| onedoc-40-conflict | 3 | 4800 / 4663 / 137 / 0 / 0 / 0 | 0 | 3.095 / 7.619 / 13.543 | 9.447 / 19.919 / 25.791 | 77.7 | 60.0 | - | 16 / 28 / 27 | 0.52 | 5 | 3.9 / 1.5 / 4.8 | 0 / 0 | x |
+| onedoc-10-rate20 | 1 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.887 / 9.543 / 15.463 | 7.371 / 17.663 / 28.079 | 200.0 | 60.0 | - | 16 / 28 / 28 | 0.61 | 5 | 0.8 / 1.5 / 6.4 | 0 / 0 | x |
+| onedoc-10-rate20 | 2 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 3.315 / 11.295 / 32.319 | 7.891 / 19.903 / 40.479 | 200.0 | 60.0 | - | 16 / 28 / 28 | 0.73 | 8 | 1.2 / 1.7 / 7.8 | 0 / 0 |  |
+| onedoc-10-rate20 | 3 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.171 / 8.215 / 20.447 | 8.551 / 18.607 / 27.583 | 200.0 | 60.0 | - | 15 / 28 / 28 | 0.52 | 5 | 0.9 / 2.0 / 6.3 | 0 / 0 |  |
+| manydocs-200x3 | 1 | 36000 / 36000 / 0 / 0 / 0 / 0 | 0 | 3.071 / 23.839 / 52.351 | 6.975 / 29.199 / 54.175 | 599.4 | 60.1 | - | 15 / 84 / 77 | 1.53 | 9 | 0.9 / 1.8 / 5.0 | 0 / 0 | x |
+| manydocs-200x3 | 2 | 36000 / 36000 / 0 / 0 / 0 / 0 | 0 | 3.089 / 23.599 / 37.663 | 7.163 / 29.663 / 47.039 | 599.6 | 60.0 | - | 16 / 85 / 77 | 1.55 | 9 | 0.6 / 2.1 / 5.7 | 0 / 0 |  |
+| manydocs-200x3 | 3 | 36000 / 36000 / 0 / 0 / 0 / 0 | 0 | 5.703 / 31.727 / 54.623 | 8.007 / 36.543 / 86.719 | 599.5 | 60.0 | - | 15 / 85 / 78 | 2.98 | 17 | 1.0 / 2.6 / 7.0 | 0 / 0 |  |
+| open-100kb | 1 | n/a | 0 | 1.643 / 1.876 / 1.876 | - | n/a | 0.1 | 6.2 | 16 / 20 / 20 | 0.05 | 5 | 5.5 / 2.2 / 2.2 | 0 / 0 |  |
+| open-100kb | 2 | n/a | 0 | 1.577 / 1.888 / 1.888 | - | n/a | 0.0 | 6.0 | 16 / 20 / 20 | 0.05 | 5 | 1.2 / 3.6 / 3.6 | 0 / 0 | x |
+| open-100kb | 3 | n/a | 0 | 1.642 / 2.04 / 2.04 | - | n/a | 0.1 | 27.9 | 16 / 20 / 20 | 0.05 | 5 | 1.2 / 5.0 / 5.0 | 0 / 0 |  |
+| open-1mb | 1 | n/a | 0 | 4.391 / 16.575 / 16.575 | - | n/a | 0.2 | 10.6 | 16 / 22 / 22 | 0.06 | 6 | 1.2 / 2.5 / 2.5 | 0 / 0 |  |
+| open-1mb | 2 | n/a | 0 | 4.199 / 15.879 / 15.879 | - | n/a | 0.1 | 17.4 | 16 / 21 / 21 | 0.05 | 5 | 3.1 / 2.1 / 2.1 | 0 / 0 | x |
+| open-1mb | 3 | n/a | 0 | 4.671 / 5.239 / 5.239 | - | n/a | 0.1 | 10.3 | 16 / 21 / 21 | 0.05 | 5 | 3.3 / 3.3 / 3.3 | 0 / 0 |  |
+| open-5mb | 1 | n/a | 0 | 17.983 / 35.487 / 35.487 | - | n/a | 0.5 | 29.5 | 16 / 25 / 25 | 0.06 | 6 | 1.2 / 2.2 / 3.4 | 0 / 0 |  |
+| open-5mb | 2 | n/a | 0 | 19.279 / 38.399 / 38.399 | - | n/a | 0.5 | 29.6 | 16 / 25 / 25 | 0.08 | 8 | 1.0 / 1.9 / 2.6 | 0 / 0 | x |
+| open-5mb | 3 | n/a | 0 | 16.847 / 38.591 / 38.591 | - | n/a | 0.4 | 27.4 | 16 / 26 / 26 | 0.08 | 8 | 0.9 / 1.6 / 2.6 | 0 / 0 |  |
+| idle-500 | 1 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 16 / 64 / 28 | 1.09 | 17 | 1.0 / 2.6 / 6.3 | 0 / 0 |  |
+| idle-500 | 2 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 16 / 62 / 27 | 1.23 | 28 | 2.3 / 2.6 / 8.1 | 0 / 0 |  |
+| idle-500 | 3 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 62 / 27 | 1.48 | 28 | 2.6 / 2.7 / 10.2 | 0 / 0 | x |
+| idle-1000 | 1 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.2 | - | 16 / 149 / 32 | 3.34 | 75 | 0.9 / 4.1 / 11.8 | 0 / 0 |  |
+| idle-1000 | 2 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 152 / 32 | 2.66 | 34 | 0.8 / 3.8 / 7.9 | 0 / 0 |  |
+| idle-1000 | 3 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.2 | - | 16 / 151 / 32 | 2.89 | 64 | 1.8 / 3.9 / 18.7 | 0 / 0 | x |
+| idle-2000 | 1 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.5 | - | 15 / 384 / 37 | 11.31 | 129 | 4.4 / 7.5 / 30.1 | 0 / 0 |  |
+| idle-2000 | 2 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.4 | - | 16 / 392 / 38 | 12.14 | 183 | 2.1 / 7.8 / 25.0 | 0 / 0 |  |
+| idle-2000 | 3 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.4 | - | 16 / 391 / 37 | 15.41 | 260 | 2.4 / 8.2 / 27.6 | 0 / 0 | x |
+
+#### rust-0.2.0-dev-19b-sqlite (targets): the median run of each scenario
+
+| Run | connections | changes (sent / accepted / rejected / timeouts / errors / dropped) | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | doc bytes | welcome bytes | first open | RSS MB | server CPU s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| many-docs 2000 docs x 5 editors, rate 0.1 | 10000 | 60000 / 60000 / 0 / 0 / 0 / 0 | 4.021 / 66.303 / 494.591 | 7.471 / 244.735 / 928.767 | 984.7 | 61 | 2645 | 2218-2745 | - | 16 / 532 / 374 | 5.34 |
+| many-docs 1000 docs x 5 editors, rate 0.1 | 5000 | 30000 / 30000 / 0 / 0 / 0 / 0 | 2.965 / 23.135 / 223.871 | 7.167 / 31.855 / 309.759 | 495.9 | 60 | 2645 | 2218-2744 | - | 16 / 275 / 197 | 2.8 |
+
+#### rust-0.2.0-dev-19b-sqlite (targets): every run
+
+| Scenario | run | changes (sent / accepted / rejected / timeouts / errors / dropped) | refused connections | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | first open | RSS MB | server CPU s | busiest second, % of a core | machine CPU % before / mean / max | server log warnings / errors | median |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| target-manydocs-2000x5 | 1 | 60000 / 60000 / 0 / 0 / 0 / 0 | 0 | 4.021 / 66.303 / 494.591 | 7.471 / 244.735 / 928.767 | 984.7 | 60.9 | - | 16 / 532 / 374 | 5.34 | 26 | 0.6 / 1.9 / 13.0 | 0 / 0 | x |
+| target-manydocs-2000x5 | 2 | 60000 / 60000 / 0 / 0 / 0 / 0 | 0 | 3.937 / 46.207 / 295.423 | 7.435 / 72.255 / 677.887 | 984.6 | 60.9 | - | 15 / 531 / 394 | 6.23 | 31 | 2.1 / 1.9 / 7.6 | 0 / 0 |  |
+| target-manydocs-2000x5 | 3 | 60000 / 60000 / 0 / 0 / 0 / 0 | 0 | 4.383 / 221.823 / 949.759 | 7.839 / 681.471 / 1566 | 980.1 | 61.2 | - | 16 / 511 / 378 | 5.5 | 23 | 4.4 / 3.3 / 15.7 | 0 / 0 |  |
+| target-manydocs-1000x5 | 1 | 30000 / 30000 / 0 / 0 / 0 / 0 | 0 | 3.035 / 22.735 / 197.759 | 7.123 / 30.287 / 270.079 | 497.1 | 60.4 | - | 16 / 272 / 195 | 2.56 | 26 | 0.6 / 1.5 / 6.1 | 0 / 0 |  |
+| target-manydocs-1000x5 | 2 | 30000 / 30000 / 0 / 0 / 0 / 0 | 0 | 2.965 / 23.135 / 223.871 | 7.167 / 31.855 / 309.759 | 495.9 | 60.5 | - | 16 / 275 / 197 | 2.8 | 19 | 0.8 / 2.4 / 21.1 | 0 / 0 | x |
+| target-manydocs-1000x5 | 3 | 30000 / 30000 / 0 / 0 / 0 / 0 | 0 | 3.143 / 23.711 / 204.415 | 7.187 / 32.223 / 299.775 | 496.3 | 60.5 | - | 16 / 275 / 198 | 2.52 | 22 | 0.3 / 1.8 / 7.6 | 0 / 0 |  |
+
+#### rust-0.2.0-dev-19b-postgres (comparison): the median run of each scenario
+
+| Run | connections | changes (sent / accepted / rejected / timeouts / errors / dropped) | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | doc bytes | welcome bytes | first open | RSS MB | server CPU s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| one-doc 10 editors, rate 2, 200 features | 10 | 1200 / 1200 / 0 / 0 / 0 / 0 | 1.844 / 3.379 / 50.207 | 10.111 / 18.559 / 57.599 | 20.0 | 60 | 23370 | 18284-19436 | - | 14 / 21 / 21 | 0.19 |
+| one-doc 40 editors, rate 2, 200 features | 40 | 4800 / 4800 / 0 / 0 / 0 / 0 | 1.897 / 3.893 / 46.623 | 8.751 / 18.191 / 56.639 | 80.1 | 60 | 23370 | 18284-23308 | - | 15 / 26 / 24 | 0.62 |
+| one-doc 100 editors, rate 2, 200 features | 100 | 12000 / 12000 / 0 / 0 / 0 / 0 | 2.205 / 4.583 / 49.535 | 7.159 / 17.055 / 50.047 | 200.0 | 60 | 23370 | 18284-31048 | - | 15 / 33 / 28 | 1.78 |
+| one-doc 200 editors, rate 2, 200 features | 200 | 24000 / 24000 / 0 / 0 / 0 / 0 | 4.199 / 10.463 / 66.303 | 6.383 / 19.759 / 72.831 | 399.9 | 60 | 23370 | 18284-44048 | - | 14 / 46 / 34 | 7.31 |
+| one-doc 40 editors, rate 2, 20 features | 40 | 4800 / 4724 / 76 / 0 / 0 / 0 | 2.169 / 4.339 / 70.335 | 8.559 / 18.191 / 79.295 | 78.7 | 60 | 2645 | 2218-7242 | - | 15 / 24 / 23 | 0.75 |
+| one-doc 10 editors, rate 20, 200 features (2 of 5 runs FAILED) | 10 | 12000 / 12000 / 0 / 0 / 0 / 0 | 2.153 / 4.335 / 54.591 | 8.423 / 18.207 / 54.943 | 200.0 | 60 | 23370 | 18284-19436 | - | 15 / 26 / 25 | 0.59 |
+| many-docs 200 docs x 3 editors, rate 1 | 600 | 36000 / 36000 / 0 / 0 / 0 / 0 | 2.775 / 7.147 / 42.207 | 6.023 / 18.287 / 46.495 | 599.6 | 60 | 2645 | 2218-2480 | - | 15 / 80 / 70 | 1.17 |
+| open 100 KB x20 | 1 | n/a | 2.277 / 4.755 / 4.755 | - | n/a | 0.1 | 100770 | 97982-97983 | 17.5 | 15 / 18 / 18 | 0.05 |
+| open 1 MB x20 | 1 | n/a | 5.455 / 9.271 / 9.271 | - | n/a | 0.2 | 1000770 | 997982-997983 | 41.8 | 14 / 20 / 20 | 0.05 |
+| open 5 MB x20 | 1 | n/a | 20.063 / 73.727 / 73.727 | - | n/a | 0.6 | 5000770 | 4997982-4997983 | 41.4 | 15 / 24 / 24 | 0.08 |
+| idle 500 connections | 500 | 0 / 0 / 0 / 0 / 0 / 0 | - | - | 0.0 | 60 | 492 | 578-65342 | - | 15 / 59 / 26 | 2.75 |
+| idle 1000 connections | 1000 | 0 / 0 / 0 / 0 / 0 / 0 | - | - | 0.0 | 60 | 492 | 579-130342 | - | 15 / 143 / 31 | 2.84 |
+| idle 2000 connections | 2000 | 0 / 0 / 0 / 0 / 0 / 0 | - | - | 0.0 | 60 | 492 | 578-261342 | - | 15 / 387 / 35 | 12.03 |
+
+#### rust-0.2.0-dev-19b-postgres (comparison): every run
+
+| Scenario | run | changes (sent / accepted / rejected / timeouts / errors / dropped) | refused connections | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | first open | RSS MB | server CPU s | busiest second, % of a core | machine CPU % before / mean / max | server log warnings / errors | median |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| onedoc-10 | 1 | 1200 / 1200 / 0 / 0 / 0 / 0 | 0 | 1.881 / 3.007 / 6.599 | 9.879 / 18.415 / 19.727 | 20.0 | 60.0 | - | 15 / 21 / 21 | 0.12 | 5 | 0.4 / 1.3 / 5.9 | 0 / 0 |  |
+| onedoc-10 | 2 | 1200 / 1200 / 0 / 0 / 0 / 0 | 0 | 1.844 / 3.379 / 50.207 | 10.111 / 18.559 / 57.599 | 20.0 | 60.0 | - | 14 / 21 / 21 | 0.19 | 8 | 0.5 / 1.2 / 8.1 | 0 / 0 | x |
+| onedoc-10 | 3 | 1200 / 1200 / 0 / 0 / 0 / 0 | 0 | 1.829 / 3.987 / 47.935 | 10.015 / 18.975 / 63.807 | 20.0 | 60.0 | - | 15 / 21 / 21 | 0.25 | 8 | 0.4 / 4.9 / 84.7 | 0 / 0 |  |
+| onedoc-40 | 1 | 4800 / 4800 / 0 / 0 / 0 / 0 | 0 | 1.895 / 3.859 / 50.367 | 8.639 / 18.191 / 59.391 | 80.0 | 60.0 | - | 15 / 25 / 24 | 0.7 | 9 | 3.8 / 1.9 / 6.5 | 0 / 0 |  |
+| onedoc-40 | 2 | 4800 / 4800 / 0 / 0 / 0 / 0 | 0 | 2.049 / 4.303 / 50.303 | 8.639 / 18.175 / 50.911 | 80.0 | 60.0 | - | 15 / 26 / 25 | 0.31 | 8 | 3.6 / 2.5 / 10.0 | 0 / 0 |  |
+| onedoc-40 | 3 | 4800 / 4800 / 0 / 0 / 0 / 0 | 0 | 1.897 / 3.893 / 46.623 | 8.751 / 18.191 / 56.639 | 80.1 | 60.0 | - | 15 / 26 / 24 | 0.62 | 6 | 0.8 / 2.0 / 6.1 | 0 / 0 | x |
+| onedoc-100 | 1 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.219 / 4.231 / 45.247 | 7.447 / 17.535 / 46.015 | 200.0 | 60.0 | - | 14 / 33 / 27 | 1.72 | 16 | 1.7 / 1.7 / 8.2 | 0 / 0 |  |
+| onedoc-100 | 2 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.205 / 4.583 / 49.535 | 7.159 / 17.055 / 50.047 | 200.0 | 60.0 | - | 15 / 33 / 28 | 1.78 | 11 | 1.4 / 2.0 / 5.9 | 0 / 0 | x |
+| onedoc-100 | 3 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.281 / 4.691 / 51.263 | 7.275 / 17.423 / 61.311 | 199.9 | 60.0 | - | 15 / 35 / 29 | 1.27 | 11 | 1.3 / 2.0 / 6.3 | 0 / 0 |  |
+| onedoc-200 | 1 | 24000 / 24000 / 0 / 0 / 0 / 0 | 0 | 3.535 / 10.407 / 52.735 | 5.819 / 19.119 / 61.151 | 399.8 | 60.0 | - | 15 / 46 / 34 | 6.38 | 26 | 1.3 / 3.8 / 17.3 | 0 / 0 |  |
+| onedoc-200 | 2 | 24000 / 24000 / 0 / 0 / 0 / 0 | 0 | 4.135 / 10.895 / 57.759 | 6.515 / 19.935 / 62.591 | 399.9 | 60.0 | - | 14 / 44 / 32 | 8.03 | 33 | 1.7 / 4.5 / 15.3 | 0 / 0 |  |
+| onedoc-200 | 3 | 24000 / 24000 / 0 / 0 / 0 / 0 | 0 | 4.199 / 10.463 / 66.303 | 6.383 / 19.759 / 72.831 | 399.9 | 60.0 | - | 14 / 46 / 34 | 7.31 | 29 | 7.6 / 4.1 / 12.9 | 0 / 0 | x |
+| onedoc-40-conflict | 1 | 4800 / 4724 / 76 / 0 / 0 / 0 | 0 | 2.169 / 4.339 / 70.335 | 8.559 / 18.191 / 79.295 | 78.7 | 60.0 | - | 15 / 24 / 23 | 0.75 | 6 | 6.8 / 5.7 / 10.8 | 0 / 0 | x |
+| onedoc-40-conflict | 2 | 4800 / 4753 / 47 / 0 / 0 / 0 | 0 | 2.109 / 4.399 / 49.375 | 8.895 / 18.335 / 49.759 | 79.2 | 60.0 | - | 15 / 23 / 23 | 0.69 | 8 | 6.1 / 5.6 / 9.8 | 0 / 0 |  |
+| onedoc-40-conflict | 3 | 4800 / 4696 / 104 / 0 / 0 / 0 | 0 | 2.117 / 4.195 / 58.239 | 8.871 / 18.383 / 58.975 | 78.3 | 60.0 | - | 15 / 23 / 23 | 0.66 | 5 | 7.1 / 5.2 / 12.3 | 0 / 0 |  |
+| onedoc-10-rate20 | 1 | FAILED: loadgen exit 1, no report | - | - | - | - | - | - | - | - | - | 7.2 / ? / ? | 0 / 0 | |
+| onedoc-10-rate20 | 2 | FAILED: loadgen exit 1, no report | - | - | - | - | - | - | - | - | - | 2.0 / ? / ? | 0 / 0 | |
+| onedoc-10-rate20 | 3 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 2.153 / 4.335 / 54.591 | 8.423 / 18.207 / 54.943 | 200.0 | 60.0 | - | 15 / 26 / 25 | 0.59 | 8 | 5.7 / 5.8 / 18.0 | 0 / 0 | x |
+| onedoc-10-rate20 | 4 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 1.888 / 3.507 / 43.967 | 8.103 / 17.311 / 46.207 | 200.0 | 60.0 | - | 15 / 25 / 24 | 0.27 | 3 | 4.7 / 1.1 / 7.2 | 0 / 0 |  |
+| onedoc-10-rate20 | 5 | 12000 / 12000 / 0 / 0 / 0 / 0 | 0 | 1.8 / 3.427 / 45.023 | 7.843 / 16.671 / 55.999 | 200.0 | 60.0 | - | 15 / 25 / 25 | 0.27 | 8 | 0.5 / 1.1 / 5.9 | 0 / 0 |  |
+| manydocs-200x3 | 1 | 36000 / 36000 / 0 / 0 / 0 / 0 | 0 | 2.837 / 7.627 / 30.847 | 6.007 / 19.055 / 39.743 | 599.6 | 60.0 | - | 15 / 79 / 72 | 1.72 | 22 | 6.7 / 5.6 / 10.0 | 0 / 0 |  |
+| manydocs-200x3 | 2 | 36000 / 36000 / 0 / 0 / 0 / 0 | 0 | 2.775 / 7.147 / 42.207 | 6.023 / 18.287 / 46.495 | 599.6 | 60.0 | - | 15 / 80 / 70 | 1.17 | 9 | 5.9 / 4.5 / 11.0 | 0 / 0 | x |
+| manydocs-200x3 | 3 | 36000 / 36000 / 0 / 0 / 0 / 0 | 0 | 2.787 / 7.079 / 36.895 | 6.167 / 18.543 / 75.007 | 599.7 | 60.0 | - | 15 / 81 / 74 | 1.16 | 12 | 5.6 / 4.1 / 10.1 | 0 / 0 |  |
+| open-100kb | 1 | n/a | 0 | 2.277 / 4.755 / 4.755 | - | n/a | 0.1 | 17.5 | 15 / 18 / 18 | 0.05 | 5 | 3.0 / 3.3 / 3.3 | 0 / 0 | x |
+| open-100kb | 2 | n/a | 0 | 1.963 / 3.783 / 3.783 | - | n/a | 0.1 | 15.8 | 15 / 18 / 18 | 0.05 | 5 | 6.5 / 8.8 / 8.8 | 0 / 0 |  |
+| open-100kb | 3 | n/a | 0 | 2.113 / 5.415 / 5.415 | - | n/a | 0.1 | 19.4 | 15 / 19 / 19 | 0.06 | 6 | 5.8 / 7.6 / 7.6 | 0 / 0 |  |
+| open-1mb | 1 | n/a | 0 | 5.831 / 47.039 / 47.039 | - | n/a | 0.2 | 22.5 | 15 / 19 / 19 | 0.05 | 5 | 8.8 / 3.5 / 3.5 | 0 / 0 |  |
+| open-1mb | 2 | n/a | 0 | 5.455 / 9.271 / 9.271 | - | n/a | 0.2 | 41.8 | 14 / 20 / 20 | 0.05 | 5 | 2.7 / 5.5 / 5.5 | 0 / 0 | x |
+| open-1mb | 3 | n/a | 0 | 5.251 / 7.815 / 7.815 | - | n/a | 0.2 | 23.1 | 15 / 19 / 19 | 0.08 | 8 | 3.2 / 5.0 / 5.0 | 0 / 0 |  |
+| open-5mb | 1 | n/a | 0 | 28.959 / 82.047 / 82.047 | - | n/a | 0.7 | 63.6 | 15 / 24 / 24 | 0.16 | 16 | 3.9 / 8.6 / 11.0 | 0 / 0 |  |
+| open-5mb | 2 | n/a | 0 | 20.063 / 73.727 / 73.727 | - | n/a | 0.6 | 41.4 | 15 / 24 / 24 | 0.08 | 8 | 5.8 / 9.2 / 12.1 | 0 / 0 | x |
+| open-5mb | 3 | n/a | 0 | 25.535 / 66.943 / 66.943 | - | n/a | 0.7 | 63.3 | 14 / 24 / 24 | 0.06 | 6 | 3.1 / 5.2 / 5.6 | 0 / 0 |  |
+| idle-500 | 1 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 59 / 26 | 2.75 | 30 | 5.5 / 5.3 / 12.8 | 0 / 0 | x |
+| idle-500 | 2 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 59 / 26 | 2.28 | 23 | 6.7 / 4.8 / 16.4 | 0 / 0 |  |
+| idle-500 | 3 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 60 / 25 | 1.69 | 23 | 6.5 / 2.4 / 9.4 | 0 / 0 |  |
+| idle-1000 | 1 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 143 / 31 | 2.84 | 39 | 0.7 / 2.1 / 8.2 | 0 / 0 | x |
+| idle-1000 | 2 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.1 | - | 15 / 142 / 31 | 3.31 | 39 | 1.9 / 2.6 / 7.2 | 0 / 0 |  |
+| idle-1000 | 3 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.2 | - | 15 / 144 / 29 | 3.66 | 40 | 2.3 / 5.0 / 19.7 | 0 / 0 |  |
+| idle-2000 | 1 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.4 | - | 15 / 387 / 35 | 12.03 | 228 | 3.7 / 8.0 / 26.0 | 0 / 0 | x |
+| idle-2000 | 2 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.4 | - | 15 / 396 / 37 | 12.06 | 205 | 0.7 / 4.6 / 21.1 | 0 / 0 |  |
+| idle-2000 | 3 | 0 / 0 / 0 / 0 / 0 / 0 | 0 | - | - | 0.0 | 60.5 | - | 14 / 385 / 37 | 11.77 | 140 | 0.5 / 4.7 / 24.5 | 0 / 0 |  |
+
+#### rust-0.2.0-dev-19b-postgres (targets): the median run of each scenario
+
+| Run | connections | changes (sent / accepted / rejected / timeouts / errors / dropped) | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | doc bytes | welcome bytes | first open | RSS MB | server CPU s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| many-docs 2000 docs x 5 editors, rate 0.1 | 10000 | 60000 / 60000 / 0 / 0 / 0 / 0 | 3.155 / 105.471 / 865.279 | 5.639 / 359.679 / 1163 | 982.4 | 61 | 2645 | 2218-2745 | - | 15 / 500 / 331 | 3.84 |
+| many-docs 1000 docs x 5 editors, rate 0.1 | 5000 | 30000 / 30000 / 0 / 0 / 0 / 0 | 2.759 / 6.359 / 202.111 | 6.327 / 18.351 / 266.239 | 497.2 | 60 | 2645 | 2218-2744 | - | 15 / 268 / 191 | 1.89 |
+
+#### rust-0.2.0-dev-19b-postgres (targets): every run
+
+| Scenario | run | changes (sent / accepted / rejected / timeouts / errors / dropped) | refused connections | service p50 / p99 / max | schedule p50 / p99 / max | accepted per s | run s | first open | RSS MB | server CPU s | busiest second, % of a core | machine CPU % before / mean / max | server log warnings / errors | median |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| target-manydocs-2000x5 | 1 | 60000 / 60000 / 0 / 0 / 0 / 0 | 0 | 3.155 / 105.471 / 865.279 | 5.639 / 359.679 / 1163 | 982.4 | 61.1 | - | 15 / 500 / 331 | 3.84 | 39 | 0.4 / 2.0 / 10.6 | 0 / 0 | x |
+| target-manydocs-2000x5 | 2 | 60000 / 60000 / 0 / 0 / 0 / 0 | 0 | 3.163 / 53.567 / 500.479 | 5.563 / 177.663 / 859.135 | 982.2 | 61.1 | - | 14 / 502 / 333 | 3.67 | 29 | 0.3 / 2.1 / 12.0 | 0 / 0 |  |
+| target-manydocs-2000x5 | 3 | 60000 / 60000 / 0 / 0 / 0 / 0 | 0 | 3.207 / 152.063 / 918.015 | 5.663 / 513.279 / 1452 | 977.1 | 61.4 | - | 15 / 506 / 333 | 3.52 | 31 | 0.5 / 2.2 / 18.0 | 0 / 0 |  |
+| target-manydocs-1000x5 | 1 | 30000 / 30000 / 0 / 0 / 0 / 0 | 0 | 2.759 / 6.359 / 202.111 | 6.327 / 18.351 / 266.239 | 497.2 | 60.3 | - | 15 / 268 / 191 | 1.89 | 25 | 0.3 / 1.3 / 5.3 | 0 / 0 | x |
+| target-manydocs-1000x5 | 2 | 30000 / 30000 / 0 / 0 / 0 / 0 | 0 | 2.773 / 6.467 / 223.231 | 6.495 / 18.671 / 265.471 | 497.1 | 60.4 | - | 15 / 267 / 191 | 1.95 | 31 | 0.7 / 1.4 / 6.5 | 0 / 0 |  |
+| target-manydocs-1000x5 | 3 | 30000 / 30000 / 0 / 0 / 0 / 0 | 0 | 2.719 / 6.235 / 214.911 | 6.347 / 18.367 / 267.775 | 496.9 | 60.4 | - | 14 / 270 / 192 | 2.56 | 37 | 4.3 / 1.4 / 5.3 | 0 / 0 |  |
