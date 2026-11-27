@@ -179,6 +179,8 @@ impl Room {
             draft: None,
             presence_news: None,
             draft_news: None,
+            draft_frame: None,
+            owed: None,
             live_rate: Bucket::default(),
             lock_rate: Bucket::default(),
             joined: self.next_join,
@@ -259,6 +261,7 @@ impl Room {
         };
         let revoked = c.outbox.close_code().is_some_and(close::ends_access);
         self.behind.remove(&conn);
+        self.owing.remove(&conn);
         if self.conns.is_empty() {
             self.idle_since = Some(self.state.clock.now());
         }

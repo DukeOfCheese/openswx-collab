@@ -90,6 +90,33 @@ async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
     }
 }
 
+/// A presence after a quiet spell is relayed at once: it reaches the others well within a tick,
+/// not at the next one.
+#[tokio::test]
+async fn the_first_presence_after_a_quiet_spell_is_relayed_at_once() {
+    let (server, world) = world().await;
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut watcher = Live::connect(&server, &doc, &world.admin).await;
+    a.drain().await;
+    watcher.drain().await;
+    let mut took = Vec::new();
+    for n in 0..7 {
+        tokio::time::sleep(oswx_server::room::LIVE_TICK * 3).await;
+        let sent = Instant::now();
+        a.presence(json!({"n": n})).await;
+        let r: Relayed = watcher.expect().await;
+        took.push(sent.elapsed());
+        assert_eq!(r.data, Some(plain(json!({"n": n}))));
+    }
+    took.sort();
+    let median = took[took.len() / 2];
+    assert!(
+        median < oswx_server::room::LIVE_TICK / 2,
+        "{median:?} (all: {took:?})"
+    );
+}
+
 async fn upload(server: &TestServer, world: &World, body: &[u8]) -> String {
     let sha = hex::encode(Sha256::digest(body));
     let r = reqwest::Client::new()

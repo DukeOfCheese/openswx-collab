@@ -585,59 +585,139 @@ async fn a_reader_that_never_reads_is_dropped_before_it_costs_memory() {
     assert_eq!(stuck.closed().await.0, 4408);
 }
 
-/// A reader that does not keep up with presence and drafts (and who comes and goes) falls behind on
-/// them instead of being closed: they are dropped for it, and once it has written what it had it
-/// is sent everyone as they are now. What must arrive (a change) still does, in order.
-#[tokio::test]
-async fn a_reader_behind_on_presence_is_kept_and_sent_the_peers_when_it_reads_again() {
-    let (server, world) = world().await;
-    let doc = world.document(&server, None, None, None).await;
-    let mut stuck =
-        Live::connect_with(&server, &doc, &world.admin, Hello::client("slow-reader")).await;
-    let stuck_id = stuck.client_id.clone();
-    let mut a = Live::connect(&server, &doc, &world.admin).await;
-    let mut b = Live::connect(&server, &doc, &world.admin).await;
+/// The status of one connection of the document.
+async fn conn_status(
+    server: &TestServer,
+    doc: &str,
+    client_id: &str,
+) -> Option<oswx_server::room::ConnStatus> {
+    server
+        .room_status(doc)
+        .await
+        .connections
+        .into_iter()
+        .find(|c| c.client_id == client_id)
+}
+
+/// Big drafts from `flooders`, as fast as each may send them (each counting on from `n`), until
+/// the connection `stuck` is behind on soft frames; its queue stays bounded meanwhile. With
+/// `to_a_standstill`, until its socket takes nothing more either (it stays behind with the same
+/// frames queued: a reader that is behind but whose socket still has room writes them, and is
+/// caught up without reading).
+async fn flood_until_behind(
+    server: &TestServer,
+    doc: &str,
+    stuck: &str,
+    flooders: &mut [Live],
+    n: &mut u64,
+    within: Duration,
+    to_a_standstill: bool,
+) {
     let pad = "x".repeat(120_000);
-    let status = |s: &oswx_server::room::RoomStatus| {
-        s.connections
-            .iter()
-            .find(|c| c.client_id == stuck_id)
-            .cloned()
-    };
-    // Big drafts, as fast as each may send them, until the reader's socket and its queue are full.
-    let mut n = 0;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + within;
+    let mut still = (0, 0);
     loop {
-        n += 1;
-        a.draft(Some(json!({"n": n, "pad": pad}))).await;
-        b.draft(Some(json!({"n": n, "pad": pad}))).await;
+        *n += 1;
+        for f in flooders.iter_mut() {
+            f.draft(Some(json!({"n": *n, "pad": pad}))).await;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
-        a.drain().await;
-        b.drain().await;
-        let c = status(&server.room_status(&doc).await).expect("the slow reader is still there");
+        for f in flooders.iter_mut() {
+            f.drain().await;
+        }
+        let c = conn_status(server, doc, stuck)
+            .await
+            .expect("the slow reader is still there");
         assert!(
             c.queued_bytes <= 1024 * 1024 + 2 * 130_000,
             "{} bytes queued",
             c.queued_bytes
         );
-        if c.behind {
-            break;
+        if c.behind && !to_a_standstill {
+            return;
+        }
+        still = match (c.behind, c.queued_bytes) {
+            (true, b) if b > 0 && b == still.1 => (still.0 + 1, b),
+            (true, b) => (1, b),
+            _ => (0, 0),
+        };
+        if still.0 >= 5 {
+            return;
         }
         assert!(Instant::now() < deadline, "the reader never fell behind");
     }
+}
+
+/// A reader that does not keep up with presence and drafts (and who comes and goes) falls behind on
+/// them instead of being closed: they are dropped for it, and once it has written everything it
+/// had it is sent everyone as they are now, itself included, in one small list without drafts,
+/// however large the drafts (here more than 1 MiB in all). Who joined while it was behind is in
+/// it and who left is not. Then every peer's current draft follows, without it falling behind
+/// again. What must arrive (a change) still does, in order.
+#[tokio::test]
+async fn a_reader_behind_is_caught_up_with_a_small_list_and_then_the_drafts() {
+    let hooks = oswx_server::room::Hooks {
+        // (Those that never read below stay.)
+        frozen_after: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut stuck =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("slow-reader")).await;
+    let stuck_id = stuck.client_id.clone();
+    // Ten that each leave a big draft and then never read (the list would be over 1 MiB with them).
+    let big = |i: usize| json!({"sitter": i, "pad": "y".repeat(120_000)});
+    let mut sitters = Vec::new();
+    for i in 0..10 {
+        let mut s = Live::connect(&server, &doc, &world.admin).await;
+        s.draft(Some(big(i))).await;
+        sitters.push(s);
+    }
+    let mut flooders = vec![
+        Live::connect(&server, &doc, &world.admin).await,
+        Live::connect(&server, &doc, &world.admin).await,
+    ];
+    let mut n = 0;
+    flood_until_behind(
+        &server,
+        &doc,
+        &stuck_id,
+        &mut flooders,
+        &mut n,
+        WAIT * 3,
+        true,
+    )
+    .await;
+    let b_last = n;
     // More of them while it is behind cost it nothing.
+    let pad = "x".repeat(120_000);
     for _ in 0..5 {
         n += 1;
-        a.draft(Some(json!({"n": n, "pad": pad}))).await;
+        flooders[0].draft(Some(json!({"n": n, "pad": pad}))).await;
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
-    b.presence(json!({"tool": "last"})).await;
-    let seq = a.change(vec![set_depth(3)], vec![], vec![]).await.seq();
-    let c = status(&server.room_status(&doc).await).expect("still there");
-    assert!(c.behind && c.queued_bytes <= 1024 * 1024 + 3 * 130_000);
-    // It reads again: what its socket held, the change in its place, and then the peers as they
-    // are now; never a close.
-    let (a_id, b_id) = (a.client_id.clone(), b.client_id.clone());
+    flooders[1].presence(json!({"tool": "last"})).await;
+    // One joins and one leaves while it is behind.
+    let joiner = Live::connect(&server, &doc, &world.admin).await;
+    let leaver = sitters.pop().unwrap();
+    let leaver_id = leaver.client_id.clone();
+    leaver.close().await;
+    let seq = flooders[0]
+        .change(vec![set_depth(3)], vec![], vec![])
+        .await
+        .seq();
+    let c = conn_status(&server, &doc, &stuck_id)
+        .await
+        .expect("still there");
+    assert!(
+        c.behind && c.queued_bytes <= 1024 * 1024 + 3 * 130_000,
+        "{c:?}"
+    );
+    // It reads again: what its socket held (lists of earlier catch-ups among it, while its
+    // socket still had room), the change in its place, and then the peers as they are now; never
+    // a close.
     let mut change_seen = false;
     let peers = loop {
         match stuck.recv().await {
@@ -645,24 +725,190 @@ async fn a_reader_behind_on_presence_is_kept_and_sent_the_peers_when_it_reads_ag
                 assert_eq!(ev.seq, seq);
                 change_seen = true;
             }
-            ServerMsg::PeerList { peers } => break peers,
+            ServerMsg::PeerList { peers } if change_seen => break peers,
             _ => {}
         }
     };
-    assert!(change_seen, "the change came before the list it is behind");
-    let peer = |id: &str| peers.iter().find(|p| &*p.client_id == id).unwrap().clone();
-    assert_eq!(peers.len(), 2, "everyone but itself");
-    assert_eq!(peer(&a_id).draft, Some(plain(json!({"n": n, "pad": pad}))));
-    assert_eq!(peer(&b_id).presence, Some(plain(json!({"tool": "last"}))));
-    assert!(stuck.closed.is_none());
-    // And it takes presence again as it comes.
-    a.presence(json!({"tool": "again"})).await;
-    let r: Relayed = stuck.expect().await;
+    let ids: Vec<&str> = peers.iter().map(|p| &*p.client_id).collect();
     assert_eq!(
-        (r.client_id.as_str(), r.data),
-        (a_id.as_str(), Some(plain(json!({"tool": "again"}))))
+        peers.len(),
+        1 + 9 + 2 + 1,
+        "everyone, itself included: {ids:?}"
     );
-    assert!(!status(&server.room_status(&doc).await).unwrap().behind);
+    assert!(
+        ids.contains(&stuck_id.as_str()),
+        "itself (it skips its own id)"
+    );
+    assert!(ids.contains(&joiner.client_id.as_str()), "who joined");
+    assert!(!ids.contains(&leaver_id.as_str()), "not who left");
+    assert!(peers.iter().all(|p| p.draft.is_none()), "no drafts");
+    let peer = |id: &str| peers.iter().find(|p| &*p.client_id == id).unwrap().clone();
+    assert_eq!(
+        peer(&flooders[1].client_id).presence,
+        Some(plain(json!({"tool": "last"})))
+    );
+    let list = oswx_core::wire::encode_server(&ServerMsg::PeerList {
+        peers: peers.clone(),
+    });
+    assert!(list.len() < 16 * 1024, "{} bytes", list.len());
+    // The drafts follow: every peer's current one.
+    let mut want: std::collections::HashMap<String, Plain> = sitters
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.client_id.clone(), plain(big(i))))
+        .collect();
+    want.insert(
+        flooders[0].client_id.clone(),
+        plain(json!({"n": n, "pad": pad})),
+    );
+    want.insert(
+        flooders[1].client_id.clone(),
+        plain(json!({"n": b_last, "pad": pad})),
+    );
+    while !want.is_empty() {
+        match stuck.recv().await {
+            ServerMsg::Draft {
+                client_id,
+                data: Some(data),
+            } => {
+                if want.get(&*client_id) == Some(&data) {
+                    want.remove(&*client_id);
+                }
+            }
+            ServerMsg::PeerList { .. } => panic!("caught up again"),
+            _ => {}
+        }
+    }
+    assert!(stuck.closed.is_none());
+    assert!(!conn_status(&server, &doc, &stuck_id).await.unwrap().behind);
+    // And it takes presence again as it comes.
+    let a_id = flooders[0].client_id.clone();
+    flooders[0].presence(json!({"tool": "again"})).await;
+    loop {
+        let r: Relayed = stuck.expect().await;
+        if r.kind == "presence" && r.client_id == a_id {
+            assert_eq!(r.data, Some(plain(json!({"tool": "again"}))));
+            break;
+        }
+    }
+    assert!(!conn_status(&server, &doc, &stuck_id).await.unwrap().behind);
+}
+
+/// A reader behind is caught up at most once a period, even when it has written everything
+/// again sooner.
+#[tokio::test]
+async fn a_reader_is_caught_up_at_most_once_a_period() {
+    let every = Duration::from_secs(5);
+    let hooks = oswx_server::room::Hooks {
+        catch_up_every: every,
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut stuck =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("slow-reader")).await;
+    let stuck_id = stuck.client_id.clone();
+    let mut flooders = vec![
+        Live::connect(&server, &doc, &world.admin).await,
+        Live::connect(&server, &doc, &world.admin).await,
+    ];
+    let mut n = 0;
+    flood_until_behind(
+        &server,
+        &doc,
+        &stuck_id,
+        &mut flooders,
+        &mut n,
+        WAIT * 3,
+        false,
+    )
+    .await;
+    while !matches!(stuck.recv().await, ServerMsg::PeerList { .. }) {}
+    let first = Instant::now();
+    // Behind again at once, and it reads everything it can.
+    flood_until_behind(
+        &server,
+        &doc,
+        &stuck_id,
+        &mut flooders,
+        &mut n,
+        every / 2,
+        false,
+    )
+    .await;
+    let lists = stuck
+        .drain()
+        .await
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::PeerList { .. }))
+        .count();
+    assert_eq!(lists, 0, "not caught up again yet");
+    // It has written everything, and is still behind until the period is over.
+    let c = conn_status(&server, &doc, &stuck_id).await.unwrap();
+    assert!(
+        first.elapsed() < every - Duration::from_secs(1),
+        "too slow to tell"
+    );
+    assert!(c.behind, "{c:?}");
+    while !matches!(stuck.recv().await, ServerMsg::PeerList { .. }) {}
+    let gap = first.elapsed();
+    assert!(
+        gap >= every - Duration::from_millis(100),
+        "caught up again after {gap:?}"
+    );
+    assert!(stuck.closed.is_none());
+}
+
+/// A reader that stops reading while presence and drafts keep coming is behind on them, never
+/// too slow for what must arrive: it is closed once it has been behind a while with its socket
+/// taking nothing, and leaves the others' peer lists.
+#[tokio::test]
+async fn a_reader_frozen_behind_is_closed_and_leaves() {
+    let hooks = oswx_server::room::Hooks {
+        frozen_after: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut stuck =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("frozen-one")).await;
+    let stuck_id = stuck.client_id.clone();
+    let mut flooders = vec![
+        Live::connect(&server, &doc, &world.admin).await,
+        Live::connect(&server, &doc, &world.admin).await,
+    ];
+    let mut n = 0;
+    flood_until_behind(
+        &server,
+        &doc,
+        &stuck_id,
+        &mut flooders,
+        &mut n,
+        WAIT * 3,
+        true,
+    )
+    .await;
+    // Presence only from now on.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let left = 'wait: loop {
+        flooders[0].presence(json!({"n": n})).await;
+        n += 1;
+        for m in flooders[1].drain().await {
+            if let ServerMsg::PeerLeft { client_id } = m {
+                break 'wait client_id;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the frozen reader was never closed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(&*left, stuck_id.as_str());
+    assert!(conn_status(&server, &doc, &stuck_id).await.is_none());
+    assert_eq!(stuck.closed().await.0, 4408);
 }
 
 // ------------------------------------------------------------------ storage and database trouble

@@ -94,7 +94,7 @@ use util::Bounded;
 
 pub use conn::{ConnId, Heard, Outbox};
 pub use locks::MAX_LOCKS;
-pub use presence::MAX_ONLINE;
+pub use presence::{LIVE_TICK, MAX_ONLINE};
 pub use rebuild::{BLAME_KEEP, MAX_BROKE};
 
 /// WebSocket close codes the server uses, in one place.
@@ -163,6 +163,12 @@ pub const JOIN_WAIT: Duration = Duration::from_secs(10);
 /// A snapshot's index keeps this many changes of history to judge late changes against; older
 /// marks are pruned just before the snapshot is written ([`Hooks::index_keep`] by default).
 pub const INDEX_KEEP: Seq = 100_000;
+/// A connection behind on soft frames is caught up (sent `peer.list`) at most this often
+/// ([`Hooks::catch_up_every`] by default).
+pub const CATCH_UP_EVERY: Duration = Duration::from_secs(1);
+/// A connection behind on soft frames whose socket has taken nothing for this long is closed as
+/// too slow ([`Hooks::frozen_after`] by default).
+pub const FROZEN_AFTER: Duration = Duration::from_secs(30);
 
 /// Knobs of the rooms that tests turn; a running server keeps the defaults.
 #[doc(hidden)]
@@ -196,6 +202,11 @@ pub struct Hooks {
     pub snapshot_wait: Duration,
     /// How long a request waits for the mail it sends ([`crate::mail::MAIL_WAIT`]).
     pub mail_wait: Duration,
+    /// How often a connection behind on soft frames may be caught up ([`CATCH_UP_EVERY`]).
+    pub catch_up_every: Duration,
+    /// How long a connection behind on soft frames may go without its socket taking a frame
+    /// ([`FROZEN_AFTER`]).
+    pub frozen_after: Duration,
 }
 
 /// A gate tests shut to hold work at a point and open to let it go on.
@@ -346,6 +357,8 @@ impl Default for Hooks {
             revoke_order: Arc::default(),
             snapshot_wait: SNAPSHOT_WAIT,
             mail_wait: crate::mail::MAIL_WAIT,
+            catch_up_every: CATCH_UP_EVERY,
+            frozen_after: FROZEN_AFTER,
         }
     }
 }
@@ -919,6 +932,12 @@ struct Conn {
     /// Its presence and draft not yet relayed to the others (the latest of each), encoded once.
     presence_news: Option<oswx_core::wire::LiveEntry>,
     draft_news: Option<oswx_core::wire::LiveEntry>,
+    /// Its draft as a `draft` frame, made when a connection that caught up is first owed it, and
+    /// shared by every such connection (forgotten when the draft changes).
+    draft_frame: Option<Bytes>,
+    /// Since it last caught up: the peers whose drafts it is owed (`peer.list` carries none), and
+    /// how many of them it has been sent.
+    owed: Option<(Arc<[ConnId]>, usize)>,
     /// Its allowance of presence and draft messages, and of `lock.acquire`s.
     live_rate: presence::Bucket,
     lock_rate: presence::Bucket,
@@ -1048,6 +1067,8 @@ struct Room {
     live_due: Option<Instant>,
     /// Connections behind on soft frames, to be sent the peers once they have written theirs.
     behind: std::collections::HashSet<ConnId>,
+    /// Connections that caught up and are still owed drafts.
+    owing: std::collections::HashSet<ConnId>,
 }
 
 fn next_room_id() -> u64 {
@@ -1133,6 +1154,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
             .unwrap_or_else(Instant::now),
         live_due: None,
         behind: std::collections::HashSet::new(),
+        owing: std::collections::HashSet::new(),
         state,
     };
     crate::metrics::room_loaded();
