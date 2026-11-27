@@ -18,10 +18,19 @@
 //!   for `write_timeout` (60 s unless set), the connection is closed, and with it whatever the
 //!   answer held (a file, a connection to the bucket, an export's place).
 //! - **There are only so many connections**: `max_connections` (4,096 unless set), document
-//!   connections included. One more is accepted and closed at once, and counted. (Not left
-//!   unaccepted: the kernel's queue would fill and every later client, a health check too,
-//!   would wait for a time it cannot know; a closed connection is an answer.) Keep the process's
-//!   limit on open files above it.
+//!   connections included, counted from the moment one is accepted. When the server has them, a
+//!   new one takes the place of the connection that has waited longest without finishing its
+//!   first request head (someone holding sockets open by sending a byte now and then), or
+//!   failing that the one idle longest; never one with a request in its handler, never a
+//!   document connection. With none of those, it goes in a small reserve ([`HEALTH_RESERVE`])
+//!   that answers `GET /api/health` alone (anything else: 503 [`FULL`]), so that a health check
+//!   always gets through; with that full too, it is accepted and closed at once, and counted.
+//!   (Not left unaccepted: the kernel's queue would fill and every later client would wait for a
+//!   time it cannot know; a closed connection is an answer.) Keep the process's limit on open
+//!   files above `max_connections` and its reserve.
+//! - **One address holds only so many**: `max_connections_per_address` (512 unless set; 0: no
+//!   limit). One more from it is closed at once. A trusted proxy's address (`trusted_proxies`)
+//!   is not limited: every client behind it shares it.
 //!
 //! # Long transfers
 //!
@@ -30,7 +39,7 @@
 //!
 //! | | while it moves | when it stops |
 //! |---|---|---|
-//! | blob upload | not under `request_timeout`; at most `max_blob_uploads` at once ([`crate::uploads`]) | no bytes for `blob_idle_timeout`, or slower than the minimum rate: 400, nothing stored |
+//! | blob upload | not under `request_timeout`; only so many at once, in `upload_memory` ([`crate::uploads`]); done within `max(upload_time_limit, size / upload_time_rate)` | no bytes for `blob_idle_timeout`, or slower than the minimum rate: 400, nothing stored |
 //! | any other request body | does not count against `request_timeout` while it keeps up the minimum rate | 503 `request_timeout` after it stopped, or after it fell behind the rate |
 //! | blob download, export | the handler has answered long before; the body is sent for as long as the client reads | nothing written for `write_timeout`: the connection is closed (and the storage's side after `blob_idle_timeout`, an export after its own stall time) |
 //! | document connection | the upgrade is answered at once | the room closes a slow consumer; a socket that takes nothing for `write_timeout` is closed |
@@ -51,11 +60,12 @@
 //! All of that is given `shutdown_timeout` (8 s unless set: `docker stop` kills after 10); what
 //! has not finished by then is abandoned, and [`serve`] says so.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -72,7 +82,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 use tower_service::Service as _;
@@ -116,20 +126,34 @@ pub async fn serve(
     };
     let (closing, _) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let open = Arc::new(Conns::default());
     let mut stop = pin!(stop);
     loop {
         tokio::select! {
             () = &mut stop => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) if state.http.open() >= settings.max_connections => {
-                    // Closed at once (see the module documentation).
-                    state.http.refused();
-                    drop(stream);
-                }
                 Ok((stream, peer)) => {
+                    // Counted from here, before anything else of it runs.
+                    let trusted = settings
+                        .trusted_proxies
+                        .iter()
+                        .any(|proxy| proxy.contains(peer.ip()));
+                    let admitted = open.admit(
+                        peer.ip(),
+                        trusted,
+                        settings.max_connections,
+                        settings.max_connections_per_address,
+                        &state.http,
+                    );
+                    let Some(conn) = admitted else {
+                        // Closed at once (see the module documentation).
+                        drop(stream);
+                        continue;
+                    };
                     connections.spawn(connection(
                         stream,
                         peer,
+                        conn,
                         app.clone(),
                         limits,
                         state.http.clone(),
@@ -211,26 +235,37 @@ struct Limits {
     write: Duration,
 }
 
-/// Serves one connection to its end.
+/// Serves one connection to its end (or until it is evicted to make room for another).
 async fn connection(
     stream: TcpStream,
     peer: SocketAddr,
+    conn: Admitted,
     app: Router,
     limits: Limits,
     stats: Arc<HttpStats>,
     mut closing: watch::Receiver<bool>,
 ) {
+    let (open, conn) = (conn.open, conn.registered);
+    let this = conn.0.clone();
     let in_handlers = stats.clone();
-    let io = TokioIo::new(TakenInTime::new(stream, limits.write, stats));
-    // How many of the connection's requests are in their handlers (one at most, on HTTP/1).
-    let handling = Arc::new(AtomicUsize::new(0));
-    let counted = handling.clone();
+    let io = TokioIo::new(TakenInTime::new(stream, limits.write, stats, open, conn));
+    let reserved = this.reserved;
+    let seen = this.clone();
     let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
         let mut app = app.clone();
-        let handled = (Handling::begin(&counted), in_handlers.handling());
+        let handled = (Handling::begin(&seen), in_handlers.handling());
+        // A connection taken in the reserve is for the health check alone.
+        let refused = reserved && request.uri().path() != HEALTH;
+        let seen = seen.clone();
         async move {
+            if refused {
+                return Ok(detail_response(StatusCode::SERVICE_UNAVAILABLE, FULL));
+            }
             let response = app.call(request).await;
+            if matches!(&response, Ok(r) if r.status() == StatusCode::SWITCHING_PROTOCOLS) {
+                seen.upgraded.store(true, Ordering::SeqCst);
+            }
             drop(handled);
             response
         }
@@ -239,12 +274,15 @@ async fn connection(
         http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(limits.header)
+            .keep_alive(!reserved)
             .serve_connection(io, service)
             .with_upgrades()
     );
     // (A connection's end is its client's business: a reset, a timeout above, a bad request.)
     tokio::select! {
         _ = served.as_mut() => return,
+        // Made room for another (see `Conns::admit`): dropping `served` closes the socket.
+        () = this.evicted.notified() => return,
         _ = closing.wait_for(|closing| *closing) => {}
     }
     // Stopping: the request in its handler is answered; a connection without one is closed once
@@ -254,7 +292,7 @@ async fn connection(
         tokio::select! {
             _ = served.as_mut() => return,
             () = tokio::time::sleep(LINGER) => {
-                if handling.load(Ordering::SeqCst) == 0 {
+                if this.handling.load(Ordering::SeqCst) == 0 {
                     return;
                 }
             }
@@ -262,19 +300,244 @@ async fn connection(
     }
 }
 
-/// A request in its handler, counted until this is dropped.
-struct Handling(Arc<AtomicUsize>);
+/// The path that connections in the reserve may ask for.
+const HEALTH: &str = "/api/health";
+
+/// What a connection in the reserve that asks for anything but [`HEALTH`] is answered (503).
+pub const FULL: &str = "the server has as many connections as it holds; try again in a moment";
+
+/// How many connections beyond `max_connections` the server takes for `GET /api/health` alone
+/// (each is closed after one answer), so that a health check gets through when every connection
+/// is busy.
+pub const HEALTH_RESERVE: usize = 8;
+
+/// A request in its handler on a connection, counted until this is dropped.
+struct Handling(Arc<Conn>);
 
 impl Handling {
-    fn begin(count: &Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count.clone())
+    fn begin(conn: &Arc<Conn>) -> Self {
+        conn.headed.store(true, Ordering::SeqCst);
+        conn.handling.fetch_add(1, Ordering::SeqCst);
+        Self(conn.clone())
     }
 }
 
 impl Drop for Handling {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.handling.fetch_sub(1, Ordering::SeqCst);
+        self.0.touch();
+    }
+}
+
+// ------------------------------------------------------------------ how many connections
+
+/// One open connection, as [`Conns`] sees it.
+#[derive(Debug)]
+struct Conn {
+    id: u64,
+    ip: IpAddr,
+    accepted: Instant,
+    /// Taken in the reserve: it may ask for [`HEALTH`] alone.
+    reserved: bool,
+    /// A request head has arrived on it.
+    headed: AtomicBool,
+    /// How many of its requests are in their handlers (one at most, on HTTP/1).
+    handling: AtomicUsize,
+    /// It became a document connection (a WebSocket): never evicted.
+    upgraded: AtomicBool,
+    /// When anything last moved on it, in milliseconds after `base`.
+    active_ms: AtomicU64,
+    base: Instant,
+    /// Chosen to make room for another: its task closes it.
+    evicted: Notify,
+}
+
+impl Conn {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Something moved on it.
+    fn touch(&self) {
+        if !self.upgraded.load(Ordering::Relaxed) {
+            self.active_ms.store(self.now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Whether it may be closed to make room for another: no request in its handler, not a
+    /// document connection, not already chosen.
+    fn evictable(&self, chosen: &HashSet<u64>) -> bool {
+        self.handling.load(Ordering::SeqCst) == 0
+            && !self.upgraded.load(Ordering::SeqCst)
+            && !chosen.contains(&self.id)
+    }
+}
+
+/// The open connections, for the limits on how many ([`Conns::admit`]).
+#[derive(Debug)]
+struct Conns {
+    base: Instant,
+    inner: Mutex<ConnsInner>,
+}
+
+impl Default for Conns {
+    fn default() -> Self {
+        Self {
+            base: Instant::now(),
+            inner: Mutex::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConnsInner {
+    next: u64,
+    all: HashMap<u64, Arc<Conn>>,
+    by_address: HashMap<IpAddr, usize>,
+    /// Those chosen to make room, still closing: no longer counted.
+    evicted: HashSet<u64>,
+    /// How many are counted (not chosen to make room), outside the reserve and in it.
+    regular: usize,
+    reserve: usize,
+}
+
+impl ConnsInner {
+    /// One fewer counted, of the kind `conn` is.
+    fn uncount(&mut self, conn: &Conn) {
+        if conn.reserved {
+            self.reserve -= 1;
+        } else {
+            self.regular -= 1;
+        }
+    }
+}
+
+/// A connection [`Conns::admit`] took: counted until its socket closes.
+struct Admitted {
+    open: OpenConnection,
+    registered: Registered,
+}
+
+/// A connection in [`Conns`], until this is dropped (with its socket).
+struct Registered(Arc<Conn>, Arc<Conns>);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        let mut inner = self.1.lock();
+        let conn = &self.0;
+        inner.all.remove(&conn.id);
+        if !inner.evicted.remove(&conn.id) {
+            inner.uncount(conn);
+        }
+        if let Some(n) = inner.by_address.get_mut(&conn.ip) {
+            *n -= 1;
+            if *n == 0 {
+                inner.by_address.remove(&conn.ip);
+            }
+        }
+    }
+}
+
+impl Conns {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ConnsInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes a connection just accepted from `ip`, or answers `None` when it must be closed at
+    /// once:
+    ///
+    /// - an address that is not a `trusted` proxy holds at most `per_address` (0: any number);
+    /// - the server holds `max` and [`HEALTH_RESERVE`] more for the health check. When it has
+    ///   `max`, the new one takes the place of the one that has waited longest without
+    ///   finishing its first request head, or failing that the one idle longest (never one with
+    ///   a request in its handler, never a document connection), which is closed. With none of
+    ///   those it goes in the reserve; with the reserve full, it takes the place of a reserve
+    ///   connection that has sent nothing, or is closed.
+    fn admit(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        trusted: bool,
+        max: usize,
+        per_address: usize,
+        stats: &Arc<HttpStats>,
+    ) -> Option<Admitted> {
+        let ip = ip.to_canonical();
+        let mut inner = self.lock();
+        let from_there = inner.by_address.get(&ip).copied().unwrap_or(0);
+        if !trusted && per_address > 0 && from_there >= per_address {
+            stats.refused_for_address();
+            return None;
+        }
+        let (regular, reserve) = (inner.regular, inner.reserve);
+        let reserved = if regular < max {
+            false
+        } else if let Some(victim) = inner.victim(false) {
+            inner.evict(victim, stats);
+            false
+        } else if reserve < HEALTH_RESERVE {
+            true
+        } else if let Some(victim) = inner.victim(true) {
+            inner.evict(victim, stats);
+            true
+        } else {
+            stats.refused();
+            return None;
+        };
+        let conn = Arc::new(Conn {
+            id: inner.next,
+            ip,
+            accepted: Instant::now(),
+            reserved,
+            headed: AtomicBool::new(false),
+            handling: AtomicUsize::new(0),
+            upgraded: AtomicBool::new(false),
+            active_ms: AtomicU64::new(0),
+            base: self.base,
+            evicted: Notify::new(),
+        });
+        conn.touch();
+        inner.next += 1;
+        if reserved {
+            inner.reserve += 1;
+        } else {
+            inner.regular += 1;
+        }
+        inner.all.insert(conn.id, conn.clone());
+        *inner.by_address.entry(ip).or_default() += 1;
+        drop(inner);
+        Some(Admitted {
+            open: stats.opened(),
+            registered: Registered(conn, self.clone()),
+        })
+    }
+}
+
+impl ConnsInner {
+    /// The connection to close to make room, among those in the reserve or the others: the one
+    /// that has waited longest for its first request head; failing that (not in the reserve,
+    /// whose connections take one request), the one idle longest.
+    fn victim(&self, in_reserve: bool) -> Option<Arc<Conn>> {
+        let candidates = || {
+            self.all
+                .values()
+                .filter(move |c| c.reserved == in_reserve && c.evictable(&self.evicted))
+        };
+        let fresh = candidates()
+            .filter(|c| !c.headed.load(Ordering::SeqCst))
+            .min_by_key(|c| c.accepted);
+        if fresh.is_some() || in_reserve {
+            return fresh.cloned();
+        }
+        candidates()
+            .min_by_key(|c| c.active_ms.load(Ordering::Relaxed))
+            .cloned()
+    }
+
+    fn evict(&mut self, victim: Arc<Conn>, stats: &HttpStats) {
+        self.evicted.insert(victim.id);
+        self.uncount(&victim);
+        victim.evicted.notify_one();
+        stats.evicted();
     }
 }
 
@@ -391,16 +654,25 @@ struct TakenInTime {
     /// Counted as open for as long as the socket lives: as a document connection too, which
     /// outlives the HTTP connection it began as.
     _open: OpenConnection,
+    /// The same, for the limits on how many ([`Conns`]); told when anything moves.
+    conn: Registered,
 }
 
 impl TakenInTime {
-    fn new(stream: TcpStream, timeout: Duration, stats: Arc<HttpStats>) -> Self {
+    fn new(
+        stream: TcpStream,
+        timeout: Duration,
+        stats: Arc<HttpStats>,
+        open: OpenConnection,
+        conn: Registered,
+    ) -> Self {
         Self {
             stream,
             timeout,
             waiting: None,
             timed_out: false,
-            _open: stats.opened(),
+            _open: open,
+            conn,
             stats,
         }
     }
@@ -422,6 +694,7 @@ impl TakenInTime {
         }
         if outcome.is_ready() {
             self.waiting = None;
+            self.conn.0.touch();
             return outcome;
         }
         let timeout = self.timeout;
@@ -446,7 +719,12 @@ impl AsyncRead for TakenInTime {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let outcome = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.conn.0.touch();
+        }
+        outcome
     }
 }
 

@@ -2481,6 +2481,10 @@ impl Blobs for TestBlobs {
         self.inner.get(key).await
     }
 
+    fn upload_memory(&self) -> u64 {
+        self.inner.upload_memory()
+    }
+
     async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
         self.deletes.fetch_add(1, Ordering::SeqCst);
         self.delete_gate.pass().await;

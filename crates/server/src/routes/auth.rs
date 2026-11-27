@@ -29,7 +29,7 @@ use crate::access::CurrentUser;
 use crate::config::{IpNet, Settings};
 use crate::error::{ApiError, ApiJson};
 use crate::ext::{Event, emit};
-use crate::mail::{reset_text, send_after_commit};
+use crate::mail::{Mailed, reset_text, send_after_commit};
 use crate::routes::meta::{Registration, registration_for};
 use crate::routes::orgs::{accept_invite, approve_invite, find_invite};
 use crate::routes::reset_page::reset_page;
@@ -557,8 +557,24 @@ async fn request_reset(
     state
         .commit_then(tx, |_| async {}, async move {
             // (Not held up by a slow mail server: see `send_after_commit`.)
-            send_after_commit(&after, user.email.clone(), subject, text).await;
-            tracing::info!(user = %user.id, "password reset link sent");
+            match send_after_commit(&after, user.email.clone(), subject, text).await {
+                Mailed::Sent => tracing::info!(user = %user.id, "password reset link sent"),
+                Mailed::Pending => tracing::info!(
+                    user = %user.id,
+                    "password reset link handed on; the mail server has not answered yet"
+                ),
+                Mailed::Failed => tracing::warn!(
+                    user = %user.id,
+                    "password reset link not sent: the mail server did not take it"
+                ),
+                Mailed::Refused => tracing::warn!(
+                    user = %user.id,
+                    "password reset link not sent: too many emails were on their way"
+                ),
+                Mailed::NotConfigured => {
+                    tracing::warn!(user = %user.id, "password reset link not sent: no mail server");
+                }
+            }
             let requested = Event::PasswordResetRequested { user: user.id };
             emit(&after.ext, requested).await;
         })

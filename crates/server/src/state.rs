@@ -13,7 +13,7 @@ use crate::export::Exports;
 use crate::ext::{Extensions, NoExtensions};
 use crate::hub::Hub;
 use crate::journal::{self, JournalWriter};
-use crate::mail::{Mailer, MemoryMailer, SmtpMailer};
+use crate::mail::{MailSends, Mailer, MemoryMailer, SmtpMailer};
 use crate::metrics::HttpStats;
 use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
 use crate::org_queue::{OrgQueue, OrgTurn};
@@ -50,10 +50,13 @@ pub struct AppState {
     pub purger: Purger,
     /// Whose turn it is to change each organisation ([`crate::org_queue`]).
     pub org_queue: OrgQueue,
-    /// How many blob uploads run at once ([`Uploads`]).
+    /// How many blob uploads run at once ([`Uploads`]). Made for the `blobs` the state was built
+    /// with: one that replaces `blobs` and holds more for an upload replaces this too.
     pub uploads: Arc<Uploads>,
     /// What the serving loop counts ([`crate::serve`]).
     pub http: Arc<HttpStats>,
+    /// The emails on their way to the mail server ([`MailSends`]).
+    pub mail: Arc<MailSends>,
 }
 
 /// What the revoking steps of [`AppState::commit_then`] know of the commit.
@@ -111,6 +114,9 @@ const PURGER_WAIT: Duration = Duration::from_secs(2);
 /// How long shutdown waits for the steps after REST commits that are still running.
 const AFTER_COMMIT_WAIT: Duration = Duration::from_secs(10);
 
+/// How long shutdown waits, once the journal is written out, for emails on their way.
+const MAIL_WAIT_AT_STOP: Duration = Duration::from_secs(5);
+
 /// Counts work that runs detached from whoever started it, so that shutdown can wait for it.
 #[derive(Debug, Default)]
 pub struct InFlight {
@@ -124,7 +130,8 @@ impl InFlight {
         self.running.load(Ordering::SeqCst)
     }
 
-    fn start(self: &Arc<Self>) -> Running {
+    /// Counts one more as running, until what this answers is dropped.
+    pub(crate) fn start(self: &Arc<Self>) -> Running {
         self.running.fetch_add(1, Ordering::SeqCst);
         Running(self.clone())
     }
@@ -144,7 +151,7 @@ impl InFlight {
 }
 
 /// One running piece of [`InFlight`] work; it ends when this is dropped.
-struct Running(Arc<InFlight>);
+pub(crate) struct Running(Arc<InFlight>);
 
 impl Drop for Running {
     fn drop(&mut self) {
@@ -167,13 +174,15 @@ impl AppState {
         let mailer = Arc::new(MemoryMailer::new(settings.email_configured()));
         let journal = JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT);
         let uploads = Uploads::new(
-            settings.max_blob_uploads,
+            settings.upload_memory,
+            blobs.upload_memory(),
             settings.max_blob_uploads_per_org,
             settings.max_blob_uploads_per_user,
         );
         Self {
             uploads: Arc::new(uploads),
             http: Arc::default(),
+            mail: Arc::new(MailSends::new(settings.max_mail_sends)),
             journal,
             node_id: new_id(),
             store,
@@ -306,20 +315,6 @@ impl AppState {
         .await
     }
 
-    /// Starts `work` in a task of its own that nobody need wait for, but that shutdown waits (a
-    /// while) for: a message to the mail server, say.
-    pub fn in_background<T, F>(&self, work: F) -> tokio::task::JoinHandle<T>
-    where
-        T: Send + 'static,
-        F: Future<Output = T> + Send + 'static,
-    {
-        let running = self.after_commits.start();
-        tokio::spawn(async move {
-            let _running = running;
-            work.await
-        })
-    }
-
     /// Runs `work` in a tracked task of its own, which a dropped caller does not cancel.
     async fn detached<T, F>(&self, work: F) -> T
     where
@@ -388,25 +383,38 @@ impl AppState {
     /// queued and stops it, and last waits a moment for the purger and aborts it if it has not
     /// ended (what it has not removed stays marked, for the next start). Calling it again does
     /// no harm.
+    ///
+    /// Requests waiting for their mail stop waiting at once (an invite then says `emailed:
+    /// false`); the messages on their way are waited for (a while) only after the journal is
+    /// written out.
     pub async fn shutdown(&self) {
-        self.shutdown_with(AFTER_COMMIT_WAIT, PURGER_WAIT).await;
+        self.shutdown_with(AFTER_COMMIT_WAIT, PURGER_WAIT, MAIL_WAIT_AT_STOP)
+            .await;
     }
 
     /// [`AppState::shutdown`] for a server that has `bound` to stop in ([`crate::serve`]): the
     /// same steps in the same order, with the waits for others' work cut to fit, so that the
     /// journal is still written out and stopped inside `bound`: the steps after REST commits get
-    /// at most half of it, the purger at most a tenth. (Closing the rooms is not cut short here;
-    /// the caller's own clock runs beside this.)
+    /// at most half of it, the purger and the mail on its way at most a tenth each. (Closing the
+    /// rooms is not cut short here; the caller's own clock runs beside this.)
     pub async fn shutdown_within(&self, bound: Duration) {
         self.shutdown_with(
             AFTER_COMMIT_WAIT.min(bound / 2),
             PURGER_WAIT.min(bound / 10),
+            MAIL_WAIT_AT_STOP.min(bound / 10),
         )
         .await;
     }
 
-    async fn shutdown_with(&self, after_commit_wait: Duration, purger_wait: Duration) {
+    async fn shutdown_with(
+        &self,
+        after_commit_wait: Duration,
+        purger_wait: Duration,
+        mail_wait: Duration,
+    ) {
         self.purger.signal_stop();
+        // (So that no step after a commit waits for a mail server while the journal waits.)
+        self.mail.stop_waiting();
         self.hub.shutdown().await;
         if tokio::time::timeout(after_commit_wait, self.after_commits.idle())
             .await
@@ -418,6 +426,16 @@ impl AppState {
             );
         }
         self.journal.close().await;
+        if tokio::time::timeout(mail_wait, self.mail.idle())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{} emails were still on their way to the mail server at shutdown; they may not \
+                 have been sent",
+                self.mail.sending()
+            );
+        }
         self.purger.stop(purger_wait).await;
     }
 }

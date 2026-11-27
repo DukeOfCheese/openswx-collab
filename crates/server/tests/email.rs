@@ -850,30 +850,63 @@ impl Mailer for SlowMailer {
     }
 }
 
-#[tokio::test]
-async fn a_slow_mail_server_does_not_hold_a_request_up_and_the_mail_still_goes() {
-    use std::time::{Duration, Instant};
-    let mailer = Arc::new(SlowMailer {
-        taken: MemoryMailer::new(true),
-        delay: Duration::from_millis(1500),
-    });
-    let kept = mailer.clone();
-    // A request waits 200 ms for its mail, not the ten seconds of a real server.
+/// A server whose mail goes through `mailer`, whose requests wait `wait` for their mail, and
+/// which sends at most `at_once` at a time.
+async fn mailing_server(
+    mailer: Arc<dyn Mailer>,
+    wait: std::time::Duration,
+    at_once: usize,
+) -> TestServer {
     let hooks = oswx_server::room::Hooks {
-        mail_wait: Duration::from_millis(200),
+        mail_wait: wait,
         ..Default::default()
     };
-    let server = TestServer::start_custom(
+    TestServer::start_custom(
         |s| {
             s.smtp_host = "127.0.0.1".into();
             s.smtp_from = "collab@example.org".into();
+            s.max_mail_sends = at_once;
         },
         |s| {
-            s.mailer = kept;
+            s.mailer = mailer;
             s.room_hooks = Arc::new(hooks);
         },
     )
-    .await;
+    .await
+}
+
+async fn invite(server: &TestServer, world: &common::World, email: &str) -> Value {
+    let (status, invite) = server
+        .post(
+            &format!("/api/orgs/{}/invites", world.org),
+            Some(&world.admin),
+            json!({"email": email}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{invite}");
+    invite
+}
+
+async fn sent_at_least(mailer: &MemoryMailer, n: usize) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while mailer.sent().len() < n {
+        assert!(Instant::now() < deadline, "the mail never went");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_slow_mail_server_does_not_hold_a_request_up_and_the_mail_still_goes() {
+    use std::time::{Duration, Instant};
+    let logs = LogCapture::start();
+    // The mail server takes three seconds; a request waits 200 ms for its mail, not the ten
+    // seconds of a real server.
+    let mailer = Arc::new(SlowMailer {
+        taken: MemoryMailer::new(true),
+        delay: Duration::from_secs(3),
+    });
+    let server = mailing_server(mailer.clone(), Duration::from_millis(200), 16).await;
     let world = common::World::new(&server).await.unwrap();
 
     // A reset link: the answer is the same as ever, and comes without the mail server.
@@ -884,31 +917,30 @@ async fn a_slow_mail_server_does_not_hold_a_request_up_and_the_mail_still_goes()
     );
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(150) && took < Duration::from_millis(1200),
+        took >= Duration::from_millis(150) && took < Duration::from_millis(2500),
         "the request took {took:?}"
     );
     assert!(mailer.taken.sent().is_empty());
+    // The mail is on its way, counted apart from the steps after commits (which are done).
+    assert!(server.state.mail.sending() >= 1);
+    assert_eq!(server.state.after_commits.running(), 0);
+    assert!(
+        logs.text()
+            .contains("password reset link handed on; the mail server has not answered yet"),
+        "{}",
+        logs.text()
+    );
 
     // An invite: made, with its link, and `emailed` says only what is known by now.
     let started = Instant::now();
-    let (status, invite) = server
-        .post(
-            &format!("/api/orgs/{}/invites", world.org),
-            Some(&world.admin),
-            json!({"email": "bob@example.com"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{invite}");
-    assert!(started.elapsed() < Duration::from_millis(1200));
+    let invite = invite(&server, &world, "bob@example.com").await;
+    assert!(started.elapsed() < Duration::from_millis(2500));
     assert_eq!(invite["emailed"], false, "{invite}");
     assert!(invite["url"].as_str().unwrap().contains("/invite/"));
+    assert!(server.state.mail.sending() >= 1);
 
     // Both messages are still handed over, each when the mail server is done with it.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while mailer.taken.sent().len() < 2 {
-        assert!(Instant::now() < deadline, "the mail never went");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    sent_at_least(&mailer.taken, 2).await;
     let sent = mailer.taken.sent();
     assert_eq!(sent[0].to, "ada@example.com");
     assert_eq!(sent[1].to, "bob@example.com");
@@ -917,8 +949,166 @@ async fn a_slow_mail_server_does_not_hold_a_request_up_and_the_mail_still_goes()
     let invites: i64 = server.scalar("SELECT COUNT(*) FROM invites").await;
     assert_eq!(invites, 1);
     assert_eq!(server.state.http.request_timeouts(), 0);
-    // A stop waits for mail that is on its way (it is tracked with the steps after commits).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.mail.sending() > 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn only_so_many_emails_are_on_their_way_at_once() {
+    use std::time::{Duration, Instant};
+    let logs = LogCapture::start();
+    let before = oswx_server::metrics::counters();
+    let mailer = Arc::new(SlowMailer {
+        taken: MemoryMailer::new(true),
+        delay: Duration::from_secs(2),
+    });
+    let server = mailing_server(mailer.clone(), Duration::from_millis(100), 1).await;
+    let world = common::World::new(&server).await.unwrap();
+    // One message on its way takes the only place.
+    assert_eq!(
+        reset(&server, "ada@example.com").await.0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(server.state.mail.sending(), 1);
+    // The next is not sent, and the request hears so at once, without waiting.
+    let started = Instant::now();
+    let refused = invite(&server, &world, "bob@example.com").await;
+    assert_eq!(refused["emailed"], false, "{refused}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let after = oswx_server::metrics::counters();
+    assert!(after.mail_refused > before.mail_refused);
+    assert!(
+        logs.text().contains("an email was not sent"),
+        "{}",
+        logs.text()
+    );
+    assert!(!logs.text().contains("bob@example.com"), "{}", logs.text());
+    // The first goes; the second never does.
+    sent_at_least(&mailer.taken, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sent = mailer.taken.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].to, "ada@example.com");
+    // Its place is free again: the next invite's mail goes.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.mail.sending() > 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    invite(&server, &world, "cy@example.com").await;
+    sent_at_least(&mailer.taken, 2).await;
+    assert_eq!(mailer.taken.sent()[1].to, "cy@example.com");
+}
+
+/// A mailer that panics.
+struct PanickingMailer;
+
+#[async_trait]
+impl Mailer for PanickingMailer {
+    fn configured(&self) -> bool {
+        true
+    }
+
+    async fn send(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<()> {
+        panic!("a mailer that breaks")
+    }
+}
+
+/// A mail server that refuses, quoting the address.
+struct QuotingMailer;
+
+#[async_trait]
+impl Mailer for QuotingMailer {
+    fn configured(&self) -> bool {
+        true
+    }
+
+    async fn send(&self, to: &str, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "permanent error (550): <{}>: no such user",
+            to.to_uppercase()
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_send_that_panics_or_is_refused_is_a_failure_and_the_log_says_what_happened() {
+    use std::time::Duration;
+    let logs = LogCapture::start();
+    let before = oswx_server::metrics::counters();
+    let server = mailing_server(Arc::new(PanickingMailer), Duration::from_secs(5), 4).await;
+    server.register("ada@example.com").await;
+    assert_eq!(
+        reset(&server, "ada@example.com").await.0,
+        StatusCode::ACCEPTED
+    );
+    let after = oswx_server::metrics::counters();
+    assert!(after.mail_failures > before.mail_failures);
+    let said = logs.text();
+    assert!(said.contains("the mailer panicked"), "{said}");
+    assert!(
+        said.contains("password reset link not sent: the mail server did not take it"),
+        "{said}"
+    );
+    assert!(!said.contains("password reset link sent"), "{said}");
+    assert_eq!(server.state.mail.sending(), 0);
+
+    // A refusal that quotes the address is logged without it.
+    let server = mailing_server(Arc::new(QuotingMailer), Duration::from_secs(5), 4).await;
+    server.register("zed.private@example.com").await;
+    reset(&server, "zed.private@example.com").await;
+    let said = logs.text();
+    assert!(said.contains("permanent error (550)"), "{said}");
+    assert!(
+        !said.to_lowercase().contains("zed.private@example.com"),
+        "{said}"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_does_not_wait_for_the_mail_server_before_the_journal() {
+    use std::time::{Duration, Instant};
+    // Requests would wait 30 s for their mail; the mail server takes 20.
+    let mailer = Arc::new(SlowMailer {
+        taken: MemoryMailer::new(true),
+        delay: Duration::from_secs(20),
+    });
+    let server = mailing_server(mailer.clone(), Duration::from_secs(30), 4).await;
+    server.register("ada@example.com").await;
+    let request = {
+        let (base, client) = (server.base.clone(), reqwest::Client::new());
+        tokio::spawn(async move {
+            client
+                .post(format!("{base}/api/auth/password-reset"))
+                .json(&json!({"email": "ada@example.com"}))
+                .send()
+                .await
+                .map(|r| r.status())
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.mail.sending() == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.state.after_commits.running(), 1);
+    // The stop: the request stops waiting at once and is answered; the journal is written out;
+    // the mail on its way is waited for a tenth of the bound, and left.
+    let started = Instant::now();
+    server.state.shutdown_within(Duration::from_secs(8)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "the stop took {took:?}");
+    assert!(!server.state.journal.healthy());
     assert_eq!(server.state.after_commits.running(), 0);
+    let answered = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("the request was answered")
+        .unwrap();
+    assert_eq!(answered.unwrap(), StatusCode::ACCEPTED);
+    assert!(mailer.taken.sent().is_empty());
 }
 
 #[tokio::test]

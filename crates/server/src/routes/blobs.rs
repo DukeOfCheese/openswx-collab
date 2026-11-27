@@ -13,7 +13,8 @@
 //!   ([`crate::uploads`]): one more is refused before any of it is stored, with 429 (the
 //!   account's or the organisation's own limit) or 503 (the server's, after a short wait for a
 //!   place). An upload that does not keep up the minimum average rate
-//!   ([`crate::blobs::Pace`]) is answered 400 [`TOO_SLOW`] and leaves nothing in storage.
+//!   ([`crate::blobs::Pace`]) is answered 400 [`TOO_SLOW`], and one that is not done within
+//!   [`crate::uploads::time_allowed`] 400 [`TOO_LONG`]; neither leaves anything in storage.
 //! - `GET /api/projects/{project}/blobs/{sha256}` (viewer): the raw bytes, streamed, as
 //!   `application/octet-stream` with their `Content-Length`, `Cache-Control: private,
 //!   max-age=31536000, immutable` and `ETag: "<sha256>"`. `If-None-Match` with that tag answers 304.
@@ -51,6 +52,7 @@ use crate::error::{ApiError, ApiJson, ApiPath};
 use crate::routes::{DRAIN_AT_MOST, DRAIN_TIMEOUT};
 use crate::security::ProjectRole;
 use crate::state::AppState;
+use crate::uploads::time_allowed;
 
 /// The most hashes one `blobs/missing` request may ask about.
 pub const MAX_MISSING: usize = 2000;
@@ -60,6 +62,8 @@ const LOOKUPS_AT_ONCE: usize = 16;
 const NO_SUCH_BLOB: &str = "no such blob";
 /// What an upload that did not keep up the minimum rate is answered (400).
 pub const TOO_SLOW: &str = "the upload was too slow and was given up on";
+/// What an upload that was not done in the time it is allowed is answered (400).
+pub const TOO_LONG: &str = "the upload took too long and was given up on";
 const CACHE_FOREVER: &str = "private, max-age=31536000, immutable";
 
 /// The routes whose bodies are at most the default limit.
@@ -159,33 +163,50 @@ async fn upload(
         }
     };
     let limit = state.settings.max_blob_bytes as u64;
-    let key = blob_key(&project.org_id, &sha);
-    let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);
-    let body = fail_when_stalled(verified(body, sha), idle);
-    let body = fail_when_slow(body, Pace::from_settings(&state.settings));
-    if state.blobs.exists(&key).await? {
-        // Already stored: read and check the body (so the client is answered, not cut off), but
-        // write nothing.
-        drain(body, limit).await.map_err(upload_error)?;
-        return Ok(StatusCode::NO_CONTENT);
+    // The whole upload, storing included, is done in this time or given up on (and whatever it
+    // was writing dropped, which removes it).
+    let size = declared(&headers).unwrap_or(limit).min(limit);
+    let allowed = time_allowed(&state.settings, size);
+    let storing = async {
+        let key = blob_key(&project.org_id, &sha);
+        let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);
+        let body = fail_when_stalled(verified(body, sha), idle);
+        let body = fail_when_slow(body, Pace::from_settings(&state.settings));
+        if state.blobs.exists(&key).await? {
+            // Already stored: read and check the body (so the client is answered, not cut off),
+            // but write nothing.
+            drain(body, limit).await.map_err(upload_error)?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        state
+            .blobs
+            .put_stream(&key, body, limit)
+            .await
+            .map_err(upload_error)?;
+        Ok::<_, ApiError>(StatusCode::NO_CONTENT)
+    };
+    match tokio::time::timeout(allowed, storing).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            crate::metrics::upload_cut_short();
+            Err(ApiError::BadRequest(TOO_LONG.into()))
+        }
     }
-    state
-        .blobs
-        .put_stream(&key, body, limit)
-        .await
-        .map_err(upload_error)?;
-    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The request's `Content-Length`, if it has one.
+fn declared(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// Before an upload is refused unread: a body of modest declared size is read and thrown away
 /// (for a few seconds at most), so that a client still sending it reads the refusal rather than a
 /// connection reset, as a body over the size limit is treated.
 async fn unread(headers: &HeaderMap, body: Body) {
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|n| n <= DRAIN_AT_MOST) {
+    if declared(headers).is_some_and(|n| n <= DRAIN_AT_MOST) {
         let mut chunks = body.into_data_stream();
         let reading = async { while let Some(Ok(_)) = chunks.next().await {} };
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, reading).await;

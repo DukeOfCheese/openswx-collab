@@ -735,6 +735,12 @@ impl Blobs for S3Blobs {
         })
     }
 
+    /// The parts one upload holds at most (see the module documentation), and the compressor.
+    fn upload_memory(&self) -> u64 {
+        let parts = (self.tuning.parts_at_once as u64 + 2) * self.tuning.part_size as u64;
+        parts + super::COMPRESSOR_MEMORY
+    }
+
     async fn get_stream(&self, key: &str) -> anyhow::Result<Option<(u64, ByteStream)>> {
         let path = self.path(key)?;
         let Some(stored) = self.open_read(key, &path).await? else {
@@ -956,5 +962,21 @@ mod tests {
             ..config()
         };
         assert!(S3Blobs::new(none).is_ok());
+    }
+
+    #[test]
+    fn an_upload_is_charged_the_parts_it_holds_and_the_compressor() {
+        let blobs = S3Blobs::new(config()).unwrap();
+        // Three parts on their way, the first kept back, one filling: five of 8 MiB, and 4 MiB.
+        assert_eq!(blobs.upload_memory(), 44 << 20);
+        let mut small = config();
+        small.tuning.part_size = 5 << 20;
+        small.tuning.parts_at_once = 1;
+        assert_eq!(
+            S3Blobs::new(small).unwrap().upload_memory(),
+            (15 << 20) + super::super::COMPRESSOR_MEMORY
+        );
+        let folder = super::super::LocalBlobs::new(tempfile::tempdir().unwrap().path()).unwrap();
+        assert_eq!(folder.upload_memory(), 4 << 20);
     }
 }

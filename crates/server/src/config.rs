@@ -72,7 +72,7 @@ pub enum Storage {
 }
 
 /// A range of addresses, written as one address (`10.0.0.7`, `::1`) or in CIDR form
-/// (`172.16.0.0/12`, `fd00::/8`): an entry of `OSWX_COLLAB_TRUSTED_PROXIES`.
+/// (`172.16.0.0/12`, `fd00::/16`): an entry of `OSWX_COLLAB_TRUSTED_PROXIES`.
 ///
 /// An IPv4 address written as IPv6 (`::ffff:10.0.0.7`) is the IPv4 address, in a range and in an
 /// address asked about.
@@ -92,9 +92,11 @@ impl IpNet {
         Self { addr, prefix }
     }
 
-    /// Whether the range is every address of its family (`0.0.0.0/0`, `::/0`).
-    pub fn is_everything(&self) -> bool {
-        self.prefix == 0
+    /// Whether the range is too wide to be a list of proxies: wider than /8 for IPv4, /16 for
+    /// IPv6 (`0.0.0.0/0`, or `0.0.0.0/1` and `128.0.0.0/1`, would let any client name its own
+    /// address).
+    pub fn is_too_wide(&self) -> bool {
+        self.prefix < if self.addr.is_ipv4() { 8 } else { 16 }
     }
 
     /// Whether `ip` is in the range.
@@ -184,22 +186,40 @@ pub struct Settings {
     pub s3_path_style: Option<bool>,
     /// Seconds: a blob upload or download in which no bytes move for this long is given up on.
     pub blob_idle_timeout: f64,
-    /// The most blob uploads the server takes at once; one more is answered 503. (An upload to S3
-    /// holds up to about 40 MiB in memory.)
-    pub max_blob_uploads: usize,
-    /// The most blob uploads one organisation may have running at once (at most
-    /// `max_blob_uploads`); one more is answered 429.
+    /// Bytes of memory the blob uploads running at once may hold between them. Each is charged
+    /// what its storage holds for one ([`crate::blobs::Blobs::upload_memory`]: about 44 MiB for
+    /// S3, 4 MiB for a folder); one that does not fit is answered 503 after a short wait.
+    pub upload_memory: u64,
+    /// The most blob uploads one organisation may have running at once (at most as many as fit
+    /// in `upload_memory`); one more is answered 429.
     pub max_blob_uploads_per_org: usize,
     /// The most blob uploads one account may have running at once; one more is answered 429.
     pub max_blob_uploads_per_user: usize,
     /// Bytes a second a request body (a blob upload, a document being created, any other) must
     /// keep up on average ([`crate::blobs::Pace`]); 0: no floor.
     pub min_upload_rate: u64,
-    /// Seconds a body may fall behind `min_upload_rate` before it is given up on.
+    /// Seconds of slack a body has against `min_upload_rate`: how long it may take to start, or
+    /// pause once it has earned the time back, before it is given up on.
     pub upload_rate_grace: f64,
-    /// The most connections the server holds open at once (document connections included); one
-    /// more is accepted and closed at once.
+    /// Seconds a blob upload may take in all, at least: an upload of `n` bytes may take
+    /// `max(upload_time_limit, n / upload_time_rate)`, then it is answered 400.
+    pub upload_time_limit: f64,
+    /// Bytes a second, for the time a large upload may take (`upload_time_limit`).
+    pub upload_time_rate: u64,
+    /// The most connections the server holds open at once (document connections included). When
+    /// it has them, a new one takes the place of the one that has waited longest without
+    /// finishing its first request (or failing that, the one idle longest); with none of those,
+    /// the new one is closed at once. A few more are kept for `GET /api/health` alone.
     pub max_connections: usize,
+    /// The most connections one client address may hold open at once (not counting addresses of
+    /// `trusted_proxies`); one more is closed at once. 0: no limit.
+    pub max_connections_per_address: usize,
+    /// The most request bodies larger than the default limit (a document being created, up to
+    /// 8 MB) the server reads at once; one more is answered 503 at once.
+    pub max_large_bodies: usize,
+    /// The most emails being sent at once; one more is not sent (an invite says `emailed:
+    /// false`).
+    pub max_mail_sends: usize,
     /// Seconds a request may take from its head, or from the last of its body, to the beginning
     /// of its answer; a longer one is answered 503. A body that is arriving at `min_upload_rate`
     /// or faster does not count against it. Blob uploads are not under it (they have
@@ -280,12 +300,18 @@ impl Default for Settings {
             s3_session_token: String::new(),
             s3_path_style: None,
             blob_idle_timeout: 60.0,
-            max_blob_uploads: 16,
+            // Sixteen uploads to S3 at once (44 MiB each), as many to a folder as people send.
+            upload_memory: (704 * MIB) as u64,
             max_blob_uploads_per_org: 8,
             max_blob_uploads_per_user: 4,
             min_upload_rate: 4096,
             upload_rate_grace: 30.0,
+            upload_time_limit: 600.0,
+            upload_time_rate: 64 << 10,
             max_connections: 4096,
+            max_connections_per_address: 512,
+            max_large_bodies: 16,
+            max_mail_sends: 16,
             request_timeout: 60.0,
             write_timeout: 60.0,
             shutdown_timeout: 8.0,
@@ -364,7 +390,7 @@ impl Settings {
             s.s3_path_style = Some(path_style);
         }
         e.positive_seconds("BLOB_IDLE_TIMEOUT", &mut s.blob_idle_timeout)?;
-        e.positive_whole("MAX_BLOB_UPLOADS", &mut s.max_blob_uploads)?;
+        e.positive_whole("UPLOAD_MEMORY", &mut s.upload_memory)?;
         e.positive_whole(
             "MAX_BLOB_UPLOADS_PER_USER",
             &mut s.max_blob_uploads_per_user,
@@ -372,7 +398,15 @@ impl Settings {
         e.positive_whole("MAX_BLOB_UPLOADS_PER_ORG", &mut s.max_blob_uploads_per_org)?;
         e.whole("MIN_UPLOAD_RATE", &mut s.min_upload_rate)?;
         e.positive_seconds("UPLOAD_RATE_GRACE", &mut s.upload_rate_grace)?;
+        e.positive_seconds("UPLOAD_TIME_LIMIT", &mut s.upload_time_limit)?;
+        e.positive_whole("UPLOAD_TIME_RATE", &mut s.upload_time_rate)?;
         e.positive_whole("MAX_CONNECTIONS", &mut s.max_connections)?;
+        e.whole(
+            "MAX_CONNECTIONS_PER_ADDRESS",
+            &mut s.max_connections_per_address,
+        )?;
+        e.positive_whole("MAX_LARGE_BODIES", &mut s.max_large_bodies)?;
+        e.positive_whole("MAX_MAIL_SENDS", &mut s.max_mail_sends)?;
         e.positive_seconds("REQUEST_TIMEOUT", &mut s.request_timeout)?;
         e.positive_seconds("WRITE_TIMEOUT", &mut s.write_timeout)?;
         e.positive_seconds("SHUTDOWN_TIMEOUT", &mut s.shutdown_timeout)?;
@@ -389,11 +423,11 @@ impl Settings {
                     )
                 })?;
             // "Everybody is a trusted proxy" lets any client name its own address.
-            if s.trusted_proxies.iter().any(IpNet::is_everything) {
+            if s.trusted_proxies.iter().any(IpNet::is_too_wide) {
                 return Err(ConfigError::new(
                     "TRUSTED_PROXIES",
-                    "a list of your proxies' addresses and ranges, not every address there is \
-                     (a range ending in /0)",
+                    "a list of your proxies' addresses and ranges, none wider than /8 (IPv4) or \
+                     /16 (IPv6)",
                 ));
             }
         }
@@ -630,12 +664,20 @@ impl fmt::Debug for Settings {
             .field("s3_session_token", &secret(&self.s3_session_token))
             .field("s3_path_style", &self.s3_path_style)
             .field("blob_idle_timeout", &self.blob_idle_timeout)
-            .field("max_blob_uploads", &self.max_blob_uploads)
+            .field("upload_memory", &self.upload_memory)
             .field("max_blob_uploads_per_org", &self.max_blob_uploads_per_org)
             .field("max_blob_uploads_per_user", &self.max_blob_uploads_per_user)
             .field("min_upload_rate", &self.min_upload_rate)
             .field("upload_rate_grace", &self.upload_rate_grace)
+            .field("upload_time_limit", &self.upload_time_limit)
+            .field("upload_time_rate", &self.upload_time_rate)
             .field("max_connections", &self.max_connections)
+            .field(
+                "max_connections_per_address",
+                &self.max_connections_per_address,
+            )
+            .field("max_large_bodies", &self.max_large_bodies)
+            .field("max_mail_sends", &self.max_mail_sends)
             .field("request_timeout", &self.request_timeout)
             .field("write_timeout", &self.write_timeout)
             .field("shutdown_timeout", &self.shutdown_timeout)
@@ -980,9 +1022,56 @@ mod tests {
     #[test]
     fn the_serving_limits_have_defaults_and_are_read() {
         let s = read(&[]);
-        assert_eq!((s.max_blob_uploads, s.max_blob_uploads_per_user), (16, 4));
+        assert_eq!(
+            (s.upload_memory, s.max_blob_uploads_per_user),
+            (704 << 20, 4)
+        );
         assert_eq!((s.max_blob_uploads_per_org, s.max_connections), (8, 4096));
         assert_eq!((s.min_upload_rate, s.upload_rate_grace), (4096, 30.0));
+        assert_eq!((s.upload_time_limit, s.upload_time_rate), (600.0, 65536));
+        assert_eq!(
+            (
+                s.max_connections_per_address,
+                s.max_large_bodies,
+                s.max_mail_sends
+            ),
+            (512, 16, 16)
+        );
+        let s = read(&[
+            ("UPLOAD_MEMORY", "1048576"),
+            ("UPLOAD_TIME_LIMIT", "2.5"),
+            ("UPLOAD_TIME_RATE", "1000"),
+            ("MAX_CONNECTIONS_PER_ADDRESS", "0"),
+            ("MAX_LARGE_BODIES", "3"),
+            ("MAX_MAIL_SENDS", "2"),
+        ]);
+        assert_eq!(
+            (s.upload_memory, s.upload_time_limit, s.upload_time_rate),
+            (1 << 20, 2.5, 1000)
+        );
+        assert_eq!(
+            (
+                s.max_connections_per_address,
+                s.max_large_bodies,
+                s.max_mail_sends
+            ),
+            (0, 3, 2)
+        );
+        for var in [
+            "UPLOAD_MEMORY",
+            "UPLOAD_TIME_LIMIT",
+            "UPLOAD_TIME_RATE",
+            "MAX_LARGE_BODIES",
+            "MAX_MAIL_SENDS",
+        ] {
+            for bad in ["0", "-1", "", "x"] {
+                assert_eq!(refused(&[(var, bad)]).var, format!("{PREFIX}{var}"));
+            }
+        }
+        for bad in ["-1", "", "x"] {
+            let var = "MAX_CONNECTIONS_PER_ADDRESS";
+            assert_eq!(refused(&[(var, bad)]).var, format!("{PREFIX}{var}"));
+        }
         assert_eq!(
             (s.request_timeout, s.write_timeout, s.shutdown_timeout),
             (60.0, 60.0, 8.0)
@@ -1006,21 +1095,19 @@ mod tests {
             assert_eq!(refused(&[(var, bad)]).var, format!("{PREFIX}{var}"));
         }
         let s = read(&[
-            ("MAX_BLOB_UPLOADS", "3"),
             ("MAX_BLOB_UPLOADS_PER_USER", "1"),
             ("REQUEST_TIMEOUT", "2.5"),
             ("WRITE_TIMEOUT", "7"),
             ("SHUTDOWN_TIMEOUT", "20"),
             ("METRICS_TOKEN", " 0123456789abcdef-token "),
         ]);
-        assert_eq!((s.max_blob_uploads, s.max_blob_uploads_per_user), (3, 1));
+        assert_eq!(s.max_blob_uploads_per_user, 1);
         assert_eq!(
             (s.request_timeout, s.write_timeout, s.shutdown_timeout),
             (2.5, 7.0, 20.0)
         );
         assert_eq!(s.metrics_token, "0123456789abcdef-token");
         for var in [
-            "MAX_BLOB_UPLOADS",
             "MAX_BLOB_UPLOADS_PER_USER",
             "REQUEST_TIMEOUT",
             "WRITE_TIMEOUT",
@@ -1100,29 +1187,45 @@ mod tests {
             read(&[]).trusted_proxies,
             vec![net("127.0.0.1"), net("::1")]
         );
-        // Every address there is, in either family and any spelling, is not a list of proxies.
-        for everything in [
+        // Every address there is, in either family and any spelling, is not a list of proxies;
+        // nor is a large part of it (two halves make the whole): nothing wider than /8 for IPv4
+        // and /16 for IPv6.
+        for too_wide in [
             "0.0.0.0/0",
             "::/0",
             "10.1.2.3/0",
             "127.0.0.1, 0.0.0.0/0",
             "::ffff:0.0.0.0/96",
             "fd00::/00",
+            "0.0.0.0/1, 128.0.0.0/1",
+            "8000::/1",
+            "10.0.0.0/7",
+            "::ffff:10.0.0.0/103",
+            "fd00::/8",
+            "2001::/15",
         ] {
-            let e = refused(&[("TRUSTED_PROXIES", everything)]);
-            assert_eq!(e.var, "OSWX_COLLAB_TRUSTED_PROXIES", "{everything}");
+            let e = refused(&[("TRUSTED_PROXIES", too_wide)]);
+            assert_eq!(e.var, "OSWX_COLLAB_TRUSTED_PROXIES", "{too_wide}");
+            assert!(e.to_string().contains("/8"), "{e}");
         }
-        // (The widest ranges that are not everything are the operator's business.)
-        read(&[("TRUSTED_PROXIES", "0.0.0.0/1, 8000::/1")]);
+        // The widest that are allowed.
+        assert_eq!(
+            read(&[(
+                "TRUSTED_PROXIES",
+                "10.0.0.0/8, fd00::/16, ::ffff:10.0.0.0/104"
+            )])
+            .trusted_proxies,
+            vec![net("10.0.0.0/8"), net("fd00::/16"), net("10.0.0.0/8")]
+        );
         assert_eq!(read(&[("TRUSTED_PROXIES", "")]).trusted_proxies, vec![]);
         assert_eq!(read(&[("TRUSTED_PROXIES", " , ")]).trusted_proxies, vec![]);
         assert_eq!(
-            read(&[("TRUSTED_PROXIES", "127.0.0.1, 172.16.0.0/12 ::1,fd00::/8")]).trusted_proxies,
+            read(&[("TRUSTED_PROXIES", "127.0.0.1, 172.16.0.0/12 ::1,fd00::/64")]).trusted_proxies,
             vec![
                 net("127.0.0.1"),
                 net("172.16.0.0/12"),
                 net("::1"),
-                net("fd00::/8")
+                net("fd00::/64")
             ]
         );
         for bad in [

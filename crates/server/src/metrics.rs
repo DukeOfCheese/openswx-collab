@@ -71,6 +71,9 @@ static DB_ACQUIRE_TIMEOUTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static UPLOADS_REFUSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static MAIL_SENT: AtomicU64 = AtomicU64::new(0);
 static MAIL_FAILURES: AtomicU64 = AtomicU64::new(0);
+static MAIL_REFUSED: AtomicU64 = AtomicU64::new(0);
+static UPLOADS_CUT_SHORT: AtomicU64 = AtomicU64::new(0);
+static LARGE_BODIES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Seconds, as the nanoseconds the histograms of durations count in.
 const fn secs(s: f64) -> u64 {
@@ -346,9 +349,25 @@ pub fn mail_failed() {
     MAIL_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A message was not sent because as many were being sent as the server sends at once.
+pub fn mail_refused() {
+    MAIL_REFUSED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A blob upload was refused because as many were running as `limit` allows.
 pub fn upload_refused(limit: UploadLimit) {
     UPLOADS_REFUSED[limit as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A blob upload was given up on because it was not done in the time it is allowed.
+pub fn upload_cut_short() {
+    UPLOADS_CUT_SHORT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A request with a large body was refused because as many were being read as the server reads
+/// at once.
+pub fn large_body_refused() {
+    LARGE_BODIES_REFUSED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One frame was broadcast to `recipients` connections.
@@ -448,6 +467,12 @@ pub struct Counters {
     /// Messages handed to the mail server, and messages it did not take.
     pub mail_sent: u64,
     pub mail_failures: u64,
+    /// Messages not sent because as many were on their way as the server sends at once.
+    pub mail_refused: u64,
+    /// Blob uploads given up on for taking longer than they are allowed.
+    pub uploads_cut_short: u64,
+    /// Requests with large bodies refused because as many were being read as the server reads.
+    pub large_bodies_refused: u64,
 }
 
 /// Reads every counter.
@@ -482,6 +507,9 @@ pub fn counters() -> Counters {
         uploads_refused: std::array::from_fn(|i| get(&UPLOADS_REFUSED[i])),
         mail_sent: get(&MAIL_SENT),
         mail_failures: get(&MAIL_FAILURES),
+        mail_refused: get(&MAIL_REFUSED),
+        uploads_cut_short: get(&UPLOADS_CUT_SHORT),
+        large_bodies_refused: get(&LARGE_BODIES_REFUSED),
     }
 }
 
@@ -491,6 +519,8 @@ pub struct HttpStats {
     open: AtomicUsize,
     handling: AtomicUsize,
     refused: AtomicU64,
+    refused_for_address: AtomicU64,
+    evicted: AtomicU64,
     request_timeouts: AtomicU64,
     write_timeouts: AtomicU64,
 }
@@ -538,14 +568,36 @@ impl HttpStats {
         self.handling.load(Ordering::SeqCst)
     }
 
-    /// A connection was closed as soon as it was accepted: the server had `max_connections`.
+    /// A connection was closed as soon as it was accepted: the server had `max_connections`, and
+    /// its reserve, and none could make room.
     pub fn refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How many connections were closed as soon as they were accepted.
+    /// How many connections were closed as soon as they were accepted for the server being full.
     pub fn refusals(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
+    }
+
+    /// A connection was closed as soon as it was accepted: its address had
+    /// `max_connections_per_address`.
+    pub fn refused_for_address(&self) {
+        self.refused_for_address.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many connections were closed as soon as they were accepted for their address.
+    pub fn refusals_for_address(&self) -> u64 {
+        self.refused_for_address.load(Ordering::Relaxed)
+    }
+
+    /// A connection was closed to make room for a new one.
+    pub fn evicted(&self) {
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many connections were closed to make room for new ones.
+    pub fn evictions(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
     }
 
     /// A request took longer than `request_timeout` and was answered 503.
@@ -819,6 +871,22 @@ pub fn render(state: &AppState) -> String {
         "Blob uploads waiting for a place on the server.",
         state.uploads.queued(),
     );
+    t.gauge(
+        "blob_uploads_memory_bytes",
+        "The memory the running blob uploads are charged.",
+        usize::try_from(state.uploads.memory_held()).unwrap_or(usize::MAX),
+    );
+    t.counter(
+        "blob_uploads_cut_short_total",
+        "Blob uploads given up on for taking longer than they are allowed.",
+        c.uploads_cut_short,
+    );
+    t.counter(
+        "large_bodies_refused_total",
+        "Requests with bodies over 1 MiB refused because as many were being read as the server \
+         reads at once.",
+        c.large_bodies_refused,
+    );
     t.counter(
         "mail_sent_total",
         "Messages handed to the mail server.",
@@ -826,8 +894,18 @@ pub fn render(state: &AppState) -> String {
     );
     t.counter(
         "mail_failures_total",
-        "Messages the mail server did not take.",
+        "Messages the mail server did not take (or whose sending failed).",
         c.mail_failures,
+    );
+    t.counter(
+        "mail_refused_total",
+        "Messages not sent because as many were on their way as the server sends at once.",
+        c.mail_refused,
+    );
+    t.gauge(
+        "mail_sending",
+        "Messages on their way to the mail server.",
+        state.mail.sending(),
     );
 
     t.gauge(
@@ -842,8 +920,20 @@ pub fn render(state: &AppState) -> String {
     );
     t.counter(
         "http_connections_refused_total",
-        "Connections closed as soon as they were accepted: the server had as many as it holds.",
+        "Connections closed as soon as they were accepted: the server had as many as it holds \
+         and none could make room.",
         state.http.refusals(),
+    );
+    t.counter(
+        "http_connections_refused_for_address_total",
+        "Connections closed as soon as they were accepted: their address had as many as one \
+         address may hold.",
+        state.http.refusals_for_address(),
+    );
+    t.counter(
+        "http_connections_evicted_total",
+        "Connections closed to make room for new ones (no request finished, or idle longest).",
+        state.http.evictions(),
     );
     t.counter(
         "http_request_timeouts_total",

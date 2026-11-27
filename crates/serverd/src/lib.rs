@@ -72,14 +72,20 @@ Settings (environment variables; the default is in brackets):
                                    the bucket's region [us-east-1]
     OSWX_COLLAB_BLOB_IDLE_TIMEOUT  seconds without a byte before a blob transfer is given up [60]
     OSWX_COLLAB_MAX_BLOB_BYTES     the largest blob [268435456]
-    OSWX_COLLAB_MAX_BLOB_UPLOADS   blob uploads at once on the server; one more: 503 [16]
+    OSWX_COLLAB_UPLOAD_MEMORY      bytes the blob uploads running at once may hold in all; each
+                                   is charged what its storage holds (S3: 44 MiB, a folder:
+                                   4 MiB); one that does not fit: 503 [738197504]
     OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG
                                    blob uploads at once for one organisation; one more: 429 [8]
     OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_USER
                                    blob uploads at once for one account; one more: 429 [4]
     OSWX_COLLAB_MIN_UPLOAD_RATE    bytes a second an upload, or any request body, must keep up
                                    on average; 0: no floor [4096]
-    OSWX_COLLAB_UPLOAD_RATE_GRACE  seconds a body may fall behind that rate [30]
+    OSWX_COLLAB_UPLOAD_RATE_GRACE  seconds of slack against that rate: how long a body may take
+                                   to start, or pause once it has earned the time back [30]
+    OSWX_COLLAB_UPLOAD_TIME_LIMIT, OSWX_COLLAB_UPLOAD_TIME_RATE
+                                   an upload of n bytes may take at most
+                                   max(LIMIT, n / RATE) seconds [600, 65536]
 
   Serving
     OSWX_COLLAB_PUBLIC_URL         how clients and browsers reach the server [http://localhost:8787]
@@ -87,14 +93,20 @@ Settings (environment variables; the default is in brackets):
                                    is believed, e.g. `127.0.0.1, 172.16.0.0/12` [127.0.0.1, ::1]
     OSWX_COLLAB_REQUEST_TIMEOUT    seconds from a request's head, or the last of its body, to
                                    the beginning of its answer, before it is answered 503 [60]
-    OSWX_COLLAB_MAX_CONNECTIONS    connections held open at once; one more is closed [4096]
+    OSWX_COLLAB_MAX_CONNECTIONS    connections held open at once; when full, a new one takes the
+                                   place of one that never finished a request, or the one idle
+                                   longest; 8 more answer /api/health alone [4096]
+    OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS
+                                   connections from one address (not a trusted proxy's); 0: no
+                                   limit [512]
+    OSWX_COLLAB_MAX_LARGE_BODIES   request bodies over 1 MiB read at once; one more: 503 [16]
     OSWX_COLLAB_WRITE_TIMEOUT      seconds a client may take nothing of an answer [60]
     OSWX_COLLAB_SHUTDOWN_TIMEOUT   seconds an orderly stop may take [8]
     OSWX_COLLAB_METRICS_TOKEN      the bearer token GET /metrics asks for; empty: no /metrics []
     OSWX_COLLAB_LOG                text or json [text]
     OSWX_COLLAB_LOG_LEVEL          error, warn, info, debug or trace, for the server's own
-                                   crates [info]; other crates log warnings and errors only,
-                                   unless named: `debug,sqlx=info,hyper=trace`
+                                   crates (or `oswx=<level>`) [info]; other crates log warnings
+                                   and errors only, unless named: `debug,sqlx=info,hyper=trace`
 
   Accounts
     OSWX_COLLAB_OPEN_REGISTRATION  anyone may register; off: the first account, then invites [off]
@@ -112,6 +124,7 @@ Settings (environment variables; the default is in brackets):
     OSWX_COLLAB_SMTP_PORT [587]    OSWX_COLLAB_SMTP_SECURITY  starttls, ssl or none [starttls]
     OSWX_COLLAB_SMTP_USER, OSWX_COLLAB_SMTP_PASSWORD []
     OSWX_COLLAB_SMTP_FROM_NAME     the sender's name [openswx collaboration]
+    OSWX_COLLAB_MAX_MAIL_SENDS     emails on their way at once; one more is not sent [16]
 
   Documents
     OSWX_COLLAB_SNAPSHOT_EVERY     changes between two stored copies of a document [200]
@@ -265,6 +278,7 @@ fn log_targets(raw: &str) -> Result<Targets, String> {
         _ => Err(wrong()),
     };
     let mut ours = tracing::Level::INFO;
+    let mut ours_named = false;
     let mut targets = Targets::new().with_default(tracing::Level::WARN);
     for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
         match entry.split_once('=') {
@@ -278,12 +292,17 @@ fn log_targets(raw: &str) -> Result<Targets, String> {
                 if !named {
                     return Err(wrong());
                 }
+                ours_named |= name == OUR_CRATES;
                 targets = targets.with_target(name.to_owned(), level(asked)?);
             }
         }
     }
     // (A target is matched by its beginning: `oswx` is oswx_server, oswx_serverd, oswx_core. An
-    // entry that names one of them more exactly wins over this one.)
+    // entry that names one of them more exactly wins over this one; one that names `oswx` itself
+    // is this one.)
+    if ours_named {
+        return Ok(targets);
+    }
     Ok(targets.with_target(OUR_CRATES, ours))
 }
 
@@ -516,6 +535,11 @@ mod tests {
         assert!(would(asked, "hyper_util::client", Level::TRACE));
         assert!(!would(asked, "lettre", Level::INFO));
         assert!(would(asked, "oswx_server", Level::DEBUG));
+        // All of ours named as `oswx` is what was asked, whatever the level before it says.
+        assert!(would("debug,oswx=trace", "oswx_server", Level::TRACE));
+        assert!(would("oswx=trace,debug", "oswx_core", Level::TRACE));
+        assert!(!would("debug,oswx=warn", "oswx_server", Level::INFO));
+        assert!(!would("oswx=error", "oswx_serverd", Level::WARN));
         // One of ours named more exactly wins over the level for all of ours.
         assert!(would(
             "warn,oswx_server::journal=trace",

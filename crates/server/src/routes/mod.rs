@@ -12,7 +12,8 @@
 //! bigger bodies goes into the `large` group in the router built by `router` and applies its own limit with
 //! [`with_body_limit`]; nothing outside the `standard` group gets the default, so every router merged
 //! into `large` must set one. A path may have its methods split between the groups (e.g. `GET` in
-//! `standard`, `POST` in `large`).
+//! `standard`, `POST` in `large`). Only so many bodies over the default limit are read at once
+//! (`max_large_bodies`; the blob upload has its own limits, [`crate::uploads`]).
 //!
 //! **Time limits.** Every route but the blob upload is answered within `request_timeout`
 //! ([`crate::serve::within_time`]); extension routes too.
@@ -30,6 +31,7 @@ pub mod orgs;
 pub mod projects;
 pub mod reset_page;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -39,6 +41,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use http_body_util::{BodyExt, Limited};
+use tokio::sync::Semaphore;
 use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::error::{ApiError, detail_response};
@@ -84,11 +87,15 @@ pub(crate) fn router(state: AppState) -> Router {
     // Everything but the blob upload must be answered within `request_timeout`; an upload takes
     // as long as its bytes keep coming (see `crate::serve`).
     let in_time = || middleware::from_fn_with_state(state.clone(), crate::serve::within_time);
+    // Only so many large bodies are read at once (inside the size check: one refused for its
+    // size takes no place).
+    let large_bodies = Arc::new(Semaphore::new(state.settings.max_large_bodies.max(1)));
+    let creation = documents::create_router().layer(middleware::from_fn_with_state(
+        large_bodies,
+        few_large_bodies,
+    ));
     with_body_limit(standard, DEFAULT_BODY_LIMIT)
-        .merge(with_body_limit(
-            documents::create_router(),
-            documents::MAX_DOCUMENT_BODY,
-        ))
+        .merge(with_body_limit(creation, documents::MAX_DOCUMENT_BODY))
         .layer(in_time())
         .merge(large)
         .with_state(state.clone())
@@ -166,6 +173,43 @@ async fn enforce_body_limit(State(max): State<usize>, req: Request, next: Next) 
     }
     next.run(req.map(|body| Body::new(Limited::new(body, max))))
         .await
+}
+
+/// What a request whose body may be larger than [`DEFAULT_BODY_LIMIT`] is answered (503) while
+/// as many such bodies are being read as the server reads at once.
+pub const LARGE_BODIES_BUSY: &str =
+    "the server is receiving as many large requests as it takes at once; try again in a moment";
+
+/// Only so many requests whose bodies may be larger than [`DEFAULT_BODY_LIMIT`] (declared so, or
+/// sent without a length) are read at once (`max_large_bodies`), each holding its place until it
+/// is answered; one more is answered 503 [`LARGE_BODIES_BUSY`] at once. (A large body is held in
+/// memory whole, and on a slow uplink for a long time.) Smaller ones are not counted.
+async fn few_large_bodies(
+    State(places): State<Arc<Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // (From the headers: the body itself has been wrapped by now, and its size hint lost.) With
+    // neither header there is no body.
+    let large = match declared_length(&req) {
+        Some(n) => n > DEFAULT_BODY_LIMIT as u64,
+        None => req.headers().contains_key(header::TRANSFER_ENCODING),
+    };
+    if !large {
+        return next.run(req).await;
+    }
+    let Ok(_place) = places.try_acquire_owned() else {
+        crate::metrics::large_body_refused();
+        // The client is still sending: read the body and throw it away (holding none of it), so
+        // that it reads the answer rather than a connection reset.
+        if declared_length(&req).is_some_and(|n| n <= DRAIN_AT_MOST) {
+            let mut body = req.into_body();
+            let drain = async { while let Some(Ok(_)) = body.frame().await {} };
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, drain).await;
+        }
+        return ApiError::Unavailable(LARGE_BODIES_BUSY).into_response();
+    };
+    next.run(req).await
 }
 
 /// The request's `Content-Length`, if it has one.

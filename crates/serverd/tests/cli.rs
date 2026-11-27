@@ -146,6 +146,12 @@ fn help_names_the_commands_and_the_settings_and_version_the_version() {
         "OSWX_COLLAB_MIN_UPLOAD_RATE",
         "OSWX_COLLAB_UPLOAD_RATE_GRACE",
         "OSWX_COLLAB_MAX_CONNECTIONS",
+        "OSWX_COLLAB_UPLOAD_MEMORY",
+        "OSWX_COLLAB_UPLOAD_TIME_LIMIT",
+        "OSWX_COLLAB_UPLOAD_TIME_RATE",
+        "OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS",
+        "OSWX_COLLAB_MAX_LARGE_BODIES",
+        "OSWX_COLLAB_MAX_MAIL_SENDS",
         "OSWX_COLLAB_LOG_LEVEL",
         "OSWX_COLLAB_TRUSTED_PROXIES",
         "OSWX_COLLAB_METRICS_TOKEN",
@@ -345,8 +351,13 @@ fn a_setting_that_cannot_be_read_stops_every_command_and_is_never_repeated() {
         ("OSWX_COLLAB_STORAGE_URL", ""),
         ("OSWX_COLLAB_S3_PATH_STYLE", "sometimes"),
         ("OSWX_COLLAB_BLOB_IDLE_TIMEOUT", "never"),
-        ("OSWX_COLLAB_MAX_BLOB_UPLOADS", "0"),
+        ("OSWX_COLLAB_UPLOAD_MEMORY", "0"),
         ("OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_USER", "x"),
+        ("OSWX_COLLAB_UPLOAD_TIME_LIMIT", "0"),
+        ("OSWX_COLLAB_UPLOAD_TIME_RATE", "fast"),
+        ("OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS", "-1"),
+        ("OSWX_COLLAB_MAX_LARGE_BODIES", "0"),
+        ("OSWX_COLLAB_MAX_MAIL_SENDS", "0"),
         ("OSWX_COLLAB_REQUEST_TIMEOUT", "0"),
         ("OSWX_COLLAB_WRITE_TIMEOUT", "-3"),
         ("OSWX_COLLAB_SHUTDOWN_TIMEOUT", "soon"),
@@ -360,9 +371,11 @@ fn a_setting_that_cannot_be_read_stops_every_command_and_is_never_repeated() {
         ("OSWX_COLLAB_LOG", "xml"),
         ("OSWX_COLLAB_LOG_LEVEL", "chatty"),
         ("OSWX_COLLAB_LOG_LEVEL", "debug,sqlx=loud"),
-        // Every address there is, is not a list of proxies.
+        // Every address there is, or a large part of it, is not a list of proxies.
         ("OSWX_COLLAB_TRUSTED_PROXIES", "0.0.0.0/0"),
         ("OSWX_COLLAB_TRUSTED_PROXIES", "172.16.0.0/12, ::/0"),
+        ("OSWX_COLLAB_TRUSTED_PROXIES", "0.0.0.0/1, 128.0.0.0/1"),
+        ("OSWX_COLLAB_TRUSTED_PROXIES", "fd00::/8"),
         ("OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG", "0"),
         ("OSWX_COLLAB_MIN_UPLOAD_RATE", "slowly"),
         ("OSWX_COLLAB_UPLOAD_RATE_GRACE", "0"),
@@ -532,7 +545,12 @@ impl Server {
             // Text: `... listening on http://127.0.0.1:50123 version=...`; JSON:
             // `..."message":"listening on http://127.0.0.1:50123",...`.
             let logged = server.logged();
-            if let Some((_, rest)) = logged.split_once("listening on http://") {
+            // Only once the line is whole: a line read while it is being written could end in
+            // the middle of the port.
+            let whole = logged
+                .split_once("listening on http://")
+                .filter(|(_, rest)| rest.contains('\n'));
+            if let Some((_, rest)) = whole {
                 let address: String = rest
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')

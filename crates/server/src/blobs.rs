@@ -117,7 +117,19 @@ pub trait Blobs: Send + Sync + 'static {
     /// can be written, or the bucket exists and answers this server's credentials. A storage that is
     /// missing or unreachable is an error.
     async fn health(&self) -> anyhow::Result<()>;
+
+    /// About the most memory one [`Blobs::put_stream`] holds while it runs, in bytes: what an
+    /// upload is charged against `OSWX_COLLAB_UPLOAD_MEMORY` ([`crate::uploads`]). The default,
+    /// [`COMPRESSOR_MEMORY`], is for a storage that writes what it reads as it reads it (a folder);
+    /// one that gathers parts before sending them says how much it gathers.
+    fn upload_memory(&self) -> u64 {
+        COMPRESSOR_MEMORY
+    }
 }
+
+/// About what the compressor of one blob being stored holds (zstd at its default level: a 2 MiB
+/// window and its tables), with a body chunk in hand: what an upload to a folder costs in memory.
+pub const COMPRESSOR_MEMORY: u64 = 4 << 20;
 
 /// The key of a blob of an organisation: `orgs/<org>/blobs/<sha[:2]>/<sha>`. Blobs belong to the
 /// organisation: every project in it reaches the same blob. `sha256_hex` must already be checked

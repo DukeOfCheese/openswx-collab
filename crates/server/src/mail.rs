@@ -2,9 +2,11 @@
 //! nothing and works as before: invites are links people pass on, forgotten passwords are reset by
 //! the operator.
 //!
-//! As in the Python server, a handler awaits the send and then answers the same whatever happened: a
-//! failure is logged for the operator, never shown to the person (someone asking for a reset link is
-//! told the same thing whether or not one was sent).
+//! As in the Python server, a handler answers the same whatever happened to the send: a failure is
+//! logged for the operator (without the address), never shown to the person (someone asking for a
+//! reset link is told the same thing whether or not one was sent). Unlike it, a handler waits for
+//! its send for a few seconds at most ([`send_after_commit`]), and only so many messages are on
+//! their way at once ([`MailSends`]).
 //!
 //! **Whose certificates are trusted.** The mail server's certificate must lead to one of Mozilla's
 //! roots (built into the binary, so a container without a certificate bundle can still reach a
@@ -13,7 +15,7 @@
 //! `SSL_CERT_FILE` and `SSL_CERT_DIR` say where the store is). The certificate must be for the
 //! name in `OSWX_COLLAB_SMTP_HOST`. There is no setting that turns the check off.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -23,9 +25,10 @@ use lettre::message::{Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Certificate, CertificateStore, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use tokio::sync::{Semaphore, watch};
 
 use crate::config::{Settings, SmtpSecurity};
-use crate::state::AppState;
+use crate::state::{AppState, InFlight};
 
 #[async_trait]
 pub trait Mailer: Send + Sync + 'static {
@@ -42,8 +45,9 @@ pub trait Mailer: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 }
 
-/// Sends through `mailer` and logs a failure (with the mail server's name, never the message);
-/// answers whether the message was handed to the mail server. What handlers call.
+/// Sends through `mailer` and logs a failure (with the mail server's name, never the message nor
+/// the address it was for); answers whether the message was handed to the mail server. A send
+/// that panics counts as one that failed.
 pub async fn send_logged(
     mailer: &dyn Mailer,
     settings: &Settings,
@@ -51,33 +55,109 @@ pub async fn send_logged(
     subject: &str,
     text: &str,
 ) -> bool {
+    use futures_util::FutureExt as _;
     if !mailer.configured() {
         return false;
     }
-    match mailer.send(to, subject, text, None).await {
-        Ok(()) => {
+    let sending = std::panic::AssertUnwindSafe(mailer.send(to, subject, text, None));
+    let why = match sending.catch_unwind().await {
+        Ok(Ok(())) => {
             crate::metrics::mail_sent();
-            true
+            return true;
         }
-        Err(err) => {
-            crate::metrics::mail_failed();
-            tracing::warn!(
-                "could not send email to the mail server {}: {err:#}",
-                settings.smtp_host
-            );
-            false
-        }
+        Ok(Err(err)) => without_address(&format!("{err:#}"), to),
+        Err(_) => "the mailer panicked".to_owned(),
+    };
+    crate::metrics::mail_failed();
+    tracing::warn!(
+        "could not send email to the mail server {}: {why}",
+        settings.smtp_host
+    );
+    false
+}
+
+/// `text` with every spelling of the address `to` (in any case) replaced by `<the recipient>`:
+/// a mail server's refusal often quotes the address it refused.
+fn without_address(text: &str, to: &str) -> String {
+    let to = to.trim();
+    if to.is_empty() || !to.is_ascii() {
+        return text.to_owned();
     }
+    // (ASCII lower case keeps every byte where it was, so the places found are places in `text`.)
+    let (lower, needle) = (text.to_ascii_lowercase(), to.to_ascii_lowercase());
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(&needle) {
+        out.push_str(&text[from..from + at]);
+        out.push_str("<the recipient>");
+        from += at + needle.len();
+    }
+    out.push_str(&text[from..]);
+    out
 }
 
 /// How long a request waits for the mail it sends before it answers without knowing.
 pub const MAIL_WAIT: Duration = Duration::from_secs(10);
 
+/// What became of a message a request sent ([`send_after_commit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mailed {
+    /// The mail server took it.
+    Sent,
+    /// The mail server refused it, could not be reached, or the send failed (logged, counted).
+    Failed,
+    /// Still being sent when the request stopped waiting (it goes on by itself).
+    Pending,
+    /// Not sent: as many messages were on their way as the server sends at once
+    /// (`OSWX_COLLAB_MAX_MAIL_SENDS`; counted).
+    Refused,
+    /// No mail server is configured.
+    NotConfigured,
+}
+
+/// The messages on their way to the mail server ([`AppState::mail`]): only so many at once, and
+/// counted apart from the steps after commits, so that a stop does not hold the journal for a
+/// slow mail server.
+#[derive(Debug)]
+pub struct MailSends {
+    slots: Arc<Semaphore>,
+    sending: Arc<InFlight>,
+    /// Set when the server is stopping: requests stop waiting for their mail.
+    stopping: watch::Sender<bool>,
+}
+
+impl MailSends {
+    /// At most `at_once` messages on their way at a time (at least one).
+    pub fn new(at_once: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(at_once.max(1))),
+            sending: Arc::default(),
+            stopping: watch::Sender::new(false),
+        }
+    }
+
+    /// How many messages are on their way.
+    pub fn sending(&self) -> usize {
+        self.sending.running()
+    }
+
+    /// The server is stopping: a request waiting for its mail stops waiting (and answers
+    /// [`Mailed::Pending`]).
+    pub fn stop_waiting(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    /// Waits until no message is on its way.
+    pub async fn idle(&self) {
+        self.sending.idle().await;
+    }
+}
+
 /// Sends a message for a request that has already committed, without letting the mail server
 /// hold the request up: the send runs in a task of its own ([`send_logged`]: a failure is logged
-/// and counted), and the request waits for it for [`MAIL_WAIT`] at most. Answers whether the
-/// message was handed to the mail server **within that time**; `false` also when it is still
-/// being sent (it goes on, and shutdown waits a while for it).
+/// and counted), and the request waits for it for [`MAIL_WAIT`] at most, or until the server
+/// begins to stop. When as many messages are on their way as the server sends at once, this one
+/// is not sent ([`Mailed::Refused`]).
 ///
 /// A mail server can take a minute to refuse or accept (20 s a step). Awaited in the handler,
 /// that passed the request limit and answered 503 "try again" for something already stored.
@@ -86,15 +166,34 @@ pub async fn send_after_commit(
     to: String,
     subject: String,
     text: String,
-) -> bool {
-    let wait = state.room_hooks.mail_wait;
-    let sending = {
-        let state = state.clone();
-        state.clone().in_background(async move {
-            send_logged(state.mailer.as_ref(), &state.settings, &to, &subject, &text).await
-        })
+) -> Mailed {
+    if !state.mailer.configured() {
+        return Mailed::NotConfigured;
+    }
+    let Ok(slot) = state.mail.slots.clone().try_acquire_owned() else {
+        crate::metrics::mail_refused();
+        tracing::warn!(
+            "an email was not sent: as many are on their way to the mail server as are sent at \
+             once (OSWX_COLLAB_MAX_MAIL_SENDS)"
+        );
+        return Mailed::Refused;
     };
-    matches!(tokio::time::timeout(wait, sending).await, Ok(Ok(true)))
+    let mut stopping = state.mail.stopping.subscribe();
+    let running = state.mail.sending.start();
+    let (mailer, settings) = (state.mailer.clone(), state.settings.clone());
+    let sending = tokio::spawn(async move {
+        let (_slot, _running) = (slot, running);
+        send_logged(mailer.as_ref(), &settings, &to, &subject, &text).await
+    });
+    tokio::select! {
+        sent = tokio::time::timeout(state.room_hooks.mail_wait, sending) => match sent {
+            Ok(Ok(true)) => Mailed::Sent,
+            // (A panic was caught and counted in the task; a join error is only a cancel.)
+            Ok(Ok(false) | Err(_)) => Mailed::Failed,
+            Err(_) => Mailed::Pending,
+        },
+        _ = stopping.wait_for(|stopping| *stopping) => Mailed::Pending,
+    }
 }
 
 /// The invitation email: subject and body.
@@ -354,5 +453,16 @@ mod tests {
         );
         assert!(body.contains("Setting a new password signs you out everywhere."));
         assert!(!body.contains("  "), "no doubled spaces from line joins");
+    }
+
+    #[test]
+    fn a_refusal_is_logged_without_the_address_it_quotes() {
+        let said = "permanent error (550): 5.1.1 <Bob@Example.com>: user unknown; bob@example.COM";
+        assert_eq!(
+            without_address(said, "bob@example.com"),
+            "permanent error (550): 5.1.1 <<the recipient>>: user unknown; <the recipient>"
+        );
+        assert_eq!(without_address("timed out", "bob@example.com"), "timed out");
+        assert_eq!(without_address("x é y", ""), "x é y");
     }
 }

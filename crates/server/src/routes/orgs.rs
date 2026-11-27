@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use crate::access::{CurrentUser, parse_role, recheck_org, require_org};
 use crate::error::{ApiError, ApiJson, ApiPath};
 use crate::ext::{Event, Extensions, check_seat, emit, notify_member_added, notify_member_removed};
-use crate::mail::{invite_text, send_after_commit};
+use crate::mail::{Mailed, invite_text, send_after_commit};
 use crate::security::{OrgRole, ProjectRole, clean_email, new_token, token_hash};
 use crate::state::AppState;
 use crate::store::{Id, Invite, Org, OrgMember, ProjectMember, Tx, User, new_id};
@@ -518,9 +518,10 @@ async fn create_invite(
         .commit_then((tx, turn), |_| async {}, async move {
             let mut emailed = false;
             if let Some((to, (subject, text))) = mail {
-                // `false` also when the mail server has not answered in time: the invite is
-                // made either way, and its link is in the answer.
-                emailed = send_after_commit(&after, to, subject, text).await;
+                // `false` also when the mail server has not answered in time, or too many
+                // emails were on their way: the invite is made either way, and its link is in
+                // the answer.
+                emailed = send_after_commit(&after, to, subject, text).await == Mailed::Sent;
             }
             emit(&after.ext, event).await;
             emailed
