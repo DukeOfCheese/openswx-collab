@@ -34,7 +34,7 @@ it in its next rework; until then the Python server stays here for openswx 0.4.
 | Email (invites, password reset), optional SMTP | Done, tested against a local SMTP server |
 | Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Done, tested: the suite runs on both (latest runs: no failures; a few timing-sensitive tests have failed now and then under load on PostgreSQL); S3 tested with an in-process server and with Garage |
 | Operations: `/metrics`, JSON logs, health and readiness, orderly stop, connection and upload limits | Done, tested |
-| Docker deployment (`deploy/`) | Rust image and Compose files (SQLite; PostgreSQL; + Garage) run on a Raspberry Pi (arm64) and in CI; the published image is still the Python server |
+| Docker deployment (`deploy/`) | Rust image and Compose files (SQLite; PostgreSQL; + Garage) run on a Raspberry Pi (arm64) (a CI job for them is written but has not had a green run yet); the published image is still the Python server |
 | openswx client (toggle, sync, cursors, previews) | Shipped in openswx 0.4.0, refined in 0.4.1, against the Python server (protocol 1); the protocol 2 client is the next project |
 | Hosted service extras (seat limits, Stripe billing) | In a separate private crate through the `Extensions` trait; billing not yet tried against Stripe's test mode |
 | Several server machines, assemblies in openswx, company SSO | Later |

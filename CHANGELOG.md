@@ -43,7 +43,8 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   closed (4408): at most 30 s + 4 MiB / 16 KiB/s (under 5 minutes) after it stopped taking frames, plus
   the time of anything it was handed since. A draft may arrive up to a tick after the change that ends it.
 - New close codes: 4410 (the document was reloaded or moved, or its room stopped unexpectedly: reconnect
-  and resend) and 4429 (too many document connections for the account). A connection may have at most
+  and resend) and 4429 (too many document connections for the account, or `server_full` for the
+  server). A connection may have at most
   2,000 unanswered changes (4408).
   A client frame may hold at most 1,000,000 values; only a `change` may be longer than 512 KiB. Messages
   waiting behind one of the connection's own that the server is still working on: at most 1,024, or
@@ -61,8 +62,8 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   `BLOB_IDLE_TIMEOUT`, `UPLOAD_MEMORY`, `MAX_BLOB_UPLOADS_PER_ORG`, `MAX_BLOB_UPLOADS_PER_USER`,
   `MIN_UPLOAD_RATE`, `UPLOAD_RATE_GRACE`, `UPLOAD_TIME_LIMIT`, `UPLOAD_TIME_RATE`, `TRUSTED_PROXIES`,
   `REQUEST_TIMEOUT`, `WRITE_TIMEOUT`, `SHUTDOWN_TIMEOUT`, `MAX_CONNECTIONS` (at most 65,536),
-  `MAX_CONNECTIONS_PER_ADDRESS`, `MAX_LARGE_BODIES`, `MAX_MAIL_SENDS`, `METRICS_TOKEN`, `LOG`,
-  `LOG_LEVEL`, `PASSWORD`.
+  `MAX_CONNECTIONS_PER_ADDRESS`, `MAX_LARGE_BODIES`, `MAX_MAIL_SENDS`, `MAX_EXPORTS`, `METRICS_TOKEN`,
+  `LOG`, `LOG_LEVEL`, `PASSWORD`.
 - `deploy/Dockerfile.rust` and `deploy/docker-compose.rust.yml` (SQLite), with
   `docker-compose.rust-postgres.yml` (PostgreSQL) and the existing `docker-compose.s3.yml` (Garage) on top;
   `tools/check_deploy_rust.py` checks them, and with `--docker` builds and runs each. The image's base
@@ -86,7 +87,16 @@ to version 2. A Python server's database is not opened by the Rust server; an im
 - Deleting a project or an organisation is two steps: it is gone for everyone at once, and its rows and
   files are removed in the background, a chunk at a time, resuming after a restart; what cannot be
   removed yet, or listed, is tried again later, waiting twice as long after each failure.
-- Email is sent after the commit; `emailed: false` in an invite's answer may also mean "still on its way".
+- Email is sent after the commit; `emailed: false` in an invite's answer may also mean "still on its way",
+  or that the organisation (50 an hour) or the account (200 a day) has had as many invites emailed as it
+  may. An organisation has at most 1,000 open invites (409 beyond).
+- Exports: organisation exports and account exports have a pool of places each (`MAX_EXPORTS` of each,
+  default 2), and a client that reads an export more slowly than `MIN_UPLOAD_RATE` on average (after
+  `UPLOAD_RATE_GRACE`) loses it, as one that stops reading does.
+- An extension's quota hook is asked for `Members` (with the seat hook) and for `BlobBytes` before a blob
+  that is not stored yet is uploaded (its declared size, or `MAX_BLOB_BYTES` without one).
+- `GET /api/ready` gives its answer again for a second and checks once at a time; it logs why the server
+  is not ready when that starts, then at most once a minute.
 - Sessions and roles are dropped on the event that ends them (sign-out, password change, role change,
   deletion) as well as by a 30 s check; a session that expires while connected closes and releases its
   locks at once.
@@ -111,6 +121,17 @@ to version 2. A Python server's database is not opened by the Rust server; an im
 - `X-Forwarded-For` is believed only from `OSWX_COLLAB_TRUSTED_PROXIES` and is read from the right; the
   Rust Compose file trusts its own fixed subnet, so a TLS proxy on the host gives each client its own
   sign-in limits.
+- Sign-in attempts are counted before the password is checked, so parallel requests cannot get past the
+  limit (10 in 10 minutes per email address and client); one email address also has 100 attempts an hour
+  from anywhere. Sign-in, reset and OAuth limits count an IPv6 client by its /64.
+- Document connections may take at most `MAX_CONNECTIONS` less an eighth (and less at least 256), so that
+  they cannot leave REST without connections; one more is closed 4429 with the `error` code
+  `server_full`.
+- The Rust Compose file raises the container's limit on open files to 65,536 (Docker's soft default has
+  been 1,024 since version 25); the server raises its soft limit to the hard limit at start and warns
+  when that is below what `MAX_CONNECTIONS` needs, and when out of descriptors closes an idle connection
+  for each one it cannot accept (logged at most once a minute).
+- Invites are limited as a mail relay: 50 emailed an hour per organisation, 200 a day per account.
 - The cost of stored password hashes is bounded and hashing runs off the server's main threads; logs never
   hold a token, password, invite, login code or document content, and a panic is logged without its
   message.

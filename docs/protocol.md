@@ -26,7 +26,7 @@ Times are float seconds since the epoch; ids are 32 lower-case hex characters.
 | `POST /api/auth/login` `{email, password}` · `POST /api/auth/logout` · `GET/PATCH /api/me` | |
 | `DELETE /api/me` `{current_password?}` | delete your account (password, or a sign-in from the last 10 minutes); refused (409) while you are an organisation's only owner or the server's last admin |
 | `GET /api/me/export` | everything the server holds about you, as JSON |
-| `POST /api/auth/password-reset` `{email}` | emails a link to `/reset-password/<token>` (a page that sets the password); always 202, 501 when the server cannot send email |
+| `POST /api/auth/password-reset` `{email}` | emails a link to `/reset-password/<token>` (a page that sets the password); 202 for any well-formed request (whether or not there is such an account, and when the request was limited), 501 when the server cannot send email |
 | `POST /api/auth/password-reset/confirm` `{token, password}` | sets it, signs out everywhere |
 | `GET /api/auth/oauth/{google\|github}/start?redirect_uri=http://127.0.0.1:<port>/…&code_challenge=&invite=` | browser sign-in; ends on the loopback address with `?code=` or `?error=` |
 | `POST /api/auth/exchange` `{code, code_verifier}` | → `{token, user}` |
@@ -36,7 +36,7 @@ Times are float seconds since the epoch; ids are 32 lower-case hex characters.
 | `GET/POST /api/orgs` · `PATCH /api/orgs/{id}` · `GET /api/orgs/{id}/members` · `PATCH/DELETE …/members/{user}` | |
 | `DELETE /api/orgs/{id}` `{confirm_name, current_password?}` | owners: delete the organisation and everything in it |
 | `GET /api/orgs/{id}/export` | owners: a zip of every document (content, history, versions), the members and the blobs (`HEAD` is 405) |
-| `GET/POST /api/orgs/{id}/invites` · `DELETE …/invites/{id}` · `POST /api/invites/accept` `{token}` | an invite with an `email` is emailed when the server can (`send_email: false` to skip); the answer says `emailed` (see below) |
+| `GET/POST /api/orgs/{id}/invites` · `DELETE …/invites/{id}` · `POST /api/invites/accept` `{token}` | an invite with an `email` is emailed when the server can (`send_email: false` to skip); the answer says `emailed` (see below). An organisation has at most 1,000 open (unused, unexpired) invites: one more is 409 |
 | `GET/POST /api/orgs/{id}/projects` · `PATCH/DELETE /api/projects/{id}` · `GET …/members` · `PUT/DELETE …/members/{user}` | |
 | `GET/POST /api/projects/{id}/folders` · `PATCH/DELETE /api/folders/{id}` | folders, nested at most 32 deep; `{name, parent_id?}`; deleting one moves what was in it to its parent |
 | `POST /api/projects/{id}/blobs/missing` `[sha256…]` · `PUT/GET /api/projects/{id}/blobs/{sha256}` | large data, by the SHA-256 of its raw bytes; at most 2,000 hashes a call (400 beyond, 422 for one that is not a hash) |
@@ -73,7 +73,7 @@ admins own every project. **A project you are not in answers 404**, exactly like
 | 409 | a conflict the message names (a name taken, the last owner leaving, a part still used by assemblies). Also **`another request changed the same thing at the same moment; try again`**: the database put this request behind another one (or waited 5 s for its lock) and nothing was written; send it again. And 409 `the server could not check this with its extensions in time; try again` when an extension did not answer within 5 s |
 | 413 | the body is too large (1 MiB for most routes, 8 MB to create a document, `max_blob_bytes` for a blob) |
 | 422 | the body has the wrong shape or fails a check (text holding the zero character is refused everywhere) |
-| 429 | too many attempts (sign-in limits), or as many of this as the server does at once for you: blob uploads of your account (4) or organisation (8), exports (one per account, two per server) |
+| 429 | too many attempts (sign-in: 10 in 10 minutes for one email address from one client address, 100 in an hour for one email address from anywhere; an IPv6 client counts as its /64), or as many of this as the server does at once for you: blob uploads of your account (4) or organisation (8), exports (one per account; two organisation exports and two account exports per server, `max_exports`) |
 | 500 | the server failed; logged on the server. Rare; something unexpected, such as a database refusing a duplicate the route did not foresee |
 | 503 | the server could not get to the request; **nothing was done**, send it again later. `the server is busy; try again` (no database connection came free, the organisation already has 64 requests queued or one waited 10 s for its turn, a statement ran out of time), `the request took too long; try again` (no answer within the request time limit, 60 s), a blob upload that found no room in the server's upload memory, or too many large bodies being read at once |
 
@@ -81,8 +81,9 @@ Requests that change an organisation's data run one at a time for that organisat
 arrive.
 
 `emailed: false` in an invite's answer means the email was not confirmed sent within 10 seconds: it may
-have failed, the server may have been sending as many emails as it sends at once, or it may still be on
-its way. The invite exists either way and its link is in the answer: show the link when `emailed` is
+have failed, the server may have been sending as many emails as it sends at once, it may still be on its
+way, or it was not sent because the organisation (50 an hour) or the account (200 a day) has had as many
+invites emailed as it may. The invite exists either way and its link is in the answer: show the link when `emailed` is
 false.
 
 Deleting a project or an organisation answers at once: from that moment it is gone for everyone (404, its

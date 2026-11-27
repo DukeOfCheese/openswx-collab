@@ -100,7 +100,9 @@ Stopping: `docker stop` sends SIGTERM and waits 10 s; the server closes every op
 snapshot) and the journal within `OSWX_COLLAB_SHUTDOWN_TIMEOUT` (8 s). Keep `stop_grace_period` above it.
 
 The image's health check asks `GET /api/health`. `GET /api/ready` also checks the database and the storage
-(on S3 that costs a request each time): use it for a load balancer, not every few seconds.
+(on S3 that costs a request each time): use it for a load balancer, not every few seconds. It gives its
+answer again for a second and runs one check at a time, so many callers cost one check; it logs why the
+server is not ready when that starts, then at most once a minute.
 
 ## TLS and the proxy in front
 
@@ -219,6 +221,7 @@ to start while it is set**, naming `UPLOAD_MEMORY`. With the defaults, sixteen S
 | `OSWX_COLLAB_MAX_CONNECTIONS` | `4096` | connections held open at once, document connections included; at most **65,536** (a client takes a document's peer list of at most that many) |
 | `OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS` | `512` | connections from one address, as the connection arrives (an IPv6 address counts as its /64); a trusted proxy's connections are not counted (limit connections per client in the proxy); 0: no limit |
 | `OSWX_COLLAB_MAX_LARGE_BODIES` | `16` | request bodies over 1 MiB (document creation, up to 8 MB) read at once; one more: 503 |
+| `OSWX_COLLAB_MAX_EXPORTS` | `2` | organisation exports running at once, and account exports at once apart from them; one more: 429. An account runs one export at a time. A client that reads an export more slowly than `MIN_UPLOAD_RATE` on average (after `UPLOAD_RATE_GRACE`), or not at all for 60 s, loses it; an export takes at most 30 minutes |
 | `OSWX_COLLAB_SHUTDOWN_TIMEOUT` | `8` | seconds an orderly stop may take before the process ends anyway |
 | `OSWX_COLLAB_METRICS_TOKEN` | | the bearer token `GET /metrics` asks for: 16 to 256 printable ASCII characters, no spaces; empty: no `/metrics` (404) |
 | `OSWX_COLLAB_LOG` | `text` | `text`, or `json` for one JSON object a line |
@@ -229,9 +232,19 @@ longest without finishing its first request (someone holding sockets open a byte
 that the one idle longest; never one with a request in its handler, an answer still being sent, or a
 document connection. Eight more connections (the **health reserve**) answer `GET /api/health` alone, so a
 health check gets through when the server is full; past those a connection is accepted and closed at once.
-One address over `MAX_CONNECTIONS_PER_ADDRESS` likewise replaces its own oldest idle connection. Keep the
-process's limit on open files (`ulimit -n`; Docker's default is high enough) above `MAX_CONNECTIONS` plus a
-few hundred. A request head must arrive within 30 s, and a kept-alive connection idle for 30 s is closed.
+One address over `MAX_CONNECTIONS_PER_ADDRESS` likewise replaces its own oldest idle connection.
+Document connections (WebSockets) are never closed to make room, so they may take at most
+`MAX_CONNECTIONS` less an eighth of it, and less at least 256 (3,584 of the default 4,096): the rest stay
+for REST. One more is refused at once with close code 4429 (`server_full`), which tells the client to
+try again later.
+
+Every connection is an open file. Keep the process's limit on open files (`ulimit -n`) above
+`MAX_CONNECTIONS` plus about 260 (the health reserve and the database, storage and log). **Docker gives a
+container a soft limit of 1,024 since version 25**, which is too low: `deploy/docker-compose.rust.yml` sets
+`ulimits: nofile: 65536`; with `docker run`, pass `--ulimit nofile=65536:65536`. At start the server raises
+its soft limit to the hard limit and warns in the log when that is still below what `MAX_CONNECTIONS`
+needs. If it runs out anyway, it closes an idle connection for each one it cannot accept (so a health check
+can still get in) and logs that at most once a minute. A request head must arrive within 30 s, and a kept-alive connection idle for 30 s is closed.
 
 `/metrics` is Prometheus text (requests, rooms, connections, the journal, uploads, mail). **Make the token
 long and random** (`openssl rand -hex 32`): it is compared in constant time, but it is all that stands
@@ -295,7 +308,12 @@ works once that authority is installed in the trust store (in the image: copy it
 only if the mail server took the message within 10 seconds. `false` means it was not confirmed: the mail
 server refused it or could not be reached (the reason is in the log, without the address), the server was
 already sending `MAX_MAIL_SENDS` emails, or it is **still on its way** (a slow relay). The invite exists
-either way and its link is in the answer, which openswx shows. Password reset requests always answer 202.
+either way and its link is in the answer, which openswx shows.
+
+**Invites are limited**, so that nobody can use the server to mail strangers: an organisation has at most
+50 invites emailed an hour and an account 200 a day (past either, the invite is made, not emailed, and the
+log says so without the address), and an organisation has at most 1,000 open invites (unused and unexpired;
+one more is 409). Password reset requests always answer 202.
 
 ## S3-compatible storage
 
@@ -326,7 +344,7 @@ bytes under the same keys, so moving between them is a plain copy (`aws s3 sync`
 - An `http://` endpoint is used only when written with `http://`.
 - The server's HTTPS clients (S3, and the OAuth providers) trust the machine's trust store as well as
   Mozilla's roots.
-- **A bucket deleted while the server runs** is noticed by `/api/ready` at once, but documents and uploads
+- **A bucket deleted while the server runs** is noticed by `/api/ready` within a second, but documents and uploads
   notice only once 30 s have passed since the bucket last answered: until then a missing object reads as
   absent (a change referring to a blob is refused `missing_blob`, an upload fails with 500).
 
@@ -347,9 +365,13 @@ For someone reading the server's logs or a user's report:
 - **500 `server error`**: something unexpected; the log has the cause (a database refusing a duplicate a
   route did not expect, a storage error). Report it.
 - **402**: an extension (seat limits, a paid plan) refused; the message says why.
-- **429**: failed sign-ins (10 in 10 minutes for one email address from one client address) and OAuth
-  starts from one address (600 in 10 minutes), an account's or organisation's uploads at once, one export
-  at a time per account (two per server). Password reset requests over their limit (5 an hour) still
+- **429**: sign-in attempts (10 in 10 minutes for one email address from one client address, cleared by
+  a success; and 100 in an hour for one email address from anywhere, so that guessing from many addresses
+  is slow too — which also means someone can keep an account's password sign-in refused for a while; its
+  owner can still use a provider sign-in or reset the password) and OAuth starts from one address (600 in
+  10 minutes), an IPv6 client counting as its /64 for all of them; an account's or organisation's
+  uploads at once; one export at a time per account, and `MAX_EXPORTS` organisation exports and as many
+  account exports per server. Password reset requests over their limit (5 an hour) still
   answer 202, and nothing is sent.
 
 ## Leaving
