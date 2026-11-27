@@ -884,8 +884,8 @@ pub struct FlakyStore {
     duplicate_inserts: Arc<AtomicUsize>,
     /// The order change-id lookups ended and undo targets were asked for in.
     lookup_log: Mutex<Vec<&'static str>>,
-    /// A delay for the next change-id lookup only.
-    lookup_delay_once: Mutex<Option<Duration>>,
+    /// Set: the next change-id lookup only parks at [`FlakyStore::next_lookup_gate`].
+    hold_next_lookup: AtomicBool,
     preloads: AtomicUsize,
     preload_delay: Mutex<Duration>,
     commit_delay: Arc<Mutex<Duration>>,
@@ -918,6 +918,8 @@ pub struct FlakyStore {
     /// Shut: every [`Store::change_seq_by_client`] (a room's change-id lookup) parks here, once
     /// counted.
     pub lookup_gate: Arc<oswx_server::room::Gate>,
+    /// Where the one change-id lookup [`FlakyStore::hold_next_lookup`] picked parks until opened.
+    pub next_lookup_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every [`Store::begin_journal`] (a journal batch, a lease) parks here before it opens
     /// its transaction. (REST transactions do not pass it.)
     pub journal_gate: Arc<oswx_server::room::Gate>,
@@ -949,7 +951,7 @@ impl FlakyStore {
             lookup_delay: Mutex::new(Duration::ZERO),
             duplicate_inserts: Arc::new(AtomicUsize::new(0)),
             lookup_log: Mutex::new(Vec::new()),
-            lookup_delay_once: Mutex::new(None),
+            hold_next_lookup: AtomicBool::new(false),
             preloads: AtomicUsize::new(0),
             preload_delay: Mutex::new(Duration::ZERO),
             commit_delay: Arc::new(Mutex::new(Duration::ZERO)),
@@ -965,6 +967,7 @@ impl FlakyStore {
             history_gate: Arc::default(),
             list_orgs_gate: Arc::default(),
             lookup_gate: Arc::default(),
+            next_lookup_gate: Arc::default(),
             journal_gate: Arc::default(),
             ref_writes: Arc::new(AtomicUsize::new(0)),
             fail_part_reads: AtomicBool::new(false),
@@ -1022,12 +1025,11 @@ impl FlakyStore {
             .unwrap_or_else(PoisonError::into_inner) = d;
     }
 
-    /// Makes the next [`Store::change_seq_by_client`] (only) wait this long first.
-    pub fn lookup_delay_once(&self, d: Duration) {
-        *self
-            .lookup_delay_once
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(d);
+    /// Makes the next [`Store::change_seq_by_client`] (only) park at
+    /// [`FlakyStore::next_lookup_gate`], shut now, until the test opens it.
+    pub fn hold_next_lookup(&self) {
+        self.next_lookup_gate.shut();
+        self.hold_next_lookup.store(true, Ordering::SeqCst);
     }
 
     /// In which order change-id lookups ended and undo targets were asked for.
@@ -1418,17 +1420,13 @@ impl Store for FlakyStore {
         change_id: &str,
     ) -> anyhow::Result<Option<i64>> {
         self.change_lookups.fetch_add(1, Ordering::SeqCst);
-        let once = self
-            .lookup_delay_once
+        if self.hold_next_lookup.swap(false, Ordering::SeqCst) {
+            self.next_lookup_gate.pass().await;
+        }
+        let delay = *self
+            .lookup_delay
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let delay = once.unwrap_or_else(|| {
-            *self
-                .lookup_delay
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-        });
+            .unwrap_or_else(PoisonError::into_inner);
         pause(delay).await;
         self.lookup_gate.pass().await;
         let found = self

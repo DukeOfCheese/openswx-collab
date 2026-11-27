@@ -402,15 +402,32 @@ async fn an_undo_of_a_change_whose_seq_is_being_checked_waits_for_the_check() {
     // The room forgets X; X sent again reaches the journal, which refuses it as a duplicate, and
     // the room looks its seq up (slowly).
     server.room(&doc).forget_change_ids().await;
-    // The duplicate check is slow; the undo's own resend check (the client is no longer complete
-    // then) is quick, so the undo arrives while X's seq is still being checked.
-    flaky.lookup_delay_once(std::time::Duration::from_millis(800));
+    // The duplicate check is held; the undo's own resend check (the client is no longer complete
+    // then) is not, so the undo arrives while X's seq is still being checked.
+    flaky.hold_next_lookup();
     let mut again = x.clone();
     again.base = 1;
     a.send_change(&again).await;
-    pause(std::time::Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, flaky.next_lookup_gate.until_waiting(1))
+        .await
+        .expect("X's seq is being checked");
     let undo = a.undo_change(1, &x.change_id, vec![set_depth(10)]);
     a.send_change(&undo).await;
+    // The undo's resend check answers while X's is still held.
+    tokio::time::timeout(WAIT, async {
+        while flaky.lookup_log().is_empty() {
+            pause(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the undo's resend check answers");
+    assert_eq!(flaky.lookup_log(), ["change id looked up"]);
+    assert_eq!(
+        flaky.next_lookup_gate.waiting(),
+        1,
+        "X's check is still held"
+    );
+    flaky.next_lookup_gate.open();
     assert_eq!(a.outcome(&x.change_id).await, Outcome::Accepted(1));
     assert_eq!(a.outcome(&undo.change_id).await.seq(), 2);
     // The undo's target was read only once the check had answered.
