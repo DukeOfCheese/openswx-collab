@@ -40,7 +40,10 @@
 //! and nothing else is tried before the list can be read again.
 //!
 //! An organisation marked while a sweep is under way (after it went through the projects) is
-//! left for the next sweep, which starts at once: not a failure.
+//! left for the next sweep, which starts at once (its mark woke the purger): not a failure. Nor
+//! is one whose projects wait for their next try or could not be listed in this sweep: it waits
+//! with them. One that still holds a project for any other reason (a project not marked) is a
+//! failure, and backs off like any other.
 //!
 //! # With the journal
 //!
@@ -77,6 +80,8 @@ pub const MAX_RETRY: Duration = Duration::from_secs(3600);
 const LIST: i64 = 100;
 /// What the work list is called among the things that wait for a next try.
 const THE_LIST: &str = "the list";
+/// How an organisation's name begins among the things that wait for a next try.
+const ORGANISATION: &str = "organisation ";
 
 /// The background task that removes what was marked deleted (see the module documentation).
 /// Cloning is cheap: clones are the same purger.
@@ -377,9 +382,15 @@ impl Purger {
                 break;
             };
             for org in &orgs {
-                // (One whose projects wait for a next try waits with them, without a word.)
-                let held_up = self.lock_waiting().keys().any(|what| what != THE_LIST);
-                let what = format!("organisation {org}");
+                // (One whose projects wait for a next try, or could not be listed in this sweep,
+                // waits with them, without a word. An organisation waiting, itself included,
+                // holds up no other.)
+                let held_up = self.inner.list_failed.load(Ordering::SeqCst)
+                    || self
+                        .lock_waiting()
+                        .keys()
+                        .any(|what| what != THE_LIST && !what.starts_with(ORGANISATION));
+                let what = format!("{ORGANISATION}{org}");
                 let removed = self.remove(&what, async {
                     self.step().await?;
                     // Its blobs, then its row (which nothing hangs on any more).
@@ -387,11 +398,14 @@ impl Purger {
                     let mut tx = store.begin().await?;
                     let gone = tx.purge_org(org).await?;
                     tx.commit().await?;
-                    if !gone && !held_up {
-                        // Marked after this sweep went through the projects: the next sweep
-                        // removes them, and it.
-                        self.inner.again.store(true, Ordering::SeqCst);
-                    }
+                    // Not gone and not held up: either it was marked after this sweep went
+                    // through the projects (its mark woke the purger, so the next sweep starts
+                    // at once and removes them, and it), or it holds a project that is not
+                    // marked, which is a failure: it waits for its next try, backing off.
+                    anyhow::ensure!(
+                        gone || held_up || self.inner.again.load(Ordering::SeqCst),
+                        "it still has projects"
+                    );
                     if gone {
                         crate::metrics::purge_removed();
                         tracing::info!(org = %org, "a deleted organisation was removed");

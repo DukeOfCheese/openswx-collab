@@ -785,6 +785,94 @@ async fn a_list_that_fails_at_once_is_not_asked_in_a_loop() {
     assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 0);
 }
 
+/// The list of projects fails at once while the list of organisations works, and nothing else
+/// waits: the organisation, which still has its projects, waits with the list instead of being
+/// tried again and again (each try asking the storage and opening a transaction).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_project_list_does_not_loop_over_the_organisations() {
+    let mut handle = None;
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.open_registration = true,
+        new_journal,
+        |s| {
+            let blobs = Arc::new(common::TestBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+            s.purger = Purger::new(100, Duration::from_millis(100));
+        },
+    )
+    .await;
+    let blobs = handle.unwrap();
+    let w = World::new(&server).await.unwrap();
+    w.document(&server, None, None, None).await;
+    flaky.fail_deleted_projects(true);
+    let (lists, deletes) = (flaky.deleted_projects_calls(), blobs.deletes());
+    assert_eq!(
+        delete_org(&server, &w.admin, &w.org, "Robotics").await,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let asked = flaky.deleted_projects_calls() - lists;
+    let deleted = blobs.deletes() - deletes;
+    // (Tries at about 0, 0.1, 0.3, 0.7 s: a few, never a loop.)
+    assert!(asked <= 6, "the list was asked {asked} times in a second");
+    assert!(
+        deleted <= 6,
+        "the storage was asked {deleted} times in a second"
+    );
+    assert!(server.state.purger.busy());
+    flaky.fail_deleted_projects(false);
+    server.purged().await;
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 0);
+}
+
+/// A deleted organisation still holds a project that is not marked (which no deletion leaves, but
+/// a database edited by hand may): the organisation cannot go, and it waits for its next try,
+/// backing off, instead of being tried again and again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_organisation_holding_an_unmarked_project_backs_off() {
+    let mut handle = None;
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.open_registration = true,
+        new_journal,
+        |s| {
+            let blobs = Arc::new(common::TestBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+            s.purger = Purger::new(100, Duration::from_millis(100));
+        },
+    )
+    .await;
+    let blobs = handle.unwrap();
+    let w = World::new(&server).await.unwrap();
+    w.document(&server, None, None, None).await;
+    // The purger is held before it lists anything, while the project is unmarked.
+    server.state.purger.gate().shut();
+    assert_eq!(
+        delete_org(&server, &w.admin, &w.org, "Robotics").await,
+        StatusCode::NO_CONTENT
+    );
+    server
+        .sql(&format!(
+            "UPDATE projects SET deleted_at = NULL WHERE org_id = '{}'",
+            w.org
+        ))
+        .await;
+    let (lists, deletes) = (flaky.deleted_projects_calls(), blobs.deletes());
+    server.state.purger.gate().open();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let asked = flaky.deleted_projects_calls() - lists;
+    let deleted = blobs.deletes() - deletes;
+    assert!(asked <= 6, "the list was asked {asked} times in a second");
+    assert!(
+        deleted <= 6,
+        "the storage was asked {deleted} times in a second"
+    );
+    assert!(server.state.purger.busy());
+    assert_eq!(server.state.purger.waiting(), 1, "the organisation waits");
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 1);
+}
+
 /// An organisation marked while a sweep is under way, after the sweep went through the projects:
 /// it is not a failure (no wait of [`RETRY`]); the next sweep removes it, at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
