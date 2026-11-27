@@ -417,8 +417,9 @@ const EVICTING: usize = 1 << (usize::BITS - 1);
 
 /// What one address is counted as for `max_connections_per_address`: an IPv4 address, or an
 /// IPv6 address's /64 (what one subscriber is usually given; counting each of its addresses
-/// apart would make the limit no limit).
-fn counted_as(ip: IpAddr) -> IpAddr {
+/// apart would make the limit no limit). The sign-in, reset and OAuth limits count clients the
+/// same way.
+pub(crate) fn counted_as(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !(u128::MAX >> 64))),
         v4 => v4,

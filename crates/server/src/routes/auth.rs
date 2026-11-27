@@ -8,8 +8,12 @@
 //! Who may register: the first account on a server (it becomes the server admin); after that anyone
 //! with a valid invite; or anyone at all when `open_registration` is on.
 //!
-//! Sign-in failures are limited per email address and client address (10 in 10 minutes); reset
-//! requests per address and client and per address alone (5 an hour). The client address is the
+//! Sign-in attempts are limited per email address and client address (10 in 10 minutes; a
+//! success clears the count) and per email address alone (100 in an hour, whatever the client:
+//! guessing from many addresses at once); reset requests per address and client and per address
+//! alone (5 an hour). Every limit counts the attempt before the password is checked, in one step,
+//! so that parallel requests cannot all pass. An IPv6 client is counted by its /64 (what one
+//! subscriber is usually given), as the connection limits count it. The client address is the
 //! connection's peer, except that a peer listed in `OSWX_COLLAB_TRUSTED_PROXIES` (by default
 //! `127.0.0.1`, a proxy on this machine, as uvicorn believes by default for the Python server) is
 //! taken at its word in `X-Forwarded-For` (see [`client_ip`]).
@@ -37,6 +41,7 @@ use crate::security::{
     RateLimit, check_password_len, clean_email, hash_password, new_token, token_hash, verify_dummy,
     verify_password,
 };
+use crate::serve::counted_as;
 use crate::state::{AppState, Committed};
 use crate::store::{PasswordReset, Session, Tx, User, new_id};
 
@@ -61,16 +66,27 @@ const RESET_ANSWER: &str = "if there is an account for this address, a link is o
 const RESET_EXPIRED: &str = "this link has expired or was already used; ask for a new one";
 const NO_EMAIL: &str = "this server cannot send email: ask its operator to reset your password";
 
+/// Sign-in attempts per email address and client in [`LOGIN_WINDOW_SECS`].
+const LOGIN_MAX: usize = 10;
+const LOGIN_WINDOW_SECS: u64 = 600;
+/// Sign-in attempts per email address, from any client, in [`LOGIN_EMAIL_WINDOW_SECS`].
+pub(crate) const LOGIN_EMAIL_MAX: usize = 100;
+const LOGIN_EMAIL_WINDOW_SECS: u64 = 3600;
+
 /// The sign-in and reset limits; one set per app.
 #[derive(Debug)]
 struct Limits {
+    /// Per email address and client.
     login: RateLimit,
+    /// Per email address alone.
+    login_email: RateLimit,
     reset: RateLimit,
 }
 
 pub(crate) fn router() -> Router<AppState> {
     let limits = Arc::new(Limits {
-        login: RateLimit::new(10, 600),
+        login: RateLimit::new(LOGIN_MAX, LOGIN_WINDOW_SECS),
+        login_email: RateLimit::new(LOGIN_EMAIL_MAX, LOGIN_EMAIL_WINDOW_SECS),
         reset: RateLimit::new(5, 3600),
     });
     Router::new()
@@ -126,7 +142,8 @@ pub(crate) async fn start_session(
     Ok(token)
 }
 
-/// The client's address, for the limits (see the module documentation).
+/// The client's address as the limits count it (see the module documentation): [`client_ip`],
+/// with an IPv6 address cut to its /64 ([`counted_as`]).
 pub(crate) struct ClientAddr(pub(crate) String);
 
 /// The client's address: the connection's peer, unless the peer is one of the `trusted` proxies
@@ -178,11 +195,11 @@ impl FromRequestParts<AppState> for ClientAddr {
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
-        Ok(Self(client_ip(
-            peer,
-            &parts.headers,
-            &state.settings.trusted_proxies,
-        )))
+        let ip = client_ip(peer, &parts.headers, &state.settings.trusted_proxies);
+        Ok(Self(match ip.parse::<IpAddr>() {
+            Ok(ip) => counted_as(ip).to_string(),
+            Err(_) => ip,
+        }))
     }
 }
 
@@ -310,7 +327,11 @@ async fn login(
     let email = clean_email(&body.email).unwrap_or_default();
     let key = format!("{email}|{ip}");
     let now = state.clock.now();
-    if limits.login.blocked(&key, now) {
+    // The attempt is counted before the (slow) check, in one step per limit: parallel requests
+    // cannot all find the count below the limit and then all fail. A success clears the count.
+    if !limits.login.check(&key, now)
+        || (!email.is_empty() && !limits.login_email.check(&email, now))
+    {
         return Err(ApiError::RateLimited);
     }
     let user = if email.is_empty() {
@@ -328,10 +349,10 @@ async fn login(
     };
     // Checked again here rather than trusting that `verify_dummy` is always false.
     let Some(user) = user.filter(|u| accepted && u.active()) else {
-        limits.login.fail(&key, now);
         return Err(ApiError::WrongCredentials);
     };
     limits.login.reset(&key);
+    limits.login_email.reset(&email);
     let mut tx = state.store.begin().await?;
     tx.delete_expired_user_sessions(&user.id, now).await?;
     let token = start_session(&mut *tx, &state.settings, &user.id, &body.label, now).await?;
@@ -522,11 +543,10 @@ async fn request_reset(
     let email = clean_email(&body.email).unwrap_or_default();
     let key = format!("{email}|{ip}");
     let now = state.clock.now();
-    if limits.reset.blocked(&key, now) || limits.reset.blocked(&email, now) {
+    // Counted in one step per limit, so that parallel requests cannot all pass.
+    if !limits.reset.check(&key, now) || !limits.reset.check(&email, now) {
         return Ok(answer);
     }
-    limits.reset.fail(&key, now);
-    limits.reset.fail(&email, now);
     let user = if email.is_empty() {
         None
     } else {

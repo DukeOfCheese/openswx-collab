@@ -1106,6 +1106,86 @@ async fn behind_a_trusted_proxy_each_client_has_its_own_limit_and_cannot_forge_a
     );
 }
 
+/// The status of `n` failed sign-ins for `email` sent at once, the try `i` carrying the header
+/// `forwarded(i)`, as (refused as wrong, refused by a limit).
+async fn failed_sign_ins_at_once(
+    server: &TestServer,
+    email: &str,
+    n: usize,
+    forwarded: impl Fn(usize) -> Option<String>,
+) -> (usize, usize) {
+    let tries = (0..n).map(|i| {
+        let header = forwarded(i);
+        async move { failed_sign_in(server, email, header.as_deref()).await }
+    });
+    let statuses = futures_util::future::join_all(tries).await;
+    let wrong = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    let limited = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!(wrong + limited, n, "{statuses:?}");
+    (wrong, limited)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_ins_sent_at_once_cannot_all_get_past_the_limit() {
+    let server = TestServer::start_with(|s| s.trusted_proxies = vec![]).await;
+    World::new(&server).await.unwrap();
+    // Each is counted before its password is checked: of thirty at once, ten are checked.
+    let (wrong, limited) = failed_sign_ins_at_once(&server, "a@example.com", 30, |_| None).await;
+    assert!(wrong <= 10, "{wrong} were checked");
+    assert_eq!(wrong, 10);
+    assert_eq!(limited, 20);
+}
+
+#[tokio::test]
+async fn an_ipv6_client_is_counted_by_its_slash_64() {
+    let server = TestServer::start_with(|s| {
+        s.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+    })
+    .await;
+    World::new(&server).await.unwrap();
+    // Another address in the same /64 on every try: one client.
+    let rotating = |i: usize| Some(format!("2001:db8:1:2::{:x}", i + 1));
+    assert_eq!(
+        tries_before_the_limit(&server, "a@example.com", rotating).await,
+        10
+    );
+    // Clients in other /64s are counted apart.
+    let apart = |i: usize| Some(format!("2001:db8:1:{:x}::1", i + 100));
+    assert_eq!(
+        tries_before_the_limit(&server, "b@example.com", apart).await,
+        12
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_email_address_is_limited_whatever_the_client() {
+    let server = TestServer::start_with(|s| {
+        s.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+    })
+    .await;
+    World::new(&server).await.unwrap();
+    // A hundred clients, a guess each: all checked.
+    let client = |i: usize| Some(format!("203.0.{}.{}", i / 200, i % 200 + 1));
+    let (wrong, limited) = failed_sign_ins_at_once(&server, "a@example.com", 100, client).await;
+    assert_eq!((wrong, limited), (100, 0));
+    // The hundred and first, from a client never seen before: refused unchecked.
+    assert_eq!(
+        failed_sign_in(&server, "a@example.com", Some("198.51.100.7")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Another address is not.
+    assert_eq!(
+        failed_sign_in(&server, "b@example.com", Some("198.51.100.7")).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 // ------------------------------------------------------------------ /metrics
 
 async fn metrics(server: &TestServer, bearer: Option<&str>) -> (StatusCode, String, String) {
