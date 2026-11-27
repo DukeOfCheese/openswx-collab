@@ -866,6 +866,10 @@ async fn a_reader_is_caught_up_at_most_once_a_period() {
 /// A reader that stops reading while presence and drafts keep coming is behind on them, never
 /// too slow for what must arrive: it is closed once it has been behind a while with its socket
 /// taking nothing, and leaves the others' peer lists.
+///
+/// This test overrides `slowest_reader`: no integration test runs at the default allowance
+/// (16 KiB/s, capped at 4 MiB of it once a flush returns), which would make it minutes long. That
+/// allowance rests on the unit tests in `room::conn`.
 #[tokio::test]
 async fn a_reader_frozen_behind_is_closed_and_leaves() {
     let hooks = oswx_server::room::Hooks {
@@ -990,7 +994,23 @@ async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its
     while !seen.iter().any(|m| matches!(m, ServerMsg::PeerList { .. })) {
         seen.push(stuck.recv().await);
     }
-    // ... then stops reading: the last sitter changes its draft and the one before it leaves.
+    // ... then stops reading. The server still holds bytes for it once its socket is at a
+    // standstill: the pause lands mid-delivery, not after everything it was owed has gone.
+    let deadline = Instant::now() + WAIT;
+    let mut still = (0, 0);
+    while still.0 < 5 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let c = conn_status(&server, &doc, &stuck_id).await.unwrap();
+        still = match c.queued_bytes {
+            b if b > 0 && b == still.1 => (still.0 + 1, b),
+            b => (1, b),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "the server held nothing more for the reader: {c:?}"
+        );
+    }
+    // The last sitter changes its draft and the one before it leaves.
     let mut changer = sitters.pop().unwrap();
     let leaver = sitters.pop().unwrap();
     let changer_id = changer.client_id.clone();
@@ -1024,8 +1044,10 @@ async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its
     let current = |seen: &[ServerMsg]| {
         let mut got = std::collections::HashMap::new();
         for m in &seen[last_list(seen) + 1..] {
+            // (Its own and the leaver's are left out: those fail below, with what went wrong.)
             if let ServerMsg::Draft { client_id, data } = m
                 && **client_id != *leaver_id
+                && **client_id != *stuck_id
             {
                 got.insert(client_id.to_string(), data.clone().expect("never cleared"));
             }
@@ -1377,24 +1399,48 @@ async fn readers_behind_at_once_get_lists_within_the_presence_budget_and_the_res
         Live::connect(&server, &doc, &world.admin).await,
         Live::connect(&server, &doc, &world.admin).await,
     ];
-    flood_until_all_behind(&server, &doc, &reader_ids, &mut flooders).await;
+    // Every reader behind after a change was queued for it: the list that catches it up next is
+    // made after that change, once every sitter had joined and sent its presence, and comes after
+    // the change. (An earlier list may have had room for all it knew.)
+    let mut depth = 3;
+    let marker = 'flood: loop {
+        flood_until_all_behind(&server, &doc, &reader_ids, &mut flooders).await;
+        depth += 1;
+        let seq = flooders[0]
+            .change(vec![set_depth(depth)], vec![], vec![])
+            .await
+            .seq();
+        for id in &reader_ids {
+            if !conn_status(&server, &doc, id).await.unwrap().behind {
+                continue 'flood;
+            }
+        }
+        break seq;
+    };
     for reader in &mut readers {
         // What it knows of the sitters' presence since the last list it read.
         let mut known: Option<std::collections::HashMap<String, Plain>> = None;
         let mut lists = 0;
-        // Sitters the last list came without presence for (an earlier one, made before every
-        // sitter had joined or sent its presence, may have had room for all it knew).
-        let mut without = 0;
-        while known.as_ref() != Some(&want) {
+        let mut marker_seen = false;
+        // Sitters the last list after the marker came without presence for.
+        let mut without = None;
+        while known.as_ref() != Some(&want) || without.is_none() {
             match reader.recv().await {
+                ServerMsg::Change(ev) if ev.seq == marker => marker_seen = true,
                 ServerMsg::PeerList { peers } => {
                     lists += 1;
                     let bytes = presence_bytes(&peers);
                     assert!(bytes <= 1 << 20, "{bytes} bytes of presence in a list");
-                    without = peers
-                        .iter()
-                        .filter(|p| want.contains_key(&*p.client_id) && p.presence.is_none())
-                        .count();
+                    if marker_seen {
+                        without = Some(
+                            peers
+                                .iter()
+                                .filter(|p| {
+                                    want.contains_key(&*p.client_id) && p.presence.is_none()
+                                })
+                                .count(),
+                        );
+                    }
                     known = Some(
                         peers
                             .into_iter()
@@ -1414,7 +1460,10 @@ async fn readers_behind_at_once_get_lists_within_the_presence_budget_and_the_res
             }
         }
         assert!(lists > 0);
-        assert!(without > 0, "every presence in the last list");
+        assert!(
+            without.is_some_and(|w| w > 0),
+            "every presence in the list after the marker"
+        );
         assert!(reader.closed.is_none());
     }
 }
