@@ -35,7 +35,8 @@
 //!   address's own connection that has waited longest for its first request head, or failing
 //!   that its one idle longest (as above); it is closed at once only when none of the address's
 //!   connections can go. A trusted proxy's address (`trusted_proxies`) is not limited: every
-//!   client behind it shares it.
+//!   client behind it shares it. Its connections are not counted for the addresses beside it in
+//!   its /64 either, and are never closed to make room for them.
 //!
 //! # Long transfers
 //!
@@ -430,8 +431,9 @@ fn counted_as(ip: IpAddr) -> IpAddr {
 #[derive(Debug)]
 struct Conn {
     id: u64,
-    /// Its address as the per-address limit counts it ([`counted_as`]).
-    address: IpAddr,
+    /// Its address as the per-address limit counts it ([`counted_as`]), or `None` for a trusted
+    /// proxy: not counted, and never closed to make room for its address.
+    address: Option<IpAddr>,
     accepted: Instant,
     /// Taken in the reserve: it may ask for [`HEALTH`] alone.
     reserved: bool,
@@ -506,10 +508,12 @@ impl ConnsInner {
         } else {
             self.regular -= 1;
         }
-        if let Some(n) = self.by_address.get_mut(&conn.address) {
+        if let Some(address) = conn.address
+            && let Some(n) = self.by_address.get_mut(&address)
+        {
             *n -= 1;
             if *n == 0 {
-                self.by_address.remove(&conn.address);
+                self.by_address.remove(&address);
             }
         }
     }
@@ -548,7 +552,8 @@ impl Conns {
     ///
     /// - An address that is not a `trusted` proxy holds at most `per_address` (0: any number;
     ///   an IPv6 address counts as its /64). At that, one of the address's own connections makes
-    ///   room; with none that can, the new one is closed.
+    ///   room; with none that can, the new one is closed. A trusted proxy's connections are not
+    ///   counted for its address (or its /64), and never make room for it.
     /// - The server holds `max` and [`HEALTH_RESERVE`] more for the health check. When it has
     ///   `max`, one of the others makes room. With none that can it goes in the reserve; with
     ///   the reserve full, it takes the place of a reserve connection that has sent nothing, or
@@ -561,13 +566,12 @@ impl Conns {
         per_address: usize,
         stats: &Arc<HttpStats>,
     ) -> Option<Admitted> {
-        let address = counted_as(ip);
+        let address = (!trusted).then(|| counted_as(ip));
         let mut inner = self.lock();
-        let from_there = inner.by_address.get(&address).copied().unwrap_or(0);
-        if !trusted
+        if let Some(address) = address
             && per_address > 0
-            && from_there >= per_address
-            && !inner.make_room(|c| c.address == address, true, stats)
+            && inner.by_address.get(&address).copied().unwrap_or(0) >= per_address
+            && !inner.make_room(|c| c.address == Some(address), true, stats)
         {
             stats.refused_for_address();
             return None;
@@ -601,7 +605,9 @@ impl Conns {
             inner.regular += 1;
         }
         inner.all.insert(conn.id, conn.clone());
-        *inner.by_address.entry(address).or_default() += 1;
+        if let Some(address) = address {
+            *inner.by_address.entry(address).or_default() += 1;
+        }
         drop(inner);
         Some(Admitted {
             open: stats.opened(),
@@ -936,6 +942,33 @@ mod tests {
         let proxy = conns.admit(ip("203.0.113.7"), true, 100, 2, &stats);
         assert!(proxy.is_some());
         assert_eq!(stats.evictions(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_proxy_neither_counts_against_its_neighbours_nor_makes_room_for_them() {
+        let (conns, stats) = (Arc::new(Conns::default()), Arc::new(HttpStats::default()));
+        // A trusted proxy and an address beside it, in one /64.
+        let proxy: Vec<Admitted> = (0..3)
+            .map(|_| {
+                conns
+                    .admit(ip("2001:db8:1:2::1"), true, 100, 1, &stats)
+                    .unwrap()
+            })
+            .collect();
+        // The proxy's connections do not use up the neighbour's one place ...
+        let first = admit(&conns, &stats, "2001:db8:1:2::9", 100, 1).unwrap();
+        assert!(!proxy.iter().any(chosen) && !chosen(&first));
+        assert_eq!(stats.evictions(), 0);
+        // ... and at its limit the neighbour makes room from its own, never from the proxy's.
+        let second = admit(&conns, &stats, "2001:db8:1:2::9", 100, 1).unwrap();
+        assert!(chosen(&first) && !chosen(&second));
+        assert!(!proxy.iter().any(chosen));
+        // With nothing of its own that can go, the neighbour is refused; the proxy is untouched.
+        let busy = Handling::begin(conn(&second), &stats).unwrap();
+        assert!(admit(&conns, &stats, "2001:db8:1:2::9", 100, 1).is_none());
+        assert!(!proxy.iter().any(chosen));
+        assert_eq!((stats.evictions(), stats.refusals_for_address()), (1, 1));
+        drop(busy);
     }
 
     #[tokio::test]
