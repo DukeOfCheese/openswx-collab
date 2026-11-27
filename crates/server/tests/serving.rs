@@ -1214,9 +1214,12 @@ async fn a_completed_password_reset_lifts_the_sign_in_limits_on_the_address() {
     server.register("ada@example.com").await;
     server.register("bob@example.com").await;
     let client = |i: usize| format!("203.0.113.{}", i / 10 + 1);
-    let (wrong, limited) =
-        failed_sign_ins_at_once(&server, "ada@example.com", 100, |i| Some(client(i))).await;
-    assert_eq!((wrong, limited), (100, 0));
+    // (One after the other: a hundred password checks at once would starve the tests running
+    // beside this one.)
+    for i in 0..100 {
+        let status = failed_sign_in(&server, "ada@example.com", Some(&client(i))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "try {i}");
+    }
     for _ in 0..10 {
         failed_sign_in(&server, "bob@example.com", Some("203.0.113.1")).await;
     }
@@ -1274,9 +1277,12 @@ async fn a_successful_sign_in_clears_the_count_on_the_address() {
     .await;
     server.register("ada@example.com").await;
     // Ninety-nine guesses from ten clients: one short of the limit on the address.
-    let client = |i: usize| Some(format!("203.0.113.{}", i / 10 + 1));
-    let (wrong, limited) = failed_sign_ins_at_once(&server, "ada@example.com", 99, client).await;
-    assert_eq!((wrong, limited), (99, 0));
+    // (One after the other, as above.)
+    for i in 0..99 {
+        let client = format!("203.0.113.{}", i / 10 + 1);
+        let status = failed_sign_in(&server, "ada@example.com", Some(&client)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "try {i}");
+    }
     // The owner signs in (the hundredth attempt)...
     assert_eq!(
         sign_in_from(&server, "ada@example.com", PASSWORD, "198.51.100.7").await,
