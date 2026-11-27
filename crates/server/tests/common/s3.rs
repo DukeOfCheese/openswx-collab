@@ -89,6 +89,8 @@ pub enum Fault {
     Status(u16),
     /// Never answers.
     Hang,
+    /// Answers only once [`FakeS3::release`] has been called (and is served then).
+    Hold,
     /// Serves it, but the answer's body stops (without ending) after this many bytes.
     StallBodyAfter(usize),
 }
@@ -107,6 +109,8 @@ struct Gate {
     root: PathBuf,
     rules: Mutex<Vec<Rule>>,
     seen: Mutex<Vec<Seen>>,
+    /// Becomes true when the requests held by [`Fault::Hold`] are let go.
+    released: tokio::sync::watch::Sender<bool>,
 }
 
 impl Gate {
@@ -141,6 +145,7 @@ impl FakeS3 {
             root: root.clone(),
             rules: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
+            released: tokio::sync::watch::Sender::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -197,6 +202,11 @@ impl FakeS3 {
                 fault,
                 when: Box::new(when),
             });
+    }
+
+    /// Lets go of every request held by [`Fault::Hold`], and of those it holds from now on.
+    pub fn release(&self) {
+        self.gate.released.send_replace(true);
     }
 
     /// Forgets every fault not yet used up.
@@ -328,6 +338,10 @@ async fn serve(State(gate): State<Arc<Gate>>, request: Request) -> Response {
         }
         Some(Fault::Hang) => {
             std::future::pending::<()>().await;
+        }
+        Some(Fault::Hold) => {
+            let mut released = gate.released.subscribe();
+            let _ = released.wait_for(|&r| r).await;
         }
         _ => {}
     }

@@ -25,10 +25,15 @@
 //!
 //! # Memory
 //!
-//! An upload holds at most `(parts_at_once + 2)` parts ([`S3Tuning`]): the first part, kept back
-//! until the length that goes in its header is known, the part being filled, and those on their
-//! way; each in a buffer of its own size (the one being filled: an eighth more). A download holds what one read hands on (64 KiB) and the HTTP client's buffers. Removing
-//! a prefix holds one page of the listing (1,000 keys).
+//! An upload holds at most `parts_at_once + 2` parts ([`S3Tuning`]) and the compressor: the first
+//! part, kept back until the length that goes in its header is known; the buffer being filled, a
+//! part and [`fill_slack`] (fed to the compressor in pieces small enough that it never grows past
+//! that); and the parts on their way, each in a buffer of exactly its size. A full buffer waits
+//! until fewer than `parts_at_once` parts are on their way before a part is cut from it, so the
+//! part cut goes straight on its way: at most `parts_at_once` are ever on their way or cut and
+//! waiting. [`Blobs::upload_memory`] is that sum. A download holds what one read hands on
+//! (64 KiB) and the HTTP client's buffers. Removing a prefix holds one page of the listing
+//! (1,000 keys).
 //!
 //! # Errors
 //!
@@ -376,11 +381,16 @@ impl S3Blobs {
         }
     }
 
-    /// The most bytes any one [`Blobs::put_stream`] call has held at once: a test hook for the
-    /// promise that uploads are streamed.
+    /// The most bytes any one [`Blobs::put_stream`] call has held at once, by the capacity of its
+    /// buffers (the compressor's own memory aside): a test hook for the promise that uploads are
+    /// streamed, and hold no more than [`Blobs::upload_memory`].
     #[doc(hidden)]
     pub fn peak_buffered(&self) -> usize {
         self.peak_buffered.load(Ordering::Relaxed)
+    }
+
+    fn note_held(&self, bytes: usize) {
+        self.peak_buffered.fetch_max(bytes, Ordering::Relaxed);
     }
 
     /// Every key under this storage's prefix, in the store's order: a test hook. It reads the
@@ -576,12 +586,20 @@ impl Upload {
         self.in_flight.len()
     }
 
-    /// Sends part `index` (from 0, in any order), first waiting until fewer than `parts_at_once`
-    /// are on their way. An error is that of a part sent earlier, or of this one's wait.
-    async fn send(&mut self, index: usize, data: Bytes) -> object_store::Result<()> {
+    /// Waits until fewer than `parts_at_once` parts are on their way, so that the next one sent
+    /// goes at once. An error is that of a part sent earlier.
+    async fn ready(&mut self) -> object_store::Result<()> {
         while self.in_flight.len() >= self.parts_at_once {
             self.reap().await?;
         }
+        Ok(())
+    }
+
+    /// Sends part `index` (from 0, in any order), first waiting until fewer than `parts_at_once`
+    /// are on their way ([`Upload::ready`]). An error is that of a part sent earlier, or of this
+    /// one's wait.
+    async fn send(&mut self, index: usize, data: Bytes) -> object_store::Result<()> {
+        self.ready().await?;
         let (store, path, id) = (self.store.clone(), self.path.clone(), self.id.clone());
         self.in_flight.spawn(async move {
             let part = store
@@ -652,10 +670,16 @@ impl Drop for Upload {
     }
 }
 
-/// The room the buffer an upload fills keeps beyond one part, so that what one write of the
-/// compressor adds past a part's end seldom makes it grow (an eighth of a part).
+/// How much of a chunk of the body the compressor is handed at once. Parts are cut after each
+/// piece, so the buffer being filled holds less than a part before every write.
+const WRITE_PIECE: usize = 64 << 10;
+
+/// The room the buffer an upload fills keeps beyond one part (an eighth of a part, and at least
+/// 256 KiB), so that what the compressor adds past a part's end never makes it grow: one
+/// [`WRITE_PIECE`] of input makes zstd emit at most one block (128 KiB and a few bytes), and the
+/// compressor's own output buffer (8 KiB) may add what it held back.
 fn fill_slack(part_size: usize) -> usize {
-    part_size / 8
+    (part_size / 8).max(256 << 10)
 }
 
 /// The buffer an upload's compressed bytes gather in: the header's room, and space for a part
@@ -697,6 +721,13 @@ impl Blobs for S3Blobs {
         let mut first: Option<Vec<u8>> = None;
         let mut upload: Option<Upload> = None;
         let mut next_index = 1;
+        // The bytes held at a moment (by capacity): the buffer being filled, the first part, and
+        // those on their way.
+        let held = |filling: usize, first: &Option<Vec<u8>>, upload: &Option<Upload>| {
+            filling
+                + first.as_ref().map_or(0, Vec::capacity)
+                + upload.as_ref().map_or(0, Upload::on_their_way) * part_size
+        };
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(PutError::Body)?;
             raw_len += chunk.len() as u64;
@@ -704,32 +735,37 @@ impl Blobs for S3Blobs {
                 return Err(PutError::TooLarge.into());
             }
             hasher.update(&chunk);
-            encoder.write_all(&chunk).await?;
-            while encoder.get_ref().len() >= part_size {
-                let part = cut_part(encoder.get_mut(), part_size);
-                match &mut upload {
-                    None => {
-                        upload = Some(Upload::start(self, &path).await.map_err(failed)?);
-                        first = Some(part);
+            for piece in chunk.chunks(WRITE_PIECE) {
+                encoder.write_all(piece).await?;
+                self.note_held(held(encoder.get_ref().capacity(), &first, &upload));
+                while encoder.get_ref().len() >= part_size {
+                    // A part is cut only when it can go at once: never one more waiting.
+                    if let Some(upload) = &mut upload {
+                        upload.ready().await.map_err(failed)?;
                     }
-                    Some(upload) => {
-                        upload
-                            .send(next_index, Bytes::from(part))
-                            .await
-                            .map_err(failed)?;
-                        next_index += 1;
+                    let filling = encoder.get_ref().capacity();
+                    let part = cut_part(encoder.get_mut(), part_size);
+                    self.note_held(held(filling, &first, &upload) + part.capacity());
+                    match &mut upload {
+                        None => {
+                            upload = Some(Upload::start(self, &path).await.map_err(failed)?);
+                            first = Some(part);
+                        }
+                        Some(upload) => {
+                            upload
+                                .send(next_index, Bytes::from(part))
+                                .await
+                                .map_err(failed)?;
+                            next_index += 1;
+                        }
                     }
                 }
             }
-            let held = encoder.get_ref().len()
-                + first.as_ref().map_or(0, Vec::len)
-                + upload.as_ref().map_or(0, Upload::on_their_way) * part_size;
-            self.peak_buffered.fetch_max(held, Ordering::Relaxed);
         }
         drop(body);
         encoder.shutdown().await?;
         let mut last = encoder.into_inner();
-        // (What the compressor's end added may have made it grow.)
+        self.note_held(held(last.capacity(), &first, &upload));
         last.shrink_to_fit();
         // The body ended well (its digest and size are right, or it would have failed above): only
         // now does anything become visible under the key.
@@ -760,10 +796,12 @@ impl Blobs for S3Blobs {
         })
     }
 
-    /// The parts one upload holds at most (see the module documentation), and the compressor.
+    /// The most one upload holds (see the module documentation): `parts_at_once + 2` parts, the
+    /// filling buffer's [`fill_slack`], and the compressor.
     fn upload_memory(&self) -> u64 {
-        let parts = (self.tuning.parts_at_once as u64 + 2) * self.tuning.part_size as u64;
-        parts + super::COMPRESSOR_MEMORY
+        let part = self.tuning.part_size;
+        let parts = (self.tuning.parts_at_once as u64 + 2) * part as u64;
+        parts + fill_slack(part) as u64 + super::COMPRESSOR_MEMORY
     }
 
     async fn get_stream(&self, key: &str) -> anyhow::Result<Option<(u64, ByteStream)>> {
@@ -992,14 +1030,23 @@ mod tests {
     #[test]
     fn an_upload_is_charged_the_parts_it_holds_and_the_compressor() {
         let blobs = S3Blobs::new(config()).unwrap();
-        // Three parts on their way, the first kept back, one filling: five of 8 MiB, and 4 MiB.
-        assert_eq!(blobs.upload_memory(), 44 << 20);
+        // Three parts on their way, the first kept back, one filling: five of 8 MiB, the filling
+        // buffer's slack (an eighth of a part) and the compressor (4 MiB).
+        assert_eq!(blobs.upload_memory(), 45 << 20);
         let mut small = config();
         small.tuning.part_size = 5 << 20;
         small.tuning.parts_at_once = 1;
         assert_eq!(
             S3Blobs::new(small).unwrap().upload_memory(),
-            (15 << 20) + super::super::COMPRESSOR_MEMORY
+            (15 << 20) + (640 << 10) + super::super::COMPRESSOR_MEMORY
+        );
+        let mut tiny = config();
+        tiny.tuning.part_size = 1 << 20;
+        tiny.tuning.parts_at_once = 1;
+        assert_eq!(
+            S3Blobs::new(tiny).unwrap().upload_memory(),
+            (3 << 20) + (256 << 10) + super::super::COMPRESSOR_MEMORY,
+            "the slack is at least 256 KiB"
         );
         let folder = super::super::LocalBlobs::new(tempfile::tempdir().unwrap().path()).unwrap();
         assert_eq!(folder.upload_memory(), 4 << 20);
@@ -1020,8 +1067,8 @@ mod tests {
                 })
                 .collect()
         };
-        // As `put_stream` fills and cuts: small writes, and writes far larger than a part, which
-        // make the buffer grow past its space.
+        // As `put_stream` fills and cuts: small chunks, and chunks far larger than a part, handed
+        // to the compressor a piece at a time.
         let mut encoder = ZstdEncoder::new(filling_buffer(PART));
         let mut parts = Vec::new();
         for &size in [16 << 10, 64 << 10, 3 << 20, 7, 2 << 20, 100 << 10]
@@ -1029,24 +1076,30 @@ mod tests {
             .cycle()
             .take(36)
         {
-            encoder.write_all(&noise(size)).await.unwrap();
-            while encoder.get_ref().len() >= PART {
-                parts.push(cut_part(encoder.get_mut(), PART));
+            for piece in noise(size).chunks(WRITE_PIECE) {
+                encoder.write_all(piece).await.unwrap();
+                // The buffer never grew past its space, even just before a cut.
+                let filling = encoder.get_ref().capacity();
+                assert_eq!(
+                    filling,
+                    PART + margin,
+                    "the buffer being filled holds {filling}"
+                );
+                while encoder.get_ref().len() >= PART {
+                    parts.push(cut_part(encoder.get_mut(), PART));
+                }
             }
-            let filling = encoder.get_ref().capacity();
-            assert!(
-                filling <= PART + margin,
-                "the buffer being filled holds {filling}"
-            );
         }
+        encoder.shutdown().await.unwrap();
+        assert_eq!(
+            encoder.get_ref().capacity(),
+            PART + margin,
+            "nor at the end"
+        );
         assert!(parts.len() > 20, "{}", parts.len());
         for part in &parts {
             assert_eq!(part.len(), PART);
-            assert!(
-                part.capacity() <= PART + margin,
-                "a part of {PART} bytes holds {}",
-                part.capacity()
-            );
+            assert_eq!(part.capacity(), PART, "a part of {PART} bytes");
         }
     }
 }

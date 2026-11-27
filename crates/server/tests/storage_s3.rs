@@ -18,7 +18,8 @@ use common::{
 use futures_util::stream::{self, StreamExt};
 use oswx_core::wire::RejectCode;
 use oswx_server::blobs::{
-    Blobs, ByteStream, PutError, S3Blobs, S3Tuning, Stalled, blob_key, missing_blobs,
+    Blobs, ByteStream, COMPRESSOR_MEMORY, PutError, S3Blobs, S3Tuning, Stalled, blob_key,
+    missing_blobs,
 };
 use oswx_server::snapshot::{LoadError, load_head};
 use reqwest::StatusCode;
@@ -543,10 +544,10 @@ async fn a_large_blob_goes_up_in_bounded_parts_and_shows_only_when_complete() {
     );
     assert_eq!(b.fake.parts_held(), 0, "nothing is left of the upload");
 
-    // At most the first part, the one being filled and two on their way, and a chunk.
+    // At most the first part, the one being filled and two on their way.
     let held = b.blobs.peak_buffered();
     assert!(
-        held > PART && held <= 4 * PART + 256 * KIB,
+        held > PART && held as u64 + COMPRESSOR_MEMORY <= b.blobs.upload_memory(),
         "most bytes held at once: {held}"
     );
     let stored = std::fs::read(b.fake.object_file(&key)).unwrap();
@@ -674,7 +675,7 @@ async fn a_64_mb_upload_holds_a_few_parts_at_most() {
     // The first part (8 MiB), the one being filled and three on their way; never the 64 MiB.
     let held = b.blobs.peak_buffered();
     assert!(
-        held > 8 * MIB && held <= 5 * 8 * MIB + MIB,
+        held > 8 * MIB && held as u64 + COMPRESSOR_MEMORY <= b.blobs.upload_memory(),
         "most bytes held at once: {held}"
     );
     let parts = b.fake.count(Seen::is_part);
@@ -700,6 +701,64 @@ async fn a_64_mb_upload_holds_a_few_parts_at_most() {
 }
 
 // ------------------------------------------------------------------ reads that stall
+
+#[tokio::test]
+async fn an_upload_whose_parts_are_held_up_holds_no_more_than_it_is_charged() {
+    let b = bucket_with("", small_parts).await;
+    let data = noise(6 * PART, 21);
+    let key = blob_key("org1", &sha_of(&data));
+    // Every part is held at the store until it is let go.
+    b.fake.inject(ALWAYS, Fault::Hold, Seen::is_part);
+    let (feed, body) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(1);
+    let body: ByteStream = stream::unfold(body, |mut body| async move {
+        body.recv().await.map(|item| (item, body))
+    })
+    .boxed();
+    let uploading = {
+        let (blobs, key) = (b.blobs.clone(), key.clone());
+        tokio::spawn(async move { blobs.put_stream(&key, body, u64::MAX).await })
+    };
+    // Fed until the upload stops taking the body: two parts on their way, and it waits.
+    let mut chunks = data.chunks(100_000).peekable();
+    let mut blocked = false;
+    while let Some(chunk) = chunks.peek() {
+        let Ok(room) = tokio::time::timeout(Duration::from_millis(500), feed.reserve()).await
+        else {
+            blocked = true;
+            break;
+        };
+        room.unwrap().send(Ok(Bytes::copy_from_slice(chunk)));
+        chunks.next();
+    }
+    assert!(
+        blocked,
+        "the upload took the whole body while its parts were held"
+    );
+    assert_eq!(b.fake.count(Seen::is_part), 2, "two parts at once");
+    // At its peak, held up: no more than the upload is charged, and the parts it charges for.
+    let held = b.blobs.peak_buffered() as u64;
+    let charged = b.blobs.upload_memory();
+    assert!(
+        held + COMPRESSOR_MEMORY <= charged,
+        "held {held} bytes, charged {charged}"
+    );
+    assert!(held >= 3 * PART as u64, "held only {held} bytes");
+
+    // Let go, the upload ends well, and held no more on the way.
+    b.fake.release();
+    for chunk in chunks {
+        feed.send(Ok(Bytes::copy_from_slice(chunk))).await.unwrap();
+    }
+    drop(feed);
+    let outcome = uploading.await.unwrap().unwrap();
+    assert_eq!(outcome.sha256, sha_of(&data));
+    let held = b.blobs.peak_buffered() as u64;
+    assert!(
+        held + COMPRESSOR_MEMORY <= charged,
+        "held {held} bytes, charged {charged}"
+    );
+    assert!(read_back(b.blobs.as_ref(), &key).await.unwrap() == data);
+}
 
 #[tokio::test]
 async fn a_read_the_store_stops_feeding_is_given_up_on() {

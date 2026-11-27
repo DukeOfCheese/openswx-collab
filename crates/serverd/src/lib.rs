@@ -73,8 +73,8 @@ Settings (environment variables; the default is in brackets):
     OSWX_COLLAB_BLOB_IDLE_TIMEOUT  seconds without a byte before a blob transfer is given up [60]
     OSWX_COLLAB_MAX_BLOB_BYTES     the largest blob [268435456]
     OSWX_COLLAB_UPLOAD_MEMORY      bytes the blob uploads running at once may hold in all; each
-                                   is charged what its storage holds (S3: 44 MiB, a folder:
-                                   4 MiB); one that does not fit: 503 [738197504]. (It
+                                   is charged what its storage holds (S3: 45 MiB, a folder:
+                                   4 MiB); one that does not fit: 503 [754974720]. (It
                                    replaced OSWX_COLLAB_MAX_BLOB_UPLOADS, which must be unset.)
     OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG
                                    blob uploads at once for one organisation; one more: 429 [8]

@@ -1,7 +1,7 @@
 //! How many blob uploads run at once ([`crate::AppState::uploads`]), and how fast and how long
 //! one may take.
 //!
-//! An upload holds memory while it runs: about 44 MiB for one to S3 (the parts it gathers before
+//! An upload holds memory while it runs: about 45 MiB for one to S3 (the parts it gathers before
 //! sending them), about 4 MiB for one to a folder (the compressor). So the server's own limit is
 //! on the **memory** the running uploads hold between them (`UPLOAD_MEMORY`), each charged what
 //! its storage says one holds ([`crate::blobs::Blobs::upload_memory`]): sixteen to S3 at once by
@@ -13,7 +13,7 @@
 //! |---|---|---|---|
 //! | one account | `MAX_BLOB_UPLOADS_PER_USER` | 4 | **429** at once |
 //! | one organisation | `MAX_BLOB_UPLOADS_PER_ORG` | 8 | **429** at once |
-//! | the server | `UPLOAD_MEMORY` | 704 MiB | **503**, after waiting [`QUEUE_WAIT`] for room |
+//! | the server | `UPLOAD_MEMORY` | 720 MiB | **503**, after waiting [`QUEUE_WAIT`] for room |
 //!
 //! (An organisation's limit above the number of uploads that fit counts as that number.) The
 //! account's and the organisation's own limits answer 429: it is their own doing, and they send
@@ -316,16 +316,16 @@ mod tests {
     async fn the_server_counts_the_memory_uploads_hold_not_how_many_there_are() {
         let ids: Vec<Id> = (0..40).map(|i| format!("account {i}")).collect();
         let orgs: Vec<Id> = (0..40).map(|i| format!("org {i}")).collect();
-        // 100 MiB of room. Uploads to a bucket hold 44 MiB each: two fit, the third waits and is
+        // 100 MiB of room. Uploads to a bucket hold 45 MiB each: two fit, the third waits and is
         // refused.
         let to_s3 =
-            Arc::new(Uploads::new(100 << 20, 44 << 20, 8, 4).queue_wait(Duration::from_millis(20)));
+            Arc::new(Uploads::new(100 << 20, 45 << 20, 8, 4).queue_wait(Duration::from_millis(20)));
         assert_eq!(to_s3.fit(), 2);
         let held = [
             to_s3.place(&ids[0], &orgs[0]).await.unwrap(),
             to_s3.place(&ids[1], &orgs[1]).await.unwrap(),
         ];
-        assert_eq!(to_s3.memory_held(), 88 << 20);
+        assert_eq!(to_s3.memory_held(), 90 << 20);
         let refused = to_s3.place(&ids[2], &orgs[2]).await.unwrap_err();
         assert_eq!(refused.status(), 503);
         drop(held);

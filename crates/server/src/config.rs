@@ -187,7 +187,7 @@ pub struct Settings {
     /// Seconds: a blob upload or download in which no bytes move for this long is given up on.
     pub blob_idle_timeout: f64,
     /// Bytes of memory the blob uploads running at once may hold between them. Each is charged
-    /// what its storage holds for one ([`crate::blobs::Blobs::upload_memory`]: about 44 MiB for
+    /// what its storage holds for one ([`crate::blobs::Blobs::upload_memory`]: about 45 MiB for
     /// S3, 4 MiB for a folder); one that does not fit is answered 503 after a short wait.
     pub upload_memory: u64,
     /// The most blob uploads one organisation may have running at once (at most as many as fit
@@ -303,8 +303,8 @@ impl Default for Settings {
             s3_session_token: String::new(),
             s3_path_style: None,
             blob_idle_timeout: 60.0,
-            // Sixteen uploads to S3 at once (44 MiB each), as many to a folder as people send.
-            upload_memory: (704 * MIB) as u64,
+            // Sixteen uploads to S3 at once (45 MiB each), as many to a folder as people send.
+            upload_memory: (720 * MIB) as u64,
             max_blob_uploads_per_org: 8,
             max_blob_uploads_per_user: 4,
             min_upload_rate: 4096,
@@ -401,7 +401,7 @@ impl Settings {
                 "MAX_BLOB_UPLOADS",
                 "unset: it was replaced by OSWX_COLLAB_UPLOAD_MEMORY, the bytes the uploads \
                  running at once may hold in all (each is charged what its storage holds: about \
-                 44 MiB for S3, 4 MiB for a folder)",
+                 45 MiB for S3, 4 MiB for a folder)",
             ));
         }
         e.positive_whole("UPLOAD_MEMORY", &mut s.upload_memory)?;
@@ -1046,7 +1046,7 @@ mod tests {
         let s = read(&[]);
         assert_eq!(
             (s.upload_memory, s.max_blob_uploads_per_user),
-            (704 << 20, 4)
+            (720 << 20, 4)
         );
         assert_eq!((s.max_blob_uploads_per_org, s.max_connections), (8, 4096));
         assert_eq!((s.min_upload_rate, s.upload_rate_grace), (4096, 30.0));

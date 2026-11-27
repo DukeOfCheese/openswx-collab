@@ -794,7 +794,8 @@ async fn a_64_mb_upload_is_streamed_not_buffered() {
         // The first part (kept back for its header), the one being filled and three on their way.
         let held = s3.peak_buffered();
         assert!(
-            held > 8 * MIB && held <= 5 * 8 * MIB + MIB,
+            held > 8 * MIB
+                && held as u64 + oswx_server::blobs::COMPRESSOR_MEMORY <= s3.upload_memory(),
             "most bytes of the upload held at once: {held}"
         );
     }
