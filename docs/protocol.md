@@ -2,9 +2,11 @@
 
 For whoever writes a client (the openswx module, first of all). This is the contract with the Rust server
 (`crates/server`). The messages are defined in `crates/core/src/wire.rs` (`oswx_core::wire`) and the
-operations in `crates/core/src/op.rs`; the message and field tables below match them field for field, and
-`crates/core/tests/protocol_doc.rs` fails when a message, a field or a code is missing here. Wire test
-vectors (bytes in, bytes out) are in `crates/core/vectors/`.
+operations in `crates/core/src/op.rs`. `crates/core/tests/protocol_doc.rs` fails when a message, a field, a
+structure, an operation or a code is missing from the tables here (it does not notice one the tables name
+that the code no longer has), and a test in the server (`crates/server/src/protocol_doc.rs`) fails when a
+close code or an `error` code it sends has no row. Wire test vectors (bytes in, bytes out) are in
+`crates/core/vectors/`.
 
 Version 2 is a clean break from version 1 (the Python server's JSON messages): a version 1 client is closed
 with 4426, and `GET /api/server` says `"protocol": 2`.
@@ -213,7 +215,8 @@ reconnects of that run). The server knows you as `<your user id>.<client_id>`: t
 changes). Use it to recognise yourself. Two connections with the same `client_id` replace each other: the
 older one is closed with 4409.
 
-A refused `hello` is answered `error` and closed:
+A refused `hello` is answered `error` and closed; after the `welcome`, the last two codes below are answered
+with the connection kept. Every `code` an `error` frame carries:
 
 | `code` | close | |
 |---|---|---|
@@ -225,6 +228,8 @@ A refused `hello` is answered `error` and closed:
 | `busy` | 4408 | the server could not take the join in time; reconnect |
 | `shutting_down` | 1001 | |
 | `server_error` | 1011 | try again |
+| `bad_message` | none | after the `welcome`: a text frame, or one that is not a valid message; it was ignored |
+| `too_large` | none | after the `welcome`: a frame other than a `change` over 512 KiB; it was ignored |
 
 `welcome` carries `seq` (the durable head), the `project_id` (blobs are fetched through it), your `role`,
 whether you are `read_only` and why (`read_only_reason`), `you`, the other `peers` (with their last presence
@@ -301,8 +306,12 @@ When a peer's change arrives, clear that peer's draft yourself (see "Presence an
 Feature ids, names and types: at most 200 characters. Nesting: at most 64 levels. One change: 8 MB (bigger
 data goes in blobs); at most 4,096 distinct blob references in it. A connection may have at most **2,000
 unanswered changes** in flight: one more closes it with 4408. When you replay an offline queue, keep at most
-about 1,000 in flight and send the next as answers come. Presence and drafts: at most 60 a second per
-connection together (`presence_rate`), more are dropped silently.
+about 1,000 in flight and send the next as answers come. While one of a connection's messages waits for work
+the server does off to the side (a blob check, a journal lookup for an old change id, a large change being
+judged, a revert), its later messages wait behind it in order; more than **1,024** waiting messages, or
+more than 4 × `max_change_bytes` of them (32 MiB by default), also close it with 4408. Presence and drafts
+(which never wait): at most 60 a second per connection together (`presence_rate`), more are dropped
+silently.
 
 ### Locks
 

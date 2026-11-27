@@ -45,7 +45,9 @@ client speaks protocol 2, and is changed only for fixes to that line.
 - `tools/`: `test_postgres_rust.py` (the server's suite on a throwaway PostgreSQL), `check_deploy_rust.py`
   (the Rust deployment files; `--docker` builds and runs them), and the Python line's tools.
 - `docs/protocol.md` is the contract with the client. Keep it true: `crates/core/tests/protocol_doc.rs`
-  fails when a message, field or code of `wire.rs` is missing from it.
+  fails when a message, field, structure, operation or code of `oswx_core` is missing from its tables, and
+  `crates/server/src/protocol_doc.rs` when a close code or `error` code the server sends is; neither
+  notices a row for something the code no longer has.
 
 ## Rules that are easy to break
 
