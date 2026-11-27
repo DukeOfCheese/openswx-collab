@@ -42,6 +42,13 @@ pub const MAX_REBUILD_KEY: usize = 200;
 pub const MAX_REBUILD_MESSAGE: usize = 500;
 /// Most entries (presence and drafts together) a `presence.batch` may carry.
 pub const MAX_BATCH_ENTRIES: usize = 256;
+/// Longest user id a client takes from the server (the server's ids are 32 hex characters; this
+/// leaves room).
+pub const MAX_USER_ID: usize = 64;
+/// Longest client id in a `presence.batch`: `<user id>.<client id of the hello>`.
+pub const MAX_LIVE_CLIENT_ID: usize = MAX_USER_ID + 1 + MAX_CLIENT_ID;
+/// Most peers a `peer.list` may name (more connections than one server holds in one document).
+pub const MAX_PEER_LIST: usize = 65_536;
 
 /// Most containers (maps and lists) a frame may have open at once. A value may be `MAX_DEPTH`
 /// levels deep, but a keyed list costs one level and three wire containers (`{"$list": [[pos, item]]}`)
@@ -395,14 +402,17 @@ pub enum ServerMsg {
     /// The latest presence and drafts of several peers at once: what `presence` and `draft`
     /// messages would have said, each peer at most once per kind (the server coalesces a peer's
     /// updates to the latest). A draft of `None` clears it. At most [`MAX_BATCH_ENTRIES`] entries
-    /// in all, and at least two.
+    /// in all, and at least two; client ids at most [`MAX_LIVE_CLIENT_ID`] long.
     PresenceBatch {
         presence: Vec<(ClientId, Plain)>,
         drafts: Vec<(ClientId, Option<Plain>)>,
     },
-    /// Every other peer as it is now, with its presence and draft: replaces what the client knew
+    /// Every peer as it is now, with its presence but **no draft**: replaces what the client knew
     /// of the others (the server sends it to a client that fell behind on `peer.joined`,
-    /// `peer.left`, `presence` and `draft`, which it then stopped sending to it).
+    /// `peer.left`, `presence` and `draft`, which it then stopped sending to it). One list is
+    /// shared by every client caught up at once, so it names the recipient too: a client skips its
+    /// own `client_id`. The peers' drafts follow, as `draft` messages. At most [`MAX_PEER_LIST`]
+    /// peers, each once.
     PeerList {
         peers: Vec<Peer>,
     },
@@ -1084,7 +1094,7 @@ fn live_map(
     let mut seen = BTreeSet::new();
     let mut out = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
-        let client_id = shared(k, field, 1, usize::MAX)?;
+        let client_id = shared(k, field, 1, MAX_LIVE_CLIENT_ID)?;
         if !seen.insert(client_id.clone()) {
             return invalid(format!("{field} names a client twice"));
         }
@@ -1664,20 +1674,25 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 ));
             }
             Ok(ServerMsg::PresenceBatch {
+                // (Presence is never nil: `live_map` gave every entry data.)
                 presence: presence
                     .into_iter()
-                    .map(|(c, d)| d.map(|d| (c, d)))
-                    .collect::<Option<_>>()
-                    .ok_or_else(|| WireError::Invalid("presence data must be a map".into()))?,
+                    .filter_map(|(c, d)| d.map(|d| (c, d)))
+                    .collect(),
                 drafts,
             })
         }
-        "peer.list" => Ok(ServerMsg::PeerList {
-            peers: list(f.req("peers")?, "peers", 0, usize::MAX)?
+        "peer.list" => {
+            let peers: Vec<Peer> = list(f.req("peers")?, "peers", 0, MAX_PEER_LIST)?
                 .iter()
                 .map(peer_from_wire)
-                .collect::<Result<_, _>>()?,
-        }),
+                .collect::<Result<_, _>>()?;
+            let mut seen = BTreeSet::new();
+            if !peers.iter().all(|p| seen.insert(&p.client_id)) {
+                return invalid("a peer.list names a client twice");
+            }
+            Ok(ServerMsg::PeerList { peers })
+        }
         "rebuild.status" => Ok(ServerMsg::RebuildStatus {
             seq: uint(f.req("seq")?, "seq")?,
             broken: broken_map_from_wire(f.req("broken")?)?,

@@ -6,8 +6,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::{load, path, to_plain};
 use oswx_core::wire::{
-    LiveEntry, MAX_BATCH_ENTRIES, MAX_DRAFT, MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES,
-    MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE, encode_live, encode_peer, encode_peer_list,
+    LiveEntry, MAX_BATCH_ENTRIES, MAX_CLIENT_ID, MAX_DRAFT, MAX_LIVE_CLIENT_ID, MAX_PEER_LIST,
+    MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
+    MAX_USER_ID, encode_live, encode_peer, encode_peer_list,
 };
 use oswx_core::{
     Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, DenyReason, Lock, LockDenied,
@@ -1697,6 +1698,69 @@ fn decode_server_is_strict_about_a_peer_list() {
         );
     }
     assert!(decode_server(&frame(&json!({"t": "peer.list"}))).is_err());
+}
+
+/// What a hostile or broken server could send a client: client ids of any length in a batch, a
+/// peer named twice in a list, a list of any length. All refused.
+#[test]
+fn decode_server_bounds_live_client_ids_and_peer_lists() {
+    let data = || to_plain(json!({"x": 1}));
+    let batch = |id: &str| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("presence.batch")),
+            pair(
+                "presence",
+                Plain::Map(vec![
+                    (Plain::from(id), data()),
+                    (Plain::from("u.b"), data()),
+                ]),
+            ),
+            pair("drafts", Plain::Map(vec![])),
+        ]))
+    };
+    let longest = format!("{}.{}", "u".repeat(MAX_USER_ID), "c".repeat(MAX_CLIENT_ID));
+    assert_eq!(longest.len(), MAX_LIVE_CLIENT_ID);
+    assert!(decode_server(&batch(&longest)).is_ok());
+    assert!(matches!(
+        decode_server(&batch(&format!("{longest}x"))),
+        Err(WireError::Invalid(_))
+    ));
+    assert!(matches!(
+        decode_server(&batch(&"x".repeat(1 << 20))),
+        Err(WireError::Invalid(_))
+    ));
+
+    let peer_of = |id: &str| {
+        Plain::Map(vec![
+            pair("client_id", Plain::from(id)),
+            pair("user_id", Plain::from("u")),
+            pair("name", Plain::from("A")),
+            pair("colour", Plain::from("#000")),
+        ])
+    };
+    let list = |peers: Vec<Plain>| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("peer.list")),
+            pair("peers", Plain::Array(peers)),
+        ]))
+    };
+    assert!(decode_server(&list(vec![peer_of("u.a"), peer_of("u.b")])).is_ok());
+    assert!(
+        matches!(
+            decode_server(&list(vec![peer_of("u.a"), peer_of("u.b"), peer_of("u.a")])),
+            Err(WireError::Invalid(_))
+        ),
+        "a peer twice"
+    );
+    let many = |n: usize| list((0..n).map(|i| peer_of(&format!("u.{i}"))).collect());
+    assert!(decode_server(&many(MAX_PEER_LIST)).is_ok());
+    assert!(
+        matches!(
+            decode_server(&many(MAX_PEER_LIST + 1)),
+            Err(WireError::Invalid(_))
+        ),
+        "too many peers"
+    );
 }
 
 // -------------------------------------------------------------------------------- duplicates
