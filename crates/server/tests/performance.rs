@@ -39,7 +39,8 @@ async fn a_broadcast_is_encoded_once_for_everyone() {
 }
 
 /// Presence in a busy room goes out once per tick, each peer's latest only and many peers to a
-/// frame, and nobody gets their own back. In a quiet room a presence goes out at once, as it came.
+/// frame, and nobody gets their own back. In a quiet room a presence goes out at once, as it came
+/// (see also the two quiet-spell tests below).
 #[tokio::test]
 async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
     let (server, world) = world().await;
@@ -90,11 +91,11 @@ async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
     }
 }
 
-/// A presence after a quiet spell is relayed at once, as it came: a `presence` frame of its own,
-/// not held for the next tick. The tick is an hour here, so a presence that waited for it would
-/// not arrive within [`WAIT`]; the one after it does wait.
+/// The first presence a room relays goes out at once, as it came, and the next, within the tick,
+/// waits for it. The tick is an hour here, so a presence that waited for it would not arrive
+/// within [`WAIT`].
 #[tokio::test]
-async fn the_first_presence_after_a_quiet_spell_is_relayed_at_once() {
+async fn the_first_presence_goes_at_once_and_the_next_within_the_tick_waits() {
     let hooks = oswx_server::room::Hooks {
         live_tick: Duration::from_secs(3600),
         ..Default::default()
@@ -119,6 +120,44 @@ async fn the_first_presence_after_a_quiet_spell_is_relayed_at_once() {
     assert!(
         !seen.iter().any(|m| matches!(m, ServerMsg::Presence { .. })),
         "{seen:?}"
+    );
+}
+
+/// After a relay and a quiet spell longer than the tick, a presence goes out at once, not at the
+/// next tick. Each sender's `drain` is a barrier: its pong comes after the room handled its
+/// presence, and what the room relayed then reaches the watcher before the watcher's own pong.
+#[tokio::test]
+async fn a_presence_after_a_quiet_spell_past_the_tick_goes_at_once() {
+    let tick = Duration::from_millis(100);
+    let hooks = oswx_server::room::Hooks {
+        live_tick: tick,
+        ..Default::default()
+    };
+    let server =
+        TestServer::start_custom(|_| {}, |s| s.room_hooks = std::sync::Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let mut watcher = Live::connect(&server, &doc, &world.admin).await;
+    a.drain().await;
+    watcher.drain().await;
+    let presence = |seen: &[ServerMsg], n: i64| {
+        seen.iter().any(
+            |m| matches!(m, ServerMsg::Presence { data, .. } if *data == plain(json!({"n": n}))),
+        )
+    };
+    a.presence(json!({"n": 0})).await;
+    a.drain().await;
+    let seen = watcher.drain().await;
+    assert!(presence(&seen, 0), "the first goes at once: {seen:?}");
+    // A quiet spell past the tick (a sleep lasts at least as long as asked).
+    tokio::time::sleep(tick + tick / 2).await;
+    a.presence(json!({"n": 1})).await;
+    a.drain().await;
+    let seen = watcher.drain().await;
+    assert!(
+        presence(&seen, 1),
+        "after the quiet spell, at once: {seen:?}"
     );
 }
 
