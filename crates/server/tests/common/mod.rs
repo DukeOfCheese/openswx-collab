@@ -910,9 +910,13 @@ pub struct FlakyStore {
     pub parts_gate: Arc<oswx_server::room::Gate>,
     /// Shut: reads of a change by seq and of an undo target park here until opened.
     pub history_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every [`Store::deleted_orgs`] (the purger's list of organisations) parks here.
+    pub list_orgs_gate: Arc<oswx_server::room::Gate>,
     /// How many times `replace_assembly_refs` ran (in a transaction or savepoint).
     ref_writes: Arc<AtomicUsize>,
     fail_part_reads: AtomicBool,
+    fail_deleted_projects: AtomicBool,
+    deleted_projects_calls: AtomicUsize,
     /// How many [`Store`] calls were made (each goes through `inner`; transactions count once).
     calls: AtomicUsize,
 }
@@ -949,8 +953,11 @@ impl FlakyStore {
             commit_patience: Arc::default(),
             parts_gate: Arc::default(),
             history_gate: Arc::default(),
+            list_orgs_gate: Arc::default(),
             ref_writes: Arc::new(AtomicUsize::new(0)),
             fail_part_reads: AtomicBool::new(false),
+            fail_deleted_projects: AtomicBool::new(false),
+            deleted_projects_calls: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
         }
     }
@@ -968,6 +975,16 @@ impl FlakyStore {
     /// Makes [`Store::parts_by_ids`] fail (`true`) or delegate again (`false`).
     pub fn fail_part_reads(&self, fail: bool) {
         self.fail_part_reads.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes [`Store::deleted_projects`] fail at once (`true`) or delegate again (`false`).
+    pub fn fail_deleted_projects(&self, fail: bool) {
+        self.fail_deleted_projects.store(fail, Ordering::SeqCst);
+    }
+
+    /// How many times [`Store::deleted_projects`] was asked (the purger's work list).
+    pub fn deleted_projects_calls(&self) -> usize {
+        self.deleted_projects_calls.load(Ordering::SeqCst)
     }
 
     /// Makes the next journal insert of a change the server made (no change id) insert nothing:
@@ -1178,10 +1195,15 @@ impl Store for FlakyStore {
     }
 
     async fn deleted_projects(&self, after: &str, limit: i64) -> anyhow::Result<Vec<Id>> {
+        self.deleted_projects_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_deleted_projects.load(Ordering::SeqCst) {
+            anyhow::bail!("the flaky store was told to fail listing deleted projects");
+        }
         self.inner().deleted_projects(after, limit).await
     }
 
     async fn deleted_orgs(&self, after: &str, limit: i64) -> anyhow::Result<Vec<Id>> {
+        self.list_orgs_gate.pass().await;
         self.inner().deleted_orgs(after, limit).await
     }
 

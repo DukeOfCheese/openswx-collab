@@ -36,7 +36,11 @@
 //! thing that cannot be removed holds up only itself (and what must go after it: its project, its
 //! organisation). It is tried again after [`RETRY`], then after twice that, and so on up to
 //! [`MAX_RETRY`]; each failure is logged once, so a permanent one is a warning an hour, not a
-//! stream of them.
+//! stream of them. The work list itself backs off the same way when the database cannot list it,
+//! and nothing else is tried before the list can be read again.
+//!
+//! An organisation marked while a sweep is under way (after it went through the projects) is
+//! left for the next sweep, which starts at once: not a failure.
 //!
 //! # With the journal
 //!
@@ -71,6 +75,8 @@ pub const RETRY: Duration = Duration::from_secs(30);
 pub const MAX_RETRY: Duration = Duration::from_secs(3600);
 /// How many marked projects, organisations or documents are listed at a time.
 const LIST: i64 = 100;
+/// What the work list is called among the things that wait for a next try.
+const THE_LIST: &str = "the list";
 
 /// The background task that removes what was marked deleted (see the module documentation).
 /// Cloning is cheap: clones are the same purger.
@@ -86,6 +92,8 @@ struct Inner {
     busy: watch::Sender<bool>,
     /// Something was marked since the running sweep looked.
     again: AtomicBool,
+    /// Listing the work failed in the running sweep.
+    list_failed: AtomicBool,
     stopped: AtomicBool,
     /// Wakes a task that waits for a next try.
     nudge: Notify,
@@ -143,6 +151,7 @@ impl Purger {
                 retry,
                 busy: watch::Sender::new(false),
                 again: AtomicBool::new(false),
+                list_failed: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
                 nudge: Notify::new(),
                 task: Mutex::default(),
@@ -252,7 +261,16 @@ impl Purger {
             if inner.again.load(Ordering::SeqCst) {
                 continue;
             }
-            let next = self.lock_waiting().values().map(|w| w.next).min();
+            let next = {
+                let waiting = self.lock_waiting();
+                let soonest = waiting.values().map(|w| w.next).min();
+                // Nothing is tried before the list can be read again: what is due waits for it
+                // (were the list to fail at once, the sweep would otherwise start over at once).
+                match waiting.get(THE_LIST) {
+                    Some(list) => soonest.map(|soonest| soonest.max(list.next)),
+                    None => soonest,
+                }
+            };
             if let Some(next) = next {
                 // Something failed: its next try, or a new deletion or a stop, ends the wait.
                 tokio::select! {
@@ -301,11 +319,7 @@ impl Purger {
             Err(e) => {
                 crate::metrics::purge_failed();
                 let failures = failed_before.map_or(0, |w| w.failures) + 1;
-                let wait = self
-                    .inner
-                    .retry
-                    .saturating_mul(1 << (failures - 1).min(16))
-                    .min(MAX_RETRY);
+                let wait = self.wait_after(failures);
                 self.lock_waiting().insert(
                     what.to_owned(),
                     Waiting {
@@ -322,9 +336,26 @@ impl Purger {
         }
     }
 
+    /// How long a thing waits after its `failures`-th failure in a row.
+    fn wait_after(&self, failures: u32) -> Duration {
+        self.inner
+            .retry
+            .saturating_mul(1 << (failures.max(1) - 1).min(16))
+            .min(MAX_RETRY)
+    }
+
     /// Goes once through everything that is marked now.
     async fn sweep(&self, store: &dyn Store, blobs: &dyn Blobs) -> Result<(), Stopped> {
-        self.lock_waiting().remove("the list");
+        self.inner.list_failed.store(false, Ordering::SeqCst);
+        self.sweep_lists(store, blobs).await?;
+        if !self.inner.list_failed.load(Ordering::SeqCst) {
+            // (Every page of the list was read: it does not wait any more.)
+            self.lock_waiting().remove(THE_LIST);
+        }
+        Ok(())
+    }
+
+    async fn sweep_lists(&self, store: &dyn Store, blobs: &dyn Blobs) -> Result<(), Stopped> {
         let mut after = String::new();
         loop {
             self.step().await?;
@@ -347,7 +378,7 @@ impl Purger {
             };
             for org in &orgs {
                 // (One whose projects wait for a next try waits with them, without a word.)
-                let held_up = self.waiting() > 0;
+                let held_up = self.lock_waiting().keys().any(|what| what != THE_LIST);
                 let what = format!("organisation {org}");
                 let removed = self.remove(&what, async {
                     self.step().await?;
@@ -356,7 +387,11 @@ impl Purger {
                     let mut tx = store.begin().await?;
                     let gone = tx.purge_org(org).await?;
                     tx.commit().await?;
-                    anyhow::ensure!(gone || held_up, "it still has projects");
+                    if !gone && !held_up {
+                        // Marked after this sweep went through the projects: the next sweep
+                        // removes them, and it.
+                        self.inner.again.store(true, Ordering::SeqCst);
+                    }
                     if gone {
                         crate::metrics::purge_removed();
                         tracing::info!(org = %org, "a deleted organisation was removed");
@@ -374,21 +409,32 @@ impl Purger {
     }
 
     /// A page of the work list; `None` when the database could not say (logged; the sweep ends
-    /// here and is made again at the next wake or try).
+    /// here and is made again at the list's next try or the next wake). The list waits as a
+    /// thing that failed does: twice as long after every sweep in a row in which it failed, and
+    /// nothing else is tried before it is due ([`Purger::run`]).
     fn list(&self, page: anyhow::Result<Vec<String>>) -> Option<Vec<String>> {
         match page {
             Ok(page) => Some(page),
             Err(e) => {
                 crate::metrics::purge_failed();
-                tracing::warn!("what was deleted could not be listed: {e:#}");
-                // (So that the task looks again: as a thing that failed.)
-                let _ = self
-                    .lock_waiting()
-                    .entry("the list".to_owned())
-                    .or_insert(Waiting {
-                        failures: 1,
-                        next: Instant::now() + self.inner.retry,
-                    });
+                if !self.inner.list_failed.swap(true, Ordering::SeqCst) {
+                    // (Once a sweep: its other listings fail for the same reason.)
+                    let mut waiting = self.lock_waiting();
+                    let failures = waiting.get(THE_LIST).map_or(0, |w| w.failures) + 1;
+                    let wait = self.wait_after(failures);
+                    waiting.insert(
+                        THE_LIST.to_owned(),
+                        Waiting {
+                            failures,
+                            next: Instant::now() + wait,
+                        },
+                    );
+                    drop(waiting);
+                    tracing::warn!(
+                        "what was deleted could not be listed (try {failures}); it is listed \
+                         again in {wait:?}: {e:#}"
+                    );
+                }
                 None
             }
         }

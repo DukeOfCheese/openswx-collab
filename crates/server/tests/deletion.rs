@@ -740,6 +740,93 @@ async fn rows_wait_for_their_files_when_storage_fails() {
     );
 }
 
+/// The work list cannot be read (the database refuses at once) while something that failed before
+/// is due for its next try: the purger waits for the list's own next try, backing off, instead of
+/// asking again and again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_that_fails_at_once_is_not_asked_in_a_loop() {
+    let mut handle = None;
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.open_registration = true,
+        new_journal,
+        |s| {
+            let blobs = Arc::new(common::TestBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+            s.purger = Purger::new(100, Duration::from_millis(100));
+        },
+    )
+    .await;
+    let blobs = handle.unwrap();
+    let w = World::new(&server).await.unwrap();
+    w.document(&server, None, None, None).await;
+    blobs.fail_delete(true);
+    assert_eq!(
+        delete_org(&server, &w.admin, &w.org, "Robotics").await,
+        StatusCode::NO_CONTENT
+    );
+    // The document failed and waits for its next try (100 ms away).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while blobs.deletes() == 0 || server.state.purger.waiting() == 0 {
+        assert!(Instant::now() < deadline, "the purger never tried");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // From now on the list fails at once; the document comes due and stays due.
+    flaky.fail_deleted_projects(true);
+    let before = flaky.deleted_projects_calls();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let asked = flaky.deleted_projects_calls() - before;
+    // (Tries at about 0.1, 0.3, 0.7 s: a few, never a loop.)
+    assert!(asked <= 6, "the list was asked {asked} times in a second");
+    assert!(server.state.purger.busy());
+    flaky.fail_deleted_projects(false);
+    blobs.fail_delete(false);
+    server.purged().await;
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 0);
+}
+
+/// An organisation marked while a sweep is under way, after the sweep went through the projects:
+/// it is not a failure (no wait of [`RETRY`]); the next sweep removes it, at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_organisation_marked_during_a_sweep_is_removed_by_the_next() {
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.open_registration = true,
+        new_journal,
+        // (A failure would wait an hour.)
+        |s| s.purger = Purger::new(100, Duration::from_secs(3600)),
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    w.document(&server, None, None, None).await;
+    let other = org(&server, &w.admin, "Other").await;
+    let p = project(&server, &w.admin, &other, "P").await;
+    document(&server, &w.admin, &p, "D").await;
+    // The purger goes through the projects, then waits to list the organisations.
+    flaky.list_orgs_gate.shut();
+    assert_eq!(
+        delete_org(&server, &w.admin, &w.org, "Robotics").await,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        flaky.list_orgs_gate.until_waiting(1),
+    )
+    .await
+    .expect("the purger lists the organisations");
+    // Meanwhile the other organisation is marked: its projects were not in this sweep's list.
+    assert_eq!(
+        delete_org(&server, &w.admin, &other, "Other").await,
+        StatusCode::NO_CONTENT
+    );
+    flaky.list_orgs_gate.open();
+    tokio::time::timeout(Duration::from_secs(20), server.state.purger.idle())
+        .await
+        .expect("both organisations are removed without waiting for a retry");
+    assert_eq!(server.state.purger.waiting(), 0);
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 0);
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM projects").await, 0);
+}
+
 // ------------------------------------------------------------------ the organisation's queue
 
 /// Many requests that change one organisation, while one of them is held in its transaction: the
