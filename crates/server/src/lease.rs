@@ -22,6 +22,11 @@ use crate::store::{RoomLease, Store};
 /// Takes the room lease of `doc` for `node_id` until `now + ttl`, in one transaction, and answers
 /// the new epoch: 1 for a document that never had a lease (a new document's snapshot was written
 /// under epoch 0), the previous epoch plus one otherwise.
+///
+/// The transaction is the journal's ([`Store::begin_journal`]), with its pool and its short lock
+/// timeout (`DATABASE_JOURNAL_LOCK_TIMEOUT`, 2 s on PostgreSQL): while a REST transaction holds the
+/// document's row for longer (a deletion marking it, say), the lease is not taken and this fails;
+/// the room does not open, and the client is told to try again.
 pub async fn acquire(
     store: &dyn Store,
     doc: &str,

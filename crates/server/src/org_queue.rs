@@ -13,6 +13,10 @@
 //!
 //! An organisation has an entry only while a request holds or waits for its turn.
 //!
+//! The turn is held from before `begin` until right after the transaction commits: what follows
+//! the commit (revoking connections, announcing, extension hooks) runs without it, so one
+//! organisation's write rate does not depend on how long those take.
+//!
 //! This is per process, and so is not what keeps the data right: that is the row lock, which a
 //! request still takes. (A request whose client went away gives its turn up while its commit may
 //! still be running; the next one then waits for the row lock, briefly, as before.)

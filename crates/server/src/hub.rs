@@ -759,6 +759,9 @@ impl Hub {
 
 /// What a room of `doc` starts from: the document and project rows, the lease (acquired before the
 /// head is read, so that no write of an older holder can land after the read), and the head.
+/// Acquiring the lease runs on the journal's pool under its 2 s lock timeout
+/// ([`lease::acquire`]): while a REST transaction holds the document's row, an open can fail,
+/// and the client is answered `server_error` "try again".
 async fn load(state: &AppState, doc: &str) -> Result<RoomInit, OpenError> {
     let document = state
         .store

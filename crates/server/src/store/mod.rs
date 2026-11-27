@@ -157,9 +157,11 @@
 //! second (`40P01`). And a request's transaction that waits more than a few seconds for a lock
 //! (the organisation is busy with a long deletion, say) is ended too (`55P03`), so that waiting
 //! requests cannot hold every connection. Nothing is retried inside the server: a REST request is
-//! answered 409 [`crate::error::TRY_AGAIN`] ([`is_conflict`]) and can be sent again; a journal
-//! batch (which has connections of its own, [`Store::begin_journal`], and no lock timeout)
-//! answers every record `Unknown` and its rooms reload from the store.
+//! answered 409 [`crate::error::TRY_AGAIN`] ([`is_conflict`]) and can be sent again. The journal
+//! has connections of its own ([`Store::begin_journal`]) with a short lock timeout of their own
+//! (`DATABASE_JOURNAL_LOCK_TIMEOUT`, 2 s): a batch that times out on one document's row falls
+//! back to writing its documents one at a time, so that only the blocked document's records are
+//! answered `Unknown` (and its room reloads from the store), never the whole batch's.
 
 pub mod postgres;
 mod shared;
