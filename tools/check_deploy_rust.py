@@ -30,6 +30,7 @@ import ipaddress
 import json
 import re
 import secrets
+import shutil
 import socket
 import struct
 import subprocess
@@ -393,9 +394,9 @@ def docker_checks(remove_image: bool, port: int | None, jobs: int) -> None:
                 f"GARAGE_RPC_SECRET={secrets.token_hex(32)}", f"CARGO_BUILD_JOBS={jobs}", ""]), encoding="utf-8")
             print(f"\n--- {name} ({' + '.join(Path(f).name for f in files)}) on 127.0.0.1:{port}", flush=True)
             args = ["up", "-d"] + ([] if built else ["--build"])
-            r = compose(project, files, env_file, *args)
-            built = True
             try:
+                r = compose(project, files, env_file, *args)
+                built = True
                 check(r.returncode == 0, f"{name}: `docker compose up` works")
                 if r.returncode:
                     continue
@@ -405,6 +406,8 @@ def docker_checks(remove_image: bool, port: int | None, jobs: int) -> None:
                     print(compose(project, files, env_file, "logs", "--tail", "60", capture=True).stdout)
                     continue
                 use_the_server(base, port, project, files, env_file, postgres)
+            except Exception as e:  # one variant's surprise must not stop the others
+                check(False, f"{name}: the checks ran to the end ({type(e).__name__}: {e})")
             finally:
                 compose(project, files, env_file, "down", "-v", "--remove-orphans", capture=True)
         size = subprocess.run(["docker", "image", "inspect", IMAGE, "--format", "{{.Size}}"], text=True,
@@ -412,6 +415,7 @@ def docker_checks(remove_image: bool, port: int | None, jobs: int) -> None:
         if size:
             print(f"image {IMAGE}: {int(size) / 1e6:.0f} MB")
     finally:
+        shutil.rmtree(work, ignore_errors=True)
         if remove_image:
             subprocess.run(["docker", "image", "rm", IMAGE], capture_output=True)
 

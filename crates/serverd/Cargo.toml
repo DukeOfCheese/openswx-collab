@@ -3,6 +3,7 @@ name = "oswx-serverd"
 version = "0.2.0-dev"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish = false
 
 # The library is the whole program, taking the extensions as an argument: the open-source binary

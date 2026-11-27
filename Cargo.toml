@@ -5,6 +5,9 @@ members = ["crates/core", "crates/loadgen", "crates/server", "crates/serverd"]
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
+# The oldest Rust that builds the server with Cargo.lock as it is (uuid 1.29 needs 1.89; the code itself
+# needs 1.88, for let chains). The tests need 1.96 (s3s, the in-process S3 server).
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"

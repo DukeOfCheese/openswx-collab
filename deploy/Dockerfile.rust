@@ -4,7 +4,10 @@
 # On a small machine, limit the compiler's parallel jobs: --build-arg CARGO_BUILD_JOBS=2
 # The Compose files deploy/docker-compose.rust*.yml build and run it.
 
-FROM rust:1.99-slim-trixie AS build
+# The base images are pinned by digest (the multi-architecture index, as Docker Hub served the tag on
+# 2026-11-27), so a rebuild uses the same bytes; to move on, look up the tag's current digest
+# (`docker buildx imagetools inspect <image>:<tag>`) and replace it here.
+FROM rust:1.99-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS build
 # (Read by cargo when given; unset: as many jobs as the machine has cores.)
 ARG CARGO_BUILD_JOBS
 WORKDIR /src
@@ -15,7 +18,7 @@ COPY crates crates
 RUN cargo build --release --locked -p oswx-serverd \
     && strip target/release/openswx-collab-server
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
 LABEL org.opencontainers.image.source=https://github.com/DukeOfCheese/openswx-collab
 # CA certificates: the machine's trust store, which the S3 client uses and the mail client adds to its
 # own roots (install a private authority's certificate here, or point SSL_CERT_FILE at it).
