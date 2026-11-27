@@ -32,7 +32,7 @@ it in its next rework; until then the Python server stays here for openswx 0.4.
 | Assembly documents (components pinned to a part's version, where-used, update notices) | Done, tested on the server. The openswx side of assemblies is not designed yet |
 | Leaving: account and organisation deletion (two-step), data export | Done, tested |
 | Email (invites, password reset), optional SMTP | Done, tested against a local SMTP server |
-| Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Whole suite passes on both databases; S3 tested with an in-process server and with Garage |
+| Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Done, tested: the suite runs on both (latest runs: no failures; a few timing-sensitive tests have failed now and then under load on PostgreSQL); S3 tested with an in-process server and with Garage |
 | Operations: `/metrics`, JSON logs, health and readiness, orderly stop, connection and upload limits | Done, tested |
 | Docker deployment (`deploy/`) | Rust image and Compose files (SQLite; PostgreSQL; + Garage) run on a Raspberry Pi (arm64) and in CI; the published image is still the Python server |
 | openswx client (toggle, sync, cursors, previews) | Shipped in openswx 0.4.0, refined in 0.4.1, against the Python server (protocol 1); the protocol 2 client is the next project |
@@ -64,8 +64,11 @@ The Rust server (`crates/server`) tests its S3 storage against an S3 server insi
 OSWX_TEST_STORAGE=s3 cargo test -p oswx-server                        # every test server on S3 (in-process)
 # Against a store you have. The bucket must exist; each test works under a prefix of its own (t-<id>).
 # For Garage as deploy/docker-compose.s3.yml sets it up, start just Garage with its S3 port published:
-#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env #     run -d -p 127.0.0.1:3900:3900 garage
-OSWX_TEST_S3_URL=http://127.0.0.1:3900 OSWX_TEST_S3_BUCKET=openswx-collab OSWX_TEST_S3_REGION=garage OSWX_TEST_S3_ACCESS_KEY=<S3_ACCESS_KEY> OSWX_TEST_S3_SECRET_KEY=<S3_SECRET_KEY>   cargo test -p oswx-server --test storage_s3                         # add OSWX_TEST_STORAGE=s3 for the other tests
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env \
+#     run -d -p 127.0.0.1:3900:3900 garage
+OSWX_TEST_S3_URL=http://127.0.0.1:3900 OSWX_TEST_S3_BUCKET=openswx-collab OSWX_TEST_S3_REGION=garage \
+OSWX_TEST_S3_ACCESS_KEY=<S3_ACCESS_KEY> OSWX_TEST_S3_SECRET_KEY=<S3_SECRET_KEY> \
+  cargo test -p oswx-server --test storage_s3                         # add OSWX_TEST_STORAGE=s3 for the other tests
 ```
 
 The Python server (0.1.x):

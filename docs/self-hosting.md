@@ -14,7 +14,7 @@ real mail relay with the Rust server.
 
 ## Smallest install
 
-Build the program (Rust 1.88 or later; `cargo` from [rustup](https://rustup.rs)):
+Build the program (Rust 1.89 or later; `cargo` from [rustup](https://rustup.rs)):
 
 ```
 cargo build --release -p oswx-serverd             # target/release/openswx-collab-server
@@ -37,10 +37,13 @@ openswx-collab-server --help              # every setting, with its default
 the terminal.
 
 **Exit codes.** 0: done (`serve`: stopped in order). 1: failed (`serve`: could not start, did not stop in
-order within `OSWX_COLLAB_SHUTDOWN_TIMEOUT`, or was told twice to stop; `db-status`: there is no database
-there, or it was written by a newer version, or it cannot be reached). 2: the command line or a setting was
-wrong; the message names the variable and never repeats its value. `db-status` never creates a database:
-on a missing SQLite file it says so and exits 1.
+order within `OSWX_COLLAB_SHUTDOWN_TIMEOUT`, or was told twice to stop; `db-status`: a missing SQLite
+file, a database written by a newer version, or one that cannot be reached). 2: the command line or a
+setting was wrong; the message names the variable and never repeats its value. `db-status` never creates a
+database: on a missing SQLite file it says so and exits 1. An empty database (a PostgreSQL database the
+server has not set up yet) is not an error: it prints `database at none (an empty
+database); this server needs <version>` and exits 0, as it does for an older database that `migrate` would
+upgrade.
 
 ## Docker Compose
 
@@ -75,6 +78,24 @@ a few times while Garage comes up. To use a store you already have (AWS S3, Clou
 file and set `OSWX_COLLAB_STORAGE_URL`, `OSWX_COLLAB_S3_ENDPOINT` and the `AWS_*` variables on the server
 (see [S3-compatible storage](#s3-compatible-storage)).
 
+The Compose file passes on only the settings `deploy/.env.example` lists. For any other setting (below),
+edit the `environment:` block in `deploy/docker-compose.rust.yml`, or keep your changes apart in an override
+file of your own and add it with one more `-f`:
+
+```
+# deploy/docker-compose.override.yml
+services:
+  server:
+    environment:
+      OSWX_COLLAB_SESSION_DAYS: "14"
+      OSWX_COLLAB_LOG: json
+```
+
+```
+docker compose -f deploy/docker-compose.rust.yml -f deploy/docker-compose.override.yml \
+  --env-file deploy/.env up -d
+```
+
 Stopping: `docker stop` sends SIGTERM and waits 10 s; the server closes every open document (writing its
 snapshot) and the journal within `OSWX_COLLAB_SHUTDOWN_TIMEOUT` (8 s). Keep `stop_grace_period` above it.
 
@@ -92,22 +113,29 @@ collab.example.org {
 }
 ```
 
-**The client's address.** The server keeps its sign-in limits and its connection limit per client
-address. Behind a proxy every connection comes from the proxy, so the server reads the client's address
-from `X-Forwarded-For`, but only on connections from `OSWX_COLLAB_TRUSTED_PROXIES` (by default `127.0.0.1`
-and `::1`, a proxy on the same machine). It reads the header from the right: the last entry is what the
-proxy next to it saw, and the client is the first address that is not one of your proxies; anything a
-client wrote to the left of that is ignored, and so is an entry that is not a bare address (a host name, an
-address with a port). So **the proxy must append the address it saw to `X-Forwarded-For`** (Caddy, nginx
-with `$proxy_add_x_forwarded_for`, Traefik and HAProxy with `option forwardfor` all do), never pass on a
-client's header unchanged as the only entry. A range wider than /8 (IPv4) or /16 (IPv6) is refused.
+**The client's address.** The server keeps its sign-in limits per client address, read from
+`X-Forwarded-For` on connections from `OSWX_COLLAB_TRUSTED_PROXIES` (by default `127.0.0.1` and `::1`, a
+proxy on the same machine). The per-address connection limit is applied when a connection is accepted, so
+it does not apply to a trusted proxy's connections at all: limit connections per client in the proxy. With
+nginx that is `limit_conn_zone $binary_remote_addr zone=perclient:10m;` in `http` and `limit_conn
+perclient 512;` in the `location`; Caddy's standard build has no such setting.
+
+The server reads `X-Forwarded-For` from the right: the last entry is what the proxy next to it saw, and
+the client is the first address that is not one of your proxies; anything a client wrote to the left of
+that is ignored. An entry that is not a bare address (a host name, an address with a port) ends the
+reading: the client is then the last address read before it, which is usually your proxy. So a proxy that
+appends `ip:port` puts every client on one address, and one set of sign-in limits. **The proxy must append
+the bare address it saw to `X-Forwarded-For`** (Caddy, nginx with `$proxy_add_x_forwarded_for`, Traefik
+and HAProxy with `option forwardfor` all do), never pass on a client's header unchanged as the only entry.
+A range wider than /8 (IPv4) or /16 (IPv6) is refused.
 
 With Docker Compose a proxy on the host reaches the server through the published port, so its connections
 arrive from the Compose network's **gateway** (`172.30.87.1`), not from `127.0.0.1`. The Compose file
 therefore gives that network a fixed subnet, `NETWORK_SUBNET` in `deploy/.env` (`172.30.87.0/24` unless
 set), and sets `OSWX_COLLAB_TRUSTED_PROXIES` to it. Change it if it overlaps a network the machine already
-has. Without it every client would share the gateway's address, and so one sign-in limit and one
-connection limit.
+has. Without it every client would share the gateway's address, and so one set of sign-in limits and one
+connection limit for all of them. With it, the gateway's connections are not counted against the
+per-address connection limit at all: limit connections per client in the proxy, as above.
 
 ## First account and invites
 
@@ -148,7 +176,7 @@ error. Seconds may have a fraction. `openswx-collab-server --help` prints the sa
 
 | Variable | Default | |
 |---|---|---|
-| `OSWX_COLLAB_DATABASE_URL` | `sqlite://./data/collab.db` | `sqlite://<path>` (`sqlite:///abs/path` is absolute) or `postgres://user:password@host/database`. The Python forms `sqlite+aiosqlite:///…` and `postgresql+asyncpg://…` are accepted. No in-memory database, no `?` options on a SQLite path |
+| `OSWX_COLLAB_DATABASE_URL` | `sqlite+aiosqlite:///./data/collab.db` (the same as `sqlite://./data/collab.db`) | `sqlite://<path>` (`sqlite:///abs/path` is absolute) or `postgres://user:password@host/database`. The Python forms `sqlite+aiosqlite:///…` and `postgresql+asyncpg://…` are accepted. No in-memory database, no `?` options on a SQLite path |
 | `OSWX_COLLAB_AUTO_MIGRATE` | `true` | upgrade the schema when `serve` starts; `false`: refuse to start on an older database until `migrate` is run |
 | `OSWX_COLLAB_DATABASE_POOL` | `10` | PostgreSQL connections for requests |
 | `OSWX_COLLAB_DATABASE_JOURNAL_POOL` | `2` | PostgreSQL connections the journal (live edits) has to itself, besides those |
@@ -189,10 +217,10 @@ to start while it is set**, naming `UPLOAD_MEMORY`. With the defaults, sixteen S
 | `OSWX_COLLAB_REQUEST_TIMEOUT` | `60` | seconds from a request's head, or the last of its body, to the beginning of its answer; then 503 `the request took too long; try again`. Not for blob uploads, downloads, exports or document connections |
 | `OSWX_COLLAB_WRITE_TIMEOUT` | `60` | seconds a client may take nothing of what it is sent before its connection is closed |
 | `OSWX_COLLAB_MAX_CONNECTIONS` | `4096` | connections held open at once, document connections included; at most **65,536** (a client takes a document's peer list of at most that many) |
-| `OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS` | `512` | connections from one client address (an IPv6 address counts as its /64), not counting your trusted proxies' own; 0: no limit |
+| `OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS` | `512` | connections from one address, as the connection arrives (an IPv6 address counts as its /64); a trusted proxy's connections are not counted (limit connections per client in the proxy); 0: no limit |
 | `OSWX_COLLAB_MAX_LARGE_BODIES` | `16` | request bodies over 1 MiB (document creation, up to 8 MB) read at once; one more: 503 |
 | `OSWX_COLLAB_SHUTDOWN_TIMEOUT` | `8` | seconds an orderly stop may take before the process ends anyway |
-| `OSWX_COLLAB_METRICS_TOKEN` | | the bearer token `GET /metrics` asks for: 16 to 256 printable characters; empty: no `/metrics` (404) |
+| `OSWX_COLLAB_METRICS_TOKEN` | | the bearer token `GET /metrics` asks for: 16 to 256 printable ASCII characters, no spaces; empty: no `/metrics` (404) |
 | `OSWX_COLLAB_LOG` | `text` | `text`, or `json` for one JSON object a line |
 | `OSWX_COLLAB_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace` for the server's own crates (or `oswx=<level>`); other crates log warnings and errors only unless named: `debug,sqlx=info,hyper=trace` |
 
@@ -319,8 +347,10 @@ For someone reading the server's logs or a user's report:
 - **500 `server error`**: something unexpected; the log has the cause (a database refusing a duplicate a
   route did not expect, a storage error). Report it.
 - **402**: an extension (seat limits, a paid plan) refused; the message says why.
-- **429**: sign-in attempts from one address (10 in 10 minutes for one email address; password reset 5 an
-  hour), an account's or organisation's uploads at once, one export at a time per account (two per server).
+- **429**: failed sign-ins (10 in 10 minutes for one email address from one client address) and OAuth
+  starts from one address (600 in 10 minutes), an account's or organisation's uploads at once, one export
+  at a time per account (two per server). Password reset requests over their limit (5 an hour) still
+  answer 202, and nothing is sent.
 
 ## Leaving
 
@@ -346,7 +376,7 @@ server then refuses to start on an older database until you run
 
 ```
 openswx-collab-server migrate      # docker compose -f deploy/docker-compose.rust.yml ... run --rm server openswx-collab-server migrate
-openswx-collab-server db-status    # exits 1 if there is no database, or one written by a newer version
+openswx-collab-server db-status    # exits 1 on a missing SQLite file or a database written by a newer version
 ```
 
 A database written by a newer version is never opened by an older one. An edition with extensions adds its

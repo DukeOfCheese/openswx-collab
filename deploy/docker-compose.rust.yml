@@ -38,7 +38,7 @@ services:
       # The TLS proxy on the host reaches the server through the published port, so its connections
       # come from this network's gateway: the server believes the client address the proxy appends to
       # X-Forwarded-For only from this network. Without it every client would share the gateway's
-      # address, and its per-address limits (sign-in attempts, connections).
+      # address, and its per-address limits (sign-in attempts).
       OSWX_COLLAB_TRUSTED_PROXIES: ${NETWORK_SUBNET:-172.30.87.0/24}
     volumes:
       - rust-data:/data

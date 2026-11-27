@@ -44,7 +44,9 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   of anything it was handed since. A draft may arrive up to a tick after the change that ends it.
 - New close codes: 4410 (the document was reloaded or moved: reconnect and resend) and 4429 (too many
   document connections for the account). A connection may have at most 2,000 unanswered changes (4408).
-  A client frame may hold at most 1,000,000 values; only a `change` may be longer than 512 KiB.
+  A client frame may hold at most 1,000,000 values; only a `change` may be longer than 512 KiB. Messages
+  waiting behind one of the connection's own that the server is still working on: at most 1,024, or
+  4 × `max_change_bytes` (4408).
 - Assemblies: `GET .../references` reports the versions at a pinned seq (`pinned.versions`, to be
   preferred over a component's own `ref.version` label).
 
@@ -62,7 +64,8 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   `LOG_LEVEL`, `PASSWORD`.
 - `deploy/Dockerfile.rust` and `deploy/docker-compose.rust.yml` (SQLite), with
   `docker-compose.rust-postgres.yml` (PostgreSQL) and the existing `docker-compose.s3.yml` (Garage) on top;
-  `tools/check_deploy_rust.py` checks them, and with `--docker` builds and runs each.
+  `tools/check_deploy_rust.py` checks them, and with `--docker` builds and runs each. The image's base
+  images are pinned by digest. Building needs Rust 1.89 or later (`rust-version`).
 - Extensions (`crates/server/src/ext.rs`) replace `hooks.py`: a paid edition is a crate that depends on the
   server library and calls `oswx_serverd::run`; its migrations are `(id, sql)` pairs for each database. An
   extension's refusal answers 402; one that does not answer within 5 s, 409.
@@ -86,8 +89,9 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   deletion) as well as by a 30 s check; a session that expires while connected closes and releases its
   locks at once.
 - Settings are checked at start: a value that cannot be read stops the program with a message that names
-  the variable; booleans must be one of the known spellings. `db-status` exits 1 when there is no database
-  (it creates none) or one written by a newer version. `serve` migrates before it listens. SIGHUP stops
+  the variable; booleans must be one of the known spellings. `db-status` exits 1 on a missing SQLite file
+  (it creates none), a database written by a newer version or one it cannot reach; an empty database
+  exits 0 with "database at none". `serve` migrates before it listens. SIGHUP stops
   the server like SIGTERM.
 
 #### Removed
@@ -102,7 +106,7 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   for `/api/health`).
 - `X-Forwarded-For` is believed only from `OSWX_COLLAB_TRUSTED_PROXIES` and is read from the right; the
   Rust Compose file trusts its own fixed subnet, so a TLS proxy on the host gives each client its own
-  limits.
+  sign-in limits.
 - The cost of stored password hashes is bounded and hashing runs off the server's main threads; logs never
   hold a token, password, invite, login code or document content, and a panic is logged without its
   message.
