@@ -902,6 +902,31 @@ async fn a_room_that_does_not_answer_does_not_stop_the_others_unloading() {
     assert_eq!(server.state.hub.gauges().rooms, 0);
 }
 
+/// A room whose task panics: its connections, even idle ones that send nothing, are closed with
+/// "reconnect" (4410), and a reconnect loads a fresh room that works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_room_that_panics_tells_its_connections_to_reconnect() {
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server =
+        TestServer::start_custom(|s| s.sweep_interval = 3600.0, move |s| s.room_hooks = h).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(edit(&mut a, 1).await, 1);
+    quiet(&mut a).await;
+    let room = server.room(&doc);
+    hooks.panic_on_sweep.lock().unwrap().insert(doc.clone());
+    server.state.hub.sweep();
+    tokio::time::timeout(WAIT, room.ended())
+        .await
+        .expect("the room's task ended");
+    assert_eq!(a.closed().await.0, 4410);
+    hooks.panic_on_sweep.lock().unwrap().clear();
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(edit(&mut b, 2).await, 2);
+}
+
 // ------------------------------------------------------------------ shutdown
 
 #[tokio::test]

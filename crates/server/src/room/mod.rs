@@ -186,6 +186,8 @@ pub struct Hooks {
     /// Rooms of the documents named here stop dead when the hub's sweeper reaches them, until
     /// released (a room that does not answer).
     pub stall: Arc<Stall>,
+    /// Rooms of the documents named here panic when the hub's sweeper reaches them (a bug).
+    pub panic_on_sweep: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Shut: the steps after a REST commit ([`crate::state::AppState::after_commit`]) wait here
     /// before they start (so that a test can drop the request meanwhile).
     pub after_commit: Arc<Gate>,
@@ -353,6 +355,7 @@ impl Default for Hooks {
             max_remembered: MAX_REMEMBERED,
             page_bytes: PAGE_BYTES,
             stall: Arc::default(),
+            panic_on_sweep: Arc::default(),
             after_commit: Arc::default(),
             join_wait: JOIN_WAIT,
             after_join_timeout: Arc::default(),
@@ -1076,6 +1079,25 @@ struct Room {
     behind: std::collections::HashSet<ConnId>,
     /// Connections that caught up and are still owed presence or drafts.
     owing: std::collections::HashSet<ConnId>,
+    /// Counts the room as loaded for as long as it lives, however its task ends (a panic too).
+    _loaded: Loaded,
+}
+
+/// A loaded room in the metrics: counted loaded when made, unloaded when dropped.
+#[derive(Debug)]
+struct Loaded;
+
+impl Loaded {
+    fn new() -> Self {
+        crate::metrics::room_loaded();
+        Loaded
+    }
+}
+
+impl Drop for Loaded {
+    fn drop(&mut self) {
+        crate::metrics::room_unloaded();
+    }
 }
 
 fn next_room_id() -> u64 {
@@ -1163,8 +1185,8 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         behind: std::collections::HashSet::new(),
         owing: std::collections::HashSet::new(),
         state,
+        _loaded: Loaded::new(),
     };
-    crate::metrics::room_loaded();
     tokio::spawn(room.run(control_rx, frames_rx, internal_rx));
     RoomHandle {
         id,
@@ -1199,6 +1221,12 @@ impl Room {
                     Some(RoomCmd::Sweep) => {
                         let hooks = self.state.room_hooks.clone();
                         hooks.stall.hold(&self.doc).await;
+                        let panics = hooks
+                            .panic_on_sweep
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .contains(&*self.doc);
+                        assert!(!panics, "the room was told to panic");
                         self.on_command(RoomCmd::Sweep);
                     }
                     Some(cmd) => self.on_command(cmd),
@@ -1229,7 +1257,6 @@ impl Room {
             {
                 self.finish().await;
                 wind_up(&mut control, &mut frames);
-                crate::metrics::room_unloaded();
                 return;
             }
         }

@@ -680,6 +680,12 @@ pub async fn read(
         let next = tokio::select! {
             next = stream.next() => next,
             _ = life.wait_for(|l| *l != Life::Open) => break,
+            // The room's task ended without closing this connection (it panicked): the client
+            // reconnects, and a fresh room loads what is durable.
+            () = room.ended() => {
+                outbox.close(close::MOVED, "reconnect");
+                break;
+            }
         };
         if matches!(next, Some(Ok(Message::Binary(_) | Message::Text(_)))) {
             heard.touch();

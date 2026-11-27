@@ -472,7 +472,7 @@ that assemblies use cannot be deleted (409 with the list).
 | 4404 | the document is gone (or not yours) | close it; locks were released |
 | 4408 | too slow, or the server could not take you now | reconnect at once and resend |
 | 4409 | the same client id connected again | do not reconnect from this connection (another one of yours has the document) |
-| 4410 | **moved / reconnect**: the document was reloaded (the journal could not say whether a change was stored, the server lost the document's lease, or it had to start the join again) | reconnect at once and resend everything unanswered; resends that were stored are answered with their seq |
+| 4410 | **moved / reconnect**: the document was reloaded (the journal could not say whether a change was stored, the server lost the document's lease, its room stopped unexpectedly, or it had to start the join again) | reconnect at once and resend everything unanswered; resends that were stored are answered with their seq |
 | 4426 | protocol version | update the app |
 | 4429 | too many document connections for this account | close another; reconnecting at once will not help (a reconnect that races its own old connection at the cap can get it too: try again after a moment) |
 
