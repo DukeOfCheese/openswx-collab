@@ -1170,10 +1170,13 @@ async fn one_email_address_is_limited_whatever_the_client() {
     })
     .await;
     World::new(&server).await.unwrap();
-    // A hundred clients, a guess each: all checked.
-    let client = |i: usize| Some(format!("203.0.{}.{}", i / 200, i % 200 + 1));
-    let (wrong, limited) = failed_sign_ins_at_once(&server, "a@example.com", 100, client).await;
-    assert_eq!((wrong, limited), (100, 0));
+    // A hundred clients, a guess each: all checked. (One after the other: a hundred password
+    // checks at once would starve the tests running beside this one.)
+    for i in 0..100 {
+        let client = format!("203.0.{}.{}", i / 200, i % 200 + 1);
+        let status = failed_sign_in(&server, "a@example.com", Some(&client)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "try {i}");
+    }
     // The hundred and first, from a client never seen before: refused unchecked.
     assert_eq!(
         failed_sign_in(&server, "a@example.com", Some("198.51.100.7")).await,
