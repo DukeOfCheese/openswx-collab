@@ -459,6 +459,8 @@ pub struct RoomStatus {
     pub complete_clients: usize,
     /// Locks held, and how many of them wait for their client to come back.
     pub locks: (usize, usize),
+    /// Blob hashes the room remembers storage's answer for: found, and missing.
+    pub known_blobs: (usize, usize),
     pub connections: Vec<ConnStatus>,
 }
 
@@ -1403,6 +1405,7 @@ impl Room {
             remembered: self.recent.sizes(),
             complete_clients: self.recent.complete_clients(),
             locks: (self.locks.len(), self.locks.detached_count()),
+            known_blobs: self.known_blobs.sizes(),
             connections,
         }
     }

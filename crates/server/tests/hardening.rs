@@ -1624,6 +1624,49 @@ async fn blobs_must_be_uploaded_before_they_are_referenced() {
     assert_eq!(ok.seq(), 1);
 }
 
+/// Thousands of long malformed `$blob` strings a change, sharing a long prefix: each change is
+/// refused `missing_blob` (as a short malformed one is), storage is never asked, and the room
+/// remembers none of them, however many such changes come.
+#[tokio::test]
+async fn malformed_blob_references_are_refused_without_being_remembered() {
+    let (server, blobs) = TestServer::start_blobs(|_| {}).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &world.admin).await;
+    let prefix = "z".repeat(900);
+    for round in 0..4 {
+        let refs: Vec<serde_json::Value> = (0..4000)
+            .map(|i| json!({"$blob": format!("{prefix}{round}-{i}")}))
+            .collect();
+        let r = a
+            .change_on(0, vec![set(&["variables", "refs"], json!(refs))])
+            .await;
+        let Outcome::Rejected { code, message, .. } = r else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(code, RejectCode::MissingBlob);
+        assert!(
+            message.starts_with("upload these blobs first: "),
+            "{message}"
+        );
+        assert!(message.chars().count() <= 300, "the message is bounded");
+    }
+    assert_eq!(
+        server.room_status(&doc).await.known_blobs,
+        (0, 0),
+        "nothing malformed is remembered"
+    );
+    assert_eq!(blobs.exists_calls(), 0, "storage is never asked");
+    // A well-formed missing one is still asked about and remembered.
+    let missing = "1".repeat(64);
+    let r = a
+        .change_on(0, vec![set(&["variables", "b"], json!({"$blob": missing}))])
+        .await;
+    assert_eq!(r.code(), RejectCode::MissingBlob);
+    assert_eq!(server.room_status(&doc).await.known_blobs, (0, 1));
+    assert_eq!(head_seq(&server, &doc).await, 0, "nothing was written");
+}
+
 async fn upload(
     server: &TestServer,
     world: &World,

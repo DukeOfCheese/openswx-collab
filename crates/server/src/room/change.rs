@@ -86,8 +86,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{ConnId, Internal, Reply, Room, ServerChange, ServerChangeError, close};
 use crate::assemblies::{self, Pin, RefChange};
-use crate::blobs::missing_blobs;
-use crate::content::blob_refs;
+use crate::blobs::{is_sha256, missing_blobs};
+use crate::content::ops_blob_refs;
 use crate::journal::{Extra, JournalError, JournalWriter, Receipt, Record, RefusedWhy};
 use crate::metrics;
 use crate::record::{encode_ops, encode_paths, encode_reads};
@@ -256,6 +256,11 @@ impl KnownBlobs {
 
     fn is_missing(&self, sha: &str, now: f64) -> bool {
         self.missing.get(sha).is_some_and(|until| *until > now)
+    }
+
+    /// How many hashes are remembered as found, and as missing.
+    pub(super) fn sizes(&self) -> (usize, usize) {
+        (self.found.len(), self.missing.len())
     }
 }
 
@@ -575,19 +580,6 @@ pub(super) async fn caught<T>(
     }
 }
 
-/// The blob references in what the operations set or insert.
-fn blob_refs_of(ops: &[Op]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for op in ops {
-        match op {
-            Op::Set { value, .. } => out.extend(blob_refs(value)),
-            Op::Insert { item, .. } => out.extend(blob_refs(item)),
-            Op::Unset { .. } | Op::Remove { .. } | Op::Move { .. } => {}
-        }
-    }
-    out
-}
-
 /// What judging needs to know about the document's kind and the change's origin.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Kind {
@@ -632,7 +624,7 @@ fn judge(
             &restore
         }
     };
-    let blobs = blob_refs_of(&change.ops);
+    let blobs = ops_blob_refs(&change.ops);
     if blobs.len() > MAX_BLOB_REFS {
         return Err(Refusal::Invalid(format!(
             "a change may refer to at most {MAX_BLOB_REFS} blobs"
@@ -655,6 +647,12 @@ fn judge(
             )?
         }
     };
+    // A reference that is not a SHA-256 names no blob: missing, without asking storage (and
+    // without the room remembering it: only well-formed hashes reach `check_blobs`).
+    let malformed: Vec<String> = blobs.iter().filter(|b| !is_sha256(b)).cloned().collect();
+    if !malformed.is_empty() {
+        return Err(NotTaken::MissingBlobs(malformed));
+    }
     let references = if kind.assembly {
         // A component the change adds is brought back as it was (and needs no check) when the
         // server's own operations do it, or when an undo puts back exactly what the kept inverse
@@ -720,6 +718,8 @@ pub(super) enum NotTaken {
     Refused(Refusal),
     /// A restore whose target is the head already: nothing to do.
     Unchanged,
+    /// It refers to blobs that are malformed (answered `missing_blob`, as the REST routes do).
+    MissingBlobs(Vec<String>),
 }
 
 impl From<Refusal> for NotTaken {
@@ -1134,6 +1134,7 @@ impl Room {
             Ok(decision) => decision,
             Err(NotTaken::Refused(refusal)) => return self.refuse_item(item, refusal),
             Err(NotTaken::Unchanged) => return self.unchanged(item),
+            Err(NotTaken::MissingBlobs(missing)) => return self.missing_blob(item, &missing),
         };
         let unchecked = unchecked_pins(&decision, &item);
         if unchecked.is_empty() {
@@ -1286,8 +1287,11 @@ impl Room {
             }
         };
         let now = self.state.clock.now();
-        for sha in asked {
-            if missing.contains(&sha) {
+        let missing_set: HashSet<&str> = missing.iter().map(String::as_str).collect();
+        // (`asked` holds well-formed hashes only, as `judge` refuses the rest; checked again so
+        // that nothing else can ever be remembered.)
+        for sha in asked.into_iter().filter(|sha| is_sha256(sha)) {
+            if missing_set.contains(sha.as_str()) {
                 self.known_blobs.note_missing(sha, now);
             } else {
                 self.known_blobs.found.insert(sha, BLOBS_KEEP);
@@ -1306,8 +1310,15 @@ impl Room {
     }
 
     fn missing_blob(&mut self, item: Item, missing: &[String]) {
-        let message: String = format!("upload these blobs first: {}", missing.join(", "))
-            .chars()
+        // (Built only as far as it is sent: the references can be megabytes in all.)
+        let message: String = std::iter::once("upload these blobs first: ")
+            .chain(
+                missing
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, sha)| [if i == 0 { "" } else { ", " }, sha.as_str()]),
+            )
+            .flat_map(str::chars)
             .take(MAX_MESSAGE)
             .collect();
         self.answer_refused(item, RejectCode::MissingBlob, &message, Vec::new(), None);
@@ -1869,6 +1880,7 @@ impl Room {
                 }
                 Err(NotTaken::Refused(refusal)) => self.refuse_item(item, refusal),
                 Err(NotTaken::Unchanged) => self.unchanged(item),
+                Err(NotTaken::MissingBlobs(missing)) => self.missing_blob(item, &missing),
             }
         }
         for (_, item) in held.into_iter().rev() {

@@ -24,6 +24,10 @@ impl<T: std::hash::Hash + Eq + Clone> Bounded<T> {
     pub(super) fn contains(&self, item: &T) -> bool {
         self.set.contains(item)
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.set.len()
+    }
 }
 
 /// Counts per key, remembering at most `cap` keys (the least recently added forgotten first).
