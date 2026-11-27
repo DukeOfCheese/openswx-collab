@@ -1032,10 +1032,10 @@ impl Room {
             let (author, change) = (item.author.clone(), item.change.clone());
             let (reverts, target) = (item.reverts.clone(), item.target.clone());
             let (internal, encodes) = (self.internal.clone(), self.encodes.clone());
-            let delay = self.state.room_hooks.judge_delay;
+            let gate = self.state.room_hooks.judge_gate.clone();
             tokio::spawn(async move {
+                gate.pass().await;
                 let judging = tokio::task::spawn_blocking(move || {
-                    std::thread::sleep(delay);
                     let started = Instant::now();
                     let result = judge(
                         &head,

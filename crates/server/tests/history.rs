@@ -1796,11 +1796,9 @@ async fn when_the_restore_being_waited_for_is_refused_the_other_one_is_written()
 
 #[tokio::test]
 async fn presence_goes_on_while_a_restore_is_judged() {
-    let hooks = oswx_server::room::Hooks {
-        judge_delay: std::time::Duration::from_millis(2500),
-        ..oswx_server::room::Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(oswx_server::room::Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
@@ -1809,6 +1807,7 @@ async fn presence_goes_on_while_a_restore_is_judged() {
         .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
         .collect();
     assert_eq!(a.change(ops, vec![], vec![]).await.seq(), 1);
+    hooks.judge_gate.shut();
     let restoring = {
         let (base, token, doc) = (server.base.clone(), world.admin.clone(), doc.clone());
         tokio::spawn(async move {
@@ -1822,11 +1821,12 @@ async fn presence_goes_on_while_a_restore_is_judged() {
                 .status()
         })
     };
-    pause(std::time::Duration::from_millis(300)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the restore is being judged");
     a.presence(json!({"tool": "a"})).await;
-    let started = std::time::Instant::now();
     let a_id = a.client_id.clone();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(WAIT, async {
         loop {
             let got: Relayed = b.expect().await;
             if got.kind == "presence" && got.client_id == a_id {
@@ -1835,12 +1835,14 @@ async fn presence_goes_on_while_a_restore_is_judged() {
         }
     })
     .await
-    .expect("the presence came at once");
-    assert!(
-        !restoring.is_finished(),
+    .expect("the presence came");
+    assert_eq!(
+        hooks.judge_gate.waiting(),
+        1,
         "the restore was still being judged"
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert!(!restoring.is_finished());
+    hooks.judge_gate.open();
     assert_eq!(restoring.await.unwrap(), 200);
 }
 

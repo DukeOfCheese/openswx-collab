@@ -90,8 +90,8 @@ async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
     }
 }
 
-/// A presence after a quiet spell is relayed at once: it reaches the others well within a tick,
-/// not at the next one.
+/// A presence after a quiet spell is relayed at once, as it came: a `presence` frame of its own,
+/// not part of a tick's batch.
 #[tokio::test]
 async fn the_first_presence_after_a_quiet_spell_is_relayed_at_once() {
     let (server, world) = world().await;
@@ -100,21 +100,14 @@ async fn the_first_presence_after_a_quiet_spell_is_relayed_at_once() {
     let mut watcher = Live::connect(&server, &doc, &world.admin).await;
     a.drain().await;
     watcher.drain().await;
-    let mut took = Vec::new();
     for n in 0..7 {
+        // (Quiet: longer than a tick since the last one.)
         tokio::time::sleep(oswx_server::room::LIVE_TICK * 3).await;
-        let sent = Instant::now();
         a.presence(json!({"n": n})).await;
         let r: Relayed = watcher.expect().await;
-        took.push(sent.elapsed());
         assert_eq!(r.data, Some(plain(json!({"n": n}))));
+        assert_eq!(watcher.batches, 0, "relayed at once, as it came");
     }
-    took.sort();
-    let median = took[took.len() / 2];
-    assert!(
-        median < oswx_server::room::LIVE_TICK / 2,
-        "{median:?} (all: {took:?})"
-    );
 }
 
 async fn upload(server: &TestServer, world: &World, body: &[u8]) -> String {
@@ -144,14 +137,16 @@ async fn a_slow_blob_lookup_does_not_hold_up_other_changes() {
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect(&server, &doc, &world.admin).await;
-    blobs.exists_delay(Duration::from_secs(2));
+    blobs.exists_gate.shut();
     let slow = a.make_change(0, vec![blob_ref("brep", &"1".repeat(64))]);
     a.send_change(&slow).await;
+    tokio::time::timeout(WAIT, blobs.exists_gate.until_waiting(1))
+        .await
+        .expect("the blob is being looked up");
     // Ada's next change waits behind her first (answers come in the order she sent them) ...
     let behind = a.make_change(0, vec![set(&["variables", "x"], json!(1))]);
     a.send_change(&behind).await;
     // ... but nobody else waits.
-    let started = Instant::now();
     for n in 0..5 {
         let r = b
             .change(
@@ -162,16 +157,12 @@ async fn a_slow_blob_lookup_does_not_hold_up_other_changes() {
             .await;
         assert_eq!(r.seq(), n + 1);
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        started.elapsed()
-    );
+    assert_eq!(blobs.exists_gate.waiting(), 1, "the lookup is still held");
+    blobs.exists_gate.open();
     assert_eq!(
         a.outcome(&slow.change_id).await.code(),
         RejectCode::MissingBlob
     );
-    assert!(started.elapsed() >= Duration::from_millis(1500));
     assert_eq!(a.outcome(&behind.change_id).await.seq(), 6);
 }
 
@@ -181,24 +172,22 @@ async fn a_slow_snapshot_write_does_not_hold_up_changes() {
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
-    blobs.put_delay(Duration::from_secs(2));
-    let started = Instant::now();
+    blobs.put_gate.shut();
     for n in 0..8 {
         assert_eq!(
             a.change(vec![set_depth(n)], vec![], vec![]).await.seq(),
             n + 1
         );
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        started.elapsed()
-    );
+    tokio::time::timeout(WAIT, blobs.put_gate.until_waiting(1))
+        .await
+        .expect("the snapshot is being stored");
     let status = server.room_status(&doc).await;
     assert_eq!(
         status.snapshot_seq, 0,
         "the snapshot at 2 is still being written"
     );
+    blobs.put_gate.open();
     let deadline = tokio::time::Instant::now() + WAIT;
     while server.room_status(&doc).await.snapshot_seq < 2 {
         assert!(tokio::time::Instant::now() < deadline);

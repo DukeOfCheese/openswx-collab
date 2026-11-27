@@ -735,11 +735,13 @@ async fn an_upload_whose_parts_are_held_up_holds_no_more_than_it_is_charged() {
         "the upload took the whole body while its parts were held"
     );
     assert_eq!(b.fake.count(Seen::is_part), 2, "two parts at once");
-    // At its peak, held up: no more than the upload is charged, and the parts it charges for.
+    // At its peak, held up: exactly what the upload is charged for its parts (the rest of the
+    // charge is the compressor's).
     let held = b.blobs.peak_buffered() as u64;
     let charged = b.blobs.upload_memory();
-    assert!(
-        held + COMPRESSOR_MEMORY <= charged,
+    assert_eq!(
+        held + COMPRESSOR_MEMORY,
+        charged,
         "held {held} bytes, charged {charged}"
     );
     assert!(held >= 3 * PART as u64, "held only {held} bytes");
@@ -966,7 +968,7 @@ async fn a_change_that_names_a_blob_is_a_server_error_while_the_store_is_out() {
 
 #[tokio::test]
 async fn a_document_is_not_loaded_while_its_snapshot_cannot_be_read() {
-    let b = bucket_with("", |t| t.first_byte_timeout = Duration::from_millis(400)).await;
+    let b = bucket().await;
     let server = server_on(&b, |s| s.snapshot_every = 2).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
@@ -987,7 +989,13 @@ async fn a_document_is_not_loaded_while_its_snapshot_cannot_be_read() {
     assert_eq!(load_head(store, blobs, &doc).await.unwrap().0.seq, 5);
 
     // The store refuses, fails, stalls: an error each time, never an older snapshot and never a
-    // document from scratch.
+    // document from scratch. (A stall is read through storage of its own on the same bucket, with
+    // a short timeout; the server keeps the default one.)
+    let impatient = {
+        let mut config = b.fake.config("");
+        config.tuning.first_byte_timeout = Duration::from_millis(400);
+        S3Blobs::new(config).unwrap()
+    };
     let open = async || {
         let (status, _) = server
             .get(&format!("/api/documents/{doc}/content"), Some(&world.admin))
@@ -996,7 +1004,11 @@ async fn a_document_is_not_loaded_while_its_snapshot_cannot_be_read() {
     };
     for fault in [Fault::Status(403), Fault::Status(500), Fault::Hang] {
         b.fake.inject(ALWAYS, fault, Seen::is_get);
-        let loaded = tokio::time::timeout(Duration::from_secs(10), load_head(store, blobs, &doc))
+        let reading: &dyn oswx_server::blobs::Blobs = match fault {
+            Fault::Hang => &impatient,
+            _ => blobs,
+        };
+        let loaded = tokio::time::timeout(Duration::from_secs(10), load_head(store, reading, &doc))
             .await
             .expect("loading ended");
         assert!(

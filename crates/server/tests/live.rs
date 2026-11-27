@@ -894,9 +894,8 @@ async fn a_presence_flood_is_dropped() {
     );
 }
 
-/// Waits for a presence of `who` at `live`, answering how long it took (panics after a second).
-async fn presence_within_a_second(live: &mut Live, who: &str) -> Duration {
-    let sent = std::time::Instant::now();
+/// Waits until `live` is relayed a presence of client `who`.
+async fn presence_arrives(live: &mut Live, who: &str) {
     let wait = async {
         loop {
             let got: Relayed = live.expect().await;
@@ -905,20 +904,16 @@ async fn presence_within_a_second(live: &mut Live, who: &str) -> Duration {
             }
         }
     };
-    tokio::time::timeout(Duration::from_secs(1), wait)
+    tokio::time::timeout(WAIT, wait)
         .await
-        .expect("the presence came at once");
-    sent.elapsed()
+        .expect("the presence came");
 }
 
 #[tokio::test]
 async fn presence_goes_on_while_a_big_change_is_judged_off_the_task() {
-    let hooks = oswx_server::room::Hooks {
-        judge_delay: Duration::from_millis(2500),
-        ..oswx_server::room::Hooks::default()
-    };
-    let server =
-        TestServer::start_custom(|_| {}, |s| s.room_hooks = std::sync::Arc::new(hooks)).await;
+    let hooks = std::sync::Arc::new(oswx_server::room::Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
@@ -929,22 +924,26 @@ async fn presence_goes_on_while_a_big_change_is_judged_off_the_task() {
         .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
         .collect();
     let big = a.make_change(0, ops);
+    hooks.judge_gate.shut();
     a.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     // From the sender itself, whose later messages wait for it, and from someone else.
     a.presence(json!({"tool": "a"})).await;
     let a_id = a.client_id.clone();
-    presence_within_a_second(&mut b, &a_id).await;
+    presence_arrives(&mut b, &a_id).await;
     b.presence(json!({"tool": "b"})).await;
     let b_id = b.client_id.clone();
-    presence_within_a_second(&mut c, &b_id).await;
+    presence_arrives(&mut c, &b_id).await;
+    assert_eq!(hooks.judge_gate.waiting(), 1, "relayed while it was judged");
+    hooks.judge_gate.open();
     assert_eq!(a.outcome(&big.change_id).await.seq(), 1);
 }
 
 #[tokio::test]
 async fn presence_goes_on_while_the_senders_blobs_are_looked_up() {
     let (server, blobs) = TestServer::start_blobs(|_| {}).await;
-    blobs.exists_delay(Duration::from_millis(2500));
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
@@ -954,11 +953,20 @@ async fn presence_goes_on_while_the_senders_blobs_are_looked_up() {
         0,
         vec![set(&["variables", "brep"], json!({"$blob": missing}))],
     );
+    blobs.exists_gate.shut();
     a.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, blobs.exists_gate.until_waiting(1))
+        .await
+        .expect("the blob is being looked up");
     a.presence(json!({"tool": "line"})).await;
     let a_id = a.client_id.clone();
-    presence_within_a_second(&mut b, &a_id).await;
+    presence_arrives(&mut b, &a_id).await;
+    assert_eq!(
+        blobs.exists_gate.waiting(),
+        1,
+        "relayed while it was looked up"
+    );
+    blobs.exists_gate.open();
     assert_eq!(
         a.outcome(&change.change_id).await.code(),
         RejectCode::MissingBlob
@@ -967,32 +975,29 @@ async fn presence_goes_on_while_the_senders_blobs_are_looked_up() {
 
 #[tokio::test]
 async fn presence_does_not_wait_for_the_journal() {
-    let slow = |store: &std::sync::Arc<dyn oswx_server::store::Store>| {
-        oswx_server::journal::JournalWriter::start(
-            store.clone(),
-            oswx_server::journal::MAX_BATCH,
-            Duration::from_millis(1500),
-        )
-    };
-    let (server, _) = TestServer::start_flaky_journal(|_| {}, slow).await;
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect(&server, &doc, &world.admin).await;
+    // The journal is held: the change is tentative until it is opened.
+    flaky.journal_gate.shut();
     let change = a.make_change(0, vec![set_depth(3)]);
     a.send_change(&change).await;
-    let sent = std::time::Instant::now();
+    tokio::time::timeout(WAIT, flaky.journal_gate.until_waiting(1))
+        .await
+        .expect("the journal is about to write the change");
     a.presence(json!({"tool": "line"})).await;
     let first = b.recv().await;
-    let took = sent.elapsed();
     assert!(
         matches!(first, ServerMsg::Presence { .. }),
         "the presence comes before the change: {first:?}"
     );
-    assert!(took < Duration::from_millis(700), "{took:?}");
-    assert_eq!(a.outcome(&change.change_id).await.seq(), 1);
-    assert!(
-        sent.elapsed() >= Duration::from_millis(1000),
-        "the journal was slow"
+    assert_eq!(
+        flaky.journal_gate.waiting(),
+        1,
+        "the journal was still held"
     );
+    flaky.journal_gate.open();
+    assert_eq!(a.outcome(&change.change_id).await.seq(), 1);
 }

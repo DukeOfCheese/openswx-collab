@@ -1578,18 +1578,7 @@ async fn a_revocation_while_the_parts_are_checked_writes_nothing() {
 
 #[tokio::test]
 async fn a_change_a_rejudge_cannot_check_is_answered_server_error_and_can_be_sent_again() {
-    // A long batch window: the two changes below are written in one batch.
-    let (server, flaky) = TestServer::start_flaky_journal(
-        |_| {},
-        |store| {
-            oswx_server::journal::JournalWriter::start(
-                store.clone(),
-                oswx_server::journal::MAX_BATCH,
-                std::time::Duration::from_millis(500),
-            )
-        },
-    )
-    .await;
+    let (server, flaky) = TestServer::start_flaky(|_| {}).await;
     let world = World::new(&server).await.unwrap();
     let first = world.document(&server, None, Some("First"), None).await;
     let second = world.document(&server, None, Some("Second"), None).await;
@@ -1611,9 +1600,21 @@ async fn a_change_a_rejudge_cannot_check_is_answered_server_error_and_can_be_sen
     let seq_only = a.make_change(0, vec![set(&["components", "c1", "ref", "seq"], json!(1))]);
     // ... but the journal refuses the first: judged again without it, the second would pin First
     // at 1, which it was never checked for.
+    // (The journal is held until both are tentative: the refusal comes with the second handed
+    // over already.)
     flaky.refuse_change_once(&repoint.change_id);
+    flaky.journal_gate.shut();
     a.send_change(&repoint).await;
     a.send_change(&seq_only).await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while server.room_status(&asm).await.tentative < 2 {
+        assert!(std::time::Instant::now() < deadline, "both are tentative");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::timeout(WAIT, flaky.journal_gate.until_waiting(1))
+        .await
+        .expect("the journal is held");
+    flaky.journal_gate.open();
     a.outcome(&repoint.change_id).await;
     assert_eq!(
         a.outcome(&seq_only.change_id).await.code(),

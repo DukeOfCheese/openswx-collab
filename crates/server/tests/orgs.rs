@@ -2148,19 +2148,19 @@ async fn an_account_being_deleted_joins_and_founds_nothing() {
 
 // ------------------------------------------------------------------ Task 16, fix round 3
 
-/// A hook that, once told to, does not answer an event.
-struct SlowEvents(AtomicBool);
+/// A hook that, once its gate is shut, waits at it before it answers an event.
+#[derive(Default)]
+struct SlowEvents(oswx_server::room::Gate);
 
 #[async_trait]
 impl Extensions for SlowEvents {
     fn hook_timeout(&self) -> Duration {
-        Duration::from_secs(4)
+        // (Longer than any test: the gate decides.)
+        Duration::from_secs(600)
     }
 
     async fn on_event(&self, _event: &Event) {
-        if self.0.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
-        }
+        self.0.pass().await;
     }
 }
 
@@ -2169,11 +2169,11 @@ impl Extensions for SlowEvents {
 /// its transaction at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_next_write_does_not_wait_for_the_hooks_of_the_one_before() {
-    let ext = Arc::new(SlowEvents(false.into()));
+    let ext = Arc::new(SlowEvents::default());
     let kept = ext.clone();
     let server = TestServer::start_custom(|_| {}, |s| s.ext = kept).await;
     let w = World::new(&server).await.unwrap();
-    ext.0.store(true, Ordering::SeqCst);
+    ext.0.shut();
     let server = Arc::new(server);
     let create = |name: &'static str| {
         let (server, w) = (server.clone(), (w.org.clone(), w.admin.clone()));
@@ -2190,7 +2190,7 @@ async fn the_next_write_does_not_wait_for_the_hooks_of_the_one_before() {
     let committed = |name: &'static str| {
         let (server, org) = (server.clone(), w.org.clone());
         async move {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 let projects = server.state.store.projects_in_org(&org).await.unwrap();
                 if projects.iter().any(|p| p.name == name) {
@@ -2203,24 +2203,26 @@ async fn the_next_write_does_not_wait_for_the_hooks_of_the_one_before() {
             }
         }
     };
-    // The first is committed, and its answer waits for the hook (four seconds).
+    // The first is committed, and its answer waits for the hook (held at its gate).
     let first = create("First");
     assert!(committed("First").await);
+    tokio::time::timeout(Duration::from_secs(20), ext.0.until_waiting(1))
+        .await
+        .expect("the first one's hook runs");
     assert!(!first.is_finished());
-    assert_eq!(
-        server.state.org_queue.organisations(),
-        0,
-        "its turn is over"
-    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.org_queue.organisations() != 0 {
+        assert!(Instant::now() < deadline, "its turn is never over");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // The second commits meanwhile.
-    let started = Instant::now();
     let second = create("Second");
     assert!(
         committed("Second").await,
         "the second write waited for the first one's hook"
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
     assert!(!first.is_finished(), "the hook still hangs");
+    ext.0.open();
     for request in [first, second] {
         assert_eq!(request.await.unwrap().0, StatusCode::CREATED);
     }

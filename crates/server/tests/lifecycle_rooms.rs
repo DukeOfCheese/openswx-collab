@@ -388,11 +388,9 @@ async fn drops_are_counted_by_cause() {
 
 #[tokio::test]
 async fn a_drop_takes_effect_while_the_room_judges_a_big_change() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(3000),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
     let doc = world.document(&server, None, None, None).await;
@@ -402,18 +400,20 @@ async fn a_drop_takes_effect_while_the_room_judges_a_big_change() {
         .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
         .collect();
     let big = b.make_change(0, ops);
+    hooks.judge_gate.shut();
     b.send_change(&big).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     // And one more behind it, which waits for the big one.
     let small = b.make_change(0, vec![set_depth(2)]);
     b.send_change(&small).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let started = Instant::now();
     set_project_role(&server, &world, &bob_id, "viewer").await;
     assert_eq!(b.closed().await.0, 4403);
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        started.elapsed()
+    assert_eq!(
+        hooks.judge_gate.waiting(),
+        1,
+        "the drop arrived while the big change was still being judged"
     );
     // Neither of Bob's changes is answered or applied: the room processes nothing more of his.
     assert!(
@@ -423,8 +423,21 @@ async fn a_drop_takes_effect_while_the_room_judges_a_big_change() {
         "{:?}",
         b.seen
     );
-    tokio::time::sleep(Duration::from_millis(3200)).await;
+    hooks.judge_gate.open();
+    tentative_becomes(&server, &doc, 0).await;
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 0);
+}
+
+/// Waits until the room of `doc` has `n` changes waiting for the journal.
+async fn tentative_becomes(server: &TestServer, doc: &str, n: usize) {
+    let deadline = Instant::now() + WAIT;
+    while server.room_status(doc).await.tentative != n {
+        assert!(
+            Instant::now() < deadline,
+            "the room never had {n} tentative"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -434,21 +447,21 @@ async fn a_drop_takes_effect_while_the_journal_is_slow() {
     let (bob, _) = editor(&server, &world, "bob@example.com").await;
     let doc = world.document(&server, None, None, None).await;
     let mut b = Live::connect(&server, &doc, &bob).await;
-    flaky.commit_delay(Duration::from_millis(1500));
+    // The journal is held before its transaction (so that, on SQLite, requests still write).
+    flaky.journal_gate.shut();
     let change = b.make_change(0, vec![set_depth(2)]);
     b.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let started = Instant::now();
-    // (The password change commits through the slow store too: the drop is timed from its answer.)
+    tokio::time::timeout(WAIT, flaky.journal_gate.until_waiting(1))
+        .await
+        .expect("the journal is about to write the change");
     change_password(&server, &bob).await;
-    let answered = Instant::now();
     assert_eq!(b.closed().await.0, 4401);
-    assert!(
-        answered.elapsed() < Duration::from_millis(700),
-        "{:?}",
-        started.elapsed()
+    assert_eq!(
+        flaky.journal_gate.waiting(),
+        1,
+        "the drop arrived while the journal was still held"
     );
-    flaky.commit_delay(Duration::ZERO);
+    flaky.journal_gate.open();
 }
 
 // ------------------------------------------------------------------ the steps after a commit
@@ -478,9 +491,17 @@ async fn dropped_after_commit(
     }
     sent.abort();
     let _ = sent.await;
-    // Long enough for the server to see the client gone and drop the handler.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    handlers_dropped(server).await;
     gate.open();
+}
+
+/// Waits until the server has seen the client gone and dropped every request's handler.
+async fn handlers_dropped(server: &TestServer) {
+    let deadline = Instant::now() + WAIT;
+    while server.state.http.in_handlers() > 0 {
+        assert!(Instant::now() < deadline, "a handler was never dropped");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -695,7 +716,8 @@ async fn a_room_with_a_change_in_flight_does_not_unload() {
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
-    flaky.commit_delay(Duration::from_millis(1500));
+    // The journal is held in the middle of its batch.
+    flaky.head_gate.shut();
     let change = a.make_change(0, vec![set_depth(5)]);
     a.send_change(&change).await;
     let deadline = Instant::now() + WAIT;
@@ -706,7 +728,7 @@ async fn a_room_with_a_change_in_flight_does_not_unload() {
     a.close().await;
     clock.advance(121.0);
     assert!(!sweep_unloads(&server, &doc).await, "a change is in flight");
-    flaky.commit_delay(Duration::ZERO);
+    flaky.head_gate.open();
     let deadline = Instant::now() + WAIT;
     while server.room_status(&doc).await.seq != 1 {
         assert!(Instant::now() < deadline);
@@ -1054,8 +1076,7 @@ async fn dropped_in_commit(
     }
     sent.abort();
     let _ = sent.await;
-    // Long enough for the server to see the client gone and drop the handler.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    handlers_dropped(server).await;
     gate.open();
 }
 
@@ -1167,6 +1188,60 @@ async fn a_commit_that_fails_closes_nobody_and_announces_nothing() {
     assert!(!heard.any("ProjectMemberRemoved"));
 }
 
+/// Waits until the room of `doc` has nothing off its task holding its frames and nothing waiting
+/// for the journal.
+async fn settled(server: &TestServer, doc: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let status = server.room_status(doc).await;
+        if status.paused == 0 && status.tentative == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the room never settled: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Opens the change-id lookup gate and waits until every lookup held there has returned and the
+/// room has taken what came back: the room takes its own results before any frame, so `live`'s
+/// ping, answered, comes after them.
+async fn lookups_returned(flaky: &FlakyStore, live: &mut Live) {
+    let held = flaky.lookup_gate.waiting();
+    let ended = flaky
+        .lookup_log()
+        .iter()
+        .filter(|l| **l == "change id looked up")
+        .count();
+    flaky.lookup_gate.open();
+    let deadline = Instant::now() + WAIT;
+    while flaky
+        .lookup_log()
+        .iter()
+        .filter(|l| **l == "change id looked up")
+        .count()
+        < ended + held
+    {
+        assert!(Instant::now() < deadline, "a lookup never returned");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(alive(live).await);
+}
+
+/// Opens the blob lookup gate and waits until every lookup has returned and the room has taken
+/// what came back (as [`lookups_returned`]).
+async fn blob_lookups_returned(blobs: &TestBlobs, live: &mut Live) {
+    blobs.exists_gate.open();
+    let deadline = Instant::now() + WAIT;
+    while blobs.exists_running() > 0 {
+        assert!(Instant::now() < deadline, "a blob lookup never returned");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(alive(live).await);
+}
+
 /// Whether `live` heard a change event.
 fn heard_a_change(live: &Live) -> bool {
     live.seen.iter().any(|m| matches!(m, ServerMsg::Change(_)))
@@ -1174,11 +1249,9 @@ fn heard_a_change(live: &Live) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_change_being_judged_is_never_written_even_behind_a_full_queue() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(2000),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
     let doc = world.document(&server, None, None, None).await;
@@ -1189,8 +1262,11 @@ async fn a_revoked_change_being_judged_is_never_written_even_behind_a_full_queue
         .map(|i| set(&["variables", &format!("v{i}")], json!(i)))
         .collect();
     let big = b.make_change(0, ops);
+    hooks.judge_gate.shut();
     b.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     // The room takes no frame while it judges: the queue fills and the reader waits on it.
     let ping = oswx_core::wire::encode_client(&oswx_core::wire::ClientMsg::Ping).to_vec();
     for _ in 0..400 {
@@ -1198,7 +1274,9 @@ async fn a_revoked_change_being_judged_is_never_written_even_behind_a_full_queue
     }
     set_project_role(&server, &world, &bob_id, "viewer").await;
     assert_eq!(b.closed().await.0, 4403);
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(hooks.judge_gate.waiting(), 1, "still being judged");
+    hooks.judge_gate.open();
+    settled(&server, &doc).await;
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 0);
     a.drain().await;
     assert!(!heard_a_change(&a), "{:?}", a.seen);
@@ -1223,19 +1301,16 @@ async fn a_revoked_change_waiting_for_a_journal_lookup_is_never_written() {
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect_with(&server, &doc, &bob, Hello::client("bob-lookup")).await;
     quiet(&mut a).await;
-    flaky.lookup_delay(Duration::from_millis(1500));
-    let lookups = flaky.change_lookups();
+    flaky.lookup_gate.shut();
     let change = b.make_change(2, vec![set_depth(9)]);
     b.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        flaky.change_lookups() > lookups,
-        "the change is being looked up"
-    );
+    tokio::time::timeout(WAIT, flaky.lookup_gate.until_waiting(1))
+        .await
+        .expect("the change is being looked up");
     set_project_role(&server, &world, &bob_id, "viewer").await;
     assert_eq!(b.closed().await.0, 4403);
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-    flaky.lookup_delay(Duration::ZERO);
+    assert_eq!(flaky.lookup_gate.waiting(), 1, "still being looked up");
+    lookups_returned(&flaky, &mut a).await;
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 2);
     a.drain().await;
     assert!(!heard_a_change(&a), "{:?}", a.seen);
@@ -1252,15 +1327,21 @@ async fn a_revoked_undo_waiting_for_its_target_is_never_written() {
     let x = b.make_change(0, vec![set_depth(20)]);
     assert_eq!(b.resend(&x).await.seq(), 1);
     quiet(&mut a).await;
-    // The undone change is durable: its inverse is read from the (slow) journal.
-    flaky.lookup_delay(Duration::from_millis(1500));
+    // The undone change is durable: its inverse is read from the (held) journal.
+    flaky.history_gate.shut();
     let undo = b.undo_change(1, &x.change_id, vec![set_depth(10)]);
     b.send_change(&undo).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, flaky.history_gate.until_waiting(1))
+        .await
+        .expect("the undo's target is being read");
     set_project_role(&server, &world, &bob_id, "viewer").await;
     assert_eq!(b.closed().await.0, 4403);
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-    flaky.lookup_delay(Duration::ZERO);
+    assert_eq!(flaky.history_gate.waiting(), 1, "still being read");
+    flaky.history_gate.open();
+    while flaky.history_gate.waiting() > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(alive(&mut a).await);
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 1);
     a.drain().await;
     assert!(!heard_a_change(&a), "{:?}", a.seen);
@@ -1501,19 +1582,6 @@ async fn the_detached_locks_of_someone_removed_just_after_leaving_go_at_once() {
     assert_eq!(mine.granted, vec![path(F1)], "{mine:?}");
 }
 
-/// A journal that holds every record `ms` milliseconds before writing it.
-fn slow_journal(
-    ms: u64,
-) -> impl FnOnce(&Arc<dyn oswx_server::store::Store>) -> oswx_server::journal::JournalWriter {
-    move |store| {
-        oswx_server::journal::JournalWriter::start(
-            store.clone(),
-            oswx_server::journal::MAX_BATCH,
-            Duration::from_millis(ms),
-        )
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_join_taken_just_as_its_wait_ran_out_leaves_no_ghost() {
     let hooks = Arc::new(Hooks {
@@ -1642,22 +1710,26 @@ fn big_ops() -> Vec<oswx_core::Op> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_demoted_client_reconnecting_inherits_nothing_being_judged() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1500),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
     let doc = world.document(&server, None, None, None).await;
     let desk = Hello::client("demoted-judge");
     let mut a = Live::connect_with(&server, &doc, &bob, desk.clone()).await;
     let big = a.make_change(0, big_ops());
+    hooks.judge_gate.shut();
     a.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     let mut b = demote_and_reconnect(&server, &world, &bob, &bob_id, &doc, desk, "viewer").await;
     assert!(b.welcome.read_only);
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(hooks.judge_gate.waiting(), 1, "still being judged");
+    hooks.judge_gate.open();
+    settled(&server, &doc).await;
     nothing_written_and_told(&server, &world, &doc, &mut b, &big, 0).await;
 }
 
@@ -1678,13 +1750,16 @@ async fn a_demoted_client_reconnecting_inherits_nothing_being_looked_up() {
     assert_eq!(edit(&mut first, 2).await, 2);
     first.close().await;
     let mut a = Live::connect_with(&server, &doc, &bob, desk.clone()).await;
-    flaky.lookup_delay(Duration::from_millis(1500));
+    flaky.lookup_gate.shut();
     let change = a.make_change(2, vec![set_depth(9)]);
     a.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, flaky.lookup_gate.until_waiting(1))
+        .await
+        .expect("the change is being looked up");
     let mut b = demote_and_reconnect(&server, &world, &bob, &bob_id, &doc, desk, "viewer").await;
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-    flaky.lookup_delay(Duration::ZERO);
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(flaky.lookup_gate.waiting(), 1, "still being looked up");
+    lookups_returned(&flaky, &mut b).await;
     nothing_written_and_told(&server, &world, &doc, &mut b, &change, 2).await;
 }
 
@@ -1709,7 +1784,7 @@ async fn a_demoted_client_reconnecting_inherits_nothing_waiting_for_its_blobs() 
     assert_eq!(r.status(), 204);
     let desk = Hello::client("demoted-blobs");
     let mut a = Live::connect_with(&server, &doc, &bob, desk.clone()).await;
-    blobs.exists_delay(Duration::from_millis(1500));
+    blobs.exists_gate.shut();
     let change = a.make_change(
         0,
         vec![set(
@@ -1718,22 +1793,27 @@ async fn a_demoted_client_reconnecting_inherits_nothing_waiting_for_its_blobs() 
         )],
     );
     a.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, blobs.exists_gate.until_waiting(1))
+        .await
+        .expect("the blob is being looked up");
     let mut b = demote_and_reconnect(&server, &world, &bob, &bob_id, &doc, desk, "viewer").await;
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-    blobs.exists_delay(Duration::ZERO);
+    assert_eq!(a.closed().await.0, 4409);
+    assert_eq!(blobs.exists_gate.waiting(), 1, "still being looked up");
+    blob_lookups_returned(&blobs, &mut b).await;
     nothing_written_and_told(&server, &world, &doc, &mut b, &change, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_demoted_client_reconnecting_inherits_nothing_judged_again_after_a_refusal() {
-    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, slow_journal(800)).await;
+    let (server, flaky) = TestServer::start_flaky_journal(|_| {}, new_journal).await;
     let world = World::new(&server).await.unwrap();
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
     let doc = world.document(&server, None, None, None).await;
     let desk = Hello::client("demoted-rejudge");
     let mut a = Live::connect_with(&server, &doc, &bob, desk.clone()).await;
-    // The journal refuses the first; the second, already handed over, is judged again after it.
+    // The journal is held; it will refuse the first, and the second, already handed over, is
+    // judged again after it.
+    flaky.journal_gate.shut();
     let first = a.make_change(0, vec![set(&["variables", "x"], json!(1))]);
     flaky.refuse_change_once(&first.change_id);
     a.send_change(&first).await;
@@ -1744,30 +1824,50 @@ async fn a_demoted_client_reconnecting_inherits_nothing_judged_again_after_a_ref
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    tokio::time::timeout(WAIT, flaky.journal_gate.until_waiting(1))
+        .await
+        .expect("the journal is held");
     let mut b = demote_and_reconnect(&server, &world, &bob, &bob_id, &doc, desk, "viewer").await;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(a.closed().await.0, 4409);
+    flaky.journal_gate.open();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let status = server.room_status(&doc).await;
+        let waiting: usize = status.connections.iter().map(|c| c.waiting_answers).sum();
+        if status.tentative == 0 && waiting == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the room never settled: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     nothing_written_and_told(&server, &world, &doc, &mut b, &second, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_promoted_client_reconnecting_inherits_nothing_and_is_answered_when_it_resends() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1500),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let (bob, bob_id) = editor(&server, &world, "bob@example.com").await;
     let doc = world.document(&server, None, None, None).await;
     let desk = Hello::client("promoted-desk");
     let mut a = Live::connect_with(&server, &doc, &bob, desk.clone()).await;
     let big = a.make_change(0, big_ops());
+    hooks.judge_gate.shut();
     a.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     // Editor to owner: another role, so the old connection's work is not inherited.
     let mut b = demote_and_reconnect(&server, &world, &bob, &bob_id, &doc, desk, "owner").await;
     assert_eq!(b.welcome.role, "owner");
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(a.closed().await.0, 4409);
+    hooks.judge_gate.open();
+    settled(&server, &doc).await;
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 0);
     assert!(
         !b.seen
@@ -1778,26 +1878,30 @@ async fn a_promoted_client_reconnecting_inherits_nothing_and_is_answered_when_it
     );
     // Sent again, it is judged under the new role and answered (once).
     assert_eq!(b.resend(&big).await.seq(), 1);
-    assert!(no_answer_within(&mut b, &big.change_id, Duration::from_millis(500)).await);
+    assert!(no_answer_before_pong(&server, &doc, &mut b, &big.change_id).await);
 }
 
-/// Whether no answer for `change_id` comes within `wait`.
-async fn no_answer_within(live: &mut Live, change_id: &str, wait: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + wait;
+/// Whether no (further) answer for `change_id` comes. Once the room of `doc` has nothing
+/// tentative and nothing off its task, every answer still to come is already queued for `live`,
+/// and replies are written in order: the pong to a ping sent now comes after all of them.
+async fn no_answer_before_pong(
+    server: &TestServer,
+    doc: &str,
+    live: &mut Live,
+    change_id: &str,
+) -> bool {
+    settled(server, doc).await;
+    live.send(&oswx_core::wire::ClientMsg::Ping).await;
     loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return true;
-        }
-        match live.try_recv(left).await {
-            Some(
-                ServerMsg::Accepted { change_id: id, .. }
-                | ServerMsg::Rejected { change_id: id, .. },
-            ) if &*id == change_id => {
+        match live.recv().await {
+            ServerMsg::Pong { .. } => return true,
+            ServerMsg::Accepted { change_id: id, .. }
+            | ServerMsg::Rejected { change_id: id, .. }
+                if &*id == change_id =>
+            {
                 return false;
             }
-            Some(_) => continue,
-            None => return true,
+            other => live.seen.push(other),
         }
     }
 }
@@ -1911,7 +2015,7 @@ async fn a_connection_closed_as_too_slow_keeps_its_locks_for_the_grace_period() 
     let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
     b.lock(&[F1]).await;
     lock_news(&mut watcher).await;
-    flaky.lookup_delay(Duration::from_secs(3));
+    flaky.lookup_gate.shut();
     let wait = b.make_change(2, vec![set_depth(3)]);
     b.send_change(&wait).await;
     for _ in 0..1100 {
@@ -1923,7 +2027,7 @@ async fn a_connection_closed_as_too_slow_keeps_its_locks_for_the_grace_period() 
         news.locks.len() == 1 && news.locks[0].detached && news.released.is_empty(),
         "detached, not released: {news:?}"
     );
-    flaky.lookup_delay(Duration::ZERO);
+    flaky.lookup_gate.open();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2005,7 +2109,7 @@ async fn settled_once(
     seq: Seq,
 ) {
     assert!(
-        no_answer_within(live, &change.change_id, Duration::from_millis(500)).await,
+        no_answer_before_pong(server, doc, live, &change.change_id).await,
         "one answer"
     );
     assert_eq!(
@@ -2091,24 +2195,26 @@ async fn a_chain_of_takeovers_each_resending_gets_one_answer_per_live_send() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_takeover_while_the_change_waits_behind_another_is_answered_once() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1000),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut observer = Live::connect(&server, &doc, &world.admin).await;
     let desk = Hello::client("parked-desk");
     let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
     let big = a.make_change(0, big_ops());
+    hooks.judge_gate.shut();
     a.send_change(&big).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     // Parked behind the big one (judged off the task).
     let small = a.make_change(0, vec![set_depth(6)]);
     a.send_change(&small).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
     assert_eq!(a.closed().await.0, 4409);
+    hooks.judge_gate.open();
     assert_eq!(
         resent_once(&server, &doc, &mut b, &mut observer, &big).await,
         1
@@ -2121,27 +2227,34 @@ async fn a_takeover_while_the_change_waits_behind_another_is_answered_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_takeover_while_the_change_is_judged_off_the_task_is_answered_once() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1000),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut observer = Live::connect(&server, &doc, &world.admin).await;
     let desk = Hello::client("judged-desk");
     let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
     let big = a.make_change(0, big_ops());
+    hooks.judge_gate.shut();
     a.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     // The successor resends at once, while the old copy is still being judged: the old copy is
     // dropped when it comes back, the resend is judged afresh.
     let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
     assert_eq!(a.closed().await.0, 4409);
+    b.send_change(&big).await;
     assert_eq!(
-        resent_once(&server, &doc, &mut b, &mut observer, &big).await,
-        1
+        hooks.judge_gate.waiting(),
+        1,
+        "the old copy is still being judged"
     );
+    hooks.judge_gate.open();
+    let seq = b.outcome(&big.change_id).await.seq();
+    assert_eq!(seq, 1);
+    settled_once(&server, &doc, &mut b, &mut observer, &big, seq).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2161,17 +2274,23 @@ async fn a_takeover_while_the_change_is_looked_up_is_answered_once() {
     first.close().await;
     let mut observer = Live::connect(&server, &doc, &world.admin).await;
     let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
-    flaky.lookup_delay(Duration::from_millis(1000));
+    flaky.lookup_gate.shut();
     let change = a.make_change(2, vec![set_depth(9)]);
     a.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, flaky.lookup_gate.until_waiting(1))
+        .await
+        .expect("the change is being looked up");
     let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
     assert_eq!(a.closed().await.0, 4409);
-    assert_eq!(
-        resent_once(&server, &doc, &mut b, &mut observer, &change).await,
-        3
-    );
-    flaky.lookup_delay(Duration::ZERO);
+    // Resent while the old copy is still being looked up: the resend is looked up too.
+    b.send_change(&change).await;
+    tokio::time::timeout(WAIT, flaky.lookup_gate.until_waiting(2))
+        .await
+        .expect("the resend is looked up too");
+    flaky.lookup_gate.open();
+    let seq = b.outcome(&change.change_id).await.seq();
+    assert_eq!(seq, 3);
+    settled_once(&server, &doc, &mut b, &mut observer, &change, seq).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2195,7 +2314,7 @@ async fn a_takeover_while_the_changes_blobs_are_checked_is_answered_once() {
     let mut observer = Live::connect(&server, &doc, &world.admin).await;
     let desk = Hello::client("blob-desk");
     let mut a = Live::connect_with(&server, &doc, &world.admin, desk.clone()).await;
-    blobs.exists_delay(Duration::from_millis(1000));
+    blobs.exists_gate.shut();
     let change = a.make_change(
         0,
         vec![set(
@@ -2204,14 +2323,20 @@ async fn a_takeover_while_the_changes_blobs_are_checked_is_answered_once() {
         )],
     );
     a.send_change(&change).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, blobs.exists_gate.until_waiting(1))
+        .await
+        .expect("the blob is being looked up");
     let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
     assert_eq!(a.closed().await.0, 4409);
-    assert_eq!(
-        resent_once(&server, &doc, &mut b, &mut observer, &change).await,
-        1
-    );
-    blobs.exists_delay(Duration::ZERO);
+    // Resent while the old copy's blob is still being looked up: the resend's is looked up too.
+    b.send_change(&change).await;
+    tokio::time::timeout(WAIT, blobs.exists_gate.until_waiting(2))
+        .await
+        .expect("the resend's blob is looked up too");
+    blobs.exists_gate.open();
+    let seq = b.outcome(&change.change_id).await.seq();
+    assert_eq!(seq, 1);
+    settled_once(&server, &doc, &mut b, &mut observer, &change, seq).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2247,7 +2372,7 @@ async fn a_takeover_while_the_change_waits_to_be_judged_again_is_answered_once_p
         b.outcome(&second.change_id).await.code(),
         oswx_core::wire::RejectCode::ServerError
     );
-    assert!(no_answer_within(&mut b, &second.change_id, Duration::from_millis(300)).await);
+    assert!(no_answer_before_pong(&server, &doc, &mut b, &second.change_id).await);
     // ... and sent again, it is judged afresh and written once; so is the first.
     let s2 = resent_once(&server, &doc, &mut b, &mut observer, &second).await;
     let s1 = resent_once(&server, &doc, &mut b, &mut observer, &first).await;
@@ -2267,15 +2392,20 @@ async fn a_takeover_while_the_changes_seq_is_checked_is_answered_once() {
     // The room forgets X; sent again it reaches the journal, which says duplicate, and its seq
     // is looked up (slowly).
     server.room(&doc).forget_change_ids().await;
-    flaky.lookup_delay_once(Duration::from_millis(1000));
+    flaky.lookup_gate.shut();
     let mut again = x.clone();
     again.base = 1;
     a.send_change(&again).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, flaky.lookup_gate.until_waiting(1))
+        .await
+        .expect("its seq is being looked up");
     let mut b = Live::connect_with(&server, &doc, &world.admin, desk).await;
     assert_eq!(a.closed().await.0, 4409);
-    assert_eq!(b.resend(&again).await, Outcome::Accepted(1));
-    assert!(no_answer_within(&mut b, &x.change_id, Duration::from_millis(500)).await);
+    b.send_change(&again).await;
+    until_waiting_for_an_answer(&server, &doc, &b.client_id).await;
+    flaky.lookup_gate.open();
+    assert_eq!(b.outcome(&again.change_id).await, Outcome::Accepted(1));
+    assert!(no_answer_before_pong(&server, &doc, &mut b, &x.change_id).await);
     assert_eq!(rows_with(&server, &doc, &x.change_id).await, 1);
     assert_eq!(events_for(&mut observer, 1).await, 1);
 }
@@ -2328,17 +2458,15 @@ async fn a_successor_that_had_not_resent_gets_its_clients_change_as_an_event_in_
     assert_eq!(seen[1].0, 2);
     // Its resend is answered from memory with C's seq, once.
     assert_eq!(s.resend(&c).await, Outcome::Accepted(1));
-    assert!(no_answer_within(&mut s, &c.change_id, Duration::from_millis(500)).await);
+    assert!(no_answer_before_pong(&server, &doc, &mut s, &c.change_id).await);
     assert_eq!(rows_with(&server, &doc, &c.change_id).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_a_takeover_revoking_the_new_one_writes_nothing_and_the_old_one_changes_nothing() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(1000),
-        ..Hooks::default()
-    };
-    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let (desk_token, bob_id) = editor(&server, &world, "bob@example.com").await;
     let laptop_token = server.login("bob@example.com", PASSWORD).await;
@@ -2356,14 +2484,19 @@ async fn after_a_takeover_revoking_the_new_one_writes_nothing_and_the_old_one_ch
     assert_eq!(edit(&mut b, 3).await, 1);
     // A change in the works, a takeover, then the new connection loses its access: nothing more.
     let big = b.make_change(1, big_ops());
+    hooks.judge_gate.shut();
     b.send_change(&big).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("the big change is being judged");
     let mut c = Live::connect_with(&server, &doc, &laptop_token, desk).await;
     assert_eq!(b.closed().await.0, 4409);
     c.send_change(&big).await;
     server.state.hub.drop_account(&bob_id).await;
     assert_eq!(c.closed().await.0, 4401);
-    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert_eq!(hooks.judge_gate.waiting(), 1, "still being judged");
+    hooks.judge_gate.open();
+    settled(&server, &doc).await;
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 1);
 }
 
@@ -2436,6 +2569,14 @@ async fn a_takeover_while_a_revert_reads_its_change_is_answered_once() {
             .iter()
             .any(|m| matches!(m, ServerMsg::RevertResult { .. })),
         "{more:?}"
+    );
+    // The requester applies the result's operations itself: no event for that seq.
+    assert!(
+        !b.seen
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Change(ev) if ev.seq == 2)),
+        "{:?}",
+        b.seen
     );
     assert_eq!(content(&server, &doc, &world.admin).await["seq"], 2);
     assert_eq!(events_for(&mut observer, 2).await, 1);

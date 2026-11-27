@@ -174,8 +174,8 @@ pub const FROZEN_AFTER: Duration = Duration::from_secs(30);
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct Hooks {
-    /// How long judging a big change off the task waits first (to make races deterministic).
-    pub judge_delay: Duration,
+    /// Shut: judging a big change off the task waits here first (to make races deterministic).
+    pub judge_gate: Arc<Gate>,
     /// History the index keeps before a snapshot prunes it ([`INDEX_KEEP`]).
     pub index_keep: Seq,
     /// The most change ids a room remembers ([`MAX_REMEMBERED`]).
@@ -350,7 +350,7 @@ pub const UNDONE_KEEP: usize = 4096;
 impl Default for Hooks {
     fn default() -> Self {
         Self {
-            judge_delay: Duration::ZERO,
+            judge_gate: Arc::default(),
             index_keep: INDEX_KEEP,
             max_remembered: MAX_REMEMBERED,
             page_bytes: PAGE_BYTES,
@@ -450,6 +450,9 @@ pub struct RoomStatus {
     pub seq: Seq,
     /// Changes decided and waiting for the journal.
     pub tentative: usize,
+    /// Work off the room's task that holds its frames (big changes being judged, a change of the
+    /// server's own being checked): none means everything sent off has come back.
+    pub paused: u32,
     /// The seq of the last snapshot written (or loaded).
     pub snapshot_seq: Seq,
     /// The lease epoch the room writes under.
@@ -1426,6 +1429,7 @@ impl Room {
         RoomStatus {
             seq: self.durable.seq,
             tentative: self.pending.len(),
+            paused: self.paused,
             snapshot_seq: self.snapshot_seq,
             epoch: self.epoch,
             encodes: self.encodes.load(Ordering::Relaxed),

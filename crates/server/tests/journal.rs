@@ -531,15 +531,19 @@ async fn close_flushes_what_is_queued_and_later_appends_are_unknown() {
     let (server, _flaky, world) = setup().await;
     let a = new_doc(&server, &world, "A").await;
     let ea = lease(&server, &a).await;
-    let writer = JournalWriter::start(server.state.store.clone(), 256, Duration::from_secs(5));
+    // A batch that would wait an hour for more records.
+    let writer = JournalWriter::start(server.state.store.clone(), 256, Duration::from_secs(3600));
     let mut receipts = Vec::new();
     for seq in 1..=5 {
         receipts.push(writer.submit(simple(&a, seq, ea)).await);
     }
-    // The batch would wait 5 s for more; closing writes it at once.
-    tokio::time::timeout(Duration::from_secs(2), writer.close())
+    // Closing writes it at once: one batch, its wait cut short by the close (not run out).
+    // (The timeout only keeps a broken close from hanging the suite.)
+    tokio::time::timeout(Duration::from_secs(60), writer.close())
         .await
         .expect("close does not wait out the batch");
+    let stats = writer.stats();
+    assert_eq!((stats.batches, stats.timed_waits), (1, 0), "{stats:?}");
     for r in receipts {
         assert_eq!(r.outcome().await, Ok(()));
     }
@@ -1946,8 +1950,8 @@ async fn a_snapshot_stored_around_a_deletion_leaves_no_file() {
     let (head, _) = load_head(store(&server), server.state.blobs.as_ref(), &doc)
         .await
         .unwrap();
-    // The snapshot's file takes a second to store ...
-    blobs.put_delay(Duration::from_secs(1));
+    // The snapshot's file is held in storage ...
+    blobs.put_gate.shut();
     let snapshot = {
         let (store, storage, doc) = (
             server.state.store.clone(),
@@ -1958,7 +1962,9 @@ async fn a_snapshot_stored_around_a_deletion_leaves_no_file() {
             write_snapshot(store.as_ref(), storage.as_ref(), &doc, epoch, &head, 9.0).await
         })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(20), blobs.put_gate.until_waiting(1))
+        .await
+        .expect("the snapshot's file is being stored");
     // ... and meanwhile the project is deleted, and everything of it removed.
     let (status, _) = server
         .delete(
@@ -1978,6 +1984,7 @@ async fn a_snapshot_stored_around_a_deletion_leaves_no_file() {
         !snapshot.is_finished(),
         "the snapshot is still being stored"
     );
+    blobs.put_gate.open();
     let refused = snapshot.await.unwrap().unwrap_err();
     assert!(
         matches!(refused, WriteSnapshotError::NoDocument),

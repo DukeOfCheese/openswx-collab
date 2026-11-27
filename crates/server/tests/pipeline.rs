@@ -227,35 +227,60 @@ async fn a_resend_while_the_change_is_being_written_gets_its_seq_once() {
 
 #[tokio::test]
 async fn a_clients_answers_stay_in_order_when_big_changes_are_judged_off_the_task() {
-    let hooks = Hooks {
-        judge_delay: Duration::from_millis(800),
+    let hooks = Arc::new(Hooks {
         // (So that B's ids are not all in memory, and its changes are looked up first.)
         max_remembered: 1,
         ..Hooks::default()
-    };
+    });
+    let h = hooks.clone();
     let (server, flaky) =
-        TestServer::start_flaky_full(|_| {}, new_journal, |s| s.room_hooks = Arc::new(hooks)).await;
+        TestServer::start_flaky_full(|_| {}, new_journal, move |s| s.room_hooks = h).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut first =
         Live::connect_with(&server, &doc, &world.admin, Hello::client("order-b1")).await;
     many_changes(&mut first, 2, "first").await;
     first.close().await;
-    flaky.lookup_delay(Duration::from_millis(300));
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut b = Live::connect_with(&server, &doc, &world.admin, Hello::client("order-b1")).await;
     let lookups = flaky.change_lookups();
     let big = |who: &str| -> Vec<Op> { (0..300).map(|n| var(&format!("{who}{n}"), n)).collect() };
     // B's big change waits for the journal lookup ...
+    flaky.lookup_gate.shut();
+    hooks.judge_gate.shut();
     let b1 = b.make_change(0, big("b"));
     b.send_change(&b1).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(WAIT, flaky.lookup_gate.until_waiting(1))
+        .await
+        .expect("B1 is being looked up");
     // ... while A's big change is being judged off the task, and B sends one that builds on B1.
     let a1 = a.make_change(2, big("a"));
     a.send_change(&a1).await;
+    tokio::time::timeout(WAIT, hooks.judge_gate.until_waiting(1))
+        .await
+        .expect("A1 is being judged");
     let mut b2 = b.make_change(2, vec![var("b-after", 1)]);
     b2.depends = vec![b1.change_id.clone()];
     b.send_change(&b2).await;
+    // B1's lookup comes back while A1 is still being judged; then A1's judgement comes back.
+    let looked_up = || {
+        flaky
+            .lookup_log()
+            .iter()
+            .filter(|l| **l == "change id looked up")
+            .count()
+    };
+    let before = looked_up();
+    flaky.lookup_gate.open();
+    let deadline = std::time::Instant::now() + WAIT;
+    while looked_up() == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B1's lookup never returned"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    hooks.judge_gate.open();
     let first_answer: Answer = b.expect().await;
     assert_eq!(
         first_answer.change_id, &*b1.change_id,

@@ -912,6 +912,12 @@ pub struct FlakyStore {
     pub history_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every [`Store::deleted_orgs`] (the purger's list of organisations) parks here.
     pub list_orgs_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every [`Store::change_seq_by_client`] (a room's change-id lookup) parks here, once
+    /// counted.
+    pub lookup_gate: Arc<oswx_server::room::Gate>,
+    /// Shut: every [`Store::begin_journal`] (a journal batch, a lease) parks here before it opens
+    /// its transaction. (REST transactions do not pass it.)
+    pub journal_gate: Arc<oswx_server::room::Gate>,
     /// How many times `replace_assembly_refs` ran (in a transaction or savepoint).
     ref_writes: Arc<AtomicUsize>,
     fail_part_reads: AtomicBool,
@@ -954,6 +960,8 @@ impl FlakyStore {
             parts_gate: Arc::default(),
             history_gate: Arc::default(),
             list_orgs_gate: Arc::default(),
+            lookup_gate: Arc::default(),
+            journal_gate: Arc::default(),
             ref_writes: Arc::new(AtomicUsize::new(0)),
             fail_part_reads: AtomicBool::new(false),
             fail_deleted_projects: AtomicBool::new(false),
@@ -1190,6 +1198,7 @@ impl Store for FlakyStore {
     }
 
     async fn begin_journal(&self) -> anyhow::Result<Box<dyn Tx>> {
+        self.journal_gate.pass().await;
         self.before_begin();
         Ok(self.flaky(self.inner().begin_journal().await?))
     }
@@ -1410,6 +1419,7 @@ impl Store for FlakyStore {
                 .unwrap_or_else(PoisonError::into_inner)
         });
         pause(delay).await;
+        self.lookup_gate.pass().await;
         let found = self
             .inner()
             .change_seq_by_client(document_id, client_id, change_id)
@@ -2359,6 +2369,10 @@ pub struct TestBlobs {
     deletes: AtomicUsize,
     /// Shut: every removal of a prefix parks here, inside the storage call.
     pub delete_gate: oswx_server::room::Gate,
+    /// Shut: every `exists` parks here, once counted (it is then running).
+    pub exists_gate: oswx_server::room::Gate,
+    /// Shut: every `put` (snapshots) parks here, once counted.
+    pub put_gate: oswx_server::room::Gate,
     exists_calls: AtomicUsize,
     exists_now: AtomicUsize,
     exists_most: AtomicUsize,
@@ -2378,6 +2392,8 @@ impl TestBlobs {
             fail_delete_of: Mutex::new(None),
             deletes: AtomicUsize::new(0),
             delete_gate: oswx_server::room::Gate::default(),
+            exists_gate: oswx_server::room::Gate::default(),
+            put_gate: oswx_server::room::Gate::default(),
             exists_calls: AtomicUsize::new(0),
             exists_now: AtomicUsize::new(0),
             exists_most: AtomicUsize::new(0),
@@ -2435,6 +2451,11 @@ impl TestBlobs {
         self.exists_calls.load(Ordering::SeqCst)
     }
 
+    /// How many `exists` calls are running now.
+    pub fn exists_running(&self) -> usize {
+        self.exists_now.load(Ordering::SeqCst)
+    }
+
     /// The most `exists` calls that were running at once.
     pub fn exists_most(&self) -> usize {
         self.exists_most.load(Ordering::SeqCst)
@@ -2478,6 +2499,7 @@ impl Blobs for TestBlobs {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         pause(delay).await;
+        self.exists_gate.pass().await;
         self.exists_now.fetch_sub(1, Ordering::SeqCst);
         if self.fail_exists.load(Ordering::SeqCst) {
             anyhow::bail!("the test storage was told to fail exists");
@@ -2492,6 +2514,7 @@ impl Blobs for TestBlobs {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         pause(delay).await;
+        self.put_gate.pass().await;
         if self.fail_put.load(Ordering::SeqCst) {
             self.put_failures.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("the test storage was told to fail put");
