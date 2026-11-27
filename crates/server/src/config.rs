@@ -1075,9 +1075,10 @@ mod tests {
             (
                 s.max_connections_per_address,
                 s.max_large_bodies,
-                s.max_mail_sends
+                s.max_mail_sends,
+                s.max_exports
             ),
-            (512, 16, 16)
+            (512, 16, 16, 2)
         );
         let s = read(&[
             ("UPLOAD_MEMORY", "1048576"),
@@ -1086,6 +1087,7 @@ mod tests {
             ("MAX_CONNECTIONS_PER_ADDRESS", "0"),
             ("MAX_LARGE_BODIES", "3"),
             ("MAX_MAIL_SENDS", "2"),
+            ("MAX_EXPORTS", "5"),
         ]);
         assert_eq!(
             (s.upload_memory, s.upload_time_limit, s.upload_time_rate),
@@ -1095,9 +1097,10 @@ mod tests {
             (
                 s.max_connections_per_address,
                 s.max_large_bodies,
-                s.max_mail_sends
+                s.max_mail_sends,
+                s.max_exports
             ),
-            (0, 3, 2)
+            (0, 3, 2, 5)
         );
         for var in [
             "UPLOAD_MEMORY",
@@ -1105,6 +1108,7 @@ mod tests {
             "UPLOAD_TIME_RATE",
             "MAX_LARGE_BODIES",
             "MAX_MAIL_SENDS",
+            "MAX_EXPORTS",
         ] {
             for bad in ["0", "-1", "", "x"] {
                 assert_eq!(refused(&[(var, bad)]).var, format!("{PREFIX}{var}"));

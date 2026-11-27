@@ -459,6 +459,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_settings_say_how_many_exports_of_each_kind_run_at_once() {
+        let settings = crate::Settings {
+            max_exports: 3,
+            ..crate::Settings::default()
+        };
+        let exports = Arc::new(Exports::from_settings(&settings));
+        for kind in [ExportKind::Org, ExportKind::Account] {
+            let places: Vec<_> = ["a", "b", "c"]
+                .map(|who| exports.place(&format!("{who}-{kind:?}"), kind).unwrap())
+                .into();
+            assert_eq!(exports.running_of(kind), 3);
+            let refused = exports.place(&format!("d-{kind:?}"), kind).unwrap_err();
+            assert_eq!(refused.detail(), EXPORTS_BUSY);
+            drop(places);
+        }
+    }
+
+    #[test]
     fn a_place_is_one_per_account_and_so_many_of_each_kind_per_server() {
         use ExportKind::{Account, Org};
         let exports = Arc::new(Exports::new(2, EXPORT_STALL, EXPORT_LIMIT, 1));
