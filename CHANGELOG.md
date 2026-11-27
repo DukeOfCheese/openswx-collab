@@ -123,7 +123,9 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   sign-in limits.
 - Sign-in attempts are counted before the password is checked, so parallel requests cannot get past the
   limit (10 in 10 minutes per email address and client); one email address also has 100 attempts an hour
-  from anywhere. Sign-in, reset and OAuth limits count an IPv6 client by its /64.
+  from anywhere. A completed password reset lifts both limits on the address, from every client, so
+  that nobody can keep an owner who reads their mail from signing in. Sign-in, reset and OAuth limits
+  count an IPv6 client by its /64.
 - Document connections may take at most `MAX_CONNECTIONS` less an eighth (and less at least 256), so that
   they cannot leave REST without connections; one more is closed 4429 with the `error` code
   `server_full`.

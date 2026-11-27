@@ -313,7 +313,8 @@ either way and its link is in the answer, which openswx shows.
 **Invites are limited**, so that nobody can use the server to mail strangers: an organisation has at most
 50 invites emailed an hour and an account 200 a day (past either, the invite is made, not emailed, and the
 log says so without the address), and an organisation has at most 1,000 open invites (unused and unexpired;
-one more is 409). Password reset requests always answer 202.
+one more is 409). A password reset request answers 202 for any well-formed request, whether or not there
+is such an account and when the request was limited (501 when the server cannot send email).
 
 ## S3-compatible storage
 
@@ -365,14 +366,25 @@ For someone reading the server's logs or a user's report:
 - **500 `server error`**: something unexpected; the log has the cause (a database refusing a duplicate a
   route did not expect, a storage error). Report it.
 - **402**: an extension (seat limits, a paid plan) refused; the message says why.
-- **429**: sign-in attempts (10 in 10 minutes for one email address from one client address, cleared by
-  a success; and 100 in an hour for one email address from anywhere, so that guessing from many addresses
-  is slow too — which also means someone can keep an account's password sign-in refused for a while; its
-  owner can still use a provider sign-in or reset the password) and OAuth starts from one address (600 in
-  10 minutes), an IPv6 client counting as its /64 for all of them; an account's or organisation's
+- **429**: sign-in attempts (10 in 10 minutes for one email address from one client address, and 100 in
+  an hour for one email address from anywhere, both cleared by a success; see the next paragraph) and
+  OAuth starts from one address (600 in 10 minutes), an IPv6 client counting as its /64 for all of them; an account's or organisation's
   uploads at once; one export at a time per account, and `MAX_EXPORTS` organisation exports and as many
   account exports per server. Password reset requests over their limit (5 an hour) still
   answer 202, and nothing is sent.
+
+**A password sign-in refused by the limit on the address.** The limit of 100 attempts an hour for one email
+address makes guessing from many addresses slow, but it also lets someone keep an account (an admin's too)
+from signing in with its password, by guessing wrong from ten addresses. What still works:
+
+- **sessions already open** (openswx stays signed in): the limits apply only to signing in;
+- **a sign-in with Google or GitHub**, if the account has one linked: it is not counted against the address;
+- **a password reset by email**: once the link is used, both sign-in limits on that address are lifted, for
+  every client, and the owner signs in at once (whoever reads the mail controls the account anyway);
+- **waiting**: an attempt counts for an hour, so the refusals stop an hour after the guessing stops;
+- **`openswx-collab-server reset-password`** sets the password, but it runs as a separate process and does
+  not lift the limits of the running server: the counts are kept in memory, so they go only with a server
+  restart (which forgets every count, for every account) or by waiting.
 
 ## Leaving
 

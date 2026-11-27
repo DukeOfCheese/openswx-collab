@@ -1186,6 +1186,109 @@ async fn one_email_address_is_limited_whatever_the_client() {
     );
 }
 
+/// The status of a sign-in for `email` with `password`, from the client `forwarded` names.
+async fn sign_in_from(
+    server: &TestServer,
+    email: &str,
+    password: &str,
+    forwarded: &str,
+) -> StatusCode {
+    reqwest::Client::new()
+        .post(server.url("/api/auth/login"))
+        .header("x-forwarded-for", forwarded)
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completed_password_reset_lifts_the_sign_in_limits_on_the_address() {
+    let (server, mailer) = TestServer::start_mailing(|s| {
+        s.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+        s.open_registration = true;
+    })
+    .await;
+    // The server admin, of all people, locked out by ten clients guessing ten times each.
+    server.register("ada@example.com").await;
+    server.register("bob@example.com").await;
+    let client = |i: usize| format!("203.0.113.{}", i / 10 + 1);
+    let (wrong, limited) =
+        failed_sign_ins_at_once(&server, "ada@example.com", 100, |i| Some(client(i))).await;
+    assert_eq!((wrong, limited), (100, 0));
+    for _ in 0..10 {
+        failed_sign_in(&server, "bob@example.com", Some("203.0.113.1")).await;
+    }
+    for from in ["203.0.113.1", "198.51.100.7"] {
+        assert_eq!(
+            sign_in_from(&server, "ada@example.com", PASSWORD, from).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{from}"
+        );
+    }
+
+    // The owner reads the link sent to her mailbox and sets a password: she signs in at once,
+    // from a guessing client as from any other.
+    let (s, _) = server
+        .post(
+            "/api/auth/password-reset",
+            None,
+            json!({"email": "ada@example.com"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let text = mailer.sent().last().unwrap().text.clone();
+    let token = text
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("http://testserver/reset-password/"))
+        .expect("a reset link")
+        .to_owned();
+    let (s, body) = server
+        .post(
+            "/api/auth/password-reset/confirm",
+            None,
+            json!({"token": token, "password": "a brand new one"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    for from in ["203.0.113.1", "198.51.100.7"] {
+        assert_eq!(
+            sign_in_from(&server, "ada@example.com", "a brand new one", from).await,
+            StatusCode::OK,
+            "{from}"
+        );
+    }
+    // Somebody else's count, from one of those clients, stands.
+    assert_eq!(
+        sign_in_from(&server, "bob@example.com", PASSWORD, "203.0.113.1").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successful_sign_in_clears_the_count_on_the_address() {
+    let server = TestServer::start_with(|s| {
+        s.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+    })
+    .await;
+    server.register("ada@example.com").await;
+    // Ninety-nine guesses from ten clients: one short of the limit on the address.
+    let client = |i: usize| Some(format!("203.0.113.{}", i / 10 + 1));
+    let (wrong, limited) = failed_sign_ins_at_once(&server, "ada@example.com", 99, client).await;
+    assert_eq!((wrong, limited), (99, 0));
+    // The owner signs in (the hundredth attempt)...
+    assert_eq!(
+        sign_in_from(&server, "ada@example.com", PASSWORD, "198.51.100.7").await,
+        StatusCode::OK
+    );
+    // ...and the count starts again: the next guess is checked, not refused.
+    assert_eq!(
+        failed_sign_in(&server, "ada@example.com", Some("198.51.100.8")).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 // ------------------------------------------------------------------ /metrics
 
 async fn metrics(server: &TestServer, bearer: Option<&str>) -> (StatusCode, String, String) {

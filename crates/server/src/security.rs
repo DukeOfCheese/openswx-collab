@@ -306,6 +306,12 @@ impl RateLimit {
         self.map().remove(key);
     }
 
+    /// Forgets every key for which `forget` is true. O(keys) under the lock: for rare events (a
+    /// completed password reset), not for every request.
+    pub fn reset_where(&self, forget: impl Fn(&str) -> bool) {
+        self.map().retain(|key, _| !forget(key));
+    }
+
     /// Frees space for a new key: first the expired ones, then, if that was not enough, the least
     /// recently hit tenth of the table. That is O(n log n) under the lock, but it frees 10,000 slots, so it
     /// runs about once per 10,000 new keys.

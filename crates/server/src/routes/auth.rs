@@ -10,7 +10,8 @@
 //!
 //! Sign-in attempts are limited per email address and client address (10 in 10 minutes; a
 //! success clears the count) and per email address alone (100 in an hour, whatever the client:
-//! guessing from many addresses at once); reset requests per address and client and per address
+//! guessing from many addresses at once; a completed password reset clears both for the address,
+//! from every client); reset requests per address and client and per address
 //! alone (5 an hour). Every limit counts the attempt before the password is checked, in one step,
 //! so that parallel requests cannot all pass. An IPv6 client is counted by its /64 (what one
 //! subscriber is usually given), as the connection limits count it. The client address is the
@@ -140,6 +141,23 @@ pub(crate) async fn start_session(
     })
     .await?;
     Ok(token)
+}
+
+/// The key of the sign-in limit per email address and client. A client address never holds a
+/// `|` (it is an IP address in its canonical spelling, or `""`), so the email address is what
+/// comes before the last one (see [`Limits::forget_sign_in_failures`]).
+fn login_key(email: &str, ip: &str) -> String {
+    format!("{email}|{ip}")
+}
+
+impl Limits {
+    /// Forgets the sign-in counts of `email`: per email address alone, and per email address and
+    /// every client.
+    fn forget_sign_in_failures(&self, email: &str) {
+        self.login_email.reset(email);
+        self.login
+            .reset_where(|key| key.rsplit_once('|').is_some_and(|(e, _)| e == email));
+    }
 }
 
 /// The client's address as the limits count it (see the module documentation): [`client_ip`],
@@ -325,7 +343,7 @@ async fn login(
     max_len("email", &body.email, EMAIL_MAX)?;
     max_len("password", &body.password, CHECKED_PASSWORD_MAX)?;
     let email = clean_email(&body.email).unwrap_or_default();
-    let key = format!("{email}|{ip}");
+    let key = login_key(&email, &ip);
     let now = state.clock.now();
     // The attempt is counted before the (slow) check, in one step per limit: parallel requests
     // cannot all find the count below the limit and then all fail. A success clears the count.
@@ -609,9 +627,12 @@ struct ResetConfirmIn {
 }
 
 /// Sets the password a reset link was sent for. The address counts as confirmed (they read mail
-/// sent to it), and the account is signed out everywhere.
+/// sent to it), and the account is signed out everywhere. The sign-in limits on the address are
+/// lifted, from every client: whoever has the link controls the mailbox, so the attempts counted
+/// against it (perhaps by somebody else, to lock the owner out) no longer stand in their way.
 async fn confirm_reset(
     State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
     ApiJson(body): ApiJson<ResetConfirmIn>,
 ) -> Result<Json<Value>, ApiError> {
     max_len("token", &body.token, TOKEN_MAX)?;
@@ -650,12 +671,15 @@ async fn confirm_reset(
     tx.delete_user_sessions(&user.id).await?;
     tx.delete_user_password_resets(&user.id).await?;
     let (revoker, revoked) = (state.clone(), user.id.clone());
+    // (Stored as `clean_email` gives it, as sign-in keys it.)
+    let signed_in_as = clean_email(&user.email).unwrap_or_else(|_| user.email.clone());
     let ext = state.ext.clone();
     state
         .commit_then(
             tx,
             move |committed: Committed| async move {
                 let (code, reason) = committed.session_close();
+                limits.forget_sign_in_failures(&signed_in_as);
                 revoker.sessions.forget_user(&revoked);
                 revoker.hub.drop_account_with(&revoked, code, reason).await;
             },
