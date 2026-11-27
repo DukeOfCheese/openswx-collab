@@ -214,6 +214,8 @@ pub struct Hooks {
     /// The slowest link, bytes a second, a reader may be on and never be taken for frozen
     /// ([`conn::SLOWEST_READER`]).
     pub slowest_reader: usize,
+    /// How often a room relays presence and drafts at most ([`LIVE_TICK`]).
+    pub live_tick: Duration,
 }
 
 /// A gate tests shut to hold work at a point and open to let it go on.
@@ -368,6 +370,7 @@ impl Default for Hooks {
             catch_up_every: CATCH_UP_EVERY,
             frozen_after: FROZEN_AFTER,
             slowest_reader: conn::SLOWEST_READER,
+            live_tick: LIVE_TICK,
         }
     }
 }
@@ -1077,8 +1080,9 @@ struct Room {
     snapshot_failing: bool,
     /// Connections with presence or drafts not yet relayed, each once.
     live_news: Vec<ConnId>,
-    /// When presence and drafts were last relayed, and when they will be next.
-    live_sent: Instant,
+    /// When presence and drafts were last relayed (`None`: never, so the first goes at once), and
+    /// when they will be next.
+    live_sent: Option<Instant>,
     live_due: Option<Instant>,
     /// Connections behind on soft frames, to be sent the peers once they have written theirs.
     behind: std::collections::HashSet<ConnId>,
@@ -1183,9 +1187,7 @@ pub(crate) fn spawn(state: AppState, init: RoomInit) -> RoomHandle {
         snapshot_failing: false,
         live_news: Vec::new(),
         // The first presence is relayed at once.
-        live_sent: Instant::now()
-            .checked_sub(presence::LIVE_TICK)
-            .unwrap_or_else(Instant::now),
+        live_sent: None,
         live_due: None,
         behind: std::collections::HashSet::new(),
         owing: std::collections::HashSet::new(),

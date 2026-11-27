@@ -91,23 +91,35 @@ async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
 }
 
 /// A presence after a quiet spell is relayed at once, as it came: a `presence` frame of its own,
-/// not part of a tick's batch.
+/// not held for the next tick. The tick is an hour here, so a presence that waited for it would
+/// not arrive within [`WAIT`]; the one after it does wait.
 #[tokio::test]
 async fn the_first_presence_after_a_quiet_spell_is_relayed_at_once() {
-    let (server, world) = world().await;
+    let hooks = oswx_server::room::Hooks {
+        live_tick: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let server =
+        TestServer::start_custom(|_| {}, |s| s.room_hooks = std::sync::Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     let mut watcher = Live::connect(&server, &doc, &world.admin).await;
     a.drain().await;
     watcher.drain().await;
-    for n in 0..7 {
-        // (Quiet: longer than a tick since the last one.)
-        tokio::time::sleep(oswx_server::room::LIVE_TICK * 3).await;
-        a.presence(json!({"n": n})).await;
-        let r: Relayed = watcher.expect().await;
-        assert_eq!(r.data, Some(plain(json!({"n": n}))));
-        assert_eq!(watcher.batches, 0, "relayed at once, as it came");
-    }
+    a.presence(json!({"n": 0})).await;
+    // (`expect` gives up after `WAIT`.)
+    let r: Relayed = watcher.expect().await;
+    assert_eq!(r.data, Some(plain(json!({"n": 0}))));
+    assert_eq!(watcher.batches, 0, "relayed as it came");
+    // The next, within the tick, waits for it.
+    a.presence(json!({"n": 1})).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen = watcher.drain().await;
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Presence { .. })),
+        "{seen:?}"
+    );
 }
 
 async fn upload(server: &TestServer, world: &World, body: &[u8]) -> String {
@@ -173,7 +185,7 @@ async fn a_slow_snapshot_write_does_not_hold_up_changes() {
     let doc = world.document(&server, None, None, None).await;
     let mut a = Live::connect(&server, &doc, &world.admin).await;
     blobs.put_gate.shut();
-    for n in 0..8 {
+    for n in 0..2 {
         assert_eq!(
             a.change(vec![set_depth(n)], vec![], vec![]).await.seq(),
             n + 1
@@ -181,7 +193,15 @@ async fn a_slow_snapshot_write_does_not_hold_up_changes() {
     }
     tokio::time::timeout(WAIT, blobs.put_gate.until_waiting(1))
         .await
-        .expect("the snapshot is being stored");
+        .expect("the snapshot at 2 is being stored");
+    // Changes go on landing while it is held.
+    for n in 2..8 {
+        assert_eq!(
+            a.change(vec![set_depth(n)], vec![], vec![]).await.seq(),
+            n + 1
+        );
+    }
+    assert!(blobs.put_gate.waiting() >= 1, "the snapshot is still held");
     let status = server.room_status(&doc).await;
     assert_eq!(
         status.snapshot_seq, 0,

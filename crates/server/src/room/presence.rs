@@ -276,28 +276,30 @@ impl Room {
         }
     }
 
-    /// Relays the presence and drafts that came since the last relay, if that was [`LIVE_TICK`]
-    /// ago (otherwise sets when the next is due), catches up connections that were behind on soft
-    /// frames and have written theirs, and sends drafts to those that caught up. Called after every
-    /// event the room handles.
+    /// Relays the presence and drafts that came since the last relay, if that was a tick
+    /// ([`super::Hooks::live_tick`], [`LIVE_TICK`]) ago or there was none (otherwise sets when the
+    /// next is due), catches up connections that were behind on soft frames and have written
+    /// theirs, and sends drafts to those that caught up. Called after every event the room handles.
     pub(super) fn relay_live_when_due(&mut self) {
         if self.live_news.is_empty() && self.behind.is_empty() && self.owing.is_empty() {
             self.live_due = None;
             return;
         }
+        let tick = self.state.room_hooks.live_tick;
         let now = Instant::now();
-        let due = self.live_sent + LIVE_TICK;
-        if now < due {
+        if let Some(due) = self.live_sent.map(|sent| sent + tick)
+            && now < due
+        {
             self.live_due = Some(due);
             return;
         }
-        self.live_sent = now;
+        self.live_sent = Some(now);
         self.relay_live();
         self.catch_up_behind(now);
         self.send_owed();
         // Those still behind, or still owed presence or drafts, are looked at again a tick later.
         let again = !self.behind.is_empty() || !self.owing.is_empty();
-        self.live_due = again.then_some(now + LIVE_TICK);
+        self.live_due = again.then_some(now + tick);
     }
 
     /// Every connection's latest presence and draft since the last relay, to everyone else: one

@@ -1338,7 +1338,9 @@ async fn a_revoked_undo_waiting_for_its_target_is_never_written() {
     assert_eq!(b.closed().await.0, 4403);
     assert_eq!(flaky.history_gate.waiting(), 1, "still being read");
     flaky.history_gate.open();
+    let deadline = Instant::now() + WAIT;
     while flaky.history_gate.waiting() > 0 {
+        assert!(Instant::now() < deadline, "the read never let go");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(alive(&mut a).await);
