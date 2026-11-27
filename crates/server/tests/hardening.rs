@@ -911,6 +911,227 @@ async fn a_reader_frozen_behind_is_closed_and_leaves() {
     assert_eq!(stuck.closed().await.0, 4408);
 }
 
+/// A TCP stream that reads at most `rate` bytes a second (in bursts of at most 16 KiB), on a
+/// socket with a small receive buffer: a client on a slow link.
+struct Throttled {
+    tcp: tokio::net::TcpStream,
+    rate: f64,
+    tokens: f64,
+    at: tokio::time::Instant,
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Throttled {
+    const BURST: f64 = 16.0 * 1024.0;
+
+    async fn connect(server: &TestServer, rate: f64) -> Self {
+        let addr: std::net::SocketAddr = server.base.trim_start_matches("http://").parse().unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(8 * 1024).unwrap();
+        let tcp = socket.connect(addr).await.unwrap();
+        Self {
+            tcp,
+            rate,
+            tokens: 0.0,
+            at: tokio::time::Instant::now(),
+            sleep: None,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Throttled {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        use std::task::Poll;
+        loop {
+            if let Some(sleep) = self.sleep.as_mut() {
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.sleep = None;
+            }
+            let now = tokio::time::Instant::now();
+            let refill = now.duration_since(self.at).as_secs_f64() * self.rate;
+            self.tokens = (self.tokens + refill).min(Self::BURST);
+            self.at = now;
+            if self.tokens < 1024.0 {
+                let wait = (1024.0 - self.tokens) / self.rate;
+                self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs_f64(wait))));
+                continue;
+            }
+            let mut chunk = vec![0u8; (self.tokens as usize).min(buf.remaining())];
+            let mut read = tokio::io::ReadBuf::new(&mut chunk);
+            let this = &mut *self;
+            match std::pin::Pin::new(&mut this.tcp).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) => {
+                    this.tokens -= read.filled().len() as f64;
+                    buf.put_slice(read.filled());
+                    return Poll::Ready(Ok(()));
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Throttled {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.tcp).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_shutdown(cx)
+    }
+}
+
+/// What a slow reader got, and when: a message, or how the socket closed.
+type Got = (Instant, Result<ServerMsg, (u16, String)>);
+
+/// A client reading at `rate` bytes a second, joined with the welcome read: its client id, and
+/// everything it reads after the welcome as it reads it.
+async fn slow_reader(
+    server: &TestServer,
+    doc: &str,
+    token: &str,
+    rate: f64,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<Got>) {
+    use futures_util::StreamExt;
+    let stream = Throttled::connect(server, rate).await;
+    let (mut ws, _) = tokio_tungstenite::client_async(ws_url(server, doc), stream)
+        .await
+        .expect("the WebSocket opens");
+    let hello = Hello::client("slow-link");
+    ws.send(Message::Binary(
+        hello_frame(token, &hello, "slow-link").into(),
+    ))
+    .await
+    .unwrap();
+    let decode = |frame: &[u8]| oswx_core::wire::decode_server(frame).expect("a valid frame");
+    let welcome = loop {
+        match tokio::time::timeout(WAIT, ws.next())
+            .await
+            .expect("a welcome")
+        {
+            Some(Ok(Message::Binary(frame))) => break decode(&frame),
+            Some(Ok(_)) => continue,
+            other => panic!("no welcome: {other:?}"),
+        }
+    };
+    let ServerMsg::Welcome { you, .. } = welcome else {
+        panic!("expected a welcome, got {welcome:?}");
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let got = match ws.next().await {
+                Some(Ok(Message::Binary(frame))) => Ok(decode(&frame)),
+                Some(Ok(Message::Close(frame))) => Err(frame.map_or((1005, String::new()), |f| {
+                    (u16::from(f.code), f.reason.to_string())
+                })),
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => Err((1006, String::new())),
+            };
+            let end = got.is_err();
+            if tx.send((Instant::now(), got)).is_err() || end {
+                return;
+            }
+        }
+    });
+    (you.client_id.to_string(), rx)
+}
+
+/// A healthy reader on a slow link that is being written a big frame (here a change of 2 MiB at
+/// 512 KiB/s, four times what it reads in `frozen_after`) while presence and drafts flood is
+/// behind on those, but never frozen: the socket takes the frame as fast as the link goes. It
+/// gets the change and then the peers, and is never closed.
+#[tokio::test]
+async fn a_slow_reader_taking_a_big_frame_while_presence_floods_is_not_frozen() {
+    let after = Duration::from_secs(1);
+    let hooks = oswx_server::room::Hooks {
+        frozen_after: after,
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut writer = Live::connect(&server, &doc, &world.admin).await;
+    let mut flooders = [
+        Live::connect(&server, &doc, &world.admin).await,
+        Live::connect(&server, &doc, &world.admin).await,
+    ];
+    let (slow_id, mut got) = slow_reader(&server, &doc, &world.admin, 512.0 * 1024.0).await;
+    let big = "z".repeat(2 << 20);
+    let sent = Instant::now();
+    let seq = writer
+        .change(
+            vec![set(&["features", "f2", "params", "note"], json!(big))],
+            vec![],
+            vec![],
+        )
+        .await
+        .seq();
+    // Drafts flood while the change is being written to it: it falls behind on them.
+    let pad = "x".repeat(120_000);
+    let mut n = 0;
+    let mut behind_late = false;
+    while sent.elapsed() < 3 * after {
+        n += 1;
+        for f in flooders.iter_mut() {
+            f.draft(Some(json!({"n": n, "pad": pad}))).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for f in flooders.iter_mut().chain([&mut writer]) {
+            f.drain().await;
+        }
+        let c = conn_status(&server, &doc, &slow_id)
+            .await
+            .expect("the slow reader is still there");
+        behind_late |= c.behind && sent.elapsed() > 2 * after;
+    }
+    assert!(behind_late, "it never fell behind long enough to tell");
+    // It reads the change, then the peers; never a close.
+    let mut change_at = None;
+    loop {
+        let (at, msg) = tokio::time::timeout(WAIT, got.recv())
+            .await
+            .expect("the slow reader reads on")
+            .expect("its socket is open");
+        match msg {
+            Ok(ServerMsg::Change(ev)) => {
+                assert_eq!(ev.seq, seq);
+                change_at = Some(at);
+            }
+            Ok(ServerMsg::PeerList { .. }) if change_at.is_some() => break,
+            Ok(_) => {}
+            Err(close) => panic!("the slow reader was closed: {close:?}"),
+        }
+    }
+    let took = change_at.unwrap() - sent;
+    assert!(
+        took > 2 * after,
+        "the change was read in {took:?}: too fast to tell"
+    );
+    assert!(conn_status(&server, &doc, &slow_id).await.is_some());
+}
+
 // ------------------------------------------------------------------ storage and database trouble
 
 /// A change sent while the journal cannot commit: nobody is told it was accepted, every client is

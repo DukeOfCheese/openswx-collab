@@ -24,10 +24,14 @@
 //! of being closed. Soft frames are then dropped until it has written everything it had (what must
 //! arrive included) and the room has sent it the peers as they are now (`peer.list`,
 //! [`Outbox::catch_up`], at most once a [`super::CATCH_UP_EVERY`]), which counts for no limit. One
-//! that stays behind for [`super::FROZEN_AFTER`] without the socket taking a frame is closed with
-//! [`close::TOO_SLOW`]: its client stopped reading. Otherwise a connection is only closed for what
-//! must arrive (answers, changes, locks); frames are written in the order they were queued,
-//! whatever their kind.
+//! that has been behind for [`super::FROZEN_AFTER`] is closed with [`close::TOO_SLOW`] once the
+//! socket has not finished what it was handed for that long, and that long has also passed since
+//! a link of [`SLOWEST_READER`] bytes a second would have read every frame that must arrive (and
+//! every catch-up) it was handed, flushed or not (the socket's own buffers may take a big frame at
+//! once, and then nothing while the client reads it): its client stopped reading. A reader on a
+//! slow link taking a big welcome or change is not frozen. Otherwise a connection is only closed
+//! for what must arrive (answers, changes, locks); frames are written in the order they were
+//! queued, whatever their kind.
 //!
 //! The reader decodes frames (on the blocking pool when they are large) and hands messages to the
 //! room; malformed ones are answered in their turn through the room. Every frame read counts as
@@ -65,6 +69,9 @@ pub const MAX_SOFT: usize = 64;
 pub const MAX_SOFT_BYTES: usize = 1024 * 1024;
 /// The most frames the writer hands the socket with one flush.
 const MAX_PER_WRITE: usize = 64;
+/// The slowest link (bytes a second) a reader may be on and never be taken for frozen: the frames
+/// that must arrive are given this long to be read, over and above [`super::Hooks::frozen_after`].
+pub const SLOWEST_READER: usize = 16 * 1024;
 /// How long closing may wait for the last frames and the close frame to be written.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// After the server closed a connection, how long the reader keeps reading (and dropping) what the
@@ -173,6 +180,10 @@ struct State {
     handed: (usize, usize, bool),
     /// Since when the writer has been writing what it handed (it has not flushed since).
     writing_since: Option<Instant>,
+    /// When a reader on a link of [`SLOWEST_READER`] would have read every frame that must arrive
+    /// (and every catch-up) handed to the socket so far, flushed or not: the socket's own buffers
+    /// may take a big frame at once, and then nothing more while the client reads it.
+    read_by: Option<Instant>,
     /// Soft frames were dropped: none is queued until the room has sent what replaces them.
     behind: bool,
     /// Since when it has been behind.
@@ -219,6 +230,7 @@ impl Outbox {
                 list: None,
                 handed: (0, 0, false),
                 writing_since: None,
+                read_by: None,
                 behind: false,
                 behind_since: None,
                 caught_up_at: None,
@@ -352,12 +364,19 @@ impl Outbox {
         true
     }
 
-    /// Whether the connection has been behind for `after` while the writer has written nothing:
-    /// a client that stopped reading (a soft frame, or any, stuck on its socket).
+    /// Whether the connection has been behind for `after` while the writer has not finished what
+    /// it handed the socket in `after`, and `after` has also passed since a link of
+    /// [`SLOWEST_READER`] would have read every frame that must arrive (and every catch-up) it was
+    /// handed: a client that stopped reading (a frame stuck on its socket), not one on a slow
+    /// link taking a big frame (a welcome, a change).
     pub fn is_frozen(&self, now: Instant, after: Duration) -> bool {
         let s = self.lock();
         let long_ago = |at: Option<Instant>| at.is_some_and(|at| now >= at + after);
-        s.life == Life::Open && s.behind && long_ago(s.behind_since) && long_ago(s.writing_since)
+        s.life == Life::Open
+            && s.behind
+            && long_ago(s.behind_since)
+            && long_ago(s.writing_since)
+            && s.read_by.is_none_or(|at| now >= at + after)
     }
 
     /// Puts `first` (the welcome) ahead of everything queued and lets the writer start.
@@ -461,7 +480,12 @@ impl Outbox {
             Kind::Soft => s.handed.1 += 1,
             Kind::List => s.handed.2 = true,
         }
-        s.writing_since.get_or_insert_with(Instant::now);
+        let now = Instant::now();
+        if kind != Kind::Soft {
+            let reading = Duration::from_secs_f64(frame.len() as f64 / SLOWEST_READER as f64);
+            s.read_by = Some(s.read_by.map_or(now, |at| at.max(now)) + reading);
+        }
+        s.writing_since.get_or_insert(now);
         Some(frame)
     }
 
@@ -1027,7 +1051,8 @@ mod tests {
         for _ in 0..=MAX_SOFT {
             outbox.push_soft(frame(2));
         }
-        let since = Instant::now();
+        // (The welcome's one byte is read in no time even at the slowest link.)
+        let since = Instant::now().max(outbox.lock().read_by.unwrap());
         assert!(outbox.is_behind());
         assert!(!outbox.is_frozen(since + after / 2, after));
         assert!(outbox.is_frozen(since + after, after));
@@ -1040,6 +1065,55 @@ mod tests {
         assert!(outbox.is_frozen(again + after, after));
         outbox.close_now(close::TOO_SLOW, "too slow");
         assert!(!outbox.is_frozen(again + after, after), "closed");
+    }
+
+    /// A reader on a slow link taking a big frame that must arrive is given the time the slowest
+    /// link takes to read it, over and above `after`, even once the socket's buffers have taken
+    /// it (flushed); soft frames give none.
+    #[test]
+    fn a_big_frame_being_written_gives_the_reader_time_by_its_size() {
+        let after = Duration::from_secs(1);
+        let outbox = Outbox::new(usize::MAX);
+        // A welcome four seconds long at the slowest link, and a change behind it.
+        outbox.release(frame(4 * SLOWEST_READER));
+        outbox.push(frame(SLOWEST_READER / 2));
+        assert_eq!(start_writing(&outbox), Some(4 * SLOWEST_READER));
+        assert_eq!(start_writing(&outbox), Some(SLOWEST_READER / 2));
+        // A soft frame handed with them adds nothing.
+        outbox.push_soft(frame(8 * SLOWEST_READER));
+        assert_eq!(start_writing(&outbox), Some(8 * SLOWEST_READER));
+        for _ in 0..=MAX_SOFT {
+            outbox.push_soft(frame(2));
+        }
+        assert!(outbox.is_behind());
+        let since = outbox.lock().writing_since.unwrap();
+        let behind = outbox.lock().behind_since.unwrap();
+        let read_by = outbox.lock().read_by.unwrap();
+        assert!(read_by >= since + Duration::from_millis(4500));
+        assert!(!outbox.is_frozen(behind + after, after));
+        let just_before = read_by + after - Duration::from_millis(1);
+        assert!(!outbox.is_frozen(just_before, after));
+        assert!(outbox.is_frozen(behind.max(read_by + after), after));
+        // The socket's buffers took them all at once, and now take nothing more: the slowest
+        // link is still reading them.
+        outbox.written();
+        assert_eq!(start_writing(&outbox), Some(2));
+        let again = outbox.lock().writing_since.unwrap();
+        assert!(!outbox.is_frozen(again + after, after));
+        assert!(!outbox.is_frozen(just_before, after));
+        assert!(outbox.is_frozen(again.max(read_by) + after, after));
+        // Soft frames alone: `after` is all it gets.
+        let outbox = Outbox::new(usize::MAX);
+        outbox.release(frame(1));
+        outbox.drain_for_tests();
+        outbox.push_soft(frame(8 * SLOWEST_READER));
+        assert_eq!(start_writing(&outbox), Some(8 * SLOWEST_READER));
+        for _ in 0..=MAX_SOFT {
+            outbox.push_soft(frame(2));
+        }
+        let at = outbox.lock().writing_since.unwrap();
+        let behind = outbox.lock().behind_since.unwrap();
+        assert!(outbox.is_frozen(at.max(behind) + after, after));
     }
 
     #[test]

@@ -25,8 +25,9 @@
 //! drafts follow: each peer's current draft as a `draft` frame (made once per draft and shared by
 //! every reader owed it), queued a few at a time while the reader has room to spare
 //! ([`super::conn::Outbox::push_soft_with_room`]), so that they never make it fall behind again. A
-//! reader that stays behind for [`super::Hooks::frozen_after`] while its socket takes nothing is
-//! closed as too slow (and leaves the others' peer lists).
+//! reader that stays behind for [`super::Hooks::frozen_after`] while its socket takes nothing (and
+//! that long after the slowest link would have read what must arrive:
+//! [`super::conn::Outbox::is_frozen`]) is closed as too slow (and leaves the others' peer lists).
 //!
 //! The room also publishes who has the document open ([`super::RoomHandle::online`]): one entry per
 //! person, in the order they joined, at most [`MAX_ONLINE`], and how many people in all. It is
