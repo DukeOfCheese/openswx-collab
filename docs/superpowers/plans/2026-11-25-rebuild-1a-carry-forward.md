@@ -52,10 +52,26 @@ server plan (1b), the import/docs plan (1c) and the client project. Nothing here
   each client at most once per kind; apply each entry as the message it stands for). A client never
   gets its own back.
 - `peer.joined`, `peer.left`, `presence`, `draft` and `presence.batch` may be dropped for a client
-  that does not read fast enough (it is not closed for them); it is then sent
-  `peer.list {peers: [peer]}`: every other peer as it is now, presence and draft included, which
-  replaces what it knew of the others. Changes, answers and lock messages are never dropped; a client
-  too slow for those is still closed with 4408.
+  that does not read fast enough (it is not closed for them). Once it has read everything the
+  server had for it, it is sent `peer.list {peers: [peer]}` (at most once a second), which
+  replaces what it knew of the others:
+  - it names **every** peer as it is now, **the recipient included** (one list is shared by every
+    client caught up at once): skip the entry whose `client_id` is your own;
+  - it carries each peer's presence but **no drafts** (`draft` is absent): forget the drafts you
+    had; each peer's current draft follows, as a `draft` message, after the list.
+  At most 65,536 peers, each `client_id` once; a `presence.batch` client id is at most 129
+  characters (user id, a dot, the hello's client id).
+- Changes, answers and lock messages are never dropped; a client too slow for those is closed with
+  4408. So is one that stays behind on the soft messages for 30 s while it reads nothing at all.
+- Until a `peer.list` arrives, a client that fell behind may get `lock.changed` / `lock.result`
+  frames naming a `client_id` it was never told about (a `peer.joined` it missed) or one that has
+  left (a `peer.left` it missed): show the lock anyway, with the name the lock carries, and do not
+  expect the peer to be in your list.
+- Presence and drafts can arrive up to a tick (50 ms) after a later message of the same peer that
+  is never delayed: a draft cleared just after its change was committed may come after that
+  change, and so may a draft the peer sent just before it. When a peer's change arrives
+  (`change`), clear that peer's draft yourself; a draft that still comes within the tick is applied
+  as it says, and the peer's own clear follows it.
 
 `CHANGELOG.md` needs the same list when v2 ships. The import tool must give legacy documents with an
 empty-string key or id a valid name (no client operation can address `""`).
