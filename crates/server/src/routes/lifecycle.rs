@@ -38,9 +38,10 @@
 //! is read ahead of the client: when it reads slowly the export waits, and when it reads nothing
 //! for [`EXPORT_STALL`](crate::export::EXPORT_STALL), or the export has run for
 //! [`EXPORT_LIMIT`](crate::export::EXPORT_LIMIT), it is given up. No database transaction or
-//! connection is held between reads. At most
-//! [`EXPORTS_AT_ONCE`](crate::export::EXPORTS_AT_ONCE) exports run on a server, and one per
-//! account; one more is answered 429. Both answer `Cache-Control: no-store`, and only to `GET`
+//! connection is held between reads. A client that reads more slowly than the minimum rate of
+//! uploads on average loses its export too. At most `max_exports` organisation exports run on a
+//! server, `max_exports` account exports apart from them, and one per account; one more is
+//! answered 429. Both answer `Cache-Control: no-store`, and only to `GET`
 //! (`HEAD` is 405: it would start an export to throw it away). The machinery is in
 //! [`crate::export`].
 //!
@@ -69,7 +70,7 @@ use crate::access::{CurrentUser, NO_SUCH_ORG, recheck_org, require_org};
 use crate::blobs::{blob_key, is_sha256};
 use crate::content::{blob_refs, json_from_plain, ops_blob_refs};
 use crate::error::{ApiError, ApiJson, ApiPath, detail_response};
-use crate::export::{Archive, Pipe, close_entry, download};
+use crate::export::{Archive, ExportKind, Pipe, close_entry, download};
 use crate::ext::{Event, check_org_delete, emit, notify_member_removed};
 use crate::routes::auth::{CHECKED_PASSWORD_MAX, confirm, max_len};
 use crate::routes::history::{history_entry_of, rows_within, stored_ops};
@@ -210,7 +211,7 @@ async fn export_account(
     current: CurrentUser,
 ) -> Result<Response, ApiError> {
     let me = load_user(&state, &current).await?;
-    let place = state.exports.place(&me.id)?;
+    let place = state.exports.place(&me.id, ExportKind::Account)?;
     let (writer, id) = (state.clone(), me.id.clone());
     let body = download(&state.exports, place, "account", id, move |pipe| {
         write_account_export(writer, me, pipe)
@@ -423,7 +424,7 @@ async fn export_org(
         .org_by_id(&org_id)
         .await?
         .ok_or(ApiError::NotFound(NO_SUCH_ORG))?;
-    let place = state.exports.place(&user.id)?;
+    let place = state.exports.place(&user.id, ExportKind::Org)?;
     let disposition = HeaderValue::from_str(&content_disposition(&org.name))?;
     let (writer, id, by) = (state.clone(), org.id.clone(), user.id);
     let body = download(&state.exports, place, "organisation", id, move |pipe| {

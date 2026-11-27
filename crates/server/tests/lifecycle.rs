@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::*;
 use futures_util::stream::{self, StreamExt};
-use oswx_server::blobs::{Blobs, ByteStream, PutOutcome, blob_key};
+use oswx_server::blobs::{Blobs, ByteStream, Pace, PutOutcome, blob_key};
 use oswx_server::clock::Clock;
 use oswx_server::export::Exports;
 use oswx_server::ext::{Event, Extensions};
@@ -1345,22 +1345,35 @@ async fn only_so_many_exports_run_at_once() {
             None,
         )
         .await;
-    let (bob, _) = world.editor(&server, "bob@example.com").await;
+    let (bob, bob_id) = world.editor(&server, "bob@example.com").await;
     blobs.hold();
     let first = export(&server, &world.org, Some(&world.admin)).await;
     assert_eq!(first.status(), 200);
     assert!(eventually(|| blobs.reads_started() == 1).await);
-    // One is running: the next, someone else's, is refused and holds nothing.
+    // An account's export of itself has places of its own: it runs.
     assert_eq!(
-        server.get("/api/me/export", Some(&bob)).await,
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({"detail": "too many exports are running; try again in a moment"})
-        )
+        server.get("/api/me/export", Some(&bob)).await.0,
+        StatusCode::OK
     );
-    assert_eq!(server.state.exports.running(), 1);
     // Someone who may not export is told so, not that the server is busy.
     assert_eq!(export(&server, &world.org, Some(&bob)).await.status(), 403);
+    // One organisation export is running: the next, someone else's, is refused and holds
+    // nothing.
+    let (status, _) = server
+        .patch(
+            &format!("/api/orgs/{}/members/{bob_id}", world.org),
+            Some(&world.admin),
+            json!({"role": "owner"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let refused = export(&server, &world.org, Some(&bob)).await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap(),
+        json!({"detail": "too many exports are running; try again in a moment"})
+    );
+    assert_eq!(server.state.exports.running(), 1);
 
     blobs.release();
     let bytes = first.bytes().await.expect("the first export finishes");
@@ -1455,6 +1468,49 @@ async fn a_client_that_stops_reading_an_export_loses_it() {
     let text = logs.text();
     assert!(text.contains("stopped reading"), "{text}");
     logs.assert_never_logged(&["Robotics", "ada@example.com", "Ada"]);
+}
+
+#[tokio::test]
+async fn a_client_that_reads_an_export_more_slowly_than_the_floor_loses_it() {
+    const LEN: u64 = 32 << 20;
+    // A minute's patience for a client that reads nothing, but 1 MiB a second on average, with
+    // half a second of grace.
+    let exports = Exports::new(1, MINUTE, HOUR, 500).with_pace(Pace {
+        floor: 1 << 20,
+        grace: Duration::from_millis(500),
+    });
+    let (server, blobs) = with_export_blobs(exports).await;
+    let world = World::new(&server).await.unwrap();
+    let sha = blobs.make_up(&world.org, LEN);
+    world
+        .document(&server, Some(part_with_blob(&sha, LEN)), None, None)
+        .await;
+    let logs = LogCapture::start();
+    let mut slow = export(&server, &world.org, Some(&world.admin)).await;
+    assert_eq!(slow.status(), 200);
+    // It takes a few bytes now and then: the export is given up long before the minute, and its
+    // place is free for another.
+    let started = std::time::Instant::now();
+    let mut got = 0u64;
+    let ended = loop {
+        if server.state.exports.running() == 0 {
+            break true;
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            break false;
+        }
+        if let Ok(Ok(Some(chunk))) =
+            tokio::time::timeout(Duration::from_secs(5), slow.chunk()).await
+        {
+            got += chunk.len() as u64;
+        }
+        pause(Duration::from_millis(200)).await;
+    };
+    assert!(ended, "the slow export was not given up ({got} bytes read)");
+    assert!(blobs.pulled() < LEN, "the blob was not read to its end");
+    let text = logs.text();
+    assert!(text.contains("more slowly than the minimum rate"), "{text}");
+    export_zip(&server, &world.org, &world.admin).await;
 }
 
 #[tokio::test]

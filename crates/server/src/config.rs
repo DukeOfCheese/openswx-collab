@@ -224,6 +224,9 @@ pub struct Settings {
     /// The most emails being sent at once; one more is not sent (an invite says `emailed:
     /// false`).
     pub max_mail_sends: usize,
+    /// The most organisation exports running at once, and apart from them the most account
+    /// exports; one more of either is answered 429 (an account runs one export at a time).
+    pub max_exports: usize,
     /// Seconds a request may take from its head, or from the last of its body, to the beginning
     /// of its answer; a longer one is answered 503. A body that is arriving at `min_upload_rate`
     /// or faster does not count against it. Blob uploads are not under it (they have
@@ -316,6 +319,7 @@ impl Default for Settings {
             max_connections_per_address: 512,
             max_large_bodies: 16,
             max_mail_sends: 16,
+            max_exports: crate::export::EXPORTS_AT_ONCE,
             request_timeout: 60.0,
             write_timeout: 60.0,
             shutdown_timeout: 8.0,
@@ -443,6 +447,7 @@ impl Settings {
         )?;
         e.positive_whole("MAX_LARGE_BODIES", &mut s.max_large_bodies)?;
         e.positive_whole("MAX_MAIL_SENDS", &mut s.max_mail_sends)?;
+        e.positive_whole("MAX_EXPORTS", &mut s.max_exports)?;
         e.positive_seconds("REQUEST_TIMEOUT", &mut s.request_timeout)?;
         e.positive_seconds("WRITE_TIMEOUT", &mut s.write_timeout)?;
         e.positive_seconds("SHUTDOWN_TIMEOUT", &mut s.shutdown_timeout)?;
@@ -714,6 +719,7 @@ impl fmt::Debug for Settings {
             )
             .field("max_large_bodies", &self.max_large_bodies)
             .field("max_mail_sends", &self.max_mail_sends)
+            .field("max_exports", &self.max_exports)
             .field("request_timeout", &self.request_timeout)
             .field("write_timeout", &self.write_timeout)
             .field("shutdown_timeout", &self.shutdown_timeout)

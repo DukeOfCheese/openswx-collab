@@ -3,10 +3,13 @@
 //! [`crate::routes::lifecycle`].
 //!
 //! An export is written by a task of its own into a small pipe (`download`). The task holds a
-//! place (`Place`): one of [`EXPORTS_AT_ONCE`] on the server, and the only one of its account.
-//! It is given up when its client reads nothing for [`EXPORT_STALL`] or when it has run for
-//! [`EXPORT_LIMIT`] (a client that reads a little now and then holds its place no longer than
-//! that), and stopped when its response goes away.
+//! place (`Place`): one of `max_exports` ([`EXPORTS_AT_ONCE`] by default) of its kind on the
+//! server (organisation exports and account exports have a pool each, so that accounts exporting
+//! themselves cannot keep an owner from exporting the organisation), and the only one of its
+//! account. It is given up when its client reads nothing for [`EXPORT_STALL`], when its client
+//! reads more slowly than the minimum rate on average ([`Pace`], the floor and grace of uploads:
+//! `min_upload_rate`, `upload_rate_grace`), or when it has run for [`EXPORT_LIMIT`]; and stopped
+//! when its response goes away.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -27,10 +30,12 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::{Compat, FuturesAsyncWriteCompatExt};
 use tokio_util::io::ReaderStream;
 
+use crate::blobs::Pace;
 use crate::error::ApiError;
 use crate::store::Id;
 
-/// How many exports run at once on a server unless [`Exports`] says otherwise.
+/// How many exports of each kind run at once on a server unless [`Exports`] says otherwise
+/// (`OSWX_COLLAB_MAX_EXPORTS`).
 pub const EXPORTS_AT_ONCE: usize = 2;
 /// How long an export waits for its client to read before it gives up.
 pub const EXPORT_STALL: Duration = Duration::from_secs(60);
@@ -44,37 +49,85 @@ const PIPE_BYTES: usize = 64 << 10;
 const EXPORTS_BUSY: &str = "too many exports are running; try again in a moment";
 const EXPORT_RUNNING: &str = "you have an export running already; try again when it has finished";
 
+/// What is being exported: each kind has its own pool of places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    /// An organisation (`GET /api/orgs/{org}/export`).
+    Org,
+    /// An account (`GET /api/me/export`).
+    Account,
+}
+
 /// The limits of the exports ([`crate::AppState::exports`]).
 #[derive(Debug)]
 pub struct Exports {
-    permits: Arc<Semaphore>,
+    orgs: Arc<Semaphore>,
+    account_exports: Arc<Semaphore>,
     at_once: usize,
     /// The accounts that have an export running.
     accounts: Mutex<HashSet<Id>>,
     stall: Duration,
     limit: Duration,
+    pace: Pace,
     page_rows: i64,
 }
 
 impl Exports {
-    /// At most `at_once` exports at a time on the server and one per account, each given up when
-    /// its client reads nothing for `stall` or when it has run for `limit`, reading at most
-    /// `page_rows` rows from the database at a time.
+    /// At most `at_once` exports of each kind at a time on the server and one per account, each
+    /// given up when its client reads nothing for `stall` or when it has run for `limit`, reading
+    /// at most `page_rows` rows from the database at a time. No minimum rate
+    /// ([`Exports::with_pace`]).
     pub fn new(at_once: usize, stall: Duration, limit: Duration, page_rows: i64) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(at_once)),
+            orgs: Arc::new(Semaphore::new(at_once)),
+            account_exports: Arc::new(Semaphore::new(at_once)),
             at_once,
             accounts: Mutex::default(),
             stall,
             limit,
+            pace: Pace {
+                floor: 0,
+                grace: stall,
+            },
             page_rows: page_rows.max(1),
         }
     }
 
-    /// How many exports are running.
+    /// As the settings say: `max_exports` of each kind, the minimum rate of uploads
+    /// ([`Pace::from_settings`]), and the default stall and time limits.
+    pub fn from_settings(settings: &crate::Settings) -> Self {
+        Self::new(
+            settings.max_exports,
+            EXPORT_STALL,
+            EXPORT_LIMIT,
+            EXPORT_PAGE_ROWS,
+        )
+        .with_pace(Pace::from_settings(settings))
+    }
+
+    /// Gives up an export whose client reads more slowly than `pace` on average: only the time
+    /// the export waits for its client to take what it wrote counts (see [`Pace`]).
+    pub fn with_pace(mut self, pace: Pace) -> Self {
+        self.pace = pace;
+        self
+    }
+
+    fn pool(&self, kind: ExportKind) -> &Arc<Semaphore> {
+        match kind {
+            ExportKind::Org => &self.orgs,
+            ExportKind::Account => &self.account_exports,
+        }
+    }
+
+    /// How many exports are running, of both kinds.
     pub fn running(&self) -> usize {
+        self.running_of(ExportKind::Org) + self.running_of(ExportKind::Account)
+    }
+
+    /// How many exports of `kind` are running.
+    pub fn running_of(&self, kind: ExportKind) -> usize {
         self.at_once
-            .saturating_sub(self.permits.available_permits())
+            .saturating_sub(self.pool(kind).available_permits())
     }
 
     /// How many rows an export reads from the database at a time.
@@ -82,15 +135,20 @@ impl Exports {
         self.page_rows
     }
 
-    /// A place among the running exports for an export by `account`; 429 when that account has
-    /// one running, or the server has as many as it runs at once.
-    pub(crate) fn place(self: &Arc<Self>, account: &Id) -> Result<Place, ApiError> {
+    /// A place among the running exports of `kind` for an export by `account`; 429 when that
+    /// account has one running (of either kind), or the server has as many of `kind` as it runs
+    /// at once.
+    pub(crate) fn place(
+        self: &Arc<Self>,
+        account: &Id,
+        kind: ExportKind,
+    ) -> Result<Place, ApiError> {
         let mut accounts = self.accounts.lock().unwrap_or_else(PoisonError::into_inner);
         if accounts.contains(account) {
             return Err(ApiError::Busy(EXPORT_RUNNING));
         }
         let permit = self
-            .permits
+            .pool(kind)
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::Busy(EXPORTS_BUSY))?;
@@ -209,13 +267,58 @@ pub(crate) type Pipe = BufWriter<Patient<DuplexStream>>;
 #[error("the client stopped reading")]
 struct Stalled;
 
-/// A writer that gives up ([`Stalled`], as an `io::Error` of kind `TimedOut`) when one write has
-/// waited `patience` for room: whoever reads the other end has stopped.
+/// The client read more slowly than the minimum rate.
+#[derive(Debug, thiserror::Error)]
+#[error("the client read too slowly")]
+struct ReadTooSlowly;
+
+/// A writer that gives up when whoever reads the other end has stopped, or reads too slowly
+/// (each as an `io::Error` of kind `TimedOut`): [`Stalled`] when one write has waited `patience`
+/// for room; [`ReadTooSlowly`] when the writes have waited for room longer than `pace` allows
+/// (the allowance starts at its grace; waiting uses it up, every byte taken earns `1 / floor`
+/// seconds back).
 pub(crate) struct Patient<W> {
     inner: W,
     patience: Duration,
-    /// Running while a write waits for room.
-    waiting: Option<Pin<Box<tokio::time::Sleep>>>,
+    pace: Pace,
+    /// What is left of the allowance ([`Pace::after`]).
+    allowance: Duration,
+    /// Running while a write waits for room: since when, until when it may wait, and whether that
+    /// limit is the allowance's.
+    waiting: Option<Waiting>,
+}
+
+struct Waiting {
+    since: tokio::time::Instant,
+    until: Pin<Box<tokio::time::Sleep>>,
+    by_pace: bool,
+}
+
+impl<W> Patient<W> {
+    pub(crate) fn new(inner: W, patience: Duration, pace: Pace) -> Self {
+        Self {
+            inner,
+            patience,
+            pace,
+            allowance: pace.grace,
+            waiting: None,
+        }
+    }
+
+    /// A write begins to wait: for `patience`, or less when the allowance is shorter.
+    fn start_waiting(&self) -> Waiting {
+        let by_pace = self.pace.floor > 0 && self.allowance < self.patience;
+        let limit = if by_pace {
+            self.allowance
+        } else {
+            self.patience
+        };
+        Waiting {
+            since: tokio::time::Instant::now(),
+            until: Box::pin(tokio::time::sleep(limit)),
+            by_pace,
+        }
+    }
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for Patient<W> {
@@ -227,18 +330,30 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Patient<W> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(done) => {
-                this.waiting = None;
+                let waited = this
+                    .waiting
+                    .take()
+                    .map_or(Duration::ZERO, |w| w.since.elapsed());
+                if let Ok(n) = &done {
+                    this.allowance = this.pace.after(this.allowance, waited, *n);
+                }
                 Poll::Ready(done)
             }
             Poll::Pending => {
-                let patience = this.patience;
-                let waiting = this
-                    .waiting
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(patience)));
-                match waiting.as_mut().poll(cx) {
+                if this.waiting.is_none() {
+                    this.waiting = Some(this.start_waiting());
+                }
+                let waiting = this.waiting.as_mut().expect("just set");
+                match waiting.until.as_mut().poll(cx) {
                     Poll::Ready(()) => {
+                        let by_pace = waiting.by_pace;
                         this.waiting = None;
-                        Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, Stalled)))
+                        let e = if by_pace {
+                            io::Error::new(io::ErrorKind::TimedOut, ReadTooSlowly)
+                        } else {
+                            io::Error::new(io::ErrorKind::TimedOut, Stalled)
+                        };
+                        Poll::Ready(Err(e))
                     }
                     Poll::Pending => Poll::Pending,
                 }
@@ -282,11 +397,7 @@ where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let (into, from) = tokio::io::duplex(PIPE_BYTES);
-    let patient = Patient {
-        inner: into,
-        patience: exports.stall,
-        waiting: None,
-    };
+    let patient = Patient::new(into, exports.stall, exports.pace);
     let pipe = BufWriter::with_capacity(PIPE_BYTES, patient);
     let limit = exports.limit;
     let task = tokio::spawn(async move {
@@ -328,9 +439,14 @@ where
 /// warning, anything else an error. Only the id is named, never a name or an address.
 fn log_failure(what: &str, id: &str, e: &anyhow::Error) {
     let io = e.chain().find_map(|c| c.downcast_ref::<io::Error>());
-    let stalled = io.is_some_and(|e| e.get_ref().is_some_and(|inner| inner.is::<Stalled>()));
-    if stalled {
+    let inner = io.and_then(|e| e.get_ref());
+    if inner.is_some_and(|inner| inner.is::<Stalled>()) {
         tracing::warn!("the export of {what} {id} was given up: its client stopped reading");
+    } else if inner.is_some_and(|inner| inner.is::<ReadTooSlowly>()) {
+        tracing::warn!(
+            "the export of {what} {id} was given up: its client read more slowly than the \
+             minimum rate"
+        );
     } else if io.is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) {
         tracing::debug!("the export of {what} {id} ended early: its client went away");
     } else {
@@ -343,21 +459,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_place_is_one_per_account_and_so_many_per_server() {
+    fn a_place_is_one_per_account_and_so_many_of_each_kind_per_server() {
+        use ExportKind::{Account, Org};
         let exports = Arc::new(Exports::new(2, EXPORT_STALL, EXPORT_LIMIT, 1));
-        let (a, b, c) = ("a".to_owned(), "b".to_owned(), "c".to_owned());
-        let first = exports.place(&a).unwrap();
-        assert_eq!(exports.place(&a).unwrap_err().detail(), EXPORT_RUNNING);
+        let [a, b, c, d, e] = ["a", "b", "c", "d", "e"].map(str::to_owned);
+        let first = exports.place(&a, Org).unwrap();
+        assert_eq!(exports.place(&a, Org).unwrap_err().detail(), EXPORT_RUNNING);
+        assert_eq!(
+            exports.place(&a, Account).unwrap_err().detail(),
+            EXPORT_RUNNING
+        );
         assert_eq!(exports.running(), 1, "a refusal takes no place");
-        let second = exports.place(&b).unwrap();
-        assert_eq!(exports.place(&c).unwrap_err().detail(), EXPORTS_BUSY);
+        let second = exports.place(&b, Org).unwrap();
+        assert_eq!(exports.place(&c, Org).unwrap_err().detail(), EXPORTS_BUSY);
+        // Accounts exporting themselves have places of their own, and cannot take the others'.
+        let mine = exports.place(&c, Account).unwrap();
+        let yours = exports.place(&d, Account).unwrap();
+        assert_eq!(
+            exports.place(&e, Account).unwrap_err().detail(),
+            EXPORTS_BUSY
+        );
+        assert_eq!(
+            (exports.running_of(Org), exports.running_of(Account)),
+            (2, 2)
+        );
+        drop((mine, yours));
+        assert_eq!(exports.running_of(Org), 2);
         // (A refusal for the server's sake does not mark the account as exporting.)
         drop(first);
-        let third = exports.place(&c).unwrap();
+        let third = exports.place(&e, Org).unwrap();
         assert_eq!(exports.running(), 2);
         drop((second, third));
         assert_eq!(exports.running(), 0);
-        exports.place(&a).unwrap();
+        exports.place(&a, Org).unwrap();
     }
 
     #[test]
@@ -381,15 +515,21 @@ mod tests {
         }
     }
 
+    /// No minimum rate.
+    fn no_floor() -> Pace {
+        Pace {
+            floor: 0,
+            grace: Duration::from_secs(30),
+        }
+    }
+
     #[tokio::test]
     async fn a_writer_nobody_reads_from_gives_up_and_one_that_is_read_does_not() {
         use tokio::io::AsyncReadExt;
         let (into, mut from) = tokio::io::duplex(16);
-        let mut patient = Patient {
-            inner: into,
-            patience: Duration::from_millis(50),
-            waiting: None,
-        };
+        // A patience fifty times the reader's pause: far above the timer's granularity (about
+        // 16 ms on Windows).
+        let mut patient = Patient::new(into, Duration::from_secs(1), no_floor());
         // Slow, but read: each write waits less than the patience.
         let reader = tokio::spawn(async move {
             let mut got = Vec::new();
@@ -410,5 +550,45 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(e.get_ref().unwrap().is::<Stalled>());
         drop(from);
+    }
+
+    /// Reads `from` 1 KiB at a time, pausing `pause` before each read, to its end.
+    async fn read_every(mut from: DuplexStream, pause: Duration) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        loop {
+            tokio::time::sleep(pause).await;
+            if from.read(&mut buf).await.unwrap_or(0) == 0 {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_read_more_slowly_than_the_floor_gives_up_and_one_read_fast_enough_does_not() {
+        // 16 KiB a second, with a second of grace; the patience far longer.
+        let pace = Pace {
+            floor: 16 << 10,
+            grace: Duration::from_secs(1),
+        };
+        // 1 KiB every 10 ms (about 100 KiB a second): kept, however long it takes.
+        let (into, from) = tokio::io::duplex(1024);
+        let mut fast = Patient::new(into, Duration::from_secs(60), pace);
+        let reader = tokio::spawn(read_every(from, Duration::from_millis(10)));
+        fast.write_all(&vec![1u8; 160 << 10]).await.unwrap();
+        drop(fast);
+        reader.await.unwrap();
+        // 1 KiB every 250 ms (4 KiB a second): given up once the grace is used up, long before
+        // the patience runs out.
+        let (into, from) = tokio::io::duplex(1024);
+        let mut slow = Patient::new(into, Duration::from_secs(60), pace);
+        let reader = tokio::spawn(read_every(from, Duration::from_millis(250)));
+        let started = tokio::time::Instant::now();
+        let e = slow.write_all(&vec![2u8; 64 << 10]).await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.get_ref().unwrap().is::<ReadTooSlowly>(), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        drop(slow);
+        reader.await.unwrap();
     }
 }

@@ -102,6 +102,8 @@ Settings (environment variables; the default is in brackets):
                                    address counts as its /64); one more takes the place of the
                                    address's own idle one; 0: no limit [512]
     OSWX_COLLAB_MAX_LARGE_BODIES   request bodies over 1 MiB read at once; one more: 503 [16]
+    OSWX_COLLAB_MAX_EXPORTS        organisation exports at once, and account exports at once
+                                   apart from them; one more: 429 [2]
     OSWX_COLLAB_WRITE_TIMEOUT      seconds a client may take nothing of an answer [60]
     OSWX_COLLAB_SHUTDOWN_TIMEOUT   seconds an orderly stop may take [8]
     OSWX_COLLAB_METRICS_TOKEN      the bearer token GET /metrics asks for; empty: no /metrics []

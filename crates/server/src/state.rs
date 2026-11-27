@@ -179,6 +179,7 @@ impl AppState {
             settings.max_blob_uploads_per_org,
             settings.max_blob_uploads_per_user,
         );
+        let exports = Arc::new(Exports::from_settings(&settings));
         Self {
             uploads: Arc::new(uploads),
             http: Arc::default(),
@@ -196,7 +197,7 @@ impl AppState {
             oauth: Arc::new(NoProviders),
             room_hooks: Arc::default(),
             after_commits: Arc::default(),
-            exports: Arc::default(),
+            exports,
             purger: Purger::default(),
             org_queue: OrgQueue::default(),
         }
