@@ -494,5 +494,9 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        // Nothing half-open is kept: the connections are opened afresh when first needed.
+        for pool in [&a, &b, &c] {
+            assert_eq!(pool.size(), 0);
+        }
     }
 }
