@@ -23,13 +23,14 @@
 //! A request's lock timeout is at most 20 s ([`MAX_LOCK_TIMEOUT`]), well below the statement
 //! timeout, and the journal's at most 7.5 s ([`MAX_JOURNAL_LOCK_TIMEOUT`], a quarter of the time
 //! a journal batch may take), so that a lock wait ends as a lock wait (409, or the journal's
-//! fallback) and not as a statement that ran out of time (503) or a batch given up as a whole. [`PgStore::connect`] refuses longer ones, and
-//! sets both on the connection it makes first, so that a database that will not take them says
-//! so when the server starts.
+//! fallback) and not as a statement that ran out of time (503) or a batch given up as a whole.
+//! [`PgStore::connect`] refuses longer ones, and sets both on the connection it makes first, so
+//! that a database that will not take them says so when the server starts.
 //!
 //! With the defaults the server holds at most **12** connections (5 + 5 + 2): one of each pool
-//! opened when the store is (and kept), the others as they are needed. A caller waits up to 30 s for a free one ([`super::is_busy`]: 503). Every connection is
-//! opened with:
+//! opened when the store is (and kept; the store waits up to 5 s for them, then starts without
+//! them), the others as they are needed. A caller waits up to 30 s for a free one
+//! ([`super::is_busy`]: 503). Every connection is opened with:
 //!
 //! - `default_transaction_isolation = read committed`, whatever the database or role is set to:
 //!   the server's transactions are written for it (see "Isolation and locks" in [`crate::store`]);
@@ -106,6 +107,22 @@ const STATEMENT_TIMEOUT_MS: u32 = 30_000;
 const IDLE_IN_TRANSACTION_MS: u32 = 60_000;
 /// Connections each pool keeps open while idle (see [`PgStore::warm`]).
 const WARM_CONNECTIONS: u32 = 1;
+/// How long opening the store waits for those connections.
+const WARM_WAIT: Duration = Duration::from_secs(5);
+
+/// Opens a connection of each of `pools` (kept by the pool), waiting at most `wait`; answers
+/// whether every attempt ended in time (opened or failed).
+async fn warm_within(pools: [&PgPool; 3], wait: Duration) -> bool {
+    let open = |pool: &PgPool| {
+        let pool = pool.clone();
+        async move { drop(pool.acquire().await) }
+    };
+    let [a, b, c] = pools;
+    let all = async {
+        tokio::join!(open(a), open(b), open(c));
+    };
+    tokio::time::timeout(wait, all).await.is_ok()
+}
 /// Prepared statements kept per connection: every fixed statement of [`super::sql`] fits.
 const STATEMENT_CACHE: usize = 256;
 
@@ -288,22 +305,22 @@ impl PgStore {
         Ok(store)
     }
 
-    /// Opens one connection of each pool now. Opening one takes tens of milliseconds (on
-    /// Windows about 35 ms: a new server process, and the password exchange), which would
-    /// otherwise land on the first request, or the first document opened (whose room lease is
-    /// taken on the journal's connections). The pools keep [`WARM_CONNECTIONS`] open from then on:
-    /// sqlx opens new ones when it closes idle ones, but not at the start. A pool that cannot open
-    /// one now opens it when it is first needed, as it would have.
+    /// Opens one connection of each pool now, waiting at most [`WARM_WAIT`]. Opening one takes
+    /// tens of milliseconds (on Windows about 35 ms: a new server process, and the password
+    /// exchange), which would otherwise land on the first request, or the first document opened
+    /// (whose room lease is taken on the journal's connections). The pools keep
+    /// [`WARM_CONNECTIONS`] open from then on: sqlx opens new ones when it closes idle ones, but
+    /// not at the start. A pool that cannot open one now (or not in time: the server starts
+    /// anyway, with a warning) opens it when it is first needed, as it would have.
     async fn warm(&self) {
-        let open = |pool: &PgPool| {
-            let pool = pool.clone();
-            async move { drop(pool.acquire().await) }
-        };
-        tokio::join!(
-            open(&self.transactions),
-            open(&self.reads),
-            open(&self.journal)
-        );
+        let pools = [&self.transactions, &self.reads, &self.journal];
+        if !warm_within(pools, WARM_WAIT).await {
+            tracing::warn!(
+                "the database's first connections took more than {} s to open: the server \
+                 starts without them, and opens them when they are first needed",
+                WARM_WAIT.as_secs()
+            );
+        }
     }
 
     /// A connection of its own for migrations, without the statement timeout (building an index
@@ -441,3 +458,41 @@ impl PgTx<'_> {
 }
 
 super::shared::store_impl!(PgStore, PgTx, PgConnection, postgres);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database that takes the connection and never answers does not hold up the start: the
+    /// first connections are given up after the wait.
+    #[tokio::test]
+    async fn warming_gives_up_on_a_database_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let options = PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(port)
+            .username("nobody")
+            .database("nothing");
+        let pool = || {
+            PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(ACQUIRE_TIMEOUT)
+                .connect_lazy_with(options.clone())
+        };
+        let (a, b, c) = (pool(), pool(), pool());
+        let started = std::time::Instant::now();
+        assert!(!warm_within([&a, &b, &c], Duration::from_millis(200)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+}
