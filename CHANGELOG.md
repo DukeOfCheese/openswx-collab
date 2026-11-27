@@ -6,6 +6,125 @@ protocol or the database; the change is listed here).
 
 ## Unreleased
 
+### 0.2.0 (not yet released): the Rust server and protocol version 2
+
+The server is rewritten in Rust (`crates/`): one program, `openswx-collab-server`, on SQLite and files in a
+folder for a self-hosted install, or on PostgreSQL and an S3-compatible bucket. A change now costs work in
+proportion to the change, not to the document, and the server keeps up where the Python server fell
+behind. **Protocol version 2 is a clean break**: version 1 clients (openswx 0.4) are refused with close
+code 4426 and keep using the Python server (0.1.x, still in this repository) until openswx's client moves
+to version 2. A Python server's database is not opened by the Rust server; an import tool comes later.
+`docs/protocol.md` is rewritten as the contract; `docs/self-hosting.md` describes the new settings.
+
+#### Protocol 2
+- WebSocket frames are binary MessagePack maps with a `t` field. REST stays JSON. Wire test vectors are
+  in `crates/core/vectors/`.
+- Documents are edited at any depth: a **keyed list** (any list of maps with distinct ids: `features`,
+  `components`, `mates` and lists inside parameters alike) travels as `{"$list": [[pos, item], ...]}` and
+  is addressed by id. Five operations, `set`, `unset`, `insert`, `remove` and `move`, with positions
+  instead of whole-list reordering. Two edits conflict only when one writes what the other wrote, above or
+  under it, or removes what the other `reads`; edits to different parameters of one feature both go in.
+- Ids are made by the client, `<user id>.<client id>.<counter>`, so features can be created offline;
+  `ids.reserve` is gone. Feature names are checked at the end of a change (`name_taken`).
+- `change` carries `reads` and `depends`. Rejection codes: `stale`, `locked`, `dependency`, `name_taken`,
+  `id_taken`, `invalid`, `missing_blob`, `read_only`, `too_old`, `server_error` (not stored: send it
+  again). A resend of a stored change id is answered with its seq, however old; an `accepted` for a change
+  already settled is a no-op and never moves the client's seq backwards. A client receives its own change
+  as an event in a catch-up, or when it became durable before it was resent after a reconnect or takeover.
+- Undo is an ordinary change with `undo_of`, judged with the inverse the server stored; revert of anyone's
+  change from history is `change.revert`.
+- Locks on any path (`lock.acquire`, `lock.result`, `lock.release`, `lock.changed`), with quotas and a
+  rate per connection; a lock on a list and locks on its items do not exclude each other. Lock frames may
+  name peers a client fell behind on.
+- Presence and drafts are relayed at most every 50 ms per document, each peer's latest, several at once
+  in `presence.batch`. For a client that does not read fast enough, peer, presence and draft frames are
+  dropped instead of closing it, and it is then sent `peer.list` (every peer as now, the recipient
+  included, no drafts, presence up to 1 MiB; the rest follows). A reader that stops reading altogether is
+  closed (4408). A draft may arrive up to a tick after the change that ends it.
+- New close codes: 4410 (the document was reloaded or moved: reconnect and resend) and 4429 (too many
+  document connections for the account). A connection may have at most 2,000 unanswered changes (4408).
+  A client frame may hold at most 1,000,000 values; only a `change` may be longer than 512 KiB.
+- Assemblies: `GET .../references` reports the versions at a pinned seq (`pinned.versions`, to be
+  preferred over a component's own `ref.version` label).
+
+#### Added
+- Folders in projects (`/api/projects/{id}/folders`, `/api/folders/{id}`; documents get `folder_id`).
+- `GET /api/ready` (database, storage and journal), `GET /metrics` (Prometheus, behind
+  `OSWX_COLLAB_METRICS_TOKEN`), JSON logs (`OSWX_COLLAB_LOG=json`), `OSWX_COLLAB_LOG_LEVEL`.
+- `GET /api/me/providers`, `POST /api/me/providers/{name}/unlink`, `POST /api/auth/oauth/link/finish`.
+- Settings (all `OSWX_COLLAB_*`; `--help` lists every setting with its default): `DATABASE_POOL`,
+  `DATABASE_JOURNAL_POOL`, `DATABASE_LOCK_TIMEOUT`, `DATABASE_JOURNAL_LOCK_TIMEOUT`, `S3_PATH_STYLE`,
+  `BLOB_IDLE_TIMEOUT`, `UPLOAD_MEMORY`, `MAX_BLOB_UPLOADS_PER_ORG`, `MAX_BLOB_UPLOADS_PER_USER`,
+  `MIN_UPLOAD_RATE`, `UPLOAD_RATE_GRACE`, `UPLOAD_TIME_LIMIT`, `UPLOAD_TIME_RATE`, `TRUSTED_PROXIES`,
+  `REQUEST_TIMEOUT`, `WRITE_TIMEOUT`, `SHUTDOWN_TIMEOUT`, `MAX_CONNECTIONS` (at most 65,536),
+  `MAX_CONNECTIONS_PER_ADDRESS`, `MAX_LARGE_BODIES`, `MAX_MAIL_SENDS`, `METRICS_TOKEN`, `LOG`,
+  `LOG_LEVEL`, `PASSWORD`.
+- `deploy/Dockerfile.rust` and `deploy/docker-compose.rust.yml` (SQLite), with
+  `docker-compose.rust-postgres.yml` (PostgreSQL) and the existing `docker-compose.s3.yml` (Garage) on top;
+  `tools/check_deploy_rust.py` checks them, and with `--docker` builds and runs each.
+- Extensions (`crates/server/src/ext.rs`) replace `hooks.py`: a paid edition is a crate that depends on the
+  server library and calls `oswx_serverd::run`; its migrations are `(id, sql)` pairs for each database. An
+  extension's refusal answers 402; one that does not answer within 5 s, 409.
+- The load generator (`crates/loadgen`) speaks both protocols; results in `bench/results/README.md`.
+
+#### Changed
+- Every change is written by one journal writer, in batches, before it is acknowledged; a document judges
+  its next change while the previous one is being written. A document is held by one node under a lease
+  fenced by epoch, ready for several machines later. If the outcome of a write is unknown, the document
+  reloads and its clients reconnect (4410) and resend; nothing acknowledged is lost.
+- Snapshots are written in the background, from durable versions only; loading a document reads one
+  snapshot and the journal after it.
+- Blobs are hashed and stored as their raw bytes (zstd-compressed in storage), streamed both ways.
+- Requests that change an organisation's data run one at a time per organisation, queued in the server
+  (at most 64 waiting, 10 s each; then 503 "the server is busy; try again"). On PostgreSQL a request that
+  loses to another, or waits 5 s for its lock, answers 409 "try again"; one that finds no connection, 503.
+- Deleting a project or an organisation is two steps: it is gone for everyone at once, and its rows and
+  files are removed in the background, a chunk at a time, resuming after a restart.
+- Email is sent after the commit; `emailed: false` in an invite's answer may also mean "still on its way".
+- Sessions and roles are dropped on the event that ends them (sign-out, password change, role change,
+  deletion) as well as by a 30 s check; a session that expires while connected closes and releases its
+  locks at once.
+- Settings are checked at start: a value that cannot be read stops the program with a message that names
+  the variable; booleans must be one of the known spellings. `db-status` exits 1 when there is no database
+  (it creates none) or one written by a newer version. `serve` migrates before it listens. SIGHUP stops
+  the server like SIGTERM.
+
+#### Removed
+- `OSWX_COLLAB_MAX_BLOB_UPLOADS`: replaced by `UPLOAD_MEMORY`; the server refuses to start while it is set.
+- `ids.reserve` and server-issued feature ids and names; `next_id` and `counters` are no longer
+  server-owned.
+
+#### Security
+- Every REST body and WebSocket field has a type and a size limit; requests have time limits from head to
+  answer, bodies a minimum rate, uploads a memory budget and a duration limit; connections are limited in
+  all and per address (a full server replaces idle and never-finished connections, and keeps a reserve
+  for `/api/health`).
+- `X-Forwarded-For` is believed only from `OSWX_COLLAB_TRUSTED_PROXIES` and is read from the right; the
+  Rust Compose file trusts its own fixed subnet, so a TLS proxy on the host gives each client its own
+  limits.
+- The cost of stored password hashes is bounded and hashing runs off the server's main threads; logs never
+  hold a token, password, invite, login code or document content, and a panic is logged without its
+  message.
+
+#### Performance
+Measured with `loadgen` on one laptop (Windows 11, i7-11800H), with the scenarios of the Python baseline
+(`bench/results/README.md`; service time p50 / p99 in ms, median runs):
+
+| Scenario | Python 0.1.2 (SQLite) | Rust, first runs (SQLite · PostgreSQL) | Rust after the follow-up (SQLite · PostgreSQL) |
+|---|---|---|---|
+| 10 editors in one document | 5.1 / 9.7 | 18.6 / 21.6 · 17.2 / 18.8 | 1.7 / 3.4 · 1.8 / 3.4 |
+| 100 editors in one document | 532 / 590 | 19.2 / 34.6 · 17.7 / 20.0 | 2.3 / 9.7 · 2.2 / 4.6 |
+| 200 editors in one document | 1,851 / 3,152 (104 of 400 edits/s) | 16.7 / 39.6 · 15.7 / 23.2 | 3.7 / 18.0 · 4.2 / 10.5 (all 400/s) |
+| 200 documents x 3 editors | 1,637 / 4,497 (337 of 600 edits/s) | 19.1 / 48.8 · 18.7 / 21.9 | 3.1 / 23.8 · 2.8 / 7.1 (all 600/s) |
+| 2,000 idle peers in one document | failed (all dropped) | 1 of 3 runs dropped peers; about 690 CPU-s, 700 MB | none dropped; 12 to 15 CPU-s, about 390 MB |
+| 10,000 connections on 2,000 documents | not run | p99 1,165 · 186; about 1.8 GB | p99 66 · 105; about 520 MB |
+
+The follow-up removed a timer wait from the journal writer (about 15 ms on Windows), relays presence once
+per tick with soft frames for slow readers, cut a connection's memory from about 170 KB to about 21 KB
+(an 8 KiB WebSocket read buffer), and opens the PostgreSQL pools' first connections at start (the first
+open of a document on PostgreSQL takes 16 to 64 ms instead of 52 to 109). The proposed 20 ms p99 at 10,000
+connections is still missed on this machine, and Linux was not measured.
+
 ## 0.1.2 - 2026-11-24
 
 A faster server: each message is encoded once for everyone, big documents no longer hold up the others, and a
