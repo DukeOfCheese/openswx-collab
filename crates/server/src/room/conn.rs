@@ -26,12 +26,19 @@
 //! [`Outbox::catch_up`], at most once a [`super::CATCH_UP_EVERY`]), which counts for no limit. One
 //! that has been behind for [`super::FROZEN_AFTER`] is closed with [`close::TOO_SLOW`] once the
 //! socket has not finished what it was handed for that long, and that long has also passed since
-//! a link of [`SLOWEST_READER`] bytes a second would have read every frame that must arrive (and
-//! every catch-up) it was handed, flushed or not (the socket's own buffers may take a big frame at
-//! once, and then nothing while the client reads it): its client stopped reading. A reader on a
-//! slow link taking a big welcome or change is not frozen. Otherwise a connection is only closed
-//! for what must arrive (answers, changes, locks); frames are written in the order they were
-//! queued, whatever their kind.
+//! a link of [`SLOWEST_READER`] bytes a second would have read every frame it was handed (what
+//! must arrive, soft frames and catch-ups alike), flushed or not (the socket's own buffers may
+//! take a big frame at once, and then nothing while the client reads it): its client stopped
+//! reading. A reader on a slow link taking a big welcome or change, or a full batch of drafts, is
+//! not frozen. Otherwise a connection is only closed for what must arrive (answers, changes,
+//! locks); frames are written in the order they were queued, whatever their kind.
+//!
+//! A known residual: because that allowance counts what was handed, flushed or not, a client that
+//! read a burst quickly keeps the unused part of its allowance, and may then stop reading for up to
+//! that long (at most the time the slowest link takes over everything it was handed, about a minute
+//! a MiB) beyond [`super::Hooks::frozen_after`] before it is taken for frozen. It holds nothing
+//! more meanwhile: its queues keep their limits, and a frame that must arrive still closes it
+//! when they are broken.
 //!
 //! The reader decodes frames (on the blocking pool when they are large) and hands messages to the
 //! room; malformed ones are answered in their turn through the room. Every frame read counts as
@@ -69,8 +76,9 @@ pub const MAX_SOFT: usize = 64;
 pub const MAX_SOFT_BYTES: usize = 1024 * 1024;
 /// The most frames the writer hands the socket with one flush.
 const MAX_PER_WRITE: usize = 64;
-/// The slowest link (bytes a second) a reader may be on and never be taken for frozen: the frames
-/// that must arrive are given this long to be read, over and above [`super::Hooks::frozen_after`].
+/// The slowest link (bytes a second) a reader may be on and never be taken for frozen: every frame
+/// handed to the socket (soft ones too) is given this long to be read, over and above
+/// [`super::Hooks::frozen_after`].
 pub const SLOWEST_READER: usize = 16 * 1024;
 /// How long closing may wait for the last frames and the close frame to be written.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
@@ -180,9 +188,9 @@ struct State {
     handed: (usize, usize, bool),
     /// Since when the writer has been writing what it handed (it has not flushed since).
     writing_since: Option<Instant>,
-    /// When a reader on a link of [`SLOWEST_READER`] would have read every frame that must arrive
-    /// (and every catch-up) handed to the socket so far, flushed or not: the socket's own buffers
-    /// may take a big frame at once, and then nothing more while the client reads it.
+    /// When a reader on a link of [`SLOWEST_READER`] would have read every frame handed to the
+    /// socket so far (soft ones and catch-ups too), flushed or not: the socket's own buffers may
+    /// take a big frame at once, and then nothing more while the client reads it.
     read_by: Option<Instant>,
     /// Soft frames were dropped: none is queued until the room has sent what replaces them.
     behind: bool,
@@ -366,9 +374,9 @@ impl Outbox {
 
     /// Whether the connection has been behind for `after` while the writer has not finished what
     /// it handed the socket in `after`, and `after` has also passed since a link of
-    /// [`SLOWEST_READER`] would have read every frame that must arrive (and every catch-up) it was
-    /// handed: a client that stopped reading (a frame stuck on its socket), not one on a slow
-    /// link taking a big frame (a welcome, a change).
+    /// [`SLOWEST_READER`] would have read every frame it was handed, soft or not: a client that
+    /// stopped reading (a frame stuck on its socket), not one on a slow link taking a big frame
+    /// (a welcome, a change) or a full batch of drafts.
     pub fn is_frozen(&self, now: Instant, after: Duration) -> bool {
         let s = self.lock();
         let long_ago = |at: Option<Instant>| at.is_some_and(|at| now >= at + after);
@@ -480,11 +488,11 @@ impl Outbox {
             Kind::Soft => s.handed.1 += 1,
             Kind::List => s.handed.2 = true,
         }
+        // Every frame handed, soft ones too: a reader must read a batch of drafts before anything
+        // behind it, so a slow link is as slow on those.
         let now = Instant::now();
-        if kind != Kind::Soft {
-            let reading = Duration::from_secs_f64(frame.len() as f64 / SLOWEST_READER as f64);
-            s.read_by = Some(s.read_by.map_or(now, |at| at.max(now)) + reading);
-        }
+        let reading = Duration::from_secs_f64(frame.len() as f64 / SLOWEST_READER as f64);
+        s.read_by = Some(s.read_by.map_or(now, |at| at.max(now)) + reading);
         s.writing_since.get_or_insert(now);
         Some(frame)
     }
@@ -1067,9 +1075,8 @@ mod tests {
         assert!(!outbox.is_frozen(again + after, after), "closed");
     }
 
-    /// A reader on a slow link taking a big frame that must arrive is given the time the slowest
-    /// link takes to read it, over and above `after`, even once the socket's buffers have taken
-    /// it (flushed); soft frames give none.
+    /// A reader on a slow link taking a big frame is given the time the slowest link takes to read
+    /// it, over and above `after`, even once the socket's buffers have taken it (flushed).
     #[test]
     fn a_big_frame_being_written_gives_the_reader_time_by_its_size() {
         let after = Duration::from_secs(1);
@@ -1079,7 +1086,7 @@ mod tests {
         outbox.push(frame(SLOWEST_READER / 2));
         assert_eq!(start_writing(&outbox), Some(4 * SLOWEST_READER));
         assert_eq!(start_writing(&outbox), Some(SLOWEST_READER / 2));
-        // A soft frame handed with them adds nothing.
+        // A soft frame handed with them adds its own time.
         outbox.push_soft(frame(8 * SLOWEST_READER));
         assert_eq!(start_writing(&outbox), Some(8 * SLOWEST_READER));
         for _ in 0..=MAX_SOFT {
@@ -1089,7 +1096,7 @@ mod tests {
         let since = outbox.lock().writing_since.unwrap();
         let behind = outbox.lock().behind_since.unwrap();
         let read_by = outbox.lock().read_by.unwrap();
-        assert!(read_by >= since + Duration::from_millis(4500));
+        assert!(read_by >= since + Duration::from_millis(12_500));
         assert!(!outbox.is_frozen(behind + after, after));
         let just_before = read_by + after - Duration::from_millis(1);
         assert!(!outbox.is_frozen(just_before, after));
@@ -1101,21 +1108,36 @@ mod tests {
         let again = outbox.lock().writing_since.unwrap();
         assert!(!outbox.is_frozen(again + after, after));
         assert!(!outbox.is_frozen(just_before, after));
+        // (The two bytes handed since add next to nothing.)
+        let read_by = outbox.lock().read_by.unwrap();
         assert!(outbox.is_frozen(again.max(read_by) + after, after));
-        // Soft frames alone: `after` is all it gets.
+    }
+
+    /// A reader on a slow link taking a full batch of soft frames (heavy drafts) is given the time
+    /// the slowest link takes to read it too: soft bytes are bytes it must read before it can read
+    /// anything else.
+    #[test]
+    fn a_soft_batch_being_written_gives_the_reader_time_by_its_size() {
+        let after = Duration::from_secs(30);
         let outbox = Outbox::new(usize::MAX);
         outbox.release(frame(1));
         outbox.drain_for_tests();
-        outbox.push_soft(frame(8 * SLOWEST_READER));
-        assert_eq!(start_writing(&outbox), Some(8 * SLOWEST_READER));
+        // 1 MiB of drafts: 64 seconds at the slowest link.
+        outbox.push_soft(frame(MAX_SOFT_BYTES));
+        assert_eq!(start_writing(&outbox), Some(MAX_SOFT_BYTES));
         for _ in 0..=MAX_SOFT {
             outbox.push_soft(frame(2));
         }
-        let at = outbox.lock().writing_since.unwrap();
+        assert!(outbox.is_behind());
+        let since = outbox.lock().writing_since.unwrap();
         let behind = outbox.lock().behind_since.unwrap();
-        // (The welcome's one byte is read in no time even at the slowest link.)
-        let welcome_read = outbox.lock().read_by.unwrap();
-        assert!(outbox.is_frozen(at.max(behind).max(welcome_read) + after, after));
+        let start = since.max(behind);
+        assert!(!outbox.is_frozen(start + after, after), "still reading");
+        let reading = Duration::from_secs(MAX_SOFT_BYTES as u64 / SLOWEST_READER as u64);
+        assert!(!outbox.is_frozen(since + reading + after / 2, after));
+        let read_by = outbox.lock().read_by.unwrap();
+        assert!(read_by >= since + reading);
+        assert!(outbox.is_frozen(start.max(read_by) + after, after));
     }
 
     #[test]
