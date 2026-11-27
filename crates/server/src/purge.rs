@@ -37,7 +37,9 @@
 //! organisation). It is tried again after [`RETRY`], then after twice that, and so on up to
 //! [`MAX_RETRY`]; each failure is logged once, so a permanent one is a warning an hour, not a
 //! stream of them. The work list itself backs off the same way when the database cannot list it,
-//! and nothing else is tried before the list can be read again.
+//! and nothing else is tried before the list can be read again. Something that waits but is no
+//! longer in the list once a sweep has read all of it (removed some other way, or by a commit
+//! whose answer was lost) is forgotten: it would never be tried again.
 //!
 //! An organisation marked while a sweep is under way (after it went through the projects) is
 //! left for the next sweep, which starts at once (its mark woke the purger): not a failure. Nor
@@ -55,7 +57,7 @@
 //! A single document deleted on its own is only marked, as it always was: its row and snapshots
 //! stay (assemblies may still show what they used, and an undo may bring a reference back).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -105,6 +107,8 @@ struct Inner {
     task: Mutex<Option<JoinHandle<()>>>,
     /// What failed and waits for its next try, by what it is (`document <id>`, …).
     waiting: Mutex<HashMap<String, Waiting>>,
+    /// What the running sweep found in the work list, by the same names.
+    listed: Mutex<HashSet<String>>,
     gate: Gate,
     chunks: AtomicUsize,
 }
@@ -161,6 +165,7 @@ impl Purger {
                 nudge: Notify::new(),
                 task: Mutex::default(),
                 waiting: Mutex::default(),
+                listed: Mutex::default(),
                 gate: Gate::default(),
                 chunks: AtomicUsize::new(0),
             }),
@@ -207,6 +212,15 @@ impl Purger {
             .waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes that the running sweep found the thing called `what` in the work list.
+    fn found(&self, what: &str) {
+        self.inner
+            .listed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(what.to_owned());
     }
 
     /// Says that something was marked deleted (or that the server has just started): the task is
@@ -311,6 +325,7 @@ impl Purger {
     where
         F: Future<Output = anyhow::Result<()>>,
     {
+        self.found(what);
         let failed_before = self.lock_waiting().get(what).copied();
         if failed_before.is_some_and(|w| w.next > Instant::now()) {
             return Ok(false);
@@ -352,10 +367,22 @@ impl Purger {
     /// Goes once through everything that is marked now.
     async fn sweep(&self, store: &dyn Store, blobs: &dyn Blobs) -> Result<(), Stopped> {
         self.inner.list_failed.store(false, Ordering::SeqCst);
+        let listed = || {
+            self.inner
+                .listed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        listed().clear();
         self.sweep_lists(store, blobs).await?;
         if !self.inner.list_failed.load(Ordering::SeqCst) {
-            // (Every page of the list was read: it does not wait any more.)
-            self.lock_waiting().remove(THE_LIST);
+            // Every page of the list was read: it does not wait any more, and nor does anything
+            // that waited but is no longer in it (removed by some other way, say). Such a thing
+            // would otherwise never be tried, so never leave: it would keep the organisations
+            // held up, and once its next try was due, the sweep starting over at once, again
+            // and again.
+            let listed = std::mem::take(&mut *listed());
+            self.lock_waiting().retain(|what, _| listed.contains(what));
         }
         Ok(())
     }
@@ -460,6 +487,8 @@ impl Purger {
         blobs: &dyn Blobs,
         project: &str,
     ) -> Result<(), Stopped> {
+        // (Found even when its documents keep it from its own try: what it waits for stays.)
+        self.found(&format!("project {project}"));
         let mut all = true;
         let mut after = String::new();
         loop {

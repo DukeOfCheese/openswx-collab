@@ -873,6 +873,55 @@ async fn an_organisation_holding_an_unmarked_project_backs_off() {
     assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 1);
 }
 
+/// A document that failed and waits for its next try is then removed some other way (by hand,
+/// say), so the work list stops naming it: the purger forgets it once a sweep has read the whole
+/// list. Kept, it would never be tried again, so never leave: the purger would stay busy for good,
+/// and, its next try long due, sweep again and again without a pause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_waits_but_is_no_longer_listed_is_forgotten() {
+    let mut handle = None;
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| s.open_registration = true,
+        new_journal,
+        |s| {
+            let blobs = Arc::new(common::TestBlobs::new(s.blobs.clone()));
+            handle = Some(blobs.clone());
+            s.blobs = blobs;
+            s.purger = Purger::new(100, Duration::from_millis(100));
+        },
+    )
+    .await;
+    let blobs = handle.unwrap();
+    let w = World::new(&server).await.unwrap();
+    let doc = w.document(&server, None, None, None).await;
+    blobs.fail_delete_of(Some(&format!("docs/{doc}/")));
+    assert_eq!(
+        delete_org(&server, &w.admin, &w.org, "Robotics").await,
+        StatusCode::NO_CONTENT
+    );
+    // The document failed and waits for its next try.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.purger.waiting() == 0 {
+        assert!(Instant::now() < deadline, "the purger never tried");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Its rows go some other way; its project and organisation can go now.
+    let mut tx = server.state.store.begin().await.unwrap();
+    while tx.purge_document_rows(&doc, 1000).await.unwrap() > 0 {}
+    assert!(tx.purge_document(&doc).await.unwrap());
+    tx.commit().await.unwrap();
+    let before = flaky.deleted_projects_calls();
+    let idle = tokio::time::timeout(Duration::from_secs(20), server.state.purger.idle()).await;
+    let asked = flaky.deleted_projects_calls() - before;
+    assert!(
+        idle.is_ok(),
+        "the purger never finished; it listed the work {asked} times"
+    );
+    assert!(asked <= 10, "the list was asked {asked} times");
+    assert_eq!(server.state.purger.waiting(), 0);
+    assert_eq!(count(&server, "SELECT COUNT(*) FROM orgs").await, 0);
+}
+
 /// An organisation marked while a sweep is under way, after the sweep went through the projects:
 /// it is not a failure (no wait of [`RETRY`]); the next sweep removes it, at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
