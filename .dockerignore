@@ -1,0 +1,10 @@
+# What a `docker build` from the repository root does not need to send (the build output above all).
+target/
+.venv/
+data/
+.git/
+.superpowers/
+**/__pycache__/
+.pytest_cache/
+.env
+deploy/.env

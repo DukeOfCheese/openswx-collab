@@ -1,6 +1,9 @@
 # Optional: keep files in an S3-compatible store instead of the local volume. This runs Garage
 # (https://garagehq.deuxfleurs.fr), a small open-source S3 server, as a single node next to the server.
 #   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env up -d
+# It goes with the Rust server's files the same way (its service is also called `server`):
+#   docker compose -f deploy/docker-compose.rust.yml -f deploy/docker-compose.rust-postgres.yml \
+#     -f deploy/docker-compose.s3.yml --env-file deploy/.env up -d --build
 # Set S3_ACCESS_KEY, S3_SECRET_KEY and GARAGE_RPC_SECRET in deploy/.env first (see .env.example for how to
 # make them). Garage creates the bucket and the key by itself on first start.
 #

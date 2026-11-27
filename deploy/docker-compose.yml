@@ -27,9 +27,10 @@ services:
       OSWX_COLLAB_GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       OSWX_COLLAB_GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       # The TLS proxy on the host reaches the server through the published port, so its connections
-      # come from this network's gateway: the server believes the client address the proxy puts in
-      # X-Forwarded-For (Caddy does) only from this network. Without it every client would share the
-      # gateway's address, and its per-address limits.
+      # come from this network's gateway. The Rust server (docker-compose.rust.yml) believes the client
+      # address the proxy appends to X-Forwarded-For only from this network. The Python server this
+      # file runs does not read the setting: it believes X-Forwarded-For only from 127.0.0.1, so here
+      # every client shares the gateway's address for its sign-in limit (docs/self-hosting.md).
       OSWX_COLLAB_TRUSTED_PROXIES: ${NETWORK_SUBNET:-172.30.87.0/24}
     volumes:
       - storage:/data

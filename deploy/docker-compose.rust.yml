@@ -1,0 +1,57 @@
+# The Rust collaboration server, built from this checkout (deploy/Dockerfile.rust). On its own this file
+# keeps everything in one volume: a SQLite database and the files (snapshots, imported bodies).
+#   cp deploy/.env.example deploy/.env   # then edit it
+#   docker compose -f deploy/docker-compose.rust.yml --env-file deploy/.env up -d --build
+# With PostgreSQL instead of SQLite, add  -f deploy/docker-compose.rust-postgres.yml
+# With files in an S3-compatible bucket (Garage), add  -f deploy/docker-compose.s3.yml
+# Put a TLS-terminating proxy in front (see docs/self-hosting.md); the server itself speaks plain HTTP.
+name: openswx-collab-rust
+
+services:
+  server:
+    image: openswx-collab-server-rust:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.rust
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
+    restart: unless-stopped
+    # An orderly stop takes at most OSWX_COLLAB_SHUTDOWN_TIMEOUT (8 s); keep this above it.
+    stop_grace_period: 10s
+    environment:
+      OSWX_COLLAB_DATABASE_URL: sqlite:///data/collab.db
+      OSWX_COLLAB_STORAGE_URL: /data/storage
+      OSWX_COLLAB_PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL}
+      OSWX_COLLAB_OPEN_REGISTRATION: ${OPEN_REGISTRATION:-false}
+      OSWX_COLLAB_SMTP_HOST: ${SMTP_HOST:-}
+      OSWX_COLLAB_SMTP_PORT: ${SMTP_PORT:-587}
+      OSWX_COLLAB_SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+      OSWX_COLLAB_SMTP_USER: ${SMTP_USER:-}
+      OSWX_COLLAB_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      OSWX_COLLAB_SMTP_FROM: ${SMTP_FROM:-}
+      OSWX_COLLAB_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      OSWX_COLLAB_GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      OSWX_COLLAB_GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      OSWX_COLLAB_GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # Empty: no /metrics. Otherwise a long random token (openssl rand -hex 32).
+      OSWX_COLLAB_METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # The TLS proxy on the host reaches the server through the published port, so its connections
+      # come from this network's gateway: the server believes the client address the proxy appends to
+      # X-Forwarded-For only from this network. Without it every client would share the gateway's
+      # address, and its per-address limits (sign-in attempts, connections).
+      OSWX_COLLAB_TRUSTED_PROXIES: ${NETWORK_SUBNET:-172.30.87.0/24}
+    volumes:
+      - rust-data:/data
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8787}:8787"  # only this machine: put a TLS proxy in front
+
+# A fixed subnet, so that the server can be told which addresses are its proxy's (above). Change
+# NETWORK_SUBNET in deploy/.env if it overlaps a network this machine already has.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-172.30.87.0/24}
+
+volumes:
+  rust-data:
