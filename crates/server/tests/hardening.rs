@@ -771,9 +771,12 @@ async fn a_reader_behind_is_caught_up_with_a_small_list_and_then_the_drafts() {
                 client_id,
                 data: Some(data),
             } => {
-                if want.get(&*client_id) == Some(&data) {
-                    want.remove(&*client_id);
-                }
+                // After the list, every draft is the peer's as it is now, and comes once.
+                assert_eq!(
+                    want.remove(&*client_id).as_ref(),
+                    Some(&data),
+                    "{client_id}: a stale draft, or one twice"
+                );
             }
             ServerMsg::PeerList { .. } => panic!("caught up again"),
             _ => {}
@@ -909,6 +912,136 @@ async fn a_reader_frozen_behind_is_closed_and_leaves() {
     assert_eq!(&*left, stuck_id.as_str());
     assert!(conn_status(&server, &doc, &stuck_id).await.is_none());
     assert_eq!(stuck.closed().await.0, 4408);
+}
+
+/// The drafts that follow a list are each peer's as it is now: one that changes its draft after
+/// the list (before its turn) is never sent the old one after the new; one that leaves before its
+/// turn is sent nothing; and the reader is never sent its own.
+#[tokio::test]
+async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its_own() {
+    let hooks = oswx_server::room::Hooks {
+        frozen_after: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let mut stuck =
+        Live::connect_with(&server, &doc, &world.admin, Hello::client("slow-reader")).await;
+    let stuck_id = stuck.client_id.clone();
+    stuck.draft(Some(json!({"mine": true}))).await;
+    // Sixteen big drafts, sent in the order they joined: the last ones wait for room well after
+    // the list.
+    let big = |i: usize| json!({"sitter": i, "pad": "y".repeat(120_000)});
+    let mut want = std::collections::HashMap::new();
+    let mut sitters = Vec::new();
+    for i in 0..16 {
+        let mut s = Live::connect(&server, &doc, &world.admin).await;
+        s.draft(Some(big(i))).await;
+        want.insert(s.client_id.clone(), plain(big(i)));
+        sitters.push(s);
+    }
+    let mut flooders = vec![
+        Live::connect(&server, &doc, &world.admin).await,
+        Live::connect(&server, &doc, &world.admin).await,
+    ];
+    let mut n = 0;
+    flood_until_behind(
+        &server,
+        &doc,
+        &stuck_id,
+        &mut flooders,
+        &mut n,
+        WAIT * 3,
+        false,
+    )
+    .await;
+    let pad = "x".repeat(120_000);
+    for f in &flooders {
+        want.insert(f.client_id.clone(), plain(json!({"n": n, "pad": pad})));
+    }
+    // It reads until it has been caught up (the list is made, and the first drafts queued) ...
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    while conn_status(&server, &doc, &stuck_id).await.unwrap().behind {
+        if let Some(m) = stuck.try_recv(Duration::from_millis(5)).await {
+            seen.push(m);
+        }
+        assert!(Instant::now() < deadline, "never caught up");
+    }
+    // ... and at once the last sitter changes its draft and the one before it leaves.
+    let mut changer = sitters.pop().unwrap();
+    let leaver = sitters.pop().unwrap();
+    let fresh = json!({"fresh": true});
+    changer.draft(Some(fresh.clone())).await;
+    want.insert(changer.client_id.clone(), plain(fresh));
+    let leaver_id = leaver.client_id.clone();
+    want.remove(&leaver_id);
+    leaver.close().await;
+    // Everything after the list.
+    while want.len() > seen_after_list(&seen, &stuck_id).len() || !has_list(&seen) {
+        seen.push(stuck.recv().await);
+    }
+    let lists = seen
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::PeerList { .. }))
+        .count();
+    seen.extend(stuck.drain().await);
+    assert_eq!(
+        lists,
+        seen.iter()
+            .filter(|m| matches!(m, ServerMsg::PeerList { .. }))
+            .count(),
+        "caught up again"
+    );
+    // (Earlier lists, from before it was last behind, may come first.)
+    let last = seen
+        .iter()
+        .rposition(|m| matches!(m, ServerMsg::PeerList { .. }))
+        .unwrap();
+    let after = &seen[last + 1..];
+    let mut got: std::collections::HashMap<String, Plain> = std::collections::HashMap::new();
+    for m in after {
+        if let ServerMsg::Draft { client_id, data } = m {
+            let client_id = client_id.to_string();
+            assert_ne!(client_id, stuck_id, "its own draft");
+            assert_ne!(client_id, leaver_id, "the draft of who left");
+            let data = data.clone().expect("no draft is cleared here");
+            if let Some(before) = got.get(&client_id) {
+                // Only the changer's may come twice (relayed, and owed), and never old after new.
+                assert_eq!(client_id, changer.client_id, "a draft twice");
+                assert_eq!(before, &data, "an old draft after the new one");
+            }
+            assert_eq!(Some(&data), want.get(&client_id), "{client_id}: stale");
+            got.insert(client_id, data);
+        }
+    }
+    assert_eq!(got, want);
+    assert!(stuck.closed.is_none());
+}
+
+/// Whether a list is among `seen`.
+fn has_list(seen: &[ServerMsg]) -> bool {
+    seen.iter().any(|m| matches!(m, ServerMsg::PeerList { .. }))
+}
+
+/// The peers whose draft came after the last list in `seen` (not `own`).
+fn seen_after_list(seen: &[ServerMsg], own: &str) -> std::collections::HashSet<String> {
+    let last = seen
+        .iter()
+        .rposition(|m| matches!(m, ServerMsg::PeerList { .. }));
+    let Some(last) = last else {
+        return Default::default();
+    };
+    seen[last + 1..]
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Draft { client_id, .. } if &**client_id != own => {
+                Some(client_id.to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A TCP stream that reads at most `rate` bytes a second (in bursts of at most 16 KiB), on a
