@@ -58,9 +58,12 @@ def free_port() -> int:
 
 
 def rust_settings() -> set[str]:
-    """The OSWX_COLLAB_* names the Rust server reads (crates/server/src/config.rs)."""
+    """The OSWX_COLLAB_* names the Rust server reads (crates/server/src/config.rs), but for the retired ones it
+    reads only to refuse to start while they are set (their error says "unset: ...")."""
     source = (ROOT / "crates/server/src/config.rs").read_text(encoding="utf-8")
-    return {PREFIX + name for name in re.findall(r'e\.\w+\(\s*"([A-Z0-9_]+)"', source)}
+    read = set(re.findall(r'e\.\w+\(\s*"([A-Z0-9_]+)"', source))
+    retired = set(re.findall(r'ConfigError::new\(\s*"([A-Z0-9_]+)",\s*"unset\b', source))
+    return {PREFIX + name for name in read - retired}
 
 
 def static_checks() -> tuple[str, dict]:
