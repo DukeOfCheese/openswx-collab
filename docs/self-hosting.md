@@ -153,6 +153,9 @@ openswx-collab-server create-admin you@example.org
 openswx-collab-server reset-password someone@example.org
 ```
 
+`reset-password` does not lift the sign-in limits of the running server (429 `too many attempts`): see
+[What the error answers mean](#what-the-error-answers-mean).
+
 ## Sign-in with Google or GitHub
 
 Create an OAuth app with the provider and set the callback address to
