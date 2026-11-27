@@ -585,6 +585,78 @@ async fn a_reader_that_never_reads_is_dropped_before_it_costs_memory() {
     assert_eq!(stuck.closed().await.0, 4408);
 }
 
+#[tokio::test]
+async fn a_document_socket_keeps_its_place_while_its_writer_still_flushes() {
+    use tokio::io::AsyncWriteExt;
+    let server = TestServer::start().await;
+    let w = World::new(&server).await.unwrap();
+    let doc = w.document(&server, None, None, None).await;
+    let mut a = Live::connect(&server, &doc, &w.admin).await;
+    // A client on a socket with a small receive buffer, which reads its welcome and then nothing.
+    let addr: std::net::SocketAddr = server.base.trim_start_matches("http://").parse().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    let tcp = socket.connect(addr).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::client_async(ws_url(&server, &doc), tcp)
+        .await
+        .expect("the WebSocket opens");
+    let hello = Hello::client("stops-reading");
+    ws.send(Message::Binary(
+        hello_frame(&w.admin, &hello, "stops-reading").into(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        use futures_util::StreamExt;
+        match tokio::time::timeout(Duration::from_secs(20), ws.next()).await {
+            Ok(Some(Ok(Message::Binary(_)))) => break,
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("no welcome: {other:?}"),
+        }
+    }
+    let stuck = format!("{}.stops-reading", w.admin_id);
+    assert!(conn_status(&server, &doc, &stuck).await.is_some());
+    assert_eq!(server.state.hub.sockets(), 2);
+    // Big changes until the sockets' buffers are full (how much they take depends on the
+    // system): the server's writer is stuck flushing one.
+    let mut n = 0;
+    while conn_status(&server, &doc, &stuck)
+        .await
+        .unwrap()
+        .queued_bytes
+        == 0
+    {
+        assert!(
+            n < 6,
+            "the socket took {n} changes of 4 MiB without filling up"
+        );
+        n += 1;
+        let pad = format!("{n}{}", "x".repeat(4 << 20));
+        let outcome = a
+            .change(vec![set(&["variables", "pad"], json!(pad))], vec![], vec![])
+            .await;
+        assert!(matches!(outcome, Outcome::Accepted(_)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The client stops sending too: the server reads the end of the stream, and the connection
+    // leaves the room and the hub.
+    ws.get_mut().shutdown().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.hub.gauges().connections > 1 {
+        assert!(Instant::now() < deadline, "the connection never went");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Its writer still holds the socket, and so its place.
+    assert_eq!(server.state.hub.sockets(), 2);
+    // Once the socket is gone, so is the place.
+    drop(ws);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.state.hub.sockets() > 1 {
+        assert!(Instant::now() < deadline, "the place was never given back");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The status of one connection of the document.
 async fn conn_status(
     server: &TestServer,

@@ -135,7 +135,9 @@ const SERVER_FULL: &str =
 
 async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     // Counted from the upgrade, before the hello: a socket that never says hello holds a place.
-    let Some(_place) = state
+    // Held until the socket closes: by the reader and, once the socket is split, by the writer
+    // too, which may still be flushing to the socket after the reader has ended.
+    let Some(place) = state
         .hub
         .take_socket(state.settings.max_document_connections())
     else {
@@ -284,7 +286,12 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     };
 
     let (sink, stream) = socket.split();
-    tokio::spawn(conn::write(sink, outbox.clone()));
+    let place = Arc::new(place);
+    let (writer_place, writer_outbox) = (Arc::clone(&place), outbox.clone());
+    tokio::spawn(async move {
+        conn::write(sink, writer_outbox).await;
+        drop(writer_place);
+    });
     let heard = conn::Heard::new(state.clock.clone());
     let mut request = JoinRequest {
         conn,
