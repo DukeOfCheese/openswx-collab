@@ -1530,20 +1530,41 @@ async fn a_revoked_users_locks_go_at_once_whichever_message_reaches_the_room_fir
         hooks
             .revoke_delay_ms
             .store(if round % 2 == 1 { 30 } else { 0 }, Ordering::SeqCst);
+        // Every announcement a hears is read, and each is checked for whose lock it is: a stale
+        // one left unread would answer a later check.
         let mut b = Live::connect(&server, &doc, &bob).await;
-        b.lock(&[F1]).await;
+        let theirs = b.lock(&[F1]).await;
+        assert_eq!(theirs.granted, vec![path(F1)], "round {round}: {theirs:?}");
         let taken = lock_news(&mut a).await;
-        assert_eq!(taken.locks.len(), 1, "round {round}: {taken:?}");
+        assert!(
+            taken.locks.len() == 1
+                && *taken.locks[0].client_id == b.client_id
+                && !taken.locks[0].detached
+                && taken.released.is_empty(),
+            "round {round}: bob's lock: {taken:?}"
+        );
         server.state.hub.drop_account(&bob_id).await;
         assert_eq!(b.closed().await.0, 4401, "round {round}");
         let news = lock_news(&mut a).await;
         assert!(
             news.locks.is_empty() && news.released == vec![path(F1)],
-            "round {round}: released at once, never detached: {news:?}"
+            "round {round}: bob's released at once, never detached: {news:?}"
         );
         let mine = a.lock(&[F1]).await;
         assert_eq!(mine.granted, vec![path(F1)], "round {round}: {mine:?}");
+        let own = lock_news(&mut a).await;
+        assert!(
+            own.locks.len() == 1
+                && *own.locks[0].client_id == a.client_id
+                && own.released.is_empty(),
+            "round {round}: a's lock: {own:?}"
+        );
         a.unlock(&[F1]).await;
+        let freed = lock_news(&mut a).await;
+        assert!(
+            freed.locks.is_empty() && freed.released == vec![path(F1)],
+            "round {round}: a's released: {freed:?}"
+        );
     }
     let order = &hooks.revoke_order;
     let (revoked, leave) = (
