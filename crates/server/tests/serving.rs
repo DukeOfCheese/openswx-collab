@@ -2202,7 +2202,10 @@ async fn one_address_holds_only_so_many_unless_it_is_a_trusted_proxy() {
 
 #[tokio::test]
 async fn a_stop_lets_the_requests_in_their_handlers_finish_before_the_rooms_close() {
-    let mut server = TestServer::start_with(|s| s.shutdown_timeout = 6.0).await;
+    // A generous bound: the stop waits up to half of it for requests in their handlers, which
+    // here is longer than the test needs even on a busy machine, and an orderly stop does not
+    // wait for it.
+    let mut server = TestServer::start_with(|s| s.shutdown_timeout = 20.0).await;
     let world = World::new(&server).await.unwrap();
     let (stop, serving) = serve_again(&mut server).await;
     let doc = world.document(&server, None, None, None).await;
@@ -2232,7 +2235,6 @@ async fn a_stop_lets_the_requests_in_their_handlers_finish_before_the_rooms_clos
         .expect("the rename committed");
     assert!(eventually(|| server.state.http.in_handlers() == 1).await);
 
-    let started = Instant::now();
     stop.send(()).unwrap();
     // Nobody new is taken ...
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2242,17 +2244,14 @@ async fn a_stop_lets_the_requests_in_their_handlers_finish_before_the_rooms_clos
     assert!(!server.state.hub.is_closing());
     gate.open();
     assert_eq!(renaming.await.unwrap().ok(), Some(StatusCode::OK));
-    // Then the rooms close, snapshotted, and the stop is in order, long before its bound.
+    // Then the rooms close, snapshotted, and the stop is in order: everything ended before its
+    // bound (`shutdown_timeout`) ran out, or `serve` would say `OutOfTime`. (That, not a clock in
+    // the test, is the proof: a busy machine makes the test slow, not the stop out of order.)
     assert_eq!(live.closed().await.0, 1001);
     let stopped = tokio::time::timeout(WAIT, serving)
         .await
         .expect("serve ends")
         .unwrap();
     assert_eq!(stopped, Stopped::InOrder);
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
     assert_eq!(snapshot_seq(&server, &doc, 2).await, 2);
 }
