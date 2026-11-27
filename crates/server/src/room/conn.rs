@@ -34,11 +34,14 @@
 //! locks); frames are written in the order they were queued, whatever their kind.
 //!
 //! A known residual: because that allowance counts what was handed, flushed or not, a client that
-//! read a burst quickly keeps the unused part of its allowance, and may then stop reading for up to
-//! that long (at most the time the slowest link takes over everything it was handed, about a minute
-//! a MiB) beyond [`super::Hooks::frozen_after`] before it is taken for frozen. It holds nothing
-//! more meanwhile: its queues keep their limits, and a frame that must arrive still closes it
-//! when they are broken.
+//! read a burst quickly keeps the unused part of its allowance, and may then stop reading for that
+//! long beyond [`super::Hooks::frozen_after`] before it is taken for frozen. Each time a flush
+//! returns, what is left is cut to the time the slowest link takes over
+//! [`MAX_UNREAD_AFTER_FLUSH`] (4 MiB, 256 seconds at 16 KiB a second); frames still being written
+//! keep their full time. So a client that stops reading is taken for frozen at most
+//! `frozen_after + 4 MiB / 16 KiB/s` after its last flush returned (plus the time of what it was
+//! handed since). It holds nothing more meanwhile: its queues keep their limits, and a frame that
+//! must arrive still closes it when they are broken.
 //!
 //! The reader decodes frames (on the blocking pool when they are large) and hands messages to the
 //! room; malformed ones are answered in their turn through the room. Every frame read counts as
@@ -80,6 +83,9 @@ const MAX_PER_WRITE: usize = 64;
 /// handed to the socket (soft ones too) is given this long to be read, over and above
 /// [`super::Hooks::frozen_after`] ([`super::Hooks::slowest_reader`] by default).
 pub const SLOWEST_READER: usize = 16 * 1024;
+/// The most bytes a reader is given time for once the socket has flushed what it was handed: a
+/// reader that read a burst quickly does not bank the rest of its allowance beyond this.
+pub const MAX_UNREAD_AFTER_FLUSH: usize = 4 * 1024 * 1024;
 /// How long closing may wait for the last frames and the close frame to be written.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// After the server closed a connection, how long the reader keeps reading (and dropping) what the
@@ -500,7 +506,7 @@ impl Outbox {
         // Every frame handed, soft ones too: a reader must read a batch of drafts before anything
         // behind it, so a slow link is as slow on those.
         let now = Instant::now();
-        let reading = Duration::from_secs_f64(frame.len() as f64 / s.slowest_reader as f64);
+        let reading = Self::reading_time(frame.len(), s.slowest_reader);
         s.read_by = Some(s.read_by.map_or(now, |at| at.max(now)) + reading);
         s.writing_since.get_or_insert(now);
         Some(frame)
@@ -551,6 +557,17 @@ impl Outbox {
             s.list = None;
         }
         s.writing_since = None;
+        // Everything handed has been flushed (frames are handed only between flushes, so none is
+        // still being written): the reader keeps at most the time the slowest link takes over
+        // MAX_UNREAD_AFTER_FLUSH, rather than banking a busy session's allowance for hours.
+        let now = Instant::now();
+        let cap = now + Self::reading_time(MAX_UNREAD_AFTER_FLUSH, s.slowest_reader);
+        s.read_by = s.read_by.map(|at| at.min(cap));
+    }
+
+    /// How long a link of `per_second` bytes a second takes to read `len` bytes.
+    fn reading_time(len: usize, per_second: usize) -> Duration {
+        Duration::from_secs_f64(len as f64 / per_second as f64)
     }
 
     /// Writes everything queued, as the writer would.
@@ -1147,6 +1164,35 @@ mod tests {
         let read_by = outbox.lock().read_by.unwrap();
         assert!(read_by >= since + reading);
         assert!(outbox.is_frozen(start.max(read_by) + after, after));
+    }
+
+    /// A reader does not bank allowance without limit: once a flush returns, it keeps at most the
+    /// time the slowest link takes over [`MAX_UNREAD_AFTER_FLUSH`], however much it was handed.
+    #[test]
+    fn a_flushed_burst_leaves_the_reader_at_most_the_cap() {
+        let after = Duration::from_secs(30);
+        let outbox = Outbox::new(usize::MAX);
+        // 64 MiB handed: over an hour at the slowest link.
+        outbox.release(frame(64 * 1024 * 1024));
+        assert_eq!(start_writing(&outbox), Some(64 * 1024 * 1024));
+        let flushed = Instant::now();
+        outbox.written();
+        // Then it stops reading: a frame stuck on the socket, and it falls behind.
+        outbox.push(frame(2));
+        assert_eq!(start_writing(&outbox), Some(2));
+        for _ in 0..=MAX_SOFT {
+            outbox.push_soft(frame(2));
+        }
+        assert!(outbox.is_behind());
+        let cap = Duration::from_secs_f64(MAX_UNREAD_AFTER_FLUSH as f64 / SLOWEST_READER as f64);
+        // It still has the cap's time to read what the socket's buffers took.
+        assert!(
+            !outbox.is_frozen(flushed + cap / 2 + after, after),
+            "within the cap"
+        );
+        // (The two bytes handed since add next to nothing.)
+        let by = Instant::now() + cap + after + Duration::from_millis(5);
+        assert!(outbox.is_frozen(by, after), "frozen by now + cap + after");
     }
 
     #[test]

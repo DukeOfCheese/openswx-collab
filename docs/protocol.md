@@ -392,6 +392,9 @@ A client that stays behind on the soft frames while it reads nothing at all is *
 4408: when it has been behind for 30 s, its socket has not finished what it was handed for that long, and
 that long has also passed since a 16 KiB/s link would have read everything it was sent (soft frames
 included). A slow link taking a big welcome, a big change or a batch of drafts is not closed for it.
+That allowance is never more than 256 s (4 MiB at 16 KiB/s) past the last write its socket finished: a
+client that read quickly and then stopped reading is closed at most 30 s + 4 MiB / 16 KiB/s (about 4.5
+minutes) after it stopped taking frames, plus the time of anything it was handed since.
 
 ### Rebuild reports
 

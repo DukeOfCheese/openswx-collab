@@ -40,7 +40,8 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   in `presence.batch`. For a client that does not read fast enough, peer, presence and draft frames are
   dropped instead of closing it, and it is then sent `peer.list` (every peer as now, the recipient
   included, no drafts, presence up to 1 MiB; the rest follows). A reader that stops reading altogether is
-  closed (4408). A draft may arrive up to a tick after the change that ends it.
+  closed (4408): at most 30 s + 4 MiB / 16 KiB/s after its socket last finished a write, plus the time
+  of anything it was handed since. A draft may arrive up to a tick after the change that ends it.
 - New close codes: 4410 (the document was reloaded or moved: reconnect and resend) and 4429 (too many
   document connections for the account). A connection may have at most 2,000 unanswered changes (4408).
   A client frame may hold at most 1,000,000 values; only a `change` may be longer than 512 KiB.
