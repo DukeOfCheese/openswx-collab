@@ -523,7 +523,31 @@ impl Live {
         token: &str,
         hello: Hello,
     ) -> Result<Live, Refused> {
-        let mut ws = ws_connect(server, doc).await;
+        let ws = ws_connect(server, doc).await;
+        Self::handshake(ws, token, hello).await
+    }
+
+    /// Connects over `tcp`, a socket already connected to the server (one with a small receive
+    /// buffer, say), with the given hello (panics if refused).
+    pub async fn connect_on(
+        tcp: TcpStream,
+        server: &TestServer,
+        doc: &str,
+        token: &str,
+        hello: Hello,
+    ) -> Live {
+        let (ws, _) =
+            tokio_tungstenite::client_async(ws_url(server, doc), MaybeTlsStream::Plain(tcp))
+                .await
+                .expect("the WebSocket opens");
+        match Self::handshake(ws, token, hello).await {
+            Ok(live) => live,
+            Err(refused) => panic!("the connection was refused: {refused:?}"),
+        }
+    }
+
+    /// Sends the hello on a socket just opened and reads the answer.
+    async fn handshake(mut ws: Socket, token: &str, hello: Hello) -> Result<Live, Refused> {
         let asked = hello.client_id.clone().unwrap_or_else(random_client_id);
         ws.send(Message::Binary(hello_frame(token, &hello, &asked).into()))
             .await

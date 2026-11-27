@@ -207,6 +207,9 @@ pub struct Hooks {
     /// How long a connection behind on soft frames may go without its socket taking a frame
     /// ([`FROZEN_AFTER`]).
     pub frozen_after: Duration,
+    /// The slowest link, bytes a second, a reader may be on and never be taken for frozen
+    /// ([`conn::SLOWEST_READER`]).
+    pub slowest_reader: usize,
 }
 
 /// A gate tests shut to hold work at a point and open to let it go on.
@@ -359,6 +362,7 @@ impl Default for Hooks {
             mail_wait: crate::mail::MAIL_WAIT,
             catch_up_every: CATCH_UP_EVERY,
             frozen_after: FROZEN_AFTER,
+            slowest_reader: conn::SLOWEST_READER,
         }
     }
 }

@@ -78,7 +78,7 @@ pub const MAX_SOFT_BYTES: usize = 1024 * 1024;
 const MAX_PER_WRITE: usize = 64;
 /// The slowest link (bytes a second) a reader may be on and never be taken for frozen: every frame
 /// handed to the socket (soft ones too) is given this long to be read, over and above
-/// [`super::Hooks::frozen_after`].
+/// [`super::Hooks::frozen_after`] ([`super::Hooks::slowest_reader`] by default).
 pub const SLOWEST_READER: usize = 16 * 1024;
 /// How long closing may wait for the last frames and the close frame to be written.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
@@ -192,6 +192,8 @@ struct State {
     /// socket so far (soft ones and catch-ups too), flushed or not: the socket's own buffers may
     /// take a big frame at once, and then nothing more while the client reads it.
     read_by: Option<Instant>,
+    /// The link `read_by` is reckoned at, bytes a second ([`SLOWEST_READER`]).
+    slowest_reader: usize,
     /// Soft frames were dropped: none is queued until the room has sent what replaces them.
     behind: bool,
     /// Since when it has been behind.
@@ -229,6 +231,12 @@ impl Outbox {
     /// A queue whose writer waits for [`Outbox::release`] (the welcome) before it sends anything.
     /// `max_behind` is the byte limit described in the module documentation.
     pub fn new(max_behind: usize) -> Arc<Self> {
+        Self::with_slowest_reader(max_behind, SLOWEST_READER)
+    }
+
+    /// [`Outbox::new`], giving a reader the time a link of `slowest_reader` bytes a second takes
+    /// to read what it is handed (instead of [`SLOWEST_READER`]).
+    pub fn with_slowest_reader(max_behind: usize, slowest_reader: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
@@ -239,6 +247,7 @@ impl Outbox {
                 handed: (0, 0, false),
                 writing_since: None,
                 read_by: None,
+                slowest_reader: slowest_reader.max(1),
                 behind: false,
                 behind_since: None,
                 caught_up_at: None,
@@ -491,7 +500,7 @@ impl Outbox {
         // Every frame handed, soft ones too: a reader must read a batch of drafts before anything
         // behind it, so a slow link is as slow on those.
         let now = Instant::now();
-        let reading = Duration::from_secs_f64(frame.len() as f64 / SLOWEST_READER as f64);
+        let reading = Duration::from_secs_f64(frame.len() as f64 / s.slowest_reader as f64);
         s.read_by = Some(s.read_by.map_or(now, |at| at.max(now)) + reading);
         s.writing_since.get_or_insert(now);
         Some(frame)

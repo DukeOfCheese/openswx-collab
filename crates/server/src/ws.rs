@@ -176,7 +176,10 @@ async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
     };
     let user_id = session.user_id.clone();
     let mut session_expires = session.expires_at;
-    let outbox = Outbox::new(4 * state.settings.max_change_bytes);
+    let outbox = Outbox::with_slowest_reader(
+        4 * state.settings.max_change_bytes,
+        state.room_hooks.slowest_reader,
+    );
     let conn = conn::next_id();
     let client: Arc<str> = Arc::from(format!("{user_id}.{client_id}"));
     let connecting = Connecting {

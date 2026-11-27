@@ -870,6 +870,9 @@ async fn a_reader_is_caught_up_at_most_once_a_period() {
 async fn a_reader_frozen_behind_is_closed_and_leaves() {
     let hooks = oswx_server::room::Hooks {
         frozen_after: Duration::from_secs(1),
+        // The drafts its socket's buffers took before they filled (a MiB or two here) would give
+        // it a minute or two more at the slowest link: this test is about what comes after.
+        slowest_reader: 1 << 30,
         ..Default::default()
     };
     let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
@@ -916,7 +919,12 @@ async fn a_reader_frozen_behind_is_closed_and_leaves() {
 
 /// The drafts that follow a list are each peer's as it is now: one that changes its draft after
 /// the list (before its turn) is never sent the old one after the new; one that leaves before its
-/// turn is sent nothing; and the reader is never sent its own.
+/// turn is sent nothing after it left; and the reader is never sent its own.
+///
+/// The owed drafts (32 of 120 KB) are more than the reader's socket (a small receive buffer) and
+/// its queue can hold, so the last ones cannot go until it reads: it stops reading once the list
+/// has come, the last two sitters (near the end of what it is owed) change and leave, the server
+/// has done both, and only then does it read on.
 #[tokio::test]
 async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its_own() {
     let hooks = oswx_server::room::Hooks {
@@ -926,16 +934,25 @@ async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its
     let server = TestServer::start_custom(|_| {}, |s| s.room_hooks = Arc::new(hooks)).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
-    let mut stuck =
-        Live::connect_with(&server, &doc, &world.admin, Hello::client("slow-reader")).await;
+    let addr: std::net::SocketAddr = server.base.trim_start_matches("http://").parse().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    let tcp = socket.connect(addr).await.unwrap();
+    let mut stuck = Live::connect_on(
+        tcp,
+        &server,
+        &doc,
+        &world.admin,
+        Hello::client("slow-reader"),
+    )
+    .await;
     let stuck_id = stuck.client_id.clone();
     stuck.draft(Some(json!({"mine": true}))).await;
-    // Sixteen big drafts, sent in the order they joined: the last ones wait for room well after
-    // the list.
+    // Big drafts, owed in the order their peers joined: about 3.8 MB in all.
     let big = |i: usize| json!({"sitter": i, "pad": "y".repeat(120_000)});
     let mut want = std::collections::HashMap::new();
     let mut sitters = Vec::new();
-    for i in 0..16 {
+    for i in 0..32 {
         let mut s = Live::connect(&server, &doc, &world.admin).await;
         s.draft(Some(big(i))).await;
         want.insert(s.client_id.clone(), plain(big(i)));
@@ -960,7 +977,7 @@ async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its
     for f in &flooders {
         want.insert(f.client_id.clone(), plain(json!({"n": n, "pad": pad})));
     }
-    // It reads until it has been caught up (the list is made, and the first drafts queued) ...
+    // It reads until it has been caught up and its list has come ...
     let mut seen = Vec::new();
     let deadline = Instant::now() + WAIT;
     while conn_status(&server, &doc, &stuck_id).await.unwrap().behind {
@@ -969,79 +986,100 @@ async fn the_drafts_after_a_list_are_as_they_are_now_and_none_of_who_left_or_its
         }
         assert!(Instant::now() < deadline, "never caught up");
     }
-    // ... and at once the last sitter changes its draft and the one before it leaves.
-    let mut changer = sitters.pop().unwrap();
-    let leaver = sitters.pop().unwrap();
-    let fresh = json!({"fresh": true});
-    changer.draft(Some(fresh.clone())).await;
-    want.insert(changer.client_id.clone(), plain(fresh));
-    let leaver_id = leaver.client_id.clone();
-    want.remove(&leaver_id);
-    leaver.close().await;
-    // Everything after the list.
-    while want.len() > seen_after_list(&seen, &stuck_id).len() || !has_list(&seen) {
+    // (It was not behind before, so this list is the first.)
+    while !seen.iter().any(|m| matches!(m, ServerMsg::PeerList { .. })) {
         seen.push(stuck.recv().await);
     }
-    let lists = seen
-        .iter()
-        .filter(|m| matches!(m, ServerMsg::PeerList { .. }))
-        .count();
-    seen.extend(stuck.drain().await);
-    assert_eq!(
-        lists,
-        seen.iter()
-            .filter(|m| matches!(m, ServerMsg::PeerList { .. }))
-            .count(),
-        "caught up again"
-    );
-    // (Earlier lists, from before it was last behind, may come first.)
-    let last = seen
-        .iter()
-        .rposition(|m| matches!(m, ServerMsg::PeerList { .. }))
-        .unwrap();
-    let after = &seen[last + 1..];
-    let mut got: std::collections::HashMap<String, Plain> = std::collections::HashMap::new();
-    for m in after {
-        if let ServerMsg::Draft { client_id, data } = m {
-            let client_id = client_id.to_string();
-            assert_ne!(client_id, stuck_id, "its own draft");
-            assert_ne!(client_id, leaver_id, "the draft of who left");
-            let data = data.clone().expect("no draft is cleared here");
-            if let Some(before) = got.get(&client_id) {
-                // Only the changer's may come twice (relayed, and owed), and never old after new.
-                assert_eq!(client_id, changer.client_id, "a draft twice");
-                assert_eq!(before, &data, "an old draft after the new one");
-            }
-            assert_eq!(Some(&data), want.get(&client_id), "{client_id}: stale");
-            got.insert(client_id, data);
+    // ... then stops reading: the last sitter changes its draft and the one before it leaves.
+    let mut changer = sitters.pop().unwrap();
+    let leaver = sitters.pop().unwrap();
+    let changer_id = changer.client_id.clone();
+    let leaver_id = leaver.client_id.clone();
+    let fresh = plain(json!({"fresh": true}));
+    changer.draft(Some(json!({"fresh": true}))).await;
+    want.insert(changer_id.clone(), fresh.clone());
+    want.remove(&leaver_id);
+    leaver.close().await;
+    // The server has done both: another reader got the new draft, and the leaver is gone.
+    let watcher = &mut flooders[0];
+    loop {
+        if let ServerMsg::Draft { client_id, data } = watcher.recv().await
+            && *client_id == *changer_id
+            && data.as_ref() == Some(&fresh)
+        {
+            break;
         }
     }
-    assert_eq!(got, want);
-    assert!(stuck.closed.is_none());
-}
-
-/// Whether a list is among `seen`.
-fn has_list(seen: &[ServerMsg]) -> bool {
-    seen.iter().any(|m| matches!(m, ServerMsg::PeerList { .. }))
-}
-
-/// The peers whose draft came after the last list in `seen` (not `own`).
-fn seen_after_list(seen: &[ServerMsg], own: &str) -> std::collections::HashSet<String> {
-    let last = seen
-        .iter()
-        .rposition(|m| matches!(m, ServerMsg::PeerList { .. }));
-    let Some(last) = last else {
-        return Default::default();
+    let deadline = Instant::now() + WAIT;
+    while conn_status(&server, &doc, &leaver_id).await.is_some() {
+        assert!(Instant::now() < deadline, "the leaver never left");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // It reads on until every peer's current draft has come after its last list.
+    let last_list = |seen: &[ServerMsg]| {
+        seen.iter()
+            .rposition(|m| matches!(m, ServerMsg::PeerList { .. }))
+            .unwrap()
     };
-    seen[last + 1..]
-        .iter()
-        .filter_map(|m| match m {
-            ServerMsg::Draft { client_id, .. } if &**client_id != own => {
-                Some(client_id.to_string())
+    let current = |seen: &[ServerMsg]| {
+        let mut got = std::collections::HashMap::new();
+        for m in &seen[last_list(seen) + 1..] {
+            if let ServerMsg::Draft { client_id, data } = m
+                && **client_id != *leaver_id
+            {
+                got.insert(client_id.to_string(), data.clone().expect("never cleared"));
             }
-            _ => None,
-        })
-        .collect()
+        }
+        got
+    };
+    while current(&seen) != want {
+        seen.push(stuck.recv().await);
+    }
+    seen.extend(stuck.drain().await);
+    assert_eq!(current(&seen), want);
+    // What the protocol promises, over everything it was sent.
+    let mut fresh_seen = false;
+    let mut left = false;
+    for m in &seen {
+        match m {
+            ServerMsg::Draft { client_id, .. } if **client_id == *stuck_id => {
+                panic!("it was sent its own draft")
+            }
+            ServerMsg::Draft { client_id, data } if **client_id == *changer_id => {
+                if data.as_ref() == Some(&fresh) {
+                    fresh_seen = true;
+                } else {
+                    assert!(!fresh_seen, "the changer's old draft after its new one");
+                }
+            }
+            ServerMsg::PeerLeft { client_id } if **client_id == *leaver_id => left = true,
+            ServerMsg::Draft { client_id, .. } | ServerMsg::Presence { client_id, .. }
+                if **client_id == *leaver_id =>
+            {
+                assert!(!left, "a message from the leaver after it left");
+            }
+            ServerMsg::PeerJoined(p) if *p.client_id == *leaver_id => {
+                assert!(!left, "the leaver joined again after it left");
+            }
+            ServerMsg::PeerList { peers } if left => {
+                assert!(
+                    peers.iter().all(|p| *p.client_id != *leaver_id),
+                    "the leaver listed after it left"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(fresh_seen);
+    // It was told the leaver left, or sent a list without it since.
+    let ServerMsg::PeerList { peers } = &seen[last_list(&seen)] else {
+        unreachable!()
+    };
+    assert!(
+        left || peers.iter().all(|p| *p.client_id != *leaver_id),
+        "never told the leaver left"
+    );
+    assert!(stuck.closed.is_none());
 }
 
 /// A TCP stream that reads at most `rate` bytes a second (in bursts of at most 16 KiB), on a
@@ -1344,17 +1382,19 @@ async fn readers_behind_at_once_get_lists_within_the_presence_budget_and_the_res
         // What it knows of the sitters' presence since the last list it read.
         let mut known: Option<std::collections::HashMap<String, Plain>> = None;
         let mut lists = 0;
+        // Sitters the last list came without presence for (an earlier one, made before every
+        // sitter had joined or sent its presence, may have had room for all it knew).
+        let mut without = 0;
         while known.as_ref() != Some(&want) {
             match reader.recv().await {
                 ServerMsg::PeerList { peers } => {
                     lists += 1;
                     let bytes = presence_bytes(&peers);
                     assert!(bytes <= 1 << 20, "{bytes} bytes of presence in a list");
-                    let without = peers
+                    without = peers
                         .iter()
                         .filter(|p| want.contains_key(&*p.client_id) && p.presence.is_none())
                         .count();
-                    assert!(without > 0, "every presence in one list");
                     known = Some(
                         peers
                             .into_iter()
@@ -1374,6 +1414,7 @@ async fn readers_behind_at_once_get_lists_within_the_presence_budget_and_the_res
             }
         }
         assert!(lists > 0);
+        assert!(without > 0, "every presence in the last list");
         assert!(reader.closed.is_none());
     }
 }
