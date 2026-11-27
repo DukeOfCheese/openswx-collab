@@ -10,7 +10,8 @@
 //!   A blob that is already stored is not written again: the body is still read and checked, and the
 //!   answer is the same 204. A path that is not a SHA-256 is 400. The server takes only so many
 //!   uploads at once, and so many from one organisation and from one account
-//!   ([`crate::uploads`]): one more is refused before any of it is stored, with 429 (the
+//!   ([`crate::uploads`]; an upload of a blob already stored holds no memory and is not counted):
+//!   one more is refused before any of it is stored, with 429 (the
 //!   account's or the organisation's own limit) or 503 (the server's, after a short wait for a
 //!   place). An upload that does not keep up the minimum average rate
 //!   ([`crate::blobs::Pace`]) is answered 400 [`TOO_SLOW`], and one that is not done within
@@ -154,35 +155,41 @@ async fn upload(
             "the blob name must be its sha256 in lower-case hex".into(),
         ));
     }
+    let key = blob_key(&project.org_id, &sha);
+    let limit = state.settings.max_blob_bytes as u64;
+    // Already stored: the body is read and checked (so the client is answered, not cut off), one
+    // chunk at a time, and nothing is written; it holds no memory to speak of, so it takes no
+    // place among the uploads.
+    let stored = state.blobs.exists(&key).await?;
     // Held until this request ends, however it ends.
-    let _place = match state.uploads.place(&user.id, &project.org_id).await {
-        Ok(place) => place,
-        Err(refusal) => {
-            unread(&headers, body).await;
-            return Err(refusal);
+    let _place = if stored {
+        None
+    } else {
+        match state.uploads.place(&user.id, &project.org_id).await {
+            Ok(place) => Some(place),
+            Err(refusal) => {
+                unread(&headers, body).await;
+                return Err(refusal);
+            }
         }
     };
-    let limit = state.settings.max_blob_bytes as u64;
     // The whole upload, storing included, is done in this time or given up on (and whatever it
     // was writing dropped, which removes it).
     let size = declared(&headers).unwrap_or(limit).min(limit);
     let allowed = time_allowed(&state.settings, size);
     let storing = async {
-        let key = blob_key(&project.org_id, &sha);
         let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);
         let body = fail_when_stalled(verified(body, sha), idle);
         let body = fail_when_slow(body, Pace::from_settings(&state.settings));
-        if state.blobs.exists(&key).await? {
-            // Already stored: read and check the body (so the client is answered, not cut off),
-            // but write nothing.
+        if stored {
             drain(body, limit).await.map_err(upload_error)?;
-            return Ok(StatusCode::NO_CONTENT);
+        } else {
+            state
+                .blobs
+                .put_stream(&key, body, limit)
+                .await
+                .map_err(upload_error)?;
         }
-        state
-            .blobs
-            .put_stream(&key, body, limit)
-            .await
-            .map_err(upload_error)?;
         Ok::<_, ApiError>(StatusCode::NO_CONTENT)
     };
     match tokio::time::timeout(allowed, storing).await {

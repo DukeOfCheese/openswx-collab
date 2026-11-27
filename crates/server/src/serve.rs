@@ -21,16 +21,21 @@
 //!   connections included, counted from the moment one is accepted. When the server has them, a
 //!   new one takes the place of the connection that has waited longest without finishing its
 //!   first request head (someone holding sockets open by sending a byte now and then), or
-//!   failing that the one idle longest; never one with a request in its handler, never a
-//!   document connection. With none of those, it goes in a small reserve ([`HEALTH_RESERVE`])
+//!   failing that the one idle longest; never one with a request in its handler or an answer
+//!   still being sent (a download read slowly is busy, not idle), never a document connection.
+//!   (A request that arrives on a connection just as it is chosen never reaches its handler: it
+//!   is answered 503 [`FULL`], if the connection lasts long enough.) With none of those, it goes in a small reserve ([`HEALTH_RESERVE`])
 //!   that answers `GET /api/health` alone (anything else: 503 [`FULL`]), so that a health check
 //!   always gets through; with that full too, it is accepted and closed at once, and counted.
 //!   (Not left unaccepted: the kernel's queue would fill and every later client would wait for a
 //!   time it cannot know; a closed connection is an answer.) Keep the process's limit on open
 //!   files above `max_connections` and its reserve.
 //! - **One address holds only so many**: `max_connections_per_address` (512 unless set; 0: no
-//!   limit). One more from it is closed at once. A trusted proxy's address (`trusted_proxies`)
-//!   is not limited: every client behind it shares it.
+//!   limit; an IPv6 address counts as its /64). One more from it takes the place of that
+//!   address's own connection that has waited longest for its first request head, or failing
+//!   that its one idle longest (as above); it is closed at once only when none of the address's
+//!   connections can go. A trusted proxy's address (`trusted_proxies`) is not limited: every
+//!   client behind it shares it.
 //!
 //! # Long transfers
 //!
@@ -41,7 +46,7 @@
 //! |---|---|---|
 //! | blob upload | not under `request_timeout`; only so many at once, in `upload_memory` ([`crate::uploads`]); done within `max(upload_time_limit, size / upload_time_rate)` | no bytes for `blob_idle_timeout`, or slower than the minimum rate: 400, nothing stored |
 //! | any other request body | does not count against `request_timeout` while it keeps up the minimum rate | 503 `request_timeout` after it stopped, or after it fell behind the rate |
-//! | blob download, export | the handler has answered long before; the body is sent for as long as the client reads | nothing written for `write_timeout`: the connection is closed (and the storage's side after `blob_idle_timeout`, an export after its own stall time) |
+//! | blob download, export | the handler has answered long before; the body is sent for as long as the client reads, and the connection counts as busy (never closed to make room) until it has been | nothing written for `write_timeout`: the connection is closed (and the storage's side after `blob_idle_timeout`, an export after its own stall time) |
 //! | document connection | the upgrade is answered at once | the room closes a slow consumer; a socket that takes nothing for `write_timeout` is closed |
 //!
 //! # Stopping
@@ -63,7 +68,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -71,13 +76,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use futures_util::StreamExt as _;
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -254,20 +259,26 @@ async fn connection(
     let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
         let mut app = app.clone();
-        let handled = (Handling::begin(&seen), in_handlers.handling());
+        // `None`: the connection was just chosen to make room for another, and is closing.
+        let handling = Handling::begin(&seen, &in_handlers);
         // A connection taken in the reserve is for the health check alone.
         let refused = reserved && request.uri().path() != HEALTH;
         let seen = seen.clone();
         async move {
+            let Some((handling, in_handler)) = handling else {
+                return Ok(detail_response(StatusCode::SERVICE_UNAVAILABLE, FULL));
+            };
             if refused {
                 return Ok(detail_response(StatusCode::SERVICE_UNAVAILABLE, FULL));
             }
-            let response = app.call(request).await;
-            if matches!(&response, Ok(r) if r.status() == StatusCode::SWITCHING_PROTOCOLS) {
+            let response = app.call(request).await?;
+            if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 seen.upgraded.store(true, Ordering::SeqCst);
             }
-            drop(handled);
-            response
+            drop(in_handler);
+            // Busy until the answer's body has been sent (or dropped): a long download is not
+            // idle, whatever its pace.
+            Ok::<_, std::convert::Infallible>(response.map(|body| handling.carried_by(body)))
         }
     });
     let mut served = pin!(
@@ -292,7 +303,7 @@ async fn connection(
         tokio::select! {
             _ = served.as_mut() => return,
             () = tokio::time::sleep(LINGER) => {
-                if this.handling.load(Ordering::SeqCst) == 0 {
+                if this.in_handler.load(Ordering::SeqCst) == 0 {
                     return;
                 }
             }
@@ -311,21 +322,105 @@ pub const FULL: &str = "the server has as many connections as it holds; try agai
 /// is busy.
 pub const HEALTH_RESERVE: usize = 8;
 
-/// A request in its handler on a connection, counted until this is dropped.
+/// A request on a connection, from its head to the end of its answer's body: while one is held
+/// the connection is busy and is never closed to make room for another ([`Conns::admit`]). It is
+/// carried in the answer's body ([`Handling::carried_by`]), so a download or an export that the
+/// client reads slowly, or not at all, stays busy until the body has been sent or dropped; one
+/// that stopped is ended by `write_timeout` ([`TakenInTime`]), which drops the body.
 struct Handling(Arc<Conn>);
 
+/// A request in its handler: counted on its connection (a stop waits for it) and in
+/// [`HttpStats::in_handlers`], until this is dropped.
+struct HandlerRunning {
+    conn: Arc<Conn>,
+    _counted: crate::metrics::InHandler,
+}
+
+impl Drop for HandlerRunning {
+    fn drop(&mut self) {
+        self.conn.in_handler.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Handling {
-    fn begin(conn: &Arc<Conn>) -> Self {
+    /// A request whose head has arrived on `conn`; `None` when the connection has just been
+    /// chosen to make room for another (it is closing: the request is answered 503 [`FULL`]
+    /// rather than cut in the middle of its handler).
+    fn begin(conn: &Arc<Conn>, stats: &Arc<HttpStats>) -> Option<(Self, HandlerRunning)> {
         conn.headed.store(true, Ordering::SeqCst);
-        conn.handling.fetch_add(1, Ordering::SeqCst);
-        Self(conn.clone())
+        // One atomic step against `Conns::claim`'s: either the eviction sees this request and
+        // passes the connection by, or this sees the eviction.
+        if conn.busy.fetch_add(1, Ordering::SeqCst) & EVICTING != 0 {
+            conn.busy.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        conn.in_handler.fetch_add(1, Ordering::SeqCst);
+        let running = HandlerRunning {
+            conn: conn.clone(),
+            _counted: stats.handling(),
+        };
+        Some((Self(conn.clone()), running))
+    }
+
+    /// `body`, holding this until it has ended or is dropped.
+    fn carried_by(self, body: Body) -> Body {
+        if body.is_end_stream() {
+            return body;
+        }
+        Body::new(Answering {
+            body,
+            handling: Some(self),
+        })
     }
 }
 
 impl Drop for Handling {
     fn drop(&mut self) {
-        self.0.handling.fetch_sub(1, Ordering::SeqCst);
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
         self.0.touch();
+    }
+}
+
+/// An answer's body with its request's [`Handling`], let go at the body's end.
+struct Answering {
+    body: Body,
+    handling: Option<Handling>,
+}
+
+impl HttpBody for Answering {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
+            self.handling = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// The bit of [`Conn::busy`] that says the connection was chosen to make room for another.
+const EVICTING: usize = 1 << (usize::BITS - 1);
+
+/// What one address is counted as for `max_connections_per_address`: an IPv4 address, or an
+/// IPv6 address's /64 (what one subscriber is usually given; counting each of its addresses
+/// apart would make the limit no limit).
+fn counted_as(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !(u128::MAX >> 64))),
+        v4 => v4,
     }
 }
 
@@ -335,14 +430,18 @@ impl Drop for Handling {
 #[derive(Debug)]
 struct Conn {
     id: u64,
-    ip: IpAddr,
+    /// Its address as the per-address limit counts it ([`counted_as`]).
+    address: IpAddr,
     accepted: Instant,
     /// Taken in the reserve: it may ask for [`HEALTH`] alone.
     reserved: bool,
     /// A request head has arrived on it.
     headed: AtomicBool,
-    /// How many of its requests are in their handlers (one at most, on HTTP/1).
-    handling: AtomicUsize,
+    /// How many of its requests are being handled or answered ([`Handling`]; one at most, on
+    /// HTTP/1), with [`EVICTING`] set once it is chosen to make room.
+    busy: AtomicUsize,
+    /// How many of its requests are in their handlers.
+    in_handler: AtomicUsize,
     /// It became a document connection (a WebSocket): never evicted.
     upgraded: AtomicBool,
     /// When anything last moved on it, in milliseconds after `base`.
@@ -364,12 +463,10 @@ impl Conn {
         }
     }
 
-    /// Whether it may be closed to make room for another: no request in its handler, not a
-    /// document connection, not already chosen.
-    fn evictable(&self, chosen: &HashSet<u64>) -> bool {
-        self.handling.load(Ordering::SeqCst) == 0
-            && !self.upgraded.load(Ordering::SeqCst)
-            && !chosen.contains(&self.id)
+    /// Whether it may be closed to make room for another: no request being handled or answered,
+    /// not a document connection, not already chosen.
+    fn evictable(&self) -> bool {
+        self.busy.load(Ordering::SeqCst) == 0 && !self.upgraded.load(Ordering::SeqCst)
     }
 }
 
@@ -402,12 +499,18 @@ struct ConnsInner {
 }
 
 impl ConnsInner {
-    /// One fewer counted, of the kind `conn` is.
+    /// One fewer counted, of the kind `conn` is and from its address.
     fn uncount(&mut self, conn: &Conn) {
         if conn.reserved {
             self.reserve -= 1;
         } else {
             self.regular -= 1;
+        }
+        if let Some(n) = self.by_address.get_mut(&conn.address) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_address.remove(&conn.address);
+            }
         }
     }
 }
@@ -426,14 +529,9 @@ impl Drop for Registered {
         let mut inner = self.1.lock();
         let conn = &self.0;
         inner.all.remove(&conn.id);
+        // (One chosen to make room was uncounted then.)
         if !inner.evicted.remove(&conn.id) {
             inner.uncount(conn);
-        }
-        if let Some(n) = inner.by_address.get_mut(&conn.ip) {
-            *n -= 1;
-            if *n == 0 {
-                inner.by_address.remove(&conn.ip);
-            }
         }
     }
 }
@@ -444,15 +542,17 @@ impl Conns {
     }
 
     /// Takes a connection just accepted from `ip`, or answers `None` when it must be closed at
-    /// once:
+    /// once. A connection may be closed to make room for it (never one with a request being
+    /// handled or answered, never a document connection): the one that has waited longest
+    /// without finishing its first request head, or failing that the one idle longest.
     ///
-    /// - an address that is not a `trusted` proxy holds at most `per_address` (0: any number);
-    /// - the server holds `max` and [`HEALTH_RESERVE`] more for the health check. When it has
-    ///   `max`, the new one takes the place of the one that has waited longest without
-    ///   finishing its first request head, or failing that the one idle longest (never one with
-    ///   a request in its handler, never a document connection), which is closed. With none of
-    ///   those it goes in the reserve; with the reserve full, it takes the place of a reserve
-    ///   connection that has sent nothing, or is closed.
+    /// - An address that is not a `trusted` proxy holds at most `per_address` (0: any number;
+    ///   an IPv6 address counts as its /64). At that, one of the address's own connections makes
+    ///   room; with none that can, the new one is closed.
+    /// - The server holds `max` and [`HEALTH_RESERVE`] more for the health check. When it has
+    ///   `max`, one of the others makes room. With none that can it goes in the reserve; with
+    ///   the reserve full, it takes the place of a reserve connection that has sent nothing, or
+    ///   is closed.
     fn admit(
         self: &Arc<Self>,
         ip: IpAddr,
@@ -461,23 +561,20 @@ impl Conns {
         per_address: usize,
         stats: &Arc<HttpStats>,
     ) -> Option<Admitted> {
-        let ip = ip.to_canonical();
+        let address = counted_as(ip);
         let mut inner = self.lock();
-        let from_there = inner.by_address.get(&ip).copied().unwrap_or(0);
-        if !trusted && per_address > 0 && from_there >= per_address {
+        let from_there = inner.by_address.get(&address).copied().unwrap_or(0);
+        if !trusted
+            && per_address > 0
+            && from_there >= per_address
+            && !inner.make_room(|c| c.address == address, true, stats)
+        {
             stats.refused_for_address();
             return None;
         }
-        let (regular, reserve) = (inner.regular, inner.reserve);
-        let reserved = if regular < max {
+        let reserved = if inner.regular < max || inner.make_room(|c| !c.reserved, true, stats) {
             false
-        } else if let Some(victim) = inner.victim(false) {
-            inner.evict(victim, stats);
-            false
-        } else if reserve < HEALTH_RESERVE {
-            true
-        } else if let Some(victim) = inner.victim(true) {
-            inner.evict(victim, stats);
+        } else if inner.reserve < HEALTH_RESERVE || inner.make_room(|c| c.reserved, false, stats) {
             true
         } else {
             stats.refused();
@@ -485,11 +582,12 @@ impl Conns {
         };
         let conn = Arc::new(Conn {
             id: inner.next,
-            ip,
+            address,
             accepted: Instant::now(),
             reserved,
             headed: AtomicBool::new(false),
-            handling: AtomicUsize::new(0),
+            busy: AtomicUsize::new(0),
+            in_handler: AtomicUsize::new(0),
             upgraded: AtomicBool::new(false),
             active_ms: AtomicU64::new(0),
             base: self.base,
@@ -503,7 +601,7 @@ impl Conns {
             inner.regular += 1;
         }
         inner.all.insert(conn.id, conn.clone());
-        *inner.by_address.entry(ip).or_default() += 1;
+        *inner.by_address.entry(address).or_default() += 1;
         drop(inner);
         Some(Admitted {
             open: stats.opened(),
@@ -513,31 +611,48 @@ impl Conns {
 }
 
 impl ConnsInner {
-    /// The connection to close to make room, among those in the reserve or the others: the one
-    /// that has waited longest for its first request head; failing that (not in the reserve,
-    /// whose connections take one request), the one idle longest.
-    fn victim(&self, in_reserve: bool) -> Option<Arc<Conn>> {
+    /// Closes one of the connections `among` to make room, and answers whether there was one:
+    /// the one that has waited longest for its first request head; failing that, if `idle_too`,
+    /// the one idle longest.
+    fn make_room(
+        &mut self,
+        among: impl Fn(&Conn) -> bool,
+        idle_too: bool,
+        stats: &HttpStats,
+    ) -> bool {
+        // (A connection whose request began between the choice and the claim is passed by.)
+        while let Some(victim) = self.victim(&among, idle_too) {
+            if victim
+                .busy
+                .compare_exchange(0, EVICTING, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.evicted.insert(victim.id);
+                self.uncount(&victim);
+                victim.evicted.notify_one();
+                stats.evicted();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The connection [`ConnsInner::make_room`] would close.
+    fn victim(&self, among: &impl Fn(&Conn) -> bool, idle_too: bool) -> Option<Arc<Conn>> {
         let candidates = || {
             self.all
                 .values()
-                .filter(move |c| c.reserved == in_reserve && c.evictable(&self.evicted))
+                .filter(|c| among(c) && c.evictable() && !self.evicted.contains(&c.id))
         };
         let fresh = candidates()
             .filter(|c| !c.headed.load(Ordering::SeqCst))
             .min_by_key(|c| c.accepted);
-        if fresh.is_some() || in_reserve {
+        if fresh.is_some() || !idle_too {
             return fresh.cloned();
         }
         candidates()
             .min_by_key(|c| c.active_ms.load(Ordering::Relaxed))
             .cloned()
-    }
-
-    fn evict(&mut self, victim: Arc<Conn>, stats: &HttpStats) {
-        self.evicted.insert(victim.id);
-        self.uncount(&victim);
-        victim.evicted.notify_one();
-        stats.evicted();
     }
 }
 
@@ -757,5 +872,133 @@ impl AsyncWrite for TakenInTime {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    /// Admits a connection from `from` to a server of `max` with `per_address` from one address.
+    fn admit(
+        conns: &Arc<Conns>,
+        stats: &Arc<HttpStats>,
+        from: &str,
+        max: usize,
+        per_address: usize,
+    ) -> Option<Admitted> {
+        conns.admit(ip(from), false, max, per_address, stats)
+    }
+
+    fn conn(admitted: &Admitted) -> &Arc<Conn> {
+        &admitted.registered.0
+    }
+
+    fn chosen(admitted: &Admitted) -> bool {
+        conn(admitted).busy.load(Ordering::SeqCst) & EVICTING != 0
+    }
+
+    #[tokio::test]
+    async fn an_address_at_its_limit_makes_room_from_its_own_and_is_refused_only_when_none_can_go()
+    {
+        let (conns, stats) = (Arc::new(Conns::default()), Arc::new(HttpStats::default()));
+        let first = admit(&conns, &stats, "203.0.113.7", 100, 2).unwrap();
+        let second = admit(&conns, &stats, "203.0.113.7", 100, 2).unwrap();
+        let elsewhere = admit(&conns, &stats, "198.51.100.1", 100, 2).unwrap();
+        // Both sent a head; the first was idle longer.
+        conn(&first).headed.store(true, Ordering::SeqCst);
+        conn(&second).headed.store(true, Ordering::SeqCst);
+        conn(&first).active_ms.store(0, Ordering::SeqCst);
+        conn(&second).active_ms.store(10, Ordering::SeqCst);
+        // A third from there: the first makes room, nobody else's is touched.
+        let third = admit(&conns, &stats, "203.0.113.7", 100, 2).unwrap();
+        assert!(chosen(&first) && !chosen(&second) && !chosen(&elsewhere));
+        // The newcomer, which has sent nothing, goes before the one that has.
+        let fourth = admit(&conns, &stats, "203.0.113.7", 100, 2).unwrap();
+        assert!(chosen(&third) && !chosen(&second));
+        assert_eq!((stats.evictions(), stats.refusals_for_address()), (2, 0));
+        // Both left busy: one more from there is refused, as nothing of the address can go.
+        let busy = [&second, &fourth].map(|a| Handling::begin(conn(a), &stats).unwrap());
+        assert!(admit(&conns, &stats, "203.0.113.7", 100, 2).is_none());
+        assert_eq!((stats.evictions(), stats.refusals_for_address()), (2, 1));
+        // A document connection cannot go either.
+        drop(busy);
+        conn(&second).upgraded.store(true, Ordering::SeqCst);
+        conn(&fourth).upgraded.store(true, Ordering::SeqCst);
+        assert!(admit(&conns, &stats, "203.0.113.7", 100, 2).is_none());
+        assert_eq!(stats.refusals_for_address(), 2);
+        // Another address is not held up by it; and a trusted proxy is not limited.
+        assert!(admit(&conns, &stats, "198.51.100.1", 100, 2).is_some());
+        let proxy = conns.admit(ip("203.0.113.7"), true, 100, 2, &stats);
+        assert!(proxy.is_some());
+        assert_eq!(stats.evictions(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_address_counts_as_its_64() {
+        let (conns, stats) = (Arc::new(Conns::default()), Arc::new(HttpStats::default()));
+        let first = admit(&conns, &stats, "2001:db8:1:2::1", 100, 1).unwrap();
+        // Another address of the same /64 shares its limit ...
+        let second = admit(&conns, &stats, "2001:db8:1:2:ffff::9", 100, 1).unwrap();
+        assert!(chosen(&first));
+        // ... another /64 does not; and an IPv4 address written as IPv6 is that IPv4 address.
+        let other = admit(&conns, &stats, "2001:db8:1:3::1", 100, 1).unwrap();
+        let v4 = admit(&conns, &stats, "192.0.2.1", 100, 1).unwrap();
+        let mapped = admit(&conns, &stats, "::ffff:192.0.2.1", 100, 1).unwrap();
+        assert!(!chosen(&second) && !chosen(&other) && chosen(&v4) && !chosen(&mapped));
+        assert_eq!(counted_as(ip("2001:db8:1:2:3:4:5:6")), ip("2001:db8:1:2::"));
+    }
+
+    #[tokio::test]
+    async fn a_connection_chosen_to_make_room_takes_no_request_and_a_busy_one_is_never_chosen() {
+        let (conns, stats) = (Arc::new(Conns::default()), Arc::new(HttpStats::default()));
+        let busy = admit(&conns, &stats, "192.0.2.1", 2, 0).unwrap();
+        let idle = admit(&conns, &stats, "192.0.2.2", 2, 0).unwrap();
+        let (handling, running) = Handling::begin(conn(&busy), &stats).unwrap();
+        // The handler has returned; the answer is still being sent: busy all the same.
+        drop(running);
+        assert_eq!(conn(&busy).in_handler.load(Ordering::SeqCst), 0);
+        conn(&busy).active_ms.store(0, Ordering::SeqCst);
+        conn(&idle).headed.store(true, Ordering::SeqCst);
+        conn(&idle).active_ms.store(1_000_000, Ordering::SeqCst);
+        let newcomer = admit(&conns, &stats, "192.0.2.3", 2, 0).unwrap();
+        assert!(chosen(&idle) && !chosen(&busy) && !newcomer.registered.0.reserved);
+        // A request that arrives on the chosen one is not begun (it is answered 503).
+        assert!(Handling::begin(conn(&idle), &stats).is_none());
+        assert_eq!(conn(&idle).in_handler.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.in_handlers(), 0);
+        // Once its answer is sent, the busy one can make room.
+        drop(handling);
+        conn(&newcomer).headed.store(true, Ordering::SeqCst);
+        conn(&newcomer).active_ms.store(u64::MAX, Ordering::SeqCst);
+        let _later = admit(&conns, &stats, "192.0.2.4", 2, 0).unwrap();
+        assert!(chosen(&busy));
+    }
+
+    #[tokio::test]
+    async fn with_the_reserve_full_of_connections_that_asked_for_something_one_more_is_refused() {
+        let (conns, stats) = (Arc::new(Conns::default()), Arc::new(HttpStats::default()));
+        let only = admit(&conns, &stats, "192.0.2.1", 1, 0).unwrap();
+        let _busy = Handling::begin(conn(&only), &stats).unwrap();
+        let mut reserve = Vec::new();
+        for i in 0..HEALTH_RESERVE {
+            let taken = admit(&conns, &stats, &format!("192.0.2.{}", 10 + i), 1, 0).unwrap();
+            assert!(conn(&taken).reserved);
+            reserve.push(taken);
+        }
+        // One in the reserve that has sent nothing makes room ...
+        let newcomer = admit(&conns, &stats, "192.0.2.100", 1, 0).unwrap();
+        assert!(chosen(&reserve[0]) && conn(&newcomer).reserved);
+        assert_eq!((stats.evictions(), stats.refusals()), (1, 0));
+        // ... but not one that has asked for something, even idle: then one more is refused.
+        for taken in reserve.iter().skip(1).chain([&newcomer]) {
+            conn(taken).headed.store(true, Ordering::SeqCst);
+        }
+        assert!(admit(&conns, &stats, "192.0.2.101", 1, 0).is_none());
+        assert_eq!((stats.evictions(), stats.refusals()), (1, 1));
     }
 }

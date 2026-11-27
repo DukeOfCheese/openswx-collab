@@ -9,12 +9,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use common::*;
 use futures_util::StreamExt;
 use oswx_core::Seq;
 use oswx_core::wire::RejectCode;
-use oswx_server::blobs::blob_key;
+use oswx_server::blobs::{Blobs, ByteStream, PutOutcome, blob_key};
 use oswx_server::serve::{Stopped, TOO_SLOW, serve};
 use oswx_server::uploads::Uploads;
 use reqwest::StatusCode;
@@ -534,6 +535,33 @@ async fn an_organisation_at_its_limit_does_not_stop_anothers_upload() {
     assert_eq!(upload_now(&server, &w, &bob, &two).await.0, 204);
 }
 
+#[tokio::test]
+async fn an_upload_of_a_blob_already_stored_takes_no_place() {
+    let server = server_with_uploads(1, 1, 1).await;
+    let w = World::new(&server).await.unwrap();
+    let uploads = server.state.uploads.clone();
+    let (stored, other) = (noise(MIB, 41), noise(MIB, 42));
+    assert_eq!(upload_now(&server, &w, &w.admin, &stored).await.0, 204);
+    // The one place, and the account's one, taken by an upload that is running.
+    let (finish, held) = held_upload(&server, &w, &w.admin, &other);
+    assert!(eventually(|| uploads.running() == 1).await);
+    let charged = uploads.memory_held();
+    // The blob already stored is sent again: read, checked and answered, charged nothing.
+    assert_eq!(upload_now(&server, &w, &w.admin, &stored).await.0, 204);
+    assert_eq!((uploads.running(), uploads.memory_held()), (1, charged));
+    // Checked all the same: a body that is not the blob is refused.
+    let wrong = reqwest::Client::new()
+        .put(server.url(&blob_path(&w, &sha_of(&stored))))
+        .bearer_auth(&w.admin)
+        .body(other.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 400);
+    finish.send(()).unwrap();
+    assert_eq!(held.await.unwrap(), 204);
+}
+
 /// An upload of `body` by `w`'s admin in pieces of `piece` bytes, `gap` apart, over a socket of
 /// the test's own (so that an answer that comes before the body is all sent is read, whatever the
 /// server then does with the connection): its status and its body's `detail`.
@@ -544,20 +572,48 @@ async fn paced_upload(
     piece: usize,
     gap: Duration,
 ) -> (u16, String) {
+    paced_upload_framed(server, w, body, piece, gap, false).await
+}
+
+/// [`paced_upload`], `chunked` (no `Content-Length`: the server cannot know the size).
+async fn paced_upload_framed(
+    server: &TestServer,
+    w: &World,
+    body: &[u8],
+    piece: usize,
+    gap: Duration,
+    chunked: bool,
+) -> (u16, String) {
     let mut socket = TcpStream::connect(addr(server)).await.unwrap();
+    let framing = if chunked {
+        "Transfer-Encoding: chunked".to_owned()
+    } else {
+        format!("Content-Length: {}", body.len())
+    };
     let head = format!(
-        "PUT {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n{framing}\r\n\
          Connection: close\r\n\r\n",
         blob_path(w, &sha_of(body)),
         addr(server),
         w.admin,
-        body.len()
     );
     socket.write_all(head.as_bytes()).await.unwrap();
     let mut answer = Vec::new();
     let mut buf = vec![0u8; 4096];
-    for piece in body.chunks(piece) {
-        if socket.write_all(piece).await.is_err() {
+    let pieces = body.chunks(piece).count();
+    for (i, piece) in body.chunks(piece).enumerate() {
+        let framed = if chunked {
+            let mut framed = format!("{:x}\r\n", piece.len()).into_bytes();
+            framed.extend_from_slice(piece);
+            framed.extend_from_slice(b"\r\n");
+            if i + 1 == pieces {
+                framed.extend_from_slice(b"0\r\n\r\n");
+            }
+            framed
+        } else {
+            piece.to_vec()
+        };
+        if socket.write_all(&framed).await.is_err() {
             break;
         }
         // The gap, spent listening: an answer now means the server has given the upload up.
@@ -729,6 +785,125 @@ async fn an_upload_that_takes_longer_than_it_is_allowed_is_given_up_on() {
     let stored = server.stored_under("").await;
     assert_eq!(stored.len(), 1, "{stored:?}");
     assert!(oswx_server::metrics::counters().uploads_cut_short >= 2);
+}
+
+#[tokio::test]
+async fn an_upload_that_does_not_say_its_size_has_the_time_of_the_largest_blob_and_no_more() {
+    // The largest blob 40,000 bytes: an upload of unknown size may take two seconds (at 20,000
+    // bytes a second), whatever it really holds.
+    let server = TestServer::start_with(|s| {
+        s.max_blob_bytes = 40_000;
+        s.upload_time_limit = 1.0;
+        s.upload_time_rate = 20_000;
+        s.min_upload_rate = 500;
+        s.upload_rate_grace = 1.0;
+    })
+    .await;
+    let w = World::new(&server).await.unwrap();
+    // 12,000 bytes, chunked, at 7,500 bytes a second: stored, past the one-second least.
+    let body = noise(12_000, 51);
+    let started = Instant::now();
+    let (status, answer) =
+        paced_upload_framed(&server, &w, &body, 1500, Duration::from_millis(200), true).await;
+    assert_eq!(status, 204, "{answer}");
+    assert!(started.elapsed() > Duration::from_millis(1200));
+    // 30,000 bytes, chunked, at 5,000 bytes a second (six seconds): given up on at two, though it
+    // never stopped and kept well above the floor; nothing is stored.
+    let body = noise(30_000, 52);
+    let started = Instant::now();
+    let (status, answer) =
+        paced_upload_framed(&server, &w, &body, 1000, Duration::from_millis(200), true).await;
+    assert_eq!(
+        (status, answer.as_str()),
+        (400, "the upload took too long and was given up on")
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(1800) && took < Duration::from_millis(3500),
+        "{took:?}"
+    );
+    assert!(eventually(|| server.state.uploads.running() == 0).await);
+    assert_eq!(server.stored_under("").await.len(), 1);
+}
+
+/// Storage that takes a whole body and then does not answer for a minute before it stores it.
+struct SlowStore(Arc<dyn Blobs>);
+
+#[async_trait]
+impl Blobs for SlowStore {
+    async fn put_stream(
+        &self,
+        key: &str,
+        mut body: ByteStream,
+        limit: u64,
+    ) -> anyhow::Result<PutOutcome> {
+        let mut whole = Vec::new();
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        self.0.put_stream(key, chunked(&whole, MIB), limit).await
+    }
+    async fn get_stream(&self, key: &str) -> anyhow::Result<Option<(u64, ByteStream)>> {
+        self.0.get_stream(key).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.0.exists(key).await
+    }
+    async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
+        self.0.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        self.0.get(key).await
+    }
+    async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        self.0.delete_prefix(prefix).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.0.delete(key).await
+    }
+    async fn health(&self) -> anyhow::Result<()> {
+        self.0.health().await
+    }
+    fn upload_memory(&self) -> u64 {
+        self.0.upload_memory()
+    }
+}
+
+#[tokio::test]
+async fn an_upload_whose_storage_does_not_answer_is_given_up_on_in_its_time() {
+    let server = TestServer::start_custom(
+        |s| {
+            s.upload_time_limit = 1.0;
+            s.request_timeout = 30.0;
+        },
+        |s| {
+            s.blobs = Arc::new(SlowStore(s.blobs.clone()));
+            s.uploads = Arc::new(Uploads::places(1, 1, 1));
+        },
+    )
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let uploads = server.state.uploads.clone();
+    // The body is all sent at once; the storage then holds the upload up.
+    let body = noise(64 << 10, 53);
+    let started = Instant::now();
+    let (status, answer) = upload_now(&server, &w, &w.admin, &body).await;
+    assert_eq!(
+        (status, answer["detail"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("the upload took too long and was given up on")
+        )
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    // Its place came back, and nothing was stored.
+    assert!(eventually(|| uploads.running() == 0).await);
+    assert!(server.stored_under("").await.is_empty());
 }
 
 #[tokio::test]
@@ -1626,6 +1801,52 @@ async fn failing_that_the_connection_idle_longest_makes_room() {
 }
 
 #[tokio::test]
+async fn a_download_its_client_has_stopped_reading_is_not_closed_to_make_room() {
+    // The write limit far above the test, so that only eviction could end the download; idle
+    // kept-alive connections of the set-up close after a second.
+    let server = TestServer::start_with(|s| {
+        s.max_connections = 2;
+        s.write_timeout = 120.0;
+        s.blob_idle_timeout = 300.0;
+        s.request_timeout = 1.0;
+    })
+    .await;
+    let w = World::new(&server).await.unwrap();
+    let body = noise(48 * MIB, 29);
+    let sha = store_blob(&server, &w, &body).await;
+    let stats = server.state.http.clone();
+    assert!(eventually(|| stats.open() == 0).await);
+    // A download whose client reads the head and then nothing for now: once the buffers are
+    // full nothing moves on it.
+    let mut download = TcpStream::connect(addr(&server)).await.unwrap();
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        blob_path(&w, &sha),
+        w.admin
+    );
+    download.write_all(request.as_bytes()).await.unwrap();
+    let head = read_until(&mut download, b"\r\n\r\n").await;
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+    let mut got = head.len() - (head.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A connection used after it: so the download is the one idle longest by its last write.
+    let mut used = TcpStream::connect(addr(&server)).await.unwrap();
+    assert_eq!(health_on(&mut used).await, Some(200));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The server is full: a newcomer takes the place of the one used, not of the download.
+    let mut newcomer = TcpStream::connect(addr(&server)).await.unwrap();
+    assert_eq!(health_on(&mut newcomer).await, Some(200));
+    assert!(closed_by_server(&mut used).await);
+    assert_eq!(stats.evictions(), 1);
+    // The client reads again, and gets the whole blob.
+    got += tokio::time::timeout(WAIT, read_to_end(&mut download))
+        .await
+        .expect("the download ends");
+    assert_eq!(got, body.len(), "the download was cut short");
+    assert_eq!(stats.write_timeouts(), 0);
+}
+
+#[tokio::test]
 async fn with_every_connection_busy_the_health_check_still_gets_through_and_nothing_else() {
     let server = TestServer::start_with(|s| s.max_connections = 2).await;
     let world = World::new(&server).await.unwrap();
@@ -1673,7 +1894,7 @@ async fn with_every_connection_busy_the_health_check_still_gets_through_and_noth
 }
 
 #[tokio::test]
-async fn one_address_holds_only_so_many_unless_it_is_a_trusted_proxy() {
+async fn an_address_full_of_sockets_that_send_nothing_still_lets_a_newcomer_from_it_in() {
     let server = TestServer::start_with(|s| {
         s.trusted_proxies = vec![];
         s.max_connections_per_address = 2;
@@ -1681,26 +1902,61 @@ async fn one_address_holds_only_so_many_unless_it_is_a_trusted_proxy() {
     .await;
     let stats = server.state.http.clone();
     assert!(eventually(|| stats.open() == 0).await);
-    // Six at once: two are taken, counted the moment they are accepted; four are closed.
-    let mut burst = Vec::new();
-    for _ in 0..6 {
-        burst.push(TcpStream::connect(addr(&server)).await.unwrap());
+    // The address's limit taken by sockets that never finish a head (the server is far from
+    // full).
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
+        socket.write_all(b"GET /api/he").await.unwrap();
+        held.push(socket);
+        assert!(eventually(|| stats.open() == held.len()).await);
     }
-    let mut answered = 0;
-    for socket in &mut burst {
-        match health_on(socket).await {
-            Some(200) => answered += 1,
-            None => {}
-            other => panic!("{other:?}"),
-        }
-    }
-    assert_eq!(answered, 2);
-    assert_eq!(stats.refusals_for_address(), 4);
-    assert_eq!((stats.evictions(), stats.refusals()), (0, 0));
+    // Someone else at that address still gets in: the oldest of them makes room.
+    let mut newcomer = TcpStream::connect(addr(&server)).await.unwrap();
+    assert_eq!(health_on(&mut newcomer).await, Some(200));
+    assert!(closed_by_server(&mut held[0]).await);
+    // And again: the other one goes before the newcomer, which asked for something.
+    let mut another = TcpStream::connect(addr(&server)).await.unwrap();
+    assert_eq!(health_on(&mut another).await, Some(200));
+    assert!(closed_by_server(&mut held[1]).await);
+    assert_eq!(health_on(&mut newcomer).await, Some(200));
+    assert_eq!(
+        (
+            stats.evictions(),
+            stats.refusals_for_address(),
+            stats.refusals()
+        ),
+        (2, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn one_address_holds_only_so_many_unless_it_is_a_trusted_proxy() {
+    let server = TestServer::start_with(|s| {
+        s.trusted_proxies = vec![];
+        s.max_connections_per_address = 2;
+    })
+    .await;
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let other_doc = world.document(&server, None, None, None).await;
+    let stats = server.state.http.clone();
+    // Two document connections from the address: neither may be closed for another.
+    let mut first = Live::connect(&server, &doc, &world.admin).await;
+    let mut second = Live::connect(&server, &other_doc, &world.admin).await;
+    assert!(eventually(|| stats.open() == 2).await);
+    // So one more from there is closed at once, whatever it asks.
+    let refused = stats.refusals_for_address();
+    let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
+    assert_eq!(health_on(&mut socket).await, None);
+    assert_eq!(stats.refusals_for_address(), refused + 1);
+    assert_eq!(edit(&mut first, 1).await, 1);
+    assert_eq!(edit(&mut second, 2).await, 1);
     // One goes: there is room for another from there.
-    burst.clear();
-    assert!(eventually(|| stats.open() == 0).await);
-    assert_eq!(server.get("/api/health", None).await.0, 200);
+    drop(first);
+    assert!(eventually(|| stats.open() == 1).await);
+    let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
+    assert_eq!(health_on(&mut socket).await, Some(200));
 
     // A trusted proxy's address is not limited: every client behind it shares it.
     let server = TestServer::start_with(|s| s.max_connections_per_address = 2).await;
