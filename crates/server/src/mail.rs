@@ -76,24 +76,63 @@ pub async fn send_logged(
     false
 }
 
-/// `text` with every spelling of the address `to` (in any case) replaced by `<the recipient>`:
-/// a mail server's refusal often quotes the address it refused.
+/// What a failure is logged as: `text` with every spelling of the address `to` (in any case)
+/// replaced by `<the recipient>`, since a mail server's refusal often quotes the address it
+/// refused. When that cannot be sure of leaving nothing of the address (`to` is not ASCII, or
+/// its local part or its domain, in any case or, for an internationalised domain, in either of
+/// its forms, is still in what is left), only a generic reason and the SMTP code are logged.
 fn without_address(text: &str, to: &str) -> String {
     let to = to.trim();
-    if to.is_empty() || !to.is_ascii() {
+    if to.is_empty() {
         return text.to_owned();
+    }
+    let generic = || match smtp_code(text) {
+        Some(code) => format!(
+            "the mail server's answer is left out, as it may name the recipient (SMTP {code})"
+        ),
+        None => {
+            "the send failed; what was said is left out, as it may name the recipient".to_owned()
+        }
+    };
+    if !to.is_ascii() {
+        return generic();
     }
     // (ASCII lower case keeps every byte where it was, so the places found are places in `text`.)
     let (lower, needle) = (text.to_ascii_lowercase(), to.to_ascii_lowercase());
-    let mut out = String::with_capacity(text.len());
+    let (mut out, mut left) = (String::with_capacity(text.len()), String::new());
     let mut from = 0;
     while let Some(at) = lower[from..].find(&needle) {
         out.push_str(&text[from..from + at]);
         out.push_str("<the recipient>");
+        left.push_str(&text[from..from + at]);
+        left.push('\n');
         from += at + needle.len();
     }
     out.push_str(&text[from..]);
+    left.push_str(&text[from..]);
+    // What is left of the text, as a reader would compare it: every letter in lower case (not
+    // only ASCII's).
+    let left = left.to_lowercase();
+    let (local, domain) = needle.rsplit_once('@').unwrap_or((needle.as_str(), ""));
+    let unicode_domain = url::quirks::domain_to_unicode(domain).to_lowercase();
+    let traces = [local, domain, unicode_domain.as_str()];
+    if traces.iter().any(|t| !t.is_empty() && left.contains(t)) {
+        return generic();
+    }
     out
+}
+
+/// The SMTP reply code a failure's text gives (`... (550): ...`, as the mail client words a
+/// refusal), if it gives one.
+fn smtp_code(text: &str) -> Option<&str> {
+    text.match_indices('(').find_map(|(at, _)| {
+        let code = text.get(at + 1..at + 4)?;
+        let closed = text.get(at + 4..at + 5) == Some(")");
+        (closed
+            && code.bytes().all(|b| b.is_ascii_digit())
+            && (b'2'..=b'5').contains(&code.as_bytes()[0]))
+        .then_some(code)
+    })
 }
 
 /// How long a request waits for the mail it sends before it answers without knowing.
@@ -464,5 +503,64 @@ mod tests {
         );
         assert_eq!(without_address("timed out", "bob@example.com"), "timed out");
         assert_eq!(without_address("x é y", ""), "x é y");
+
+        // Whatever cannot be scrubbed for sure is left out, but for the SMTP code.
+        let generic = |code: &str| {
+            format!(
+                "the mail server's answer is left out, as it may name the recipient (SMTP {code})"
+            )
+        };
+        let quoted = |address: &str| format!("permanent error (550): 5.1.1 <{address}>: unknown");
+        // An address that is not ASCII: in its own spelling, in upper case, or as punycode.
+        for said in [
+            quoted("zoë@bücher.example"),
+            quoted("ZOË@BÜCHER.EXAMPLE"),
+            quoted("zoë@xn--bcher-kva.example"),
+        ] {
+            let logged = without_address(&said, "zoë@bücher.example");
+            assert_eq!(logged, generic("550"), "{said}");
+        }
+        // An ASCII address with an internationalised domain, quoted in its Unicode form.
+        let said = quoted("bob@BÜCHER.example");
+        assert_eq!(
+            without_address(&said, "bob@xn--bcher-kva.example"),
+            generic("550")
+        );
+        // A domain quoted on its own: in ASCII, or in its Unicode form.
+        let said = "transient error (451): no route to xn--bcher-kva.example";
+        assert_eq!(
+            without_address(said, "ann@xn--bcher-kva.example"),
+            generic("451")
+        );
+        let said = "transient error (421): bücher.example is not answering";
+        assert_eq!(
+            without_address(said, "ann@xn--bcher-kva.example"),
+            generic("421")
+        );
+        // The local part quoted on its own, or a letter only Unicode lower-cases (the Kelvin
+        // sign) hiding the whole address from an ASCII comparison.
+        let said = "permanent error (550): mailbox Zed.Private unknown";
+        assert_eq!(
+            without_address(said, "zed.private@example.com"),
+            generic("550")
+        );
+        let said = "permanent error (553): <\u{212A}im@example.com> refused";
+        assert_eq!(without_address(said, "kim@example.com"), generic("553"));
+        // No code to keep.
+        assert_eq!(
+            without_address(
+                "connection to zoë@bücher.example failed",
+                "zoë@bücher.example"
+            ),
+            "the send failed; what was said is left out, as it may name the recipient"
+        );
+        // Nothing of the address left: the answer is kept as it is.
+        assert_eq!(
+            without_address(
+                &quoted("ann@xn--bcher-kva.example"),
+                "ann@xn--bcher-kva.example"
+            ),
+            "permanent error (550): 5.1.1 <<the recipient>>: unknown"
+        );
     }
 }
