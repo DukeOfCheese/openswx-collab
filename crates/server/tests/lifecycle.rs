@@ -2486,26 +2486,27 @@ async fn a_change_sent_between_the_deletions_commit_and_the_close_is_written_now
     );
     assert!(server.state.hub.loaded(&doc).is_some());
     // Bob, still connected, sends changes into the room of a document that is gone.
+    let mut sent = Vec::new();
     for depth in [2, 3] {
         let change = b.make_change(1, vec![set_depth(depth)]);
         b.send_change(&change).await;
+        sent.push(change);
     }
-    pause(Duration::from_millis(300)).await;
+    // The room cannot store them (the journal refuses a document marked deleted) and says so,
+    // both, while it is still open.
+    for change in &sent {
+        let outcome = b.outcome(&change.change_id).await;
+        assert!(matches!(outcome, Outcome::Rejected { .. }), "{outcome:?}");
+    }
     no_row_after(&server, &doc, 1).await;
     gate.open();
     assert_eq!(deletion.await.unwrap(), 204);
-    // The room could not store them and said so; then Bob is closed. No row was written.
+    // Then Bob is closed, having been told nothing else. No row was written.
     assert_eq!(
         b.closed().await,
         (4404, "the organisation was deleted".to_owned())
     );
-    assert!(
-        b.seen
-            .iter()
-            .all(|m| matches!(m, oswx_core::wire::ServerMsg::Rejected { .. })),
-        "{:?}",
-        b.seen
-    );
+    assert!(b.seen.is_empty(), "{:?}", b.seen);
     nothing_left_of(&server, &doc).await;
     match Live::try_connect(&server, &doc, &bob, Hello::default()).await {
         Ok(_) => panic!("a deleted document opened"),

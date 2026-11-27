@@ -886,7 +886,9 @@ async fn server_on(b: &Bucket, settings: impl FnOnce(&mut oswx_server::Settings)
     TestServer::start_custom(settings, move |s| s.blobs = blobs).await
 }
 
+/// `/api/ready`, asked once its last answer is no longer given again.
 async fn ready(server: &TestServer) -> StatusCode {
+    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
     server.get("/api/ready", None).await.0
 }
 

@@ -1591,6 +1591,113 @@ async fn two_first_sign_ins_of_one_person_at_once_make_one_account() {
     );
 }
 
+/// An account being deleted while a provider sign-in attaches to it: the deletion holds the account
+/// (parked as it erases it), the sign-in finds the account by its address and waits for it in
+/// `attach` (`lock_user`), and then sees it gone: no code, no identity on a deleted account. On
+/// SQLite the sign-in's transaction waits for the deletion's before it begins, and finds no such
+/// account at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_attaches_to_an_account_being_deleted_waits_for_it_and_gets_no_code() {
+    let (server, flaky) = TestServer::start_flaky(google).await;
+    let (token, ada) = server.register("ada@example.com").await;
+    server.providers.person("ada", "ada@example.com");
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    let r = start(&server, "google", &params).await;
+    let state = query(&location(&r))["state"][0].clone();
+    let server = Arc::new(server);
+    // The deletion holds the account's lock, parked just before it erases it.
+    flaky.erase_gate.shut();
+    let deletion = {
+        let (server, token) = (server.clone(), token.clone());
+        tokio::spawn(async move {
+            server
+                .call(
+                    reqwest::Method::DELETE,
+                    "/api/me",
+                    Some(&token),
+                    Some(json!({"current_password": PASSWORD})),
+                )
+                .await
+                .0
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), flaky.erase_gate.until_waiting(1))
+        .await
+        .expect("the deletion holds the account");
+    let signing_in = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let r = callback(
+                &server,
+                "google",
+                &[("code", "ada"), ("state", state.as_str())],
+            )
+            .await;
+            query(&location(&r))
+        })
+    };
+    // (Long enough for the sign-in to reach the account's lock, or the writer on SQLite.)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!signing_in.is_finished(), "the sign-in did not wait");
+    flaky.erase_gate.open();
+    assert_eq!(deletion.await.unwrap(), StatusCode::NO_CONTENT);
+    let back = signing_in.await.unwrap();
+    assert!(!back.contains_key("code"), "{back:?}");
+    let expected = if common::on_postgres() {
+        "account_disabled"
+    } else {
+        "invite_required"
+    };
+    assert_eq!(error(&back), expected);
+    let attached = format!("SELECT COUNT(*) FROM oauth_identities WHERE user_id = '{ada}'");
+    assert_eq!(count(&server, &attached).await, 0);
+}
+
+/// A sign-in whose every try meets a taken key: after the last try the app is told
+/// `server_error` on its loopback address (not a 500 page), and nothing is kept.
+#[tokio::test]
+async fn a_sign_in_that_meets_a_taken_key_on_every_try_ends_in_server_error() {
+    let (server, flaky) = TestServer::start_flaky(google).await;
+    server.register("ada@example.com").await;
+    server.providers.person("ada", "ada@example.com");
+    flaky.duplicate_identity_inserts(true);
+    let logs = LogCapture::start();
+    let c = challenge(VERIFIER);
+    let params = [("redirect_uri", REDIRECT), ("code_challenge", c.as_str())];
+    let r = start(&server, "google", &params).await;
+    let state = query(&location(&r))["state"][0].clone();
+    let r = callback(
+        &server,
+        "google",
+        &[("code", "ada"), ("state", state.as_str())],
+    )
+    .await;
+    let back = location(&r);
+    assert!(back.starts_with(REDIRECT), "{back}");
+    assert_eq!(error(&query(&back)), "server_error");
+    assert!(
+        logs.text().contains("a sign-in kept meeting a taken key"),
+        "{}",
+        logs.text()
+    );
+    assert_eq!(
+        count(&server, "SELECT COUNT(*) FROM oauth_identities").await,
+        0
+    );
+    // With the fault gone, the same person signs in.
+    flaky.duplicate_identity_inserts(false);
+    let r = start(&server, "google", &params).await;
+    let state = query(&location(&r))["state"][0].clone();
+    let r = callback(
+        &server,
+        "google",
+        &[("code", "ada"), ("state", state.as_str())],
+    )
+    .await;
+    assert!(query(&location(&r)).contains_key("code"));
+}
+
 /// Two first sign-ins through a provider, both past the count of accounts before either inserts
 /// its account (on SQLite, and with the accounts lock, the second waits for the first instead).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

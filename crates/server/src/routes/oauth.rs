@@ -565,10 +565,11 @@ async fn callback(
                 ended.unwrap_or_else(|err| {
                     match &err {
                         ApiError::Internal(e) => tracing::error!("a browser sign-in failed: {e:#}"),
+                        // (Not its message: an extension's refusal can carry any text.)
                         other => tracing::error!(
                             status = other.status().as_u16(),
-                            "a browser sign-in failed: {}",
-                            other.detail()
+                            kind = other.kind(),
+                            "a browser sign-in failed"
                         ),
                     }
                     Back::error("server_error")

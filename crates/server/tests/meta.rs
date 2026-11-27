@@ -13,6 +13,12 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// `/api/ready`, asked once its last answer is no longer given again.
+async fn ready(server: &TestServer) -> (StatusCode, Value) {
+    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
+    get(server, "/api/ready").await
+}
+
 async fn get(server: &TestServer, path: &str) -> (StatusCode, Value) {
     let r = reqwest::get(server.url(path)).await.unwrap();
     let status = r.status();
@@ -49,12 +55,56 @@ async fn ready_is_ok_while_the_store_answers_and_503_when_it_does_not() {
     );
 
     store.fail_health(true);
-    let (status, body) = get(&server, "/api/ready").await;
+    let (status, body) = ready(&server).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body, json!({"ok": false}));
 
     store.fail_health(false);
-    assert_eq!(get(&server, "/api/ready").await.0, StatusCode::OK);
+    assert_eq!(ready(&server).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ready_checks_once_at_a_time_gives_its_answer_again_for_a_second_and_warns_once() {
+    let (server, store) = TestServer::start_flaky(|_| {}).await;
+    assert_eq!(ready(&server).await.0, StatusCode::OK);
+    let logs = common::LogCapture::start();
+    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
+    store.fail_health(true);
+    // Twenty at once: one check, one warning, the same answer for all.
+    let asks = (0..20).map(|_| get(&server, "/api/ready"));
+    let answers = futures_util::future::join_all(asks).await;
+    assert!(
+        answers
+            .iter()
+            .all(|(s, _)| *s == StatusCode::SERVICE_UNAVAILABLE),
+        "{answers:?}"
+    );
+    // Well within the second, the store mends: the answer is given again.
+    store.fail_health(false);
+    assert_eq!(
+        get(&server, "/api/ready").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        logs.text().matches("not ready").count(),
+        1,
+        "{}",
+        logs.text()
+    );
+    // Once it is stale, the server is asked again.
+    assert_eq!(ready(&server).await.0, StatusCode::OK);
+    assert!(logs.text().contains("ready again"), "{}", logs.text());
+    // Not ready for a while: said once, not at every check.
+    store.fail_health(true);
+    for _ in 0..3 {
+        assert_eq!(ready(&server).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(
+        logs.text().matches("not ready").count(),
+        2,
+        "{}",
+        logs.text()
+    );
 }
 
 #[tokio::test]
@@ -333,10 +383,7 @@ async fn restart_keeps_a_flaky_store_wrapped_around_the_reopened_one() {
     let server = server.restart().await;
     assert_eq!(server.state.store.user_count().await.unwrap(), 1);
     flaky.fail_health(true);
-    assert_eq!(
-        get(&server, "/api/ready").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(ready(&server).await.0, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

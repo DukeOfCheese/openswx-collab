@@ -71,6 +71,27 @@ impl ApiError {
         }
     }
 
+    /// What kind of error this is, as a fixed word (for logs that must not carry a message, which
+    /// can hold text from an extension or a request).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) | Self::NotFoundDetail(_) => "not_found",
+            Self::Unauthorized => "unauthorized",
+            Self::WrongCredentials => "wrong_credentials",
+            Self::Forbidden(_) => "forbidden",
+            Self::Conflict(_) | Self::ConflictWith(_) => "conflict",
+            Self::BadRequest(_) => "bad_request",
+            Self::Unprocessable(_) => "unprocessable",
+            Self::PaymentRequired(_) => "refused_by_extension",
+            Self::TooLarge => "too_large",
+            Self::RateLimited => "rate_limited",
+            Self::Busy(_) => "busy",
+            Self::NotImplemented(_) => "not_implemented",
+            Self::Unavailable(_) => "unavailable",
+            Self::Internal(_) => "internal",
+        }
+    }
+
     /// The `detail` the client sees.
     pub fn detail(&self) -> &str {
         match self {

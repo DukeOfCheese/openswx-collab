@@ -520,6 +520,8 @@ async fn a_writer_that_dies_is_unhealthy_answers_unknown_and_fails_readiness() {
         Err(JournalError::Unknown)
     );
     assert_eq!(row_count(&server, &a).await, 0);
+    // (Once the answer before is no longer given again.)
+    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
     assert_eq!(
         server.get("/api/ready", None).await.0,
         StatusCode::SERVICE_UNAVAILABLE

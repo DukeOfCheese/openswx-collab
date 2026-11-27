@@ -897,6 +897,9 @@ pub struct FlakyStore {
     pub user_gate: Arc<oswx_server::room::Gate>,
     /// Shut: every `erase_user` parks here (an account's deletion then holds its locks).
     pub erase_gate: Arc<oswx_server::room::Gate>,
+    /// Set: every `insert_oauth_identity` inserts its row twice, so that the database refuses the
+    /// second as a duplicate key (a sign-in that meets a taken key on every try).
+    duplicate_identities: Arc<AtomicBool>,
     /// Shut: every `mark_org_deleted` parks here once it has marked (a deletion then holds the
     /// rows of the organisation's documents).
     pub mark_gate: Arc<oswx_server::room::Gate>,
@@ -954,6 +957,7 @@ impl FlakyStore {
             head_gate: Arc::default(),
             user_gate: Arc::default(),
             erase_gate: Arc::default(),
+            duplicate_identities: Arc::default(),
             mark_gate: Arc::default(),
             org_gate: Arc::default(),
             commit_patience: Arc::default(),
@@ -1120,11 +1124,18 @@ impl FlakyStore {
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
             erase_gate: self.erase_gate.clone(),
+            duplicate_identities: self.duplicate_identities.clone(),
             mark_gate: self.mark_gate.clone(),
             org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
             ref_writes: self.ref_writes.clone(),
         })
+    }
+
+    /// Makes every `insert_oauth_identity` insert its row twice (`true`): the database refuses
+    /// the second as a duplicate key.
+    pub fn duplicate_identity_inserts(&self, on: bool) {
+        self.duplicate_identities.store(on, Ordering::SeqCst);
     }
 
     /// How many transactions [`Store::begin`] and [`Store::begin_journal`] have opened so far.
@@ -1596,6 +1607,7 @@ pub struct FlakyTx<'a> {
     head_gate: Arc<oswx_server::room::Gate>,
     user_gate: Arc<oswx_server::room::Gate>,
     erase_gate: Arc<oswx_server::room::Gate>,
+    duplicate_identities: Arc<AtomicBool>,
     mark_gate: Arc<oswx_server::room::Gate>,
     org_gate: Arc<oswx_server::room::Gate>,
     commit_patience: Arc<Mutex<Option<Duration>>>,
@@ -1667,6 +1679,7 @@ impl Tx for FlakyTx<'_> {
             head_gate: self.head_gate.clone(),
             user_gate: self.user_gate.clone(),
             erase_gate: self.erase_gate.clone(),
+            duplicate_identities: self.duplicate_identities.clone(),
             mark_gate: self.mark_gate.clone(),
             org_gate: self.org_gate.clone(),
             commit_patience: self.commit_patience.clone(),
@@ -1775,7 +1788,11 @@ impl Tx for FlakyTx<'_> {
     }
 
     async fn insert_oauth_identity(&mut self, identity: &OAuthIdentity) -> anyhow::Result<()> {
-        self.inner.insert_oauth_identity(identity).await
+        self.inner.insert_oauth_identity(identity).await?;
+        if self.duplicate_identities.load(Ordering::SeqCst) {
+            self.inner.insert_oauth_identity(identity).await?;
+        }
+        Ok(())
     }
 
     async fn delete_user_identities(
