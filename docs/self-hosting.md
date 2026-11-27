@@ -46,6 +46,13 @@ collab.example.org {
 }
 ```
 
+The proxy must pass the client's address in `X-Forwarded-For` (Caddy does). The server believes that
+header only from `OSWX_COLLAB_TRUSTED_PROXIES`; otherwise every client shares the proxy's address and its
+per-address limits (sign-in attempts, connections). With Docker Compose the proxy's connections arrive
+from the Compose network's gateway, so the Compose file gives that network a fixed subnet,
+`NETWORK_SUBNET` in `deploy/.env` (`172.30.87.0/24` unless set), and trusts it. Change it if it overlaps a
+network the machine already has.
+
 ## First account and invites
 
 The first account registered becomes the server admin and can create organisations. Everyone else joins

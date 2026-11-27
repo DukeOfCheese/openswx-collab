@@ -4,7 +4,8 @@
     .venv/Scripts/python tools/check_deploy.py
 
 1. Reads deploy/Dockerfile and the Compose files: every OSWX_COLLAB_* variable they set must be a setting the
-   server has, and the command the image runs must exist.
+   server has (the Python server's or the Rust server's), the command the image runs must exist, and the
+   Compose network must have a fixed subnet that the server trusts as its proxy (OSWX_COLLAB_TRUSTED_PROXIES).
 2. Installs the server into a fresh virtual environment with the same pip command as the Dockerfile.
 3. Starts that installed server with the environment the Compose files give it (PostgreSQL through asyncpg,
    files in an S3 bucket behind a custom endpoint), on 0.0.0.0, and runs the image's health check against it.
@@ -17,6 +18,7 @@ order.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -55,8 +57,14 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def rust_settings() -> set[str]:
+    """The OSWX_COLLAB_* names the Rust server reads (crates/server/src/config.rs)."""
+    source = (ROOT / "crates/server/src/config.rs").read_text(encoding="utf-8")
+    return {PREFIX + name for name in re.findall(r'e\.\w+\(\s*"([A-Z0-9_]+)"', source)}
+
+
 def static_checks() -> tuple[str, dict]:
-    known = {PREFIX + f.name.upper() for f in fields(Settings)}
+    known = {PREFIX + f.name.upper() for f in fields(Settings)} | rust_settings()
     docker = (ROOT / "deploy/Dockerfile").read_text(encoding="utf-8")
     base = yaml.safe_load((ROOT / "deploy/docker-compose.yml").read_text(encoding="utf-8"))
     s3 = yaml.safe_load((ROOT / "deploy/docker-compose.s3.yml").read_text(encoding="utf-8"))
@@ -77,6 +85,19 @@ def static_checks() -> tuple[str, dict]:
           "the Compose file runs the published image")
     check("volumes" in base and set(base["volumes"]) == {"storage", "db"} and {"garage-meta", "garage-data"} <= set(s3["volumes"]),
           "the named volumes are declared")
+    # The host's TLS proxy reaches the server from the Compose network's gateway: the network has a fixed
+    # subnet, and the server trusts exactly that subnet's X-Forwarded-For.
+    subnets = [c.get("subnet") for c in base.get("networks", {}).get("default", {}).get("ipam", {}).get("config", [])]
+    trusted = base["services"]["server"]["environment"].get("OSWX_COLLAB_TRUSTED_PROXIES")
+    default = re.fullmatch(r"\$\{NETWORK_SUBNET:-([^}]+)\}", trusted or "")
+    try:
+        net = ipaddress.ip_network(default.group(1)) if default else None
+    except ValueError:
+        net = None
+    check(len(subnets) == 1 and subnets[0] == trusted and net is not None and net.version == 4
+          and 8 <= net.prefixlen and net.is_private,
+          f"the Compose network has a fixed private subnet and the server trusts it as its proxy "
+          f"(subnet {subnets}, OSWX_COLLAB_TRUSTED_PROXIES {trusted!r})")
     pip = re.search(r"^RUN pip install (.+)$", docker, re.M).group(1)
     cmd = json.loads(re.search(r"^CMD (\[.+\])$", docker, re.M).group(1))
     scripts = (ROOT / "server/pyproject.toml").read_text(encoding="utf-8")
