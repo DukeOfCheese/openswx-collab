@@ -789,27 +789,28 @@ async fn an_upload_that_takes_longer_than_it_is_allowed_is_given_up_on() {
 
 #[tokio::test]
 async fn an_upload_that_does_not_say_its_size_has_the_time_of_the_largest_blob_and_no_more() {
-    // The largest blob 40,000 bytes: an upload of unknown size may take two seconds (at 20,000
+    // The largest blob 40,000 bytes: an upload of unknown size may take four seconds (at 10,000
     // bytes a second), whatever it really holds.
     let server = TestServer::start_with(|s| {
         s.max_blob_bytes = 40_000;
         s.upload_time_limit = 1.0;
-        s.upload_time_rate = 20_000;
+        s.upload_time_rate = 10_000;
         s.min_upload_rate = 500;
         s.upload_rate_grace = 1.0;
     })
     .await;
     let w = World::new(&server).await.unwrap();
-    // 12,000 bytes, chunked, at 7,500 bytes a second: stored, past the one-second least.
+    // 12,000 bytes, chunked, at 7,500 bytes a second (1.6 s): stored, past the one-second least
+    // and well within the four seconds.
     let body = noise(12_000, 51);
     let started = Instant::now();
     let (status, answer) =
         paced_upload_framed(&server, &w, &body, 1500, Duration::from_millis(200), true).await;
     assert_eq!(status, 204, "{answer}");
     assert!(started.elapsed() > Duration::from_millis(1200));
-    // 30,000 bytes, chunked, at 5,000 bytes a second (six seconds): given up on at two, though it
-    // never stopped and kept well above the floor; nothing is stored.
-    let body = noise(30_000, 52);
+    // 36,000 bytes, chunked, at 5,000 bytes a second (seven seconds): given up on at four, though
+    // it never stopped and kept well above the floor; nothing is stored.
+    let body = noise(36_000, 52);
     let started = Instant::now();
     let (status, answer) =
         paced_upload_framed(&server, &w, &body, 1000, Duration::from_millis(200), true).await;
@@ -819,7 +820,7 @@ async fn an_upload_that_does_not_say_its_size_has_the_time_of_the_largest_blob_a
     );
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(1800) && took < Duration::from_millis(3500),
+        took >= Duration::from_millis(3800) && took < Duration::from_millis(6000),
         "{took:?}"
     );
     assert!(eventually(|| server.state.uploads.running() == 0).await);
