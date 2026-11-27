@@ -211,8 +211,10 @@ pub struct Settings {
     /// finishing its first request (or failing that, the one idle longest); with none of those,
     /// the new one is closed at once. A few more are kept for `GET /api/health` alone.
     pub max_connections: usize,
-    /// The most connections one client address may hold open at once (not counting addresses of
-    /// `trusted_proxies`); one more is closed at once. 0: no limit.
+    /// The most connections one client address (an IPv6 address: its /64) may hold open at once,
+    /// not counting addresses of `trusted_proxies`. One more takes the place of the address's own
+    /// connection that has waited longest for its first request head, or failing that its one
+    /// idle longest; it is closed at once only when none can go. 0: no limit.
     pub max_connections_per_address: usize,
     /// The most request bodies larger than the default limit (a document being created, up to
     /// 8 MB) the server reads at once; one more is answered 503 at once.
@@ -390,6 +392,17 @@ impl Settings {
             s.s3_path_style = Some(path_style);
         }
         e.positive_seconds("BLOB_IDLE_TIMEOUT", &mut s.blob_idle_timeout)?;
+        // Replaced by UPLOAD_MEMORY: a limit an operator set must not be dropped without a word.
+        if e.get("MAX_BLOB_UPLOADS")
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            return Err(ConfigError::new(
+                "MAX_BLOB_UPLOADS",
+                "unset: it was replaced by OSWX_COLLAB_UPLOAD_MEMORY, the bytes the uploads \
+                 running at once may hold in all (each is charged what its storage holds: about \
+                 44 MiB for S3, 4 MiB for a folder)",
+            ));
+        }
         e.positive_whole("UPLOAD_MEMORY", &mut s.upload_memory)?;
         e.positive_whole(
             "MAX_BLOB_UPLOADS_PER_USER",

@@ -334,6 +334,35 @@ async fn create_admin_and_reset_password_set_what_they_say() {
 }
 
 #[test]
+fn the_setting_upload_memory_replaced_stops_the_server_and_names_its_successor() {
+    let dir = TempDir::new().unwrap();
+    for command in [&["serve", "--port", "0"][..], &["migrate"], &["db-status"]] {
+        let ran = run(
+            dir.path(),
+            command,
+            &[("OSWX_COLLAB_MAX_BLOB_UPLOADS", "16")],
+        );
+        assert_eq!(ran.code, Some(2), "{command:?}: {}", ran.err);
+        assert!(
+            ran.err
+                .starts_with("error: OSWX_COLLAB_MAX_BLOB_UPLOADS must be unset")
+                && ran.err.contains("OSWX_COLLAB_UPLOAD_MEMORY"),
+            "{}",
+            ran.err
+        );
+        assert_eq!(ran.err.lines().count(), 1, "{}", ran.err);
+        assert_eq!(ran.out, "");
+    }
+    // Left empty, it says nothing: the server starts as without it.
+    let ran = run(
+        dir.path(),
+        &["migrate"],
+        &[("OSWX_COLLAB_MAX_BLOB_UPLOADS", " ")],
+    );
+    assert_eq!(ran.code, Some(0), "{}", ran.err);
+}
+
+#[test]
 fn a_setting_that_cannot_be_read_stops_every_command_and_is_never_repeated() {
     let dir = TempDir::new().unwrap();
     let secret = "hunter2-very-secret";

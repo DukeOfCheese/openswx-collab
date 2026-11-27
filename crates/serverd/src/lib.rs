@@ -74,7 +74,8 @@ Settings (environment variables; the default is in brackets):
     OSWX_COLLAB_MAX_BLOB_BYTES     the largest blob [268435456]
     OSWX_COLLAB_UPLOAD_MEMORY      bytes the blob uploads running at once may hold in all; each
                                    is charged what its storage holds (S3: 44 MiB, a folder:
-                                   4 MiB); one that does not fit: 503 [738197504]
+                                   4 MiB); one that does not fit: 503 [738197504]. (It
+                                   replaced OSWX_COLLAB_MAX_BLOB_UPLOADS, which must be unset.)
     OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_ORG
                                    blob uploads at once for one organisation; one more: 429 [8]
     OSWX_COLLAB_MAX_BLOB_UPLOADS_PER_USER
@@ -97,8 +98,9 @@ Settings (environment variables; the default is in brackets):
                                    place of one that never finished a request, or the one idle
                                    longest; 8 more answer /api/health alone [4096]
     OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS
-                                   connections from one address (not a trusted proxy's); 0: no
-                                   limit [512]
+                                   connections from one address (not a trusted proxy's; an IPv6
+                                   address counts as its /64); one more takes the place of the
+                                   address's own idle one; 0: no limit [512]
     OSWX_COLLAB_MAX_LARGE_BODIES   request bodies over 1 MiB read at once; one more: 503 [16]
     OSWX_COLLAB_WRITE_TIMEOUT      seconds a client may take nothing of an answer [60]
     OSWX_COLLAB_SHUTDOWN_TIMEOUT   seconds an orderly stop may take [8]
