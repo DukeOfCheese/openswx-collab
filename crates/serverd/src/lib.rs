@@ -94,9 +94,9 @@ Settings (environment variables; the default is in brackets):
                                    is believed, e.g. `127.0.0.1, 172.16.0.0/12` [127.0.0.1, ::1]
     OSWX_COLLAB_REQUEST_TIMEOUT    seconds from a request's head, or the last of its body, to
                                    the beginning of its answer, before it is answered 503 [60]
-    OSWX_COLLAB_MAX_CONNECTIONS    connections held open at once; when full, a new one takes the
-                                   place of one that never finished a request, or the one idle
-                                   longest; 8 more answer /api/health alone [4096]
+    OSWX_COLLAB_MAX_CONNECTIONS    connections held open at once, at most 65536; when full, a new
+                                   one takes the place of one that never finished a request, or
+                                   the one idle longest; 8 more answer /api/health alone [4096]
     OSWX_COLLAB_MAX_CONNECTIONS_PER_ADDRESS
                                    connections from one address (not a trusted proxy's; an IPv6
                                    address counts as its /64); one more takes the place of the

@@ -209,7 +209,8 @@ pub struct Settings {
     /// The most connections the server holds open at once (document connections included). When
     /// it has them, a new one takes the place of the one that has waited longest without
     /// finishing its first request (or failing that, the one idle longest); with none of those,
-    /// the new one is closed at once. A few more are kept for `GET /api/health` alone.
+    /// the new one is closed at once. A few more are kept for `GET /api/health` alone. At most
+    /// [`oswx_core::wire::MAX_PEER_LIST`]: every one may be in one document's peer list.
     pub max_connections: usize,
     /// The most connections one client address (an IPv6 address: its /64) may hold open at once,
     /// not counting addresses of `trusted_proxies`. One more takes the place of the address's own
@@ -414,6 +415,14 @@ impl Settings {
         e.positive_seconds("UPLOAD_TIME_LIMIT", &mut s.upload_time_limit)?;
         e.positive_whole("UPLOAD_TIME_RATE", &mut s.upload_time_rate)?;
         e.positive_whole("MAX_CONNECTIONS", &mut s.max_connections)?;
+        // A client takes a peer list of at most MAX_PEER_LIST peers (one per connection).
+        if s.max_connections > oswx_core::wire::MAX_PEER_LIST {
+            return Err(ConfigError::new(
+                "MAX_CONNECTIONS",
+                "at most 65536 (a client refuses a document's peer list of more peers than that, \
+                 and every connection can be in one document)",
+            ));
+        }
         e.whole(
             "MAX_CONNECTIONS_PER_ADDRESS",
             &mut s.max_connections_per_address,
@@ -1098,6 +1107,14 @@ mod tests {
         ]);
         assert_eq!((s.max_blob_uploads_per_org, s.max_connections), (2, 10));
         assert_eq!((s.min_upload_rate, s.upload_rate_grace), (0, 1.5));
+        // No more connections than a peer list may name.
+        let most = oswx_core::wire::MAX_PEER_LIST;
+        let (at_most, over) = (most.to_string(), (most + 1).to_string());
+        let s = read(&[("MAX_CONNECTIONS", at_most.as_str())]);
+        assert_eq!(s.max_connections, most);
+        let e = refused(&[("MAX_CONNECTIONS", over.as_str())]);
+        assert_eq!(e.var, format!("{PREFIX}MAX_CONNECTIONS"));
+        assert!(e.expected.starts_with(&format!("at most {most} ")), "{e}");
         for (var, bad) in [
             ("MAX_BLOB_UPLOADS_PER_ORG", "0"),
             ("MAX_CONNECTIONS", "0"),

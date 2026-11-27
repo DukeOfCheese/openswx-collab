@@ -363,6 +363,27 @@ fn the_setting_upload_memory_replaced_stops_the_server_and_names_its_successor()
 }
 
 #[test]
+fn more_connections_than_a_peer_list_may_name_stop_the_server() {
+    let dir = TempDir::new().unwrap();
+    let over = (oswx_core::wire::MAX_PEER_LIST + 1).to_string();
+    let ran = run(
+        dir.path(),
+        &["serve", "--port", "0"],
+        &[("OSWX_COLLAB_MAX_CONNECTIONS", over.as_str())],
+    );
+    assert_eq!(ran.code, Some(2), "{}", ran.err);
+    assert!(
+        ran.err
+            .starts_with("error: OSWX_COLLAB_MAX_CONNECTIONS must be at most 65536 ")
+            && ran.err.contains("peer list"),
+        "{}",
+        ran.err
+    );
+    assert_eq!(ran.err.lines().count(), 1, "{}", ran.err);
+    assert_eq!(ran.out, "");
+}
+
+#[test]
 fn a_setting_that_cannot_be_read_stops_every_command_and_is_never_repeated() {
     let dir = TempDir::new().unwrap();
     let secret = "hunter2-very-secret";
