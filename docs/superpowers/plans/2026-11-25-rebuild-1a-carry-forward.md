@@ -57,12 +57,17 @@ server plan (1b), the import/docs plan (1c) and the client project. Nothing here
   replaces what it knew of the others:
   - it names **every** peer as it is now, **the recipient included** (one list is shared by every
     client caught up at once): skip the entry whose `client_id` is your own;
-  - it carries each peer's presence but **no drafts** (`draft` is absent): forget the drafts you
-    had; each peer's current draft follows, as a `draft` message, after the list.
+  - it carries **no drafts** (`draft` is absent): forget the drafts you had; each peer's current
+    draft follows, as a `draft` message, after the list;
+  - it carries the peers' presence up to 1 MiB of it in all, in the order they joined; a peer past
+    that comes **without** `presence` (absent does not mean it has none), and its presence follows
+    after the list, in `presence` or `presence.batch` messages like any other.
   At most 65,536 peers, each `client_id` once; a `presence.batch` client id is at most 129
   characters (user id, a dot, the hello's client id).
 - Changes, answers and lock messages are never dropped; a client too slow for those is closed with
-  4408. So is one that stays behind on the soft messages for 30 s while it reads nothing at all.
+  4408. So is one that stays behind on the soft messages while it reads nothing at all for 30 s
+  beyond the time a 16 KiB/s link would take to read the changes, answers and lists it was sent (a
+  slow link taking a big welcome or change is not closed for it).
 - Until a `peer.list` arrives, a client that fell behind may get `lock.changed` / `lock.result`
   frames naming a `client_id` it was never told about (a `peer.joined` it missed) or one that has
   left (a `peer.left` it missed): show the lock anyway, with the name the lock carries, and do not
