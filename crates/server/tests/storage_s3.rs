@@ -883,12 +883,16 @@ async fn a_prefix_that_is_only_partly_removed_is_an_error_and_the_rest_is_gone()
 /// A server whose storage is a bucket of a fake S3 of the test's own.
 async fn server_on(b: &Bucket, settings: impl FnOnce(&mut oswx_server::Settings)) -> TestServer {
     let blobs = b.blobs.clone();
-    TestServer::start_custom(settings, move |s| s.blobs = blobs).await
+    TestServer::start_custom(settings, move |s| {
+        s.blobs = blobs;
+        // Every ask of `/api/ready` is a check.
+        s.ready_cache = std::time::Duration::ZERO;
+    })
+    .await
 }
 
-/// `/api/ready`, asked once its last answer is no longer given again.
+/// `/api/ready` (asked anew: see [`server_on`]).
 async fn ready(server: &TestServer) -> StatusCode {
-    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
     server.get("/api/ready", None).await.0
 }
 

@@ -3,6 +3,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::routing::post;
@@ -13,10 +14,14 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// `/api/ready`, asked once its last answer is no longer given again.
+/// `/api/ready` (on a server started with [`flaky_with_ready_cache`] of zero: asked anew).
 async fn ready(server: &TestServer) -> (StatusCode, Value) {
-    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
     get(server, "/api/ready").await
+}
+
+/// A server on a [`common::FlakyStore`] whose `/api/ready` gives an answer again for `cache`.
+async fn flaky_with_ready_cache(cache: Duration) -> (TestServer, Arc<common::FlakyStore>) {
+    TestServer::start_flaky_full(|_| {}, common::new_journal, |s| s.ready_cache = cache).await
 }
 
 async fn get(server: &TestServer, path: &str) -> (StatusCode, Value) {
@@ -48,7 +53,7 @@ async fn health_says_ok() {
 
 #[tokio::test]
 async fn ready_is_ok_while_the_store_answers_and_503_when_it_does_not() {
-    let (server, store) = TestServer::start_flaky(|_| {}).await;
+    let (server, store) = flaky_with_ready_cache(Duration::ZERO).await;
     assert_eq!(
         get(&server, "/api/ready").await,
         (StatusCode::OK, json!({"ok": true}))
@@ -64,11 +69,15 @@ async fn ready_is_ok_while_the_store_answers_and_503_when_it_does_not() {
 }
 
 #[tokio::test]
-async fn ready_checks_once_at_a_time_gives_its_answer_again_for_a_second_and_warns_once() {
-    let (server, store) = TestServer::start_flaky(|_| {}).await;
-    assert_eq!(ready(&server).await.0, StatusCode::OK);
+async fn ready_checks_once_at_a_time_gives_its_answer_again_and_warns_once() {
+    // An answer is given again for as long as the cache says (a second in a running server;
+    // here for longer than the test takes).
+    assert_eq!(
+        oswx_server::routes::meta::READY_CACHE,
+        Duration::from_secs(1)
+    );
+    let (server, store) = flaky_with_ready_cache(Duration::from_secs(3600)).await;
     let logs = common::LogCapture::start();
-    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
     store.fail_health(true);
     // Twenty at once: one check, one warning, the same answer for all.
     let asks = (0..20).map(|_| get(&server, "/api/ready"));
@@ -79,7 +88,7 @@ async fn ready_checks_once_at_a_time_gives_its_answer_again_for_a_second_and_war
             .all(|(s, _)| *s == StatusCode::SERVICE_UNAVAILABLE),
         "{answers:?}"
     );
-    // Well within the second, the store mends: the answer is given again.
+    // The store mends while the answer is fresh: it is given again.
     store.fail_health(false);
     assert_eq!(
         get(&server, "/api/ready").await.0,
@@ -91,7 +100,22 @@ async fn ready_checks_once_at_a_time_gives_its_answer_again_for_a_second_and_war
         "{}",
         logs.text()
     );
-    // Once it is stale, the server is asked again.
+}
+
+#[tokio::test]
+async fn ready_says_why_once_when_it_stops_being_ready_and_when_it_is_again() {
+    // Every ask is a check.
+    let (server, store) = flaky_with_ready_cache(Duration::ZERO).await;
+    let logs = common::LogCapture::start();
+    store.fail_health(true);
+    assert_eq!(ready(&server).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        logs.text().matches("not ready").count(),
+        1,
+        "{}",
+        logs.text()
+    );
+    store.fail_health(false);
     assert_eq!(ready(&server).await.0, StatusCode::OK);
     assert!(logs.text().contains("ready again"), "{}", logs.text());
     // Not ready for a while: said once, not at every check.
@@ -383,7 +407,11 @@ async fn restart_keeps_a_flaky_store_wrapped_around_the_reopened_one() {
     let server = server.restart().await;
     assert_eq!(server.state.store.user_count().await.unwrap(), 1);
     flaky.fail_health(true);
-    assert_eq!(ready(&server).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    // (The first ask of the restarted server: nothing to give again.)
+    assert_eq!(
+        get(&server, "/api/ready").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]

@@ -57,6 +57,9 @@ pub struct AppState {
     pub http: Arc<HttpStats>,
     /// The emails on their way to the mail server ([`MailSends`]).
     pub mail: Arc<MailSends>,
+    /// How long an answer of `/api/ready` is given again ([`crate::routes::meta::READY_CACHE`];
+    /// tests change it).
+    pub ready_cache: Duration,
 }
 
 /// What the revoking steps of [`AppState::commit_then`] know of the commit.
@@ -200,6 +203,7 @@ impl AppState {
             exports,
             purger: Purger::default(),
             org_queue: OrgQueue::default(),
+            ready_cache: crate::routes::meta::READY_CACHE,
         }
     }
 

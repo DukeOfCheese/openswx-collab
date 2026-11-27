@@ -502,7 +502,10 @@ async fn a_commit_that_reports_an_error_after_taking_effect_is_unknown_and_reloa
 
 #[tokio::test]
 async fn a_writer_that_dies_is_unhealthy_answers_unknown_and_fails_readiness() {
-    let (server, flaky, world) = setup().await;
+    // Every ask of `/api/ready` is a check.
+    let (server, flaky) =
+        TestServer::start_flaky_full(|_| {}, new_journal, |s| s.ready_cache = Duration::ZERO).await;
+    let world = World::new(&server).await.expect("the world is made");
     let a = new_doc(&server, &world, "A").await;
     let ea = lease(&server, &a).await;
     assert_eq!(server.get("/api/ready", None).await.0, StatusCode::OK);
@@ -520,8 +523,6 @@ async fn a_writer_that_dies_is_unhealthy_answers_unknown_and_fails_readiness() {
         Err(JournalError::Unknown)
     );
     assert_eq!(row_count(&server, &a).await, 0);
-    // (Once the answer before is no longer given again.)
-    tokio::time::sleep(oswx_server::routes::meta::READY_CACHE).await;
     assert_eq!(
         server.get("/api/ready", None).await.0,
         StatusCode::SERVICE_UNAVAILABLE

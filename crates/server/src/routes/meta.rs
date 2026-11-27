@@ -82,15 +82,15 @@ async fn health() -> Json<Value> {
 
 /// 200 when the database and the storage answer and the journal writer runs, else 503. Why is
 /// logged, not told: when the server stops being ready, then at most every
-/// [`READY_WARN_EVERY`] while it stays so. An answer is given again for [`READY_CACHE`], and one
-/// check runs at a time.
+/// [`READY_WARN_EVERY`] while it stays so. An answer is given again for
+/// [`AppState::ready_cache`] ([`READY_CACHE`]), and one check runs at a time.
 async fn ready(
     State(state): State<AppState>,
     Extension(readiness): Extension<Arc<tokio::sync::Mutex<Readiness>>>,
 ) -> (StatusCode, Json<Value>) {
     let mut readiness = readiness.lock().await;
     let ok = match readiness.last {
-        Some((at, ok)) if at.elapsed() < READY_CACHE => ok,
+        Some((at, ok)) if at.elapsed() < state.ready_cache => ok,
         last => {
             let (ok, problems) = check_ready(&state).await;
             let now = Instant::now();
