@@ -65,7 +65,7 @@ pub async fn send_logged(
             crate::metrics::mail_sent();
             return true;
         }
-        Ok(Err(err)) => without_address(&format!("{err:#}"), to),
+        Ok(Err(err)) => without_address(&format!("{err:#}"), to, failure_class(&err)),
         Err(_) => "the mailer panicked".to_owned(),
     };
     crate::metrics::mail_failed();
@@ -80,17 +80,26 @@ pub async fn send_logged(
 /// replaced by `<the recipient>`, since a mail server's refusal often quotes the address it
 /// refused. When that cannot be sure of leaving nothing of the address (`to` is not ASCII, or
 /// its local part or its domain, in any case or, for an internationalised domain, in either of
-/// its forms, is still in what is left), only a generic reason and the SMTP code are logged.
-fn without_address(text: &str, to: &str) -> String {
+/// its forms, is still in what is left), only a generic reason, the kind of failure (`class`,
+/// [`failure_class`]) and the SMTP code are logged.
+fn without_address(text: &str, to: &str, class: Option<&str>) -> String {
     let to = to.trim();
     if to.is_empty() {
         return text.to_owned();
     }
-    let generic = || match smtp_code(text) {
-        Some(code) => format!(
+    let generic = || match (smtp_code(text), class) {
+        (Some(code), Some(class)) => format!(
+            "the mail server's answer is left out, as it may name the recipient ({class} \
+             error, SMTP {code})"
+        ),
+        (Some(code), None) => format!(
             "the mail server's answer is left out, as it may name the recipient (SMTP {code})"
         ),
-        None => {
+        (None, Some(class)) => format!(
+            "the send failed ({class} error); what was said is left out, as it may name the \
+             recipient"
+        ),
+        (None, None) => {
             "the send failed; what was said is left out, as it may name the recipient".to_owned()
         }
     };
@@ -120,6 +129,32 @@ fn without_address(text: &str, to: &str) -> String {
         return generic();
     }
     out
+}
+
+/// The kind of failure `err` is, in a word, when the mail client says (never anything of the
+/// address): a refusal for good (`permanent`, 5xx) or for now (`transient`, 4xx), no answer in
+/// time (`timeout`), the encryption failed (`TLS`), the mail server's answer could not be read
+/// (`response`), the message could not be made (`client`), or the mail server could not be reached
+/// or the connection broke (`connection`).
+fn failure_class(err: &anyhow::Error) -> Option<&'static str> {
+    let smtp = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<lettre::transport::smtp::Error>())?;
+    Some(if smtp.is_permanent() {
+        "permanent"
+    } else if smtp.is_transient() {
+        "transient"
+    } else if smtp.is_timeout() {
+        "timeout"
+    } else if smtp.is_tls() {
+        "TLS"
+    } else if smtp.is_response() {
+        "response"
+    } else if smtp.is_client() {
+        "client"
+    } else {
+        "connection"
+    })
 }
 
 /// The SMTP reply code a failure's text gives (`... (550): ...`, as the mail client words a
@@ -476,6 +511,11 @@ impl Mailer for MemoryMailer {
 mod tests {
     use super::*;
 
+    /// [`without_address`] of a failure the mail client did not class.
+    fn scrubbed(text: &str, to: &str) -> String {
+        without_address(text, to, None)
+    }
+
     #[test]
     fn the_emails_say_what_the_python_server_says() {
         let (subject, body) = invite_text("Robotics", "Ada", "http://x/invite/t", 7);
@@ -498,11 +538,11 @@ mod tests {
     fn a_refusal_is_logged_without_the_address_it_quotes() {
         let said = "permanent error (550): 5.1.1 <Bob@Example.com>: user unknown; bob@example.COM";
         assert_eq!(
-            without_address(said, "bob@example.com"),
+            scrubbed(said, "bob@example.com"),
             "permanent error (550): 5.1.1 <<the recipient>>: user unknown; <the recipient>"
         );
-        assert_eq!(without_address("timed out", "bob@example.com"), "timed out");
-        assert_eq!(without_address("x é y", ""), "x é y");
+        assert_eq!(scrubbed("timed out", "bob@example.com"), "timed out");
+        assert_eq!(scrubbed("x é y", ""), "x é y");
 
         // Whatever cannot be scrubbed for sure is left out, but for the SMTP code.
         let generic = |code: &str| {
@@ -517,38 +557,26 @@ mod tests {
             quoted("ZOË@BÜCHER.EXAMPLE"),
             quoted("zoë@xn--bcher-kva.example"),
         ] {
-            let logged = without_address(&said, "zoë@bücher.example");
+            let logged = scrubbed(&said, "zoë@bücher.example");
             assert_eq!(logged, generic("550"), "{said}");
         }
         // An ASCII address with an internationalised domain, quoted in its Unicode form.
         let said = quoted("bob@BÜCHER.example");
-        assert_eq!(
-            without_address(&said, "bob@xn--bcher-kva.example"),
-            generic("550")
-        );
+        assert_eq!(scrubbed(&said, "bob@xn--bcher-kva.example"), generic("550"));
         // A domain quoted on its own: in ASCII, or in its Unicode form.
         let said = "transient error (451): no route to xn--bcher-kva.example";
-        assert_eq!(
-            without_address(said, "ann@xn--bcher-kva.example"),
-            generic("451")
-        );
+        assert_eq!(scrubbed(said, "ann@xn--bcher-kva.example"), generic("451"));
         let said = "transient error (421): bücher.example is not answering";
-        assert_eq!(
-            without_address(said, "ann@xn--bcher-kva.example"),
-            generic("421")
-        );
+        assert_eq!(scrubbed(said, "ann@xn--bcher-kva.example"), generic("421"));
         // The local part quoted on its own, or a letter only Unicode lower-cases (the Kelvin
         // sign) hiding the whole address from an ASCII comparison.
         let said = "permanent error (550): mailbox Zed.Private unknown";
-        assert_eq!(
-            without_address(said, "zed.private@example.com"),
-            generic("550")
-        );
+        assert_eq!(scrubbed(said, "zed.private@example.com"), generic("550"));
         let said = "permanent error (553): <\u{212A}im@example.com> refused";
-        assert_eq!(without_address(said, "kim@example.com"), generic("553"));
+        assert_eq!(scrubbed(said, "kim@example.com"), generic("553"));
         // No code to keep.
         assert_eq!(
-            without_address(
+            scrubbed(
                 "connection to zoë@bücher.example failed",
                 "zoë@bücher.example"
             ),
@@ -556,11 +584,98 @@ mod tests {
         );
         // Nothing of the address left: the answer is kept as it is.
         assert_eq!(
-            without_address(
+            scrubbed(
                 &quoted("ann@xn--bcher-kva.example"),
                 "ann@xn--bcher-kva.example"
             ),
             "permanent error (550): 5.1.1 <<the recipient>>: unknown"
+        );
+    }
+
+    /// A mail server on this machine (plain SMTP) that refuses every recipient with `refusal`.
+    async fn refusing_mail_server(refusal: &'static str) -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(socket);
+                    let mut answer = "220 localhost ESMTP".to_owned();
+                    loop {
+                        answer.push_str("\r\n");
+                        if stream.write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let mut line = String::new();
+                        if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let command = line.trim_end().to_ascii_uppercase();
+                        answer = if command.starts_with("RCPT TO:") {
+                            refusal.to_owned()
+                        } else if command == "QUIT" {
+                            "221 bye".to_owned()
+                        } else {
+                            "250 ok".to_owned()
+                        };
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn mailer_on(port: u16) -> SmtpMailer {
+        SmtpMailer::new(&Settings {
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: port,
+            smtp_security: SmtpSecurity::Plain,
+            smtp_from: "collab@example.com".into(),
+            ..Settings::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_cannot_be_scrubbed_is_logged_with_its_kind_and_code() {
+        let to = "zed.private@example.com";
+        // A refusal that names the mailbox on its own: for good, then for now.
+        for (refusal, kind, code) in [
+            ("550 5.1.1 mailbox Zed.Private unknown", "permanent", "550"),
+            ("451 4.3.0 Zed.Private is over quota", "transient", "451"),
+        ] {
+            let port = refusing_mail_server(refusal).await;
+            let err = mailer_on(port).send(to, "s", "t", None).await.unwrap_err();
+            assert_eq!(failure_class(&err), Some(kind), "{err:#}");
+            let logged = without_address(&format!("{err:#}"), to, failure_class(&err));
+            assert_eq!(
+                logged,
+                format!(
+                    "the mail server's answer is left out, as it may name the recipient ({kind} \
+                     error, SMTP {code})"
+                )
+            );
+        }
+        // A mail server that is not there.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let err = mailer_on(closed)
+            .send(to, "s", "t", None)
+            .await
+            .unwrap_err();
+        assert_eq!(failure_class(&err), Some("connection"), "{err:#}");
+        // Without a code, the kind alone; an error that is not the mail client's has none.
+        assert_eq!(
+            without_address("it failed for zed.private", to, Some("timeout")),
+            "the send failed (timeout error); what was said is left out, as it may name the \
+             recipient"
+        );
+        assert_eq!(
+            failure_class(&anyhow::anyhow!("not an email address")),
+            None
         );
     }
 }
