@@ -407,12 +407,14 @@ pub enum ServerMsg {
         presence: Vec<(ClientId, Plain)>,
         drafts: Vec<(ClientId, Option<Plain>)>,
     },
-    /// Every peer as it is now, with its presence but **no draft**: replaces what the client knew
-    /// of the others (the server sends it to a client that fell behind on `peer.joined`,
-    /// `peer.left`, `presence` and `draft`, which it then stopped sending to it). One list is
-    /// shared by every client caught up at once, so it names the recipient too: a client skips its
-    /// own `client_id`. The peers' drafts follow, as `draft` messages. At most [`MAX_PEER_LIST`]
-    /// peers, each once.
+    /// Every peer as it is now, with **no draft**: replaces what the client knew of the others
+    /// (the server sends it to a client that fell behind on `peer.joined`, `peer.left`,
+    /// `presence` and `draft`, which it then stopped sending to it). One list is shared by every
+    /// client caught up at once, so it names the recipient too: a client skips its own
+    /// `client_id`. It carries the peers' presence up to a budget (1 MiB on the server); the peers
+    /// past it come without, and their presence follows, as `presence` or `presence.batch`
+    /// messages. The peers' drafts follow, as `draft` messages. At most [`MAX_PEER_LIST`] peers,
+    /// each once.
     PeerList {
         peers: Vec<Peer>,
     },
@@ -1058,7 +1060,7 @@ fn peer_to_wire(p: &Peer) -> Plain {
 fn peer_from_wire(p: &Plain) -> Result<Peer, WireError> {
     let f = Fields::new(p, "a peer")?;
     Ok(Peer {
-        client_id: shared(f.req("client_id")?, "client_id", 0, usize::MAX)?,
+        client_id: shared(f.req("client_id")?, "client_id", 1, MAX_LIVE_CLIENT_ID)?,
         user_id: string(f.req("user_id")?, "user_id")?,
         name: string(f.req("name")?, "name")?,
         colour: string(f.req("colour")?, "colour")?,
@@ -1075,6 +1077,19 @@ fn peer_from_wire(p: &Plain) -> Result<Peer, WireError> {
             .map(|p| opaque_map(p, "draft", None))
             .transpose()?,
     })
+}
+
+/// The peers of a `welcome` or a `peer.list`: at most [`MAX_PEER_LIST`], each client once.
+fn peers_from_wire(p: &Plain) -> Result<Vec<Peer>, WireError> {
+    let peers: Vec<Peer> = list(p, "peers", 0, MAX_PEER_LIST)?
+        .iter()
+        .map(peer_from_wire)
+        .collect::<Result<_, _>>()?;
+    let mut seen = BTreeSet::new();
+    if !peers.iter().all(|p| seen.insert(&p.client_id)) {
+        return invalid("peers names a client twice");
+    }
+    Ok(peers)
 }
 
 /// The entries of a `presence.batch` map: client id to data, `nil` (a cleared draft) only where
@@ -1627,7 +1642,8 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
     let root = parse(frame)?;
     let f = Fields::new(&root, "a frame")?;
     let t = text(f.req("t")?, "t", 0, MAX_NAME_OF_T)?;
-    let client_id = |key: &str| shared(f.req(key)?, key, 0, usize::MAX);
+    // A peer's client id (`peer.left`, `presence`, `draft`): `<user id>.<client id of the hello>`.
+    let client_id = |key: &str| shared(f.req(key)?, key, 1, MAX_LIVE_CLIENT_ID);
     match t {
         "welcome" => Ok(ServerMsg::Welcome {
             seq: uint(f.req("seq")?, "seq")?,
@@ -1639,10 +1655,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 .map(|p| string(p, "read_only_reason"))
                 .transpose()?,
             you: peer_from_wire(f.req("you")?)?,
-            peers: list(f.req("peers")?, "peers", 0, usize::MAX)?
-                .iter()
-                .map(peer_from_wire)
-                .collect::<Result<_, _>>()?,
+            peers: peers_from_wire(f.req("peers")?)?,
             locks: locks_from_wire(f.req("locks")?)?,
             broken: broken_map_from_wire(f.req("broken")?)?,
             content: f
@@ -1745,17 +1758,9 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 drafts,
             })
         }
-        "peer.list" => {
-            let peers: Vec<Peer> = list(f.req("peers")?, "peers", 0, MAX_PEER_LIST)?
-                .iter()
-                .map(peer_from_wire)
-                .collect::<Result<_, _>>()?;
-            let mut seen = BTreeSet::new();
-            if !peers.iter().all(|p| seen.insert(&p.client_id)) {
-                return invalid("a peer.list names a client twice");
-            }
-            Ok(ServerMsg::PeerList { peers })
-        }
+        "peer.list" => Ok(ServerMsg::PeerList {
+            peers: peers_from_wire(f.req("peers")?)?,
+        }),
         "rebuild.status" => Ok(ServerMsg::RebuildStatus {
             seq: uint(f.req("seq")?, "seq")?,
             broken: broken_map_from_wire(f.req("broken")?)?,

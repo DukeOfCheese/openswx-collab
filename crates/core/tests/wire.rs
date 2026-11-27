@@ -1816,6 +1816,113 @@ fn decode_server_bounds_live_client_ids_and_peer_lists() {
     );
 }
 
+/// What a hostile or broken server could send a client: a peer, a presence, a draft or a
+/// departure naming a client id of any length; a welcome naming any number of peers, or one twice.
+/// All refused.
+#[test]
+fn decode_server_bounds_peer_client_ids_and_welcome_peers() {
+    let longest = format!("{}.{}", "u".repeat(MAX_USER_ID), "c".repeat(MAX_CLIENT_ID));
+    let too_long = format!("{longest}x");
+    let refused = |frame: Vec<u8>, why: &str| {
+        assert!(
+            matches!(decode_server(&frame), Err(WireError::Invalid(_))),
+            "{why}"
+        );
+    };
+    let peer_of = |id: &str| {
+        Plain::Map(vec![
+            pair("client_id", Plain::from(id)),
+            pair("user_id", Plain::from("u")),
+            pair("name", Plain::from("A")),
+            pair("colour", Plain::from("#000")),
+        ])
+    };
+    let message = |t: &str, fields: Vec<(&str, Plain)>| {
+        let mut pairs = vec![pair("t", Plain::from(t))];
+        pairs.extend(fields.into_iter().map(|(k, v)| pair(k, v)));
+        raw(&Plain::Map(pairs))
+    };
+    let data = || to_plain(json!({"x": 1}));
+    // Each message that names a client.
+    let joined = |id: &str| message("peer.joined", vec![("peer", peer_of(id))]);
+    let left = |id: &str| message("peer.left", vec![("client_id", Plain::from(id))]);
+    let presence = |id: &str| {
+        message(
+            "presence",
+            vec![("client_id", Plain::from(id)), ("data", data())],
+        )
+    };
+    let draft = |id: &str| {
+        message(
+            "draft",
+            vec![("client_id", Plain::from(id)), ("data", data())],
+        )
+    };
+    let welcome = |you: Plain, peers: Vec<Plain>| {
+        message(
+            "welcome",
+            vec![
+                ("seq", Plain::from(0)),
+                ("project_id", Plain::from("p")),
+                ("role", Plain::from("editor")),
+                ("read_only", Plain::from(false)),
+                ("you", you),
+                ("peers", Plain::Array(peers)),
+                ("locks", Plain::Array(vec![])),
+                ("broken", Plain::Map(vec![])),
+            ],
+        )
+    };
+    let in_list = |id: &str| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("peer.list")),
+            pair("peers", Plain::Array(vec![peer_of(id)])),
+        ]))
+    };
+    let you_are = |id: &str| welcome(peer_of(id), vec![]);
+    let among = |id: &str| welcome(peer_of("u.me"), vec![peer_of(id)]);
+    type Make<'a> = &'a dyn Fn(&str) -> Vec<u8>;
+    let makers: [(&str, Make); 7] = [
+        ("peer.joined", &joined),
+        ("peer.left", &left),
+        ("presence", &presence),
+        ("draft", &draft),
+        ("peer.list", &in_list),
+        ("welcome you", &you_are),
+        ("welcome peers", &among),
+    ];
+    for (what, make) in makers {
+        assert!(
+            decode_server(&make(&longest)).is_ok(),
+            "{what}: the longest"
+        );
+        refused(make(&too_long), &format!("{what}: one character more"));
+        refused(make(&"x".repeat(1 << 20)), &format!("{what}: a megabyte"));
+        refused(make(""), &format!("{what}: empty"));
+    }
+    // A welcome's peers: each once, and at most as many as a peer list names.
+    assert!(
+        decode_server(&welcome(
+            peer_of("u.me"),
+            vec![peer_of("u.a"), peer_of("u.b")]
+        ))
+        .is_ok()
+    );
+    refused(
+        welcome(
+            peer_of("u.me"),
+            vec![peer_of("u.a"), peer_of("u.b"), peer_of("u.a")],
+        ),
+        "a peer twice",
+    );
+    let many = |n: usize| (0..n).map(|i| peer_of(&format!("u.{i}"))).collect();
+    assert!(decode_server(&welcome(peer_of("u.me"), many(MAX_PEER_LIST))).is_ok());
+    refused(
+        welcome(peer_of("u.me"), many(MAX_PEER_LIST + 1)),
+        "too many peers",
+    );
+}
+
 // -------------------------------------------------------------------------------- duplicates
 
 #[test]
