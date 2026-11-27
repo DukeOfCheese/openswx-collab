@@ -554,7 +554,8 @@ async fn create_invite(
         tracing::info!(
             org = %org_id,
             by = %user.id,
-            "an invite was made but not emailed: the organisation or the account has had as many              emailed as it may for now"
+            "an invite was made but not emailed: the organisation or the account has had as many \
+            emailed as it may for now"
         );
     }
     let mail = invite.email.clone().filter(|_| allowed).map(|to| {

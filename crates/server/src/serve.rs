@@ -244,7 +244,8 @@ async fn accept_failed(
         tracing::error!(
             more,
             freed,
-            "a connection could not be accepted: {e} (is the limit on open files, `ulimit -n`,              below max_connections?)"
+            "a connection could not be accepted: {e} (is the limit on open files, `ulimit -n`, \
+            below max_connections?)"
         );
     }
     let pause = if freed { FREED_PAUSE } else { ACCEPT_PAUSE };

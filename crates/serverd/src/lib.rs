@@ -455,7 +455,10 @@ fn open_files_warning(limit: Option<u64>, max_connections: usize) -> Option<Stri
     let limit = limit?;
     (limit < wanted).then(|| {
         format!(
-            "this process may open {limit} files, and OSWX_COLLAB_MAX_CONNECTIONS={max_connections}              needs about {wanted}: past that, new connections (health checks included) wait until              others close. Raise the limit (`ulimit -n`, or `ulimit: nofile` for Docker) or lower              OSWX_COLLAB_MAX_CONNECTIONS"
+            "this process may open {limit} files, and OSWX_COLLAB_MAX_CONNECTIONS={max_connections} \
+            needs about {wanted}: past that, new connections (health checks included) wait until \
+            others close. Raise the limit (`ulimit -n`, or `ulimit: nofile` for Docker) or lower \
+            OSWX_COLLAB_MAX_CONNECTIONS"
         )
     })
 }
