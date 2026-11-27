@@ -8,8 +8,9 @@
 //!
 //! # Extension migrations
 //!
-//! An extension's migrations ([`Extensions::migrations`]: a list for each kind of database, of
-//! the same length) are applied in its order **after** the server's own, by `migrate` and when a server starts ([`Db::open`], as the server's own are:
+//! An extension's migrations ([`Extensions::migrations`]: `(id, sql)` pairs for each kind of
+//! database, the same steps under the same ids; checked before any database is connected to)
+//! are applied in its order **after** the server's own, by `migrate` and when a server starts ([`Db::open`], as the server's own are:
 //! always to a database that was empty, to an older one only with `auto_migrate`), and are
 //! recorded in the table `extension_migrations`. `db-status` shows them. A server whose extension
 //! carries fewer than the database has had refuses it, as one whose own migrations are older
@@ -123,11 +124,15 @@ impl Db {
     }
 }
 
-/// The extension's migrations for `dialect`, once they are known to keep the rule of
-/// [`Extensions::migrations`] (the same number for both dialects).
+/// The SQL of the extension's migrations for `dialect`, once they are known to keep the rule of
+/// [`Extensions::migrations`] (the same steps for both dialects).
 fn migrations_of(ext: &dyn Extensions, dialect: Dialect) -> anyhow::Result<Vec<&'static str>> {
     check_migrations(ext)?;
-    Ok(ext.migrations(dialect))
+    Ok(ext
+        .migrations(dialect)
+        .into_iter()
+        .map(|(_, sql)| sql)
+        .collect())
 }
 
 fn version(v: Option<i64>) -> String {
@@ -137,6 +142,8 @@ fn version(v: Option<i64>) -> String {
 /// `migrate`: upgrades the schema whatever `auto_migrate` says. Answers `schema A -> B` or
 /// `schema B: up to date`, and the same for the extension's migrations if it has any.
 pub async fn migrate(settings: &Settings, ext: &dyn Extensions) -> anyhow::Result<String> {
+    // Before anything is connected to (or, for SQLite, made).
+    check_migrations(ext)?;
     let db = Db::connect(settings).await?;
     let done = async {
         let (before, ours_before) = db.status(ext).await?;
@@ -174,6 +181,7 @@ pub async fn migrate(settings: &Settings, ext: &dyn Extensions) -> anyhow::Resul
 /// database this server could not use (newer, edited, not its own) is an error saying why, and so
 /// is a SQLite file that does not exist (it is not created).
 pub async fn db_status(settings: &Settings, ext: &dyn Extensions) -> anyhow::Result<String> {
+    check_migrations(ext)?;
     // Connecting to a SQLite file that is not there would make it (and its folder): a command
     // that only looks must not.
     match settings.database()? {

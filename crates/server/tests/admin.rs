@@ -8,19 +8,27 @@ use std::sync::Arc;
 
 use common::{PgSchema, TestServer, on_postgres};
 use oswx_server::admin::{self, Db};
-use oswx_server::ext::{Dialect, Extensions, MigrationsError, NoExtensions, check_migrations};
+use oswx_server::ext::{
+    Dialect, Extensions, Migration, MigrationsError, NoExtensions, check_migrations,
+};
 use oswx_server::security::verify_password;
 use oswx_server::store::{ExtensionSchema, SchemaError, Session, new_id};
 use oswx_server::{AppState, Settings};
 use serde_json::json;
 use tempfile::TempDir;
 
+/// `list` as migrations named for their place: `one`, `two`, ...
+fn by_place(list: &[&'static str]) -> Vec<Migration> {
+    const IDS: [&str; 4] = ["one", "two", "three", "four"];
+    IDS.iter().copied().zip(list.iter().copied()).collect()
+}
+
 /// An extension that brings these migrations.
 struct Ext(Vec<&'static str>);
 
 impl Extensions for Ext {
-    fn migrations(&self, _dialect: Dialect) -> Vec<&'static str> {
-        self.0.clone()
+    fn migrations(&self, _dialect: Dialect) -> Vec<Migration> {
+        by_place(&self.0)
     }
 }
 
@@ -28,7 +36,19 @@ impl Extensions for Ext {
 struct PerDialect(Vec<&'static str>, Vec<&'static str>);
 
 impl Extensions for PerDialect {
-    fn migrations(&self, dialect: Dialect) -> Vec<&'static str> {
+    fn migrations(&self, dialect: Dialect) -> Vec<Migration> {
+        match dialect {
+            Dialect::Sqlite => by_place(&self.0),
+            Dialect::Postgres => by_place(&self.1),
+        }
+    }
+}
+
+/// An extension whose migrations are exactly these, in both dialects.
+struct Named(Vec<Migration>, Vec<Migration>);
+
+impl Extensions for Named {
+    fn migrations(&self, dialect: Dialect) -> Vec<Migration> {
         match dialect {
             Dialect::Sqlite => self.0.clone(),
             Dialect::Postgres => self.1.clone(),
@@ -762,4 +782,69 @@ async fn an_extension_with_a_different_number_of_migrations_per_dialect_is_refus
     // Nothing was applied by any of that.
     start(&place, true, &NoExtensions).await.unwrap();
     assert!(place.recorded().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_extension_whose_dialects_have_different_steps_is_refused_before_anything_is_opened() {
+    // The same number of migrations; the steps are not the same at one place.
+    let crossed = Named(
+        vec![("seats", FIRST), ("audit", SECOND)],
+        vec![("audit", SECOND), ("seats", FIRST)],
+    );
+    let twice = Named(
+        vec![("seats", FIRST), ("seats", SECOND)],
+        vec![("seats", FIRST), ("seats", SECOND)],
+    );
+    let uneven = PerDialect(vec![FIRST], vec![FIRST, SECOND]);
+    let place = Place::new().await;
+    for (ext, expected) in [
+        (
+            &crossed as &dyn Extensions,
+            MigrationsError::Ids {
+                version: 1,
+                sqlite: "seats",
+                postgres: "audit",
+            },
+        ),
+        (&twice, MigrationsError::Repeated { id: "seats" }),
+        (
+            &uneven,
+            MigrationsError::Counts {
+                sqlite: 1,
+                postgres: 2,
+            },
+        ),
+    ] {
+        assert_eq!(check_migrations(ext), Err(expected.clone()));
+        // A database nobody can reach: the check comes first, so that is not what is said ...
+        let mut nowhere = place.settings(true);
+        nowhere.database_url = "postgres://user:pass@127.0.0.1:1/nothing".into();
+        for refused in [
+            admin::migrate(&nowhere, ext).await.unwrap_err(),
+            admin::db_status(&nowhere, ext).await.unwrap_err(),
+            Db::open(&nowhere, ext).await.unwrap_err(),
+        ] {
+            assert_eq!(refused.downcast::<MigrationsError>().unwrap(), expected);
+        }
+        // ... and on SQLite nothing is made: no file, no folder.
+        for refused in [
+            admin::migrate(&place.settings(true), ext)
+                .await
+                .unwrap_err(),
+            start(&place, true, ext).await.unwrap_err(),
+        ] {
+            assert_eq!(refused.downcast::<MigrationsError>().unwrap(), expected);
+        }
+        if !on_postgres() {
+            let left: Vec<_> = std::fs::read_dir(place.dir.path()).unwrap().collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
+    }
+    // The steps the same in both, under ids of their own: taken.
+    let named = Named(
+        vec![("0001_seats", FIRST), ("0002_audit", SECOND)],
+        vec![("0001_seats", FIRST), ("0002_audit", SECOND)],
+    );
+    start(&place, true, &named).await.unwrap();
+    assert_eq!(place.recorded().await, vec![1, 2]);
 }

@@ -219,6 +219,10 @@ pub enum Dialect {
     Postgres,
 }
 
+/// One step of an extension's schema ([`Extensions::migrations`]): `(id, sql)`. The id names the
+/// step and never changes (`"0001_seats"`); the same step has the same id in both dialects.
+pub type Migration = (&'static str, &'static str);
+
 /// Why an extension's migrations cannot be used ([`check_migrations`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MigrationsError {
@@ -231,12 +235,29 @@ pub enum MigrationsError {
     /// A migration has no SQL in it.
     #[error("the extension's migration {version} for {dialect:?} is empty")]
     Empty { dialect: Dialect, version: usize },
+    /// A migration has no id.
+    #[error("the extension's migration {version} for {dialect:?} has no id")]
+    NoId { dialect: Dialect, version: usize },
+    /// The dialects have different steps at one place: their ids differ.
+    #[error(
+        "the extension's migration {version} is {sqlite:?} for SQLite and {postgres:?} for \
+         PostgreSQL; both dialects must have the same steps in the same order"
+    )]
+    Ids {
+        version: usize,
+        sqlite: &'static str,
+        postgres: &'static str,
+    },
+    /// Two migrations have one id.
+    #[error("the extension has two migrations called {id:?}")]
+    Repeated { id: &'static str },
 }
 
 /// Checks the rule of [`Extensions::migrations`] as far as it can be seen without a database:
-/// both dialects have the same number of migrations, and none is empty. The server checks this
-/// before it opens a database for an extension; an extension's own tests should call it, and
-/// apply both lists to a database of each kind.
+/// both dialects have the same steps (the same ids, in the same order), every id is given once,
+/// and no migration is empty. The server checks this before it connects to a database for an
+/// extension (start, `migrate`, `db-status`); an extension's own tests should call it, and apply
+/// both lists to a database of each kind.
 pub fn check_migrations(ext: &dyn Extensions) -> Result<(), MigrationsError> {
     let (sqlite, postgres) = (
         ext.migrations(Dialect::Sqlite),
@@ -248,12 +269,28 @@ pub fn check_migrations(ext: &dyn Extensions) -> Result<(), MigrationsError> {
             postgres: postgres.len(),
         });
     }
-    for (dialect, list) in [(Dialect::Sqlite, sqlite), (Dialect::Postgres, postgres)] {
-        if let Some(place) = list.iter().position(|sql| sql.trim().is_empty()) {
-            return Err(MigrationsError::Empty {
-                dialect,
+    for (dialect, list) in [(Dialect::Sqlite, &sqlite), (Dialect::Postgres, &postgres)] {
+        for (place, (id, sql)) in list.iter().enumerate() {
+            let version = place + 1;
+            if id.trim().is_empty() {
+                return Err(MigrationsError::NoId { dialect, version });
+            }
+            if sql.trim().is_empty() {
+                return Err(MigrationsError::Empty { dialect, version });
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (place, ((ours, _), (theirs, _))) in sqlite.iter().zip(&postgres).enumerate() {
+        if ours != theirs {
+            return Err(MigrationsError::Ids {
                 version: place + 1,
+                sqlite: ours,
+                postgres: theirs,
             });
+        }
+        if !seen.insert(*ours) {
+            return Err(MigrationsError::Repeated { id: ours });
         }
     }
     Ok(())
@@ -307,17 +344,18 @@ pub trait Extensions: Send + Sync + 'static {
         axum::Router::new()
     }
 
-    /// SQL migrations for the extension's own tables, in the words of the database `dialect`,
-    /// applied in order after the server's own. They must never touch the server's tables.
+    /// SQL migrations for the extension's own tables, as `(id, sql)` pairs ([`Migration`]) with
+    /// the SQL in the words of the database `dialect`, applied in order after the server's own.
+    /// They must never touch the server's tables.
     ///
-    /// **The same number, in the same order, for both dialects**: migration *n* is one step of
-    /// the extension's schema, written twice. The database records which steps it has had by
-    /// their place in the list, so a step that one database does not need is still there for
-    /// it, as a statement that changes nothing (`SELECT 1`). A released migration is never
-    /// edited or removed; a new one goes at the end. [`check_migrations`] checks what can be
-    /// checked of this without a database (the server does at start; call it from a test of
-    /// the extension too).
-    fn migrations(&self, _dialect: Dialect) -> Vec<&'static str> {
+    /// **The same steps, in the same order, for both dialects**: migration *n* is one step of
+    /// the extension's schema, written twice under one id (`("0002_audit", "CREATE TABLE ...")`
+    /// in each list). The database records which steps it has had by their place in the list,
+    /// so a step that one database does not need is still there for it, as a statement that
+    /// changes nothing (`SELECT 1`). A released migration is never edited or removed; a new one
+    /// goes at the end. [`check_migrations`] checks what can be checked of this without a
+    /// database (the server does, before it connects; call it from a test of the extension too).
+    fn migrations(&self, _dialect: Dialect) -> Vec<Migration> {
         Vec::new()
     }
 
@@ -540,10 +578,10 @@ mod tests {
     }
 
     /// An extension with these migrations for SQLite and those for PostgreSQL.
-    struct Migrating(Vec<&'static str>, Vec<&'static str>);
+    struct Migrating(Vec<Migration>, Vec<Migration>);
 
     impl Extensions for Migrating {
-        fn migrations(&self, dialect: Dialect) -> Vec<&'static str> {
+        fn migrations(&self, dialect: Dialect) -> Vec<Migration> {
             match dialect {
                 Dialect::Sqlite => self.0.clone(),
                 Dialect::Postgres => self.1.clone(),
@@ -552,13 +590,19 @@ mod tests {
     }
 
     #[test]
-    fn both_dialects_must_have_the_same_number_of_migrations_and_none_empty() {
+    fn both_dialects_must_have_the_same_steps_and_none_empty() {
         let ok = Migrating(
-            vec!["CREATE TABLE a (x BLOB)", "SELECT 1"],
-            vec!["CREATE TABLE a (x BYTEA)", "CREATE INDEX i ON a (x)"],
+            vec![("a", "CREATE TABLE a (x BLOB)"), ("a_index", "SELECT 1")],
+            vec![
+                ("a", "CREATE TABLE a (x BYTEA)"),
+                ("a_index", "CREATE INDEX i ON a (x)"),
+            ],
         );
         assert_eq!(check_migrations(&ok), Ok(()));
-        let one_more = Migrating(vec!["SELECT 1"], vec!["SELECT 1", "SELECT 2"]);
+        let one_more = Migrating(
+            vec![("a", "SELECT 1")],
+            vec![("a", "SELECT 1"), ("b", "SELECT 2")],
+        );
         assert_eq!(
             check_migrations(&one_more),
             Err(MigrationsError::Counts {
@@ -567,18 +611,62 @@ mod tests {
             })
         );
         assert_eq!(
-            check_migrations(&Migrating(vec![], vec!["SELECT 1"])),
+            check_migrations(&Migrating(vec![], vec![("a", "SELECT 1")])),
             Err(MigrationsError::Counts {
                 sqlite: 0,
                 postgres: 1
             })
         );
-        let empty = Migrating(vec!["SELECT 1", "SELECT 1"], vec!["SELECT 1", " \n "]);
+        let empty = Migrating(
+            vec![("a", "SELECT 1"), ("b", "SELECT 1")],
+            vec![("a", "SELECT 1"), ("b", " \n ")],
+        );
         assert_eq!(
             check_migrations(&empty),
             Err(MigrationsError::Empty {
                 dialect: Dialect::Postgres,
                 version: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_step_has_an_id_given_once_and_the_same_in_both_dialects() {
+        // The same number of migrations, but different steps at one place.
+        let crossed = Migrating(
+            vec![("seats", "SELECT 1"), ("audit", "SELECT 2")],
+            vec![("audit", "SELECT 2"), ("seats", "SELECT 1")],
+        );
+        assert_eq!(
+            check_migrations(&crossed),
+            Err(MigrationsError::Ids {
+                version: 1,
+                sqlite: "seats",
+                postgres: "audit"
+            })
+        );
+        let renamed = Migrating(
+            vec![("seats", "SELECT 1"), ("audit", "SELECT 2")],
+            vec![("seats", "SELECT 1"), ("audit_log", "SELECT 2")],
+        );
+        assert!(matches!(
+            check_migrations(&renamed),
+            Err(MigrationsError::Ids { version: 2, .. })
+        ));
+        let twice = Migrating(
+            vec![("seats", "SELECT 1"), ("seats", "SELECT 2")],
+            vec![("seats", "SELECT 1"), ("seats", "SELECT 2")],
+        );
+        assert_eq!(
+            check_migrations(&twice),
+            Err(MigrationsError::Repeated { id: "seats" })
+        );
+        let nameless = Migrating(vec![(" ", "SELECT 1")], vec![(" ", "SELECT 1")]);
+        assert_eq!(
+            check_migrations(&nameless),
+            Err(MigrationsError::NoId {
+                dialect: Dialect::Sqlite,
+                version: 1
             })
         );
     }
