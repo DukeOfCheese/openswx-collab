@@ -379,6 +379,7 @@ async fn run_server(settings: Settings, ext: Arc<dyn Extensions>, address: Socke
     let metrics = !settings.metrics_token.is_empty();
     let trusted_proxies = settings.trusted_proxies.len();
     let public_url = settings.public_url.clone();
+    raise_open_files(settings.max_connections);
     // The signals are listened for before anything is opened: a stop during a slow start ends
     // the program rather than being lost.
     let mut signals = match Signals::listen() {
@@ -433,6 +434,61 @@ async fn run_server(settings: Settings, ext: Arc<dyn Extensions>, address: Socke
         }
         Stopped::OutOfTime => ExitCode::FAILURE,
     }
+}
+
+/// File descriptors the server needs besides one per connection: the database pools, the
+/// storage, uploads being written, the log.
+const FILES_BESIDES_CONNECTIONS: u64 = 256;
+
+/// How many files the server would like to have open at once for `max_connections`.
+fn files_wanted(max_connections: usize) -> u64 {
+    u64::try_from(max_connections + oswx_server::serve::HEALTH_RESERVE)
+        .unwrap_or(u64::MAX)
+        .saturating_add(FILES_BESIDES_CONNECTIONS)
+}
+
+/// What to warn about a limit of `limit` open files (`None`: no limit) for `max_connections`.
+fn open_files_warning(limit: Option<u64>, max_connections: usize) -> Option<String> {
+    let wanted = files_wanted(max_connections);
+    let limit = limit?;
+    (limit < wanted).then(|| {
+        format!(
+            "this process may open {limit} files, and OSWX_COLLAB_MAX_CONNECTIONS={max_connections}              needs about {wanted}: past that, new connections (health checks included) wait until              others close. Raise the limit (`ulimit -n`, or `ulimit: nofile` for Docker) or lower              OSWX_COLLAB_MAX_CONNECTIONS"
+        )
+    })
+}
+
+/// Raises this process's soft limit on open files to its hard limit (Docker has given containers
+/// a soft limit of 1,024 since version 25, below what `max_connections` needs), and warns when it
+/// is still too low.
+fn raise_open_files(max_connections: usize) {
+    if let Some(warning) = open_files_warning(open_files_limit(), max_connections) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// The soft limit on open files once raised as far as the hard limit allows (`None`: unlimited).
+#[cfg(unix)]
+fn open_files_limit() -> Option<u64> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Nofile);
+    if limit.current.is_some() && limit.current != limit.maximum {
+        let raised = Rlimit {
+            current: limit.maximum,
+            maximum: limit.maximum,
+        };
+        // (macOS refuses "unlimited" for open files: the soft limit then stays as it was.)
+        if let Err(e) = setrlimit(Resource::Nofile, raised) {
+            tracing::debug!("the limit on open files could not be raised: {e}");
+        }
+    }
+    getrlimit(Resource::Nofile).current
+}
+
+/// Windows has no such limit on sockets.
+#[cfg(not(unix))]
+fn open_files_limit() -> Option<u64> {
+    None
 }
 
 /// The signals that tell the server to stop.
@@ -569,6 +625,20 @@ mod tests {
             );
             assert!(!said.contains("chatty") && !said.contains("loud"), "{said}");
         }
+    }
+
+    #[test]
+    fn a_limit_on_open_files_below_max_connections_is_warned_about() {
+        // Docker's soft default against the default 4,096 connections.
+        let warning = open_files_warning(Some(1024), 4096).unwrap();
+        assert!(
+            warning.contains("1024") && warning.contains("4360"),
+            "{warning}"
+        );
+        assert_eq!(open_files_warning(Some(65536), 4096), None);
+        assert_eq!(open_files_warning(Some(4360), 4096), None);
+        assert!(open_files_warning(Some(4359), 4096).is_some());
+        assert_eq!(open_files_warning(None, 4096), None);
     }
 
     #[test]

@@ -280,7 +280,7 @@ impl Room {
         // The refused ids of its client are forgotten when the connection goes (a client that
         // reconnects resends only what it has no answer for).
         self.refused.remove(&c.client);
-        let (code, reason) = close.unwrap_or((1000, ""));
+        let (code, reason) = close.unwrap_or((close::NORMAL, ""));
         c.outbox.close(code, reason);
         if announce {
             let left = self.encode(&ServerMsg::PeerLeft {

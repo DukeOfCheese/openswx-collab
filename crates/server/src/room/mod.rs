@@ -99,6 +99,8 @@ pub use rebuild::{BLAME_KEEP, MAX_BROKE};
 
 /// WebSocket close codes the server uses, in one place.
 pub mod close {
+    /// A normal close: the connection left the room with no other code (its client closed it).
+    pub const NORMAL: u16 = 1000;
     /// The server is shutting down.
     pub const GOING_AWAY: u16 = 1001;
     /// The WebSocket layer could not read a frame (malformed, or far over the size limit).

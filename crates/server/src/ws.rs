@@ -19,6 +19,7 @@
 //! | the first frame is late, text, not a hello, or malformed | `bad_hello` | 4400 |
 //! | `protocol` is not [`PROTOCOL_VERSION`] | `protocol` | 4426 |
 //! | the token is not a live session | `unauthorized` | 4401 |
+//! | the server holds as many document connections as it may ([`crate::Settings::max_document_connections`]; checked at once, before the hello) | `server_full` | 4429 |
 //! | the account has `max_connections_per_user` document connections open already | `too_many_connections` | 4429 |
 //! | the document is missing or deleted, or the account has no role in its project | `not_found` | 4404 |
 //! | the server is stopping | `shutting_down` | 1001 |
@@ -128,7 +129,18 @@ async fn first_frame(socket: &mut WebSocket, max: usize) -> Option<Result<Client
     }
 }
 
+/// What a document connection over the server's ceiling is told.
+const SERVER_FULL: &str =
+    "the server holds as many document connections as it can; try again later";
+
 async fn serve(state: AppState, document_id: String, mut socket: WebSocket) {
+    // Counted from the upgrade, before the hello: a socket that never says hello holds a place.
+    let Some(_place) = state
+        .hub
+        .take_socket(state.settings.max_document_connections())
+    else {
+        return refuse(socket, "server_full", SERVER_FULL, close::TOO_MANY).await;
+    };
     let max = frame_limit(&state.settings);
     let bad_hello = "the first message must be a valid hello";
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, first_frame(&mut socket, max)).await {

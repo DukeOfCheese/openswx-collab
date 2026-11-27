@@ -118,6 +118,9 @@ def static_checks() -> None:
     ports = server.get("ports", [])
     check(len(ports) == 1 and str(ports[0]).startswith("127.0.0.1:") and str(ports[0]).endswith(":8787"),
           f"the server is published on 127.0.0.1 only ({ports})")
+    nofile = server.get("ulimits", {}).get("nofile", {})
+    check(isinstance(nofile, dict) and min(int(nofile.get("soft", 0)), int(nofile.get("hard", 0))) >= 65536,
+          f"the server may open 65,536 files, above MAX_CONNECTIONS (Docker's soft default is 1,024): {nofile}")
     grace = str(server.get("stop_grace_period", "10s"))
     check(grace.endswith("s") and float(grace[:-1]) >= 10,
           f"docker stop waits at least 10 s, more than the server's 8 s stop ({grace})")
@@ -304,6 +307,10 @@ def use_the_server(base: str, port: int, project: str, files: list[str], env_fil
 
     status, _ = http(base, "GET", "/api/health")
     check(status == 200, "GET /api/health answers 200 through the published port")
+    r = compose(project, files, env_file, "exec", "-T", "server", "sh", "-c", "ulimit -Sn", capture=True)
+    soft = r.stdout.strip()
+    check(r.returncode == 0 and soft.isdigit() and int(soft) >= 65536,
+          f"the server's container may open at least 65,536 files (`ulimit -Sn`: {soft!r})")
     _, info = http(base, "GET", "/api/server")
     check(isinstance(info, dict) and info.get("protocol") == 2 and info.get("registration") == "first_user"
           and info.get("oauth") == [], f"GET /api/server: protocol 2, first user, no provider ({info})")
@@ -396,7 +403,7 @@ def docker_checks(remove_image: bool, port: int | None, jobs: int) -> None:
             args = ["up", "-d"] + ([] if built else ["--build"])
             try:
                 r = compose(project, files, env_file, *args)
-                built = True
+                built = built or r.returncode == 0
                 check(r.returncode == 0, f"{name}: `docker compose up` works")
                 if r.returncode:
                     continue

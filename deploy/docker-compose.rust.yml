@@ -18,6 +18,12 @@ services:
     restart: unless-stopped
     # An orderly stop takes at most OSWX_COLLAB_SHUTDOWN_TIMEOUT (8 s); keep this above it.
     stop_grace_period: 10s
+    # Every connection is an open file. Docker (since version 25) gives a container a soft limit of
+    # 1,024, below OSWX_COLLAB_MAX_CONNECTIONS (4,096) plus what the server needs besides.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       OSWX_COLLAB_DATABASE_URL: sqlite:///data/collab.db
       OSWX_COLLAB_STORAGE_URL: /data/storage

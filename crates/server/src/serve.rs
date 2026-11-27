@@ -133,6 +133,7 @@ pub async fn serve(
     let (closing, _) = watch::channel(false);
     let mut connections = JoinSet::new();
     let open = Arc::new(Conns::default());
+    let mut trouble = AcceptTrouble::default();
     let mut stop = pin!(stop);
     loop {
         tokio::select! {
@@ -166,7 +167,7 @@ pub async fn serve(
                         closing.subscribe(),
                     ));
                 }
-                Err(e) => accept_failed(&e).await,
+                Err(e) => accept_failed(&e, &open, &state.http, &mut trouble).await,
             },
             // (So that the set holds only the connections still open.)
             Some(_) = connections.join_next() => {}
@@ -221,9 +222,16 @@ pub async fn serve(
 }
 
 /// What an `accept` that failed costs: nothing for a connection that went away before it was
-/// accepted; a second's pause for anything else (out of file descriptors, say), so that the loop
-/// does not spin.
-async fn accept_failed(e: &io::Error) {
+/// accepted. Anything else is the system refusing a file descriptor (or memory) for one more
+/// socket: one idle connection is closed to give its descriptor back, so that what waits to be
+/// accepted (a health check, say) gets in, and the loop pauses a moment (a second when nothing
+/// could be closed) rather than spin. The log says so at most once a minute ([`AcceptTrouble`]).
+async fn accept_failed(
+    e: &io::Error,
+    open: &Conns,
+    stats: &HttpStats,
+    trouble: &mut AcceptTrouble,
+) {
     use io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
     if matches!(
         e.kind(),
@@ -231,8 +239,46 @@ async fn accept_failed(e: &io::Error) {
     ) {
         return;
     }
-    tracing::error!("a connection could not be accepted: {e}");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let freed = open.lock().make_room(|_| true, true, stats);
+    if let Some(more) = trouble.note(Instant::now()) {
+        tracing::error!(
+            more,
+            freed,
+            "a connection could not be accepted: {e} (is the limit on open files, `ulimit -n`,              below max_connections?)"
+        );
+    }
+    let pause = if freed { FREED_PAUSE } else { ACCEPT_PAUSE };
+    tokio::time::sleep(pause).await;
+}
+
+/// How long the loop waits after an `accept` failed and nothing could be closed.
+const ACCEPT_PAUSE: Duration = Duration::from_secs(1);
+/// ... and after one was closed, for its socket to go.
+const FREED_PAUSE: Duration = Duration::from_millis(100);
+/// How often at most a failing `accept` is logged.
+const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Failed `accept`s, so that the log is not written once a second while they last.
+#[derive(Debug, Default)]
+struct AcceptTrouble {
+    logged_at: Option<Instant>,
+    unlogged: u64,
+}
+
+impl AcceptTrouble {
+    /// One more failure at `now`: `Some(n)` when it is to be logged, `n` the failures not logged
+    /// since the last line; `None` within [`ACCEPT_LOG_EVERY`] of it.
+    fn note(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .logged_at
+            .is_some_and(|at| now.duration_since(at) < ACCEPT_LOG_EVERY)
+        {
+            self.unlogged += 1;
+            return None;
+        }
+        self.logged_at = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -907,6 +953,35 @@ mod tests {
 
     fn chosen(admitted: &Admitted) -> bool {
         conn(admitted).busy.load(Ordering::SeqCst) & EVICTING != 0
+    }
+
+    #[tokio::test]
+    async fn a_failing_accept_closes_an_idle_connection_to_free_its_descriptor() {
+        let (conns, stats) = (Arc::new(Conns::default()), Arc::new(HttpStats::default()));
+        let idle = admit(&conns, &stats, "203.0.113.7", 100, 0).unwrap();
+        let busy = admit(&conns, &stats, "203.0.113.8", 100, 0).unwrap();
+        let (_handling, _running) = Handling::begin(conn(&busy), &stats).unwrap();
+        let mut trouble = AcceptTrouble::default();
+        let out_of_files = io::Error::other("Too many open files (os error 24)");
+        accept_failed(&out_of_files, &conns, &stats, &mut trouble).await;
+        assert!(chosen(&idle) && !chosen(&busy));
+        // A connection that went away before it was accepted closes nothing.
+        let other_idle = admit(&conns, &stats, "203.0.113.9", 100, 0).unwrap();
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        accept_failed(&reset, &conns, &stats, &mut trouble).await;
+        assert!(!chosen(&other_idle));
+    }
+
+    #[test]
+    fn a_failing_accept_is_logged_at_most_once_a_minute_with_what_was_not() {
+        let mut trouble = AcceptTrouble::default();
+        let start = Instant::now();
+        assert_eq!(trouble.note(start), Some(0));
+        for s in 1..60 {
+            assert_eq!(trouble.note(start + Duration::from_secs(s)), None);
+        }
+        assert_eq!(trouble.note(start + Duration::from_secs(60)), Some(59));
+        assert_eq!(trouble.note(start + Duration::from_secs(61)), None);
     }
 
     #[tokio::test]

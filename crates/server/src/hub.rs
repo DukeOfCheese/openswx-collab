@@ -30,7 +30,10 @@
 //! never kept. A session that expires while connected is closed by its room's tick (4401).
 //!
 //! The registry also counts each account's connections: [`Hub::register`] refuses one more than
-//! `max_connections_per_user`.
+//! `max_connections_per_user`. And the hub counts the server's document sockets, from the upgrade
+//! on ([`Hub::take_socket`]), against a ceiling below `max_connections`
+//! ([`crate::Settings::max_document_connections`]): document connections are never closed to make
+//! room for others, so without it they could take every connection and leave none for REST.
 //!
 //! # Sweeper
 //!
@@ -39,7 +42,7 @@
 //! does not answer is asked again next time; no room can hold up the others.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -204,6 +207,8 @@ struct Inner {
     gates: Mutex<HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
     closing: AtomicBool,
     registry: Mutex<Registry>,
+    /// The document sockets open ([`Hub::take_socket`]).
+    sockets: AtomicUsize,
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The drop and close calls made so far (for tests).
     calls: Mutex<Vec<String>>,
@@ -225,6 +230,17 @@ pub struct Hub {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A document socket's place under the server's ceiling ([`Hub::take_socket`]), given back when
+/// this is dropped.
+#[derive(Debug)]
+pub struct SocketPlace(Hub);
+
+impl Drop for SocketPlace {
+    fn drop(&mut self) {
+        self.0.inner.sockets.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A connection's place in the hub's registry; dropping it unregisters the connection (and frees
@@ -397,6 +413,25 @@ impl Hub {
     }
 
     // ------------------------------------------------------------------ connections
+
+    /// A place for one more document socket, from its upgrade until it closes; `None` when
+    /// `ceiling` are open already.
+    pub fn take_socket(&self, ceiling: usize) -> Option<SocketPlace> {
+        let sockets = &self.inner.sockets;
+        let mut n = sockets.load(Ordering::SeqCst);
+        while n < ceiling {
+            match sockets.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(SocketPlace(self.clone())),
+                Err(now) => n = now,
+            }
+        }
+        None
+    }
+
+    /// How many document sockets are open ([`Hub::take_socket`]).
+    pub fn sockets(&self) -> usize {
+        self.inner.sockets.load(Ordering::SeqCst)
+    }
 
     /// Registers a document connection whose session is known (see the module documentation);
     /// `client` is `<user id>.<client id of the hello>`. Refused when the account has `max`

@@ -358,6 +358,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The most document connections (WebSockets, from their upgrade on) the server holds:
+    /// `max_connections` less an eighth of it, and less at least 256 (half, below 512), which stay
+    /// for REST. Document connections are never closed to make room for another connection; this
+    /// keeps them from taking all of them. One more is refused (4429, `server_full`).
+    pub fn max_document_connections(&self) -> usize {
+        let max = self.max_connections;
+        let kept = (max / 8).max(256.min(max / 2));
+        max - kept
+    }
+
     /// Reads the settings from environment variables, starting from the defaults. Variables that are
     /// not settings are ignored; a setting that cannot be read is an error naming the variable.
     pub fn from_env(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
@@ -1527,5 +1537,22 @@ mod tests {
             shown.contains("postgres://collab:<redacted>@db/collab"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn document_connections_leave_an_eighth_and_at_least_256_connections_for_rest() {
+        let ceiling = |max| {
+            Settings {
+                max_connections: max,
+                ..Settings::default()
+            }
+            .max_document_connections()
+        };
+        assert_eq!(ceiling(4096), 3584);
+        assert_eq!(ceiling(1000), 744);
+        assert_eq!(ceiling(65536), 57344);
+        assert_eq!(ceiling(10), 5);
+        assert_eq!(ceiling(2), 1);
+        assert_eq!(ceiling(1), 1);
     }
 }

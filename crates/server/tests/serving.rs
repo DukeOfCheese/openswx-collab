@@ -1929,15 +1929,22 @@ async fn a_download_its_client_has_stopped_reading_is_not_closed_to_make_room() 
 
 #[tokio::test]
 async fn with_every_connection_busy_the_health_check_still_gets_through_and_nothing_else() {
-    let server = TestServer::start_with(|s| s.max_connections = 2).await;
+    // Four connections, of which two may be document connections.
+    let server = TestServer::start_with(|s| s.max_connections = 4).await;
     let world = World::new(&server).await.unwrap();
     let doc = world.document(&server, None, None, None).await;
     let other_doc = world.document(&server, None, None, None).await;
     let stats = server.state.http.clone();
-    // Two document connections: the server holds no more, and neither may be closed for another.
+    assert!(eventually(|| stats.open() == 0).await);
+    // Two document connections and two uploads under way: the server holds no more, and none
+    // of them may be closed for another.
     let mut first = Live::connect(&server, &doc, &world.admin).await;
     let mut second = Live::connect(&server, &other_doc, &world.admin).await;
-    assert!(eventually(|| stats.open() == 2).await);
+    let _uploads = [
+        held_upload(&server, &world, &world.admin, &noise(64 << 10, 41)),
+        held_upload(&server, &world, &world.admin, &noise(64 << 10, 42)),
+    ];
+    assert!(eventually(|| stats.open() == 4).await);
     let evicted = stats.evictions();
     // A health check is answered, on a connection kept for it, which is then closed.
     let mut check = TcpStream::connect(addr(&server)).await.unwrap();
@@ -1963,7 +1970,7 @@ async fn with_every_connection_busy_the_health_check_still_gets_through_and_noth
     let mut idle = Vec::new();
     for _ in 0..oswx_server::serve::HEALTH_RESERVE {
         idle.push(TcpStream::connect(addr(&server)).await.unwrap());
-        assert!(eventually(|| stats.open() == 2 + idle.len()).await);
+        assert!(eventually(|| stats.open() == 4 + idle.len()).await);
     }
     let mut check = TcpStream::connect(addr(&server)).await.unwrap();
     assert_eq!(health_on(&mut check).await, Some(200));
@@ -1972,6 +1979,46 @@ async fn with_every_connection_busy_the_health_check_still_gets_through_and_noth
     // The document connections were never touched.
     assert_eq!(edit(&mut first, 1).await, 1);
     assert_eq!(edit(&mut second, 2).await, 1);
+}
+
+#[tokio::test]
+async fn document_connections_cannot_take_the_connections_rest_needs() {
+    // Ten connections, of which five may be document connections.
+    let server = TestServer::start_with(|s| s.max_connections = 10).await;
+    assert_eq!(server.state.settings.max_document_connections(), 5);
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let stats = server.state.http.clone();
+    let mut open = Vec::new();
+    for _ in 0..5 {
+        open.push(Live::connect(&server, &doc, &world.admin).await);
+    }
+    // One more is refused at once, before its hello is read, and says why.
+    let refused = Live::try_connect(&server, &doc, &world.admin, Hello::default())
+        .await
+        .err()
+        .expect("the sixth document connection is refused");
+    assert_eq!((refused.code(), refused.close), ("server_full", Some(4429)));
+    // (The refused one took no place.)
+    assert_eq!(server.state.hub.sockets(), 5);
+    // REST still has its connections: four kept alive and one more, all answered.
+    let mut rest = Vec::new();
+    for _ in 0..4 {
+        let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
+        assert_eq!(health_on(&mut socket).await, Some(200));
+        rest.push(socket);
+    }
+    let (status, _) = server.get("/api/me", Some(&world.admin)).await;
+    assert_eq!(status, StatusCode::OK);
+    for socket in &mut rest {
+        assert_eq!(health_on(socket).await, Some(200));
+    }
+    assert_eq!(stats.refusals(), 0);
+    // A document connection that closes gives its place back.
+    open.pop().expect("a connection").close().await;
+    assert!(eventually(|| server.state.hub.sockets() == 4).await);
+    let mut again = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(edit(&mut again, 1).await, 1);
 }
 
 #[tokio::test]

@@ -2024,6 +2024,7 @@ dependencies = [
  "oswx-server",
  "reqwest",
  "rpassword",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

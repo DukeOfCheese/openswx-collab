@@ -24,6 +24,10 @@ tokio = { workspace = true, features = ["net", "signal"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }
 
+# The limit on open files is raised at start (a safe wrapper; already in the tree through tempfile).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+
 [dev-dependencies]
 futures-util.workspace = true
 oswx-core = { path = "../core" }

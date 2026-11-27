@@ -130,6 +130,7 @@ fn the_codes_are_read_from_the_source() {
     // (So that the reading below is not vacuous: these are known to be there.)
     let (closes, errors) = source_codes();
     for code in [
+        close::NORMAL,
         close::GOING_AWAY,
         close::PROTOCOL_ERROR,
         close::POLICY,

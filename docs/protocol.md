@@ -224,6 +224,7 @@ with the connection kept. Every `code` an `error` frame carries:
 | `protocol` | 4426 | `protocol` is not 2 |
 | `unauthorized` | 4401 | the token is not a live session |
 | `too_many_connections` | 4429 | your account has 64 document connections open already (`max_connections_per_user`); close one, reconnecting will not help |
+| `server_full` | 4429 | the server holds as many document connections as it may (`max_connections` less an eighth, and less at least 256, kept for REST); sent at once, before the `hello` is read. Try again later, with back-off |
 | `not_found` | 4404 | the document does not exist, was deleted, or is not yours to open (the same answer) |
 | `busy` | 4408 | the server could not take the join in time; reconnect |
 | `shutting_down` | 1001 | |
@@ -462,6 +463,7 @@ that assemblies use cannot be deleted (409 with the list).
 
 | code | meaning | what the client does |
 |---|---|---|
+| 1000 | a normal close: the connection left the room (its client closed it) | nothing; reconnect if the app did not mean to close |
 | 1001 | the server is shutting down | reconnect after a moment |
 | 1002 | a frame far over the size limit, or not a WebSocket frame | fix the client; do not resend the same frame |
 | 1008 | the client kept sending change ids the journal already held under other changes | fix the client |
@@ -475,6 +477,6 @@ that assemblies use cannot be deleted (409 with the list).
 | 4409 | the same client id connected again | do not reconnect from this connection (another one of yours has the document) |
 | 4410 | **moved / reconnect**: the document was reloaded (the journal could not say whether a change was stored, the server lost the document's lease, its room stopped unexpectedly, or it had to start the join again) | reconnect at once and resend everything unanswered; resends that were stored are answered with their seq |
 | 4426 | protocol version | update the app |
-| 4429 | too many document connections for this account | close another; reconnecting at once will not help (a reconnect that races its own old connection at the cap can get it too: try again after a moment) |
+| 4429 | too many document connections for this account (`error` `too_many_connections`), or on this server (`server_full`) | for the account: close another; reconnecting at once will not help (a reconnect that races its own old connection at the cap can get it too: try again after a moment). For the server: try again later, with back-off |
 
 The close reason is a short text (at most 120 bytes) for logs; branch on the code.
