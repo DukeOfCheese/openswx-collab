@@ -1874,6 +1874,10 @@ impl Tx for FlakyTx<'_> {
         self.inner.insert_invite(invite).await
     }
 
+    async fn open_invite_count(&mut self, org_id: &str, now: f64) -> anyhow::Result<u64> {
+        self.inner.open_invite_count(org_id, now).await
+    }
+
     async fn claim_invite(&mut self, id: &str, user_id: &str) -> anyhow::Result<bool> {
         self.inner.claim_invite(id, user_id).await
     }

@@ -15,13 +15,18 @@
 //! once, until it expires, and if it names an email address only for the account with that address.
 //! It is used when registering ([`crate::routes::auth`]) or by a signed-in account
 //! (`POST /api/invites/accept`).
+//!
+//! So that the server cannot be used to send mail to anyone at all, an organisation emails at most
+//! [`INVITE_EMAILS_PER_ORG`] invites an hour and an account [`INVITE_EMAILS_PER_ACCOUNT`] a day;
+//! past either an invite is still made, its link in the answer, with `emailed: false`. An
+//! organisation has at most [`OPEN_INVITES_MAX`] unused, unexpired invites (409 beyond).
 
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{delete, get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -29,7 +34,7 @@ use crate::access::{CurrentUser, parse_role, recheck_org, require_org};
 use crate::error::{ApiError, ApiJson, ApiPath};
 use crate::ext::{Event, Extensions, check_seat, emit, notify_member_added, notify_member_removed};
 use crate::mail::{Mailed, invite_text, send_after_commit};
-use crate::security::{OrgRole, ProjectRole, clean_email, new_token, token_hash};
+use crate::security::{OrgRole, ProjectRole, RateLimit, clean_email, new_token, token_hash};
 use crate::state::AppState;
 use crate::store::{Id, Invite, Org, OrgMember, ProjectMember, Tx, User, new_id};
 
@@ -57,7 +62,39 @@ const SEATS_CHANGED: &str = "the organisation's members changed while this invit
      accepted; try again";
 const NEEDS_AN_OWNER: &str = "an organisation needs at least one owner";
 
+/// Invites one organisation may have emailed in an hour.
+pub(crate) const INVITE_EMAILS_PER_ORG: usize = 50;
+/// Invites one account may have emailed in a day.
+pub(crate) const INVITE_EMAILS_PER_ACCOUNT: usize = 200;
+/// Unused, unexpired invites one organisation may have.
+pub(crate) const OPEN_INVITES_MAX: u64 = 1000;
+const TOO_MANY_INVITES: &str =
+    "this organisation has 1000 open invites; revoke some (or let them expire) first";
+
+/// The limits on emailed invites; one set per app.
+#[derive(Debug)]
+struct InviteLimits {
+    per_org: RateLimit,
+    per_account: RateLimit,
+}
+
+impl InviteLimits {
+    /// Whether one more invite of `org` made by `account` may be emailed now (counted if so).
+    fn may_email(&self, org: &str, account: &str, now: f64) -> bool {
+        if self.per_org.blocked(org, now) || self.per_account.blocked(account, now) {
+            return false;
+        }
+        // (Each step is atomic; two invites at once can both pass the checks above, and then
+        // one of them is refused here.)
+        self.per_org.check(org, now) && self.per_account.check(account, now)
+    }
+}
+
 pub(crate) fn router() -> Router<AppState> {
+    let limits = Arc::new(InviteLimits {
+        per_org: RateLimit::new(INVITE_EMAILS_PER_ORG, 3600),
+        per_account: RateLimit::new(INVITE_EMAILS_PER_ACCOUNT, 86400),
+    });
     Router::new()
         .route("/api/orgs", get(list_orgs).post(create_org))
         .route("/api/orgs/{org_id}", patch(rename_org))
@@ -75,6 +112,7 @@ pub(crate) fn router() -> Router<AppState> {
             delete(revoke_invite),
         )
         .route("/api/invites/accept", post(accept))
+        .layer(Extension(limits))
 }
 
 /// A name as given, without the spaces around it: 422 if it is longer than [`NAME_MAX`]
@@ -401,9 +439,11 @@ fn invite_out(inv: &Invite) -> Result<Value, ApiError> {
     }))
 }
 
-/// Makes an invite. The token is in this answer and in the email, and nowhere else.
+/// Makes an invite. The token is in this answer and in the email, and nowhere else. 409 when the
+/// organisation has [`OPEN_INVITES_MAX`] open invites; not emailed past [`InviteLimits`].
 async fn create_invite(
     State(state): State<AppState>,
+    Extension(limits): Extension<Arc<InviteLimits>>,
     user: CurrentUser,
     ApiPath(org_id): ApiPath<String>,
     ApiJson(body): ApiJson<InviteIn>,
@@ -498,13 +538,26 @@ async fn create_invite(
     let turn = state.org_turn(&org_id).await?;
     let mut tx = state.store.begin().await?;
     recheck_org(&mut *tx, &user.id, &org_id, OrgRole::Admin).await?;
+    // (Counted in the organisation's turn: two invites at once cannot both pass.)
+    if tx.open_invite_count(&org_id, now).await? >= OPEN_INVITES_MAX {
+        return Err(ApiError::Conflict(TOO_MANY_INVITES.into()));
+    }
     tx.insert_invite(&invite).await?;
 
     let url = format!(
         "{}/invite/{token}",
         state.settings.public_url.trim_end_matches('/')
     );
-    let mail = invite.email.clone().filter(|_| body.send_email).map(|to| {
+    let emailing = invite.email.is_some() && body.send_email && state.mailer.configured();
+    let allowed = emailing && limits.may_email(&org_id, &user.id, now);
+    if emailing && !allowed {
+        tracing::info!(
+            org = %org_id,
+            by = %user.id,
+            "an invite was made but not emailed: the organisation or the account has had as many              emailed as it may for now"
+        );
+    }
+    let mail = invite.email.clone().filter(|_| allowed).map(|to| {
         let days = u32::try_from(body.days).unwrap_or(DAYS_DEFAULT as u32);
         (to, invite_text(&org.name, &inviter.name, &url, days))
     });

@@ -50,6 +50,7 @@ use crate::blobs::{
     fail_when_stalled, is_sha256,
 };
 use crate::error::{ApiError, ApiJson, ApiPath};
+use crate::ext::{Quota, check_quota};
 use crate::routes::{DRAIN_AT_MOST, DRAIN_TIMEOUT};
 use crate::security::ProjectRole;
 use crate::state::AppState;
@@ -161,6 +162,15 @@ async fn upload(
     // chunk at a time, and nothing is written; it holds no memory to speak of, so it takes no
     // place among the uploads.
     let stored = state.blobs.exists(&key).await?;
+    // At most what it says it is, and never more than a blob may be.
+    let size = declared(&headers).unwrap_or(limit).min(limit);
+    // A blob not stored yet is new storage for the organisation: its plan is asked first.
+    if !stored
+        && let Err(refusal) = check_quota(&state.ext, &project.org_id, Quota::BlobBytes(size)).await
+    {
+        unread(&headers, body).await;
+        return Err(refusal);
+    }
     // Held until this request ends, however it ends.
     let _place = if stored {
         None
@@ -175,7 +185,6 @@ async fn upload(
     };
     // The whole upload, storing included, is done in this time or given up on (and whatever it
     // was writing dropped, which removes it).
-    let size = declared(&headers).unwrap_or(limit).min(limit);
     let allowed = time_allowed(&state.settings, size);
     let storing = async {
         let idle = Duration::from_secs_f64(state.settings.blob_idle_timeout);

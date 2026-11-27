@@ -1159,3 +1159,82 @@ async fn the_test_servers_keep_their_files_where_the_environment_says() {
         assert!(fake.count(|r| r.method == "PUT" && r.path.ends_with(&sha)) == 1);
     }
 }
+
+// ------------------------------------------------------------------ the storage quota
+
+/// A plan that holds at most `max` blob bytes more, and records what it was asked.
+struct BlobQuota {
+    max: u64,
+    asked: std::sync::Mutex<Vec<u64>>,
+}
+
+#[async_trait]
+impl oswx_server::ext::Extensions for BlobQuota {
+    async fn quota(
+        &self,
+        _org: &oswx_server::store::Id,
+        what: oswx_server::ext::Quota,
+    ) -> Result<(), String> {
+        if let oswx_server::ext::Quota::BlobBytes(n) = what {
+            self.asked.lock().unwrap().push(n);
+            if n > self.max {
+                return Err("this plan holds no more files".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_quota_hook_is_asked_before_a_new_blob_is_stored_and_can_refuse_it() {
+    let plan = Arc::new(BlobQuota {
+        max: 1000,
+        asked: std::sync::Mutex::default(),
+    });
+    let ext = plan.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.ext = ext).await;
+    let w = World::new(&server).await.unwrap();
+    // Within the plan: asked with the size it declares, and stored.
+    let small = noise(800, 1);
+    assert_eq!(
+        upload(&server, &w, &w.admin, &sha_of(&small), small.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(*plan.asked.lock().unwrap(), [800]);
+    // Beyond it: 402 with the plan's reason, nothing stored, no upload place taken.
+    let big = noise(1500, 2);
+    let r = reqwest::Client::new()
+        .put(blob_url(&server, &w, &sha_of(&big)))
+        .bearer_auth(&w.admin)
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        r.json::<Value>().await.unwrap(),
+        json!({"detail": "this plan holds no more files"})
+    );
+    assert_eq!(server.state.uploads.running(), 0);
+    let (_, missing_now) = missing(&server, &w, &w.admin, json!([sha_of(&big)])).await;
+    assert_eq!(missing_now, json!([sha_of(&big)]));
+    // A blob already stored is not new storage: the plan is not asked again.
+    assert_eq!(
+        upload(&server, &w, &w.admin, &sha_of(&small), small).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(*plan.asked.lock().unwrap(), [800, 1500]);
+    // A body with no declared size is asked about as the largest a blob may be.
+    let streamed = noise(100, 3);
+    let chunks = stream::iter([Ok::<_, io::Error>(Bytes::from(streamed.clone()))]);
+    let r = reqwest::Client::new()
+        .put(blob_url(&server, &w, &sha_of(&streamed)))
+        .bearer_auth(&w.admin)
+        .body(reqwest::Body::wrap_stream(chunks))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PAYMENT_REQUIRED);
+    let max = server.state.settings.max_blob_bytes as u64;
+    assert_eq!(*plan.asked.lock().unwrap(), [800, 1500, max]);
+}

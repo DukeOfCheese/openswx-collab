@@ -9,10 +9,13 @@
 //! a database transaction is open (so a slow hook delays only its own request):
 //!
 //! - The refusing hooks are asked **before the request's transaction begins**:
-//!   [`check_seat`] ([`Extensions::may_add_member`]) when an invite is made and when one is
-//!   accepted by someone not yet a member; [`check_quota`] ([`Extensions::quota`]) before a project
-//!   is created; [`check_org_delete`] ([`Extensions::before_org_delete`]) before an organisation is
-//!   deleted. A refusal answers 402 with the hook's message (or a default one). A hook that times
+//!   [`check_seat`] ([`Extensions::may_add_member`], then [`Extensions::quota`] for
+//!   [`Quota::Members`]) when an invite is made and when one is accepted by someone not yet a
+//!   member; [`check_quota`] ([`Extensions::quota`]) before a project is created
+//!   ([`Quota::Projects`]), before a document is created ([`Quota::Documents`]), and before a blob
+//!   that is not stored yet is uploaded ([`Quota::BlobBytes`], with its declared size, or the
+//!   largest a blob may be when it declares none); [`check_org_delete`]
+//!   ([`Extensions::before_org_delete`]) before an organisation is deleted. A refusal answers 402 with the hook's message (or a default one). A hook that times
 //!   out or panics counts as a refusal and answers 409 "try again" (logged as an error with the
 //!   organisation's id). Because the answer is given before the transaction, the transaction checks
 //!   that what was approved still holds (e.g. the member count has not grown) and otherwise answers
@@ -447,8 +450,8 @@ where
     }
 }
 
-/// [`Extensions::may_add_member`]: may `org`, with `current_members` members, take one more?
-/// Call before the transaction.
+/// [`Extensions::may_add_member`]: may `org`, with `current_members` members, take one more? And
+/// if so, [`Extensions::quota`] for [`Quota::Members`]. Call before the transaction.
 pub async fn check_seat(
     ext: &Arc<dyn Extensions>,
     org: &Id,
@@ -463,7 +466,8 @@ pub async fn check_seat(
         "this organisation has no free seats",
         move |e| async move { e.may_add_member(&org_id, n).await },
     )
-    .await
+    .await?;
+    check_quota(ext, org, Quota::Members).await
 }
 
 /// [`Extensions::quota`]: may `org` have one more of `what`? Call before the transaction.

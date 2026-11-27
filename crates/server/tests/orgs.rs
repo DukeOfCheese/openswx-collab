@@ -1234,8 +1234,10 @@ async fn the_hooks_and_events_are_called_where_things_happen() {
         recorder.take(),
         [
             "hook may_add_member 1",
+            "hook quota Members",
             "invite_created",
             "hook may_add_member 1",
+            "hook quota Members",
             "registered",
             "hook member_added",
             "member_added",
@@ -1302,6 +1304,7 @@ async fn the_hooks_and_events_are_called_where_things_happen() {
             "project_renamed",
             "org_renamed",
             "hook may_add_member 2",
+            "hook quota Members",
             "invite_created",
             "invite_revoked",
             "hook member_removed",
@@ -2226,4 +2229,222 @@ async fn the_next_write_does_not_wait_for_the_hooks_of_the_one_before() {
     for request in [first, second] {
         assert_eq!(request.await.unwrap().0, StatusCode::CREATED);
     }
+}
+
+// ------------------------------------------------------------------ invites as a mail relay
+
+/// A server on a manual clock with a mail server configured (a [`MemoryMailer`]).
+async fn mailing_on_a_clock() -> (TestServer, Clock, Arc<MemoryMailer>) {
+    let clock = Clock::manual(T0);
+    let mailer = Arc::new(MemoryMailer::new(true));
+    let (c, m) = (clock.clone(), mailer.clone());
+    let server = TestServer::start_custom(
+        |s| {
+            s.smtp_host = "127.0.0.1".into();
+            s.smtp_from = "collab@example.org".into();
+        },
+        |s: &mut AppState| {
+            s.clock = c;
+            s.mailer = m;
+        },
+    )
+    .await;
+    (server, clock, mailer)
+}
+
+/// Invites `n` addresses `{prefix}{i}@example.com` to `org` as `token`; answers how many were
+/// emailed. Every one is made.
+async fn invite_many(server: &TestServer, token: &str, org: &str, prefix: &str, n: usize) -> usize {
+    let mut emailed = 0;
+    for i in 0..n {
+        let (status, out) = server
+            .post(
+                &format!("/api/orgs/{org}/invites"),
+                Some(token),
+                json!({"email": format!("{prefix}{i}@example.com")}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{out}");
+        assert!(out["url"].is_string() && out["token"].is_string(), "{out}");
+        if out["emailed"] == true {
+            emailed += 1;
+        }
+    }
+    emailed
+}
+
+#[tokio::test]
+async fn an_organisation_emails_at_most_fifty_invites_an_hour_and_an_account_two_hundred_a_day() {
+    let (server, clock, mailer) = mailing_on_a_clock().await;
+    let w = World::new(&server).await.unwrap();
+    // A second admin (the invite that brought them is the first emailed).
+    let (other, _) = w
+        .invite(&server, "other@example.com", None, None, "admin")
+        .await;
+    // Fifty go in all; the fifty-first is made, link and all, and not emailed.
+    assert_eq!(invite_many(&server, &w.admin, &w.org, "a", 50).await, 49);
+    assert_eq!(mailer.sent().len(), 50);
+    // Invites that send nothing are not counted, and are made as before.
+    let (status, out) = invite(
+        &server,
+        &w,
+        json!({"email": "x@example.com", "send_email": false}),
+    )
+    .await;
+    assert_eq!(
+        (status, out["emailed"].clone()),
+        (StatusCode::CREATED, json!(false))
+    );
+    let (status, _) = invite(&server, &w, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // The other admin is held by the organisation's limit.
+    assert_eq!(invite_many(&server, &other, &w.org, "o", 1).await, 0);
+    // An hour later the organisation may again; three more hours bring the account to 200.
+    for hour in 1..=3 {
+        clock.advance(3601.0);
+        let prefix = format!("h{hour}-");
+        assert_eq!(
+            invite_many(&server, &w.admin, &w.org, &prefix, 50).await,
+            50
+        );
+    }
+    // Past them the account is stopped for the day, in any organisation ...
+    clock.advance(3601.0);
+    let (status, org) = server
+        .post("/api/orgs", Some(&w.admin), json!({"name": "Second"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{org}");
+    let second = org["id"].as_str().unwrap().to_owned();
+    assert_eq!(invite_many(&server, &w.admin, &second, "s", 2).await, 0);
+    assert_eq!(invite_many(&server, &w.admin, &w.org, "t", 1).await, 0);
+    // ... while another admin may still send the organisation's.
+    assert_eq!(invite_many(&server, &other, &w.org, "p", 1).await, 1);
+    assert_eq!(mailer.sent().len(), 201);
+    // A day after the first, the account may again.
+    clock.advance(86400.0);
+    assert_eq!(invite_many(&server, &w.admin, &second, "d", 1).await, 1);
+}
+
+#[tokio::test]
+async fn an_organisation_has_at_most_a_thousand_open_invites() {
+    let clock = Clock::manual(T0);
+    let kept = clock.clone();
+    let server = TestServer::start_custom(|_| {}, |s| s.clock = kept).await;
+    let w = World::new(&server).await.unwrap();
+    // 999 made directly, one expiring tomorrow; the thousandth through the route.
+    let mut tx = server.state.store.begin().await.unwrap();
+    for i in 0..999 {
+        tx.insert_invite(&oswx_server::store::Invite {
+            id: oswx_server::store::new_id(),
+            token_hash: token_hash(&format!("token {i}")),
+            org_id: w.org.clone(),
+            email: None,
+            role: "member".into(),
+            projects: "[]".into(),
+            created_by: w.admin_id.clone(),
+            created_at: T0,
+            expires_at: T0 + if i == 0 { 86400.0 } else { 7.0 * 86400.0 },
+            accepted_by: None,
+        })
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let (status, last) = invite(&server, &w, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{last}");
+    // The next is refused, and nothing is stored.
+    let (status, refused) = invite(&server, &w, json!({"email": "bob@example.com"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["detail"],
+        "this organisation has 1000 open invites; revoke some (or let them expire) first"
+    );
+    let open = server
+        .state
+        .store
+        .open_invites(&w.org, clock.now())
+        .await
+        .unwrap();
+    assert_eq!(open.len(), 1000);
+    // One revoked: room for one.
+    let id = last["id"].as_str().unwrap();
+    let (status, _) = server
+        .delete(&format!("/api/orgs/{}/invites/{id}", w.org), Some(&w.admin))
+        .await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(invite(&server, &w, json!({})).await.0, StatusCode::CREATED);
+    assert_eq!(invite(&server, &w, json!({})).await.0, StatusCode::CONFLICT);
+    // One expired: room for one more.
+    clock.advance(86401.0);
+    assert_eq!(invite(&server, &w, json!({})).await.0, StatusCode::CREATED);
+    assert_eq!(invite(&server, &w, json!({})).await.0, StatusCode::CONFLICT);
+}
+
+// ------------------------------------------------------------------ the members quota
+
+/// A plan whose member quota can be closed, after the seat hook has said yes.
+#[derive(Default)]
+struct MemberQuota {
+    full: AtomicBool,
+}
+
+#[async_trait]
+impl Extensions for MemberQuota {
+    async fn quota(&self, _org: &Id, what: Quota) -> Result<(), String> {
+        match what {
+            Quota::Members if self.full.load(Ordering::SeqCst) => {
+                Err("this plan has no more members".into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_members_quota_is_asked_when_an_invite_is_made_and_when_one_is_used() {
+    let plan = Arc::new(MemberQuota::default());
+    let ext = plan.clone();
+    let server = TestServer::start_custom(|_| {}, move |s| s.ext = ext).await;
+    let w = World::new(&server).await.unwrap();
+    let full = json!({"detail": "this plan has no more members"});
+    // Made while there is room; used once there is none: refused, and nobody joins.
+    let (status, made) = invite(&server, &w, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    plan.full.store(true, Ordering::SeqCst);
+    let (status, body) = server
+        .post(
+            "/api/auth/register",
+            None,
+            json!({"email": "bob@example.com", "password": PASSWORD, "invite": made["token"]}),
+        )
+        .await;
+    assert_eq!((status, body), (StatusCode::PAYMENT_REQUIRED, full.clone()));
+    assert!(
+        server
+            .state
+            .store
+            .user_by_email("bob@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Nor can another be made.
+    assert_eq!(
+        invite(&server, &w, json!({})).await,
+        (StatusCode::PAYMENT_REQUIRED, full)
+    );
+    assert_eq!(
+        server.state.store.org_member_count(&w.org).await.unwrap(),
+        1
+    );
+    // Room again: the invite works.
+    plan.full.store(false, Ordering::SeqCst);
+    let token = made["token"].as_str().unwrap();
+    server
+        .register_invited("bob@example.com", None, token)
+        .await;
+    assert_eq!(
+        server.state.store.org_member_count(&w.org).await.unwrap(),
+        2
+    );
 }

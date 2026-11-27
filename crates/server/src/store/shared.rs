@@ -717,6 +717,10 @@ macro_rules! store_impl {
                 q::insert_invite(self.conn(), invite).await
             }
 
+            async fn open_invite_count(&mut self, org_id: &str, now: f64) -> Result<u64> {
+                q::open_invite_count(self.conn(), org_id, now).await
+            }
+
             async fn claim_invite(&mut self, id: &str, user_id: &str) -> Result<bool> {
                 q::claim_invite(self.conn(), id, user_id).await
             }
@@ -1541,6 +1545,15 @@ macro_rules! store_impl {
                     .execute(c)
                     .await?;
                 Ok(())
+            }
+
+            pub async fn open_invite_count(c: &mut $Conn, org_id: &str, now: f64) -> Result<u64> {
+                let n: i64 = sqlx::query_scalar(sql::OPEN_INVITE_COUNT)
+                    .bind(org_id)
+                    .bind(now)
+                    .fetch_one(c)
+                    .await?;
+                Ok(u64::try_from(n)?)
             }
 
             pub async fn invite_by_id(c: &mut $Conn, id: &str) -> Result<Option<Invite>> {

@@ -231,6 +231,10 @@ pub const OPEN_INVITES: &str = concat!(
      ORDER BY created_at, id"
 );
 
+/// [`super::Tx::open_invite_count`].
+pub const OPEN_INVITE_COUNT: &str =
+    "SELECT COUNT(*) FROM invites WHERE org_id = $1 AND accepted_by IS NULL AND expires_at > $2";
+
 /// [`super::Tx::claim_invite`].
 pub const CLAIM_INVITE: &str =
     "UPDATE invites SET accepted_by = $2 WHERE id = $1 AND accepted_by IS NULL";

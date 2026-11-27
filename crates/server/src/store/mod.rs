@@ -1236,6 +1236,9 @@ pub trait Tx: Send {
 
     async fn insert_invite(&mut self, invite: &Invite) -> anyhow::Result<()>;
 
+    /// How many of an organisation's invites are unused and expire after `now`.
+    async fn open_invite_count(&mut self, org_id: &str, now: f64) -> anyhow::Result<u64>;
+
     /// Marks an unused invite as used by `user_id`; `false` if it was already used (or is gone):
     /// of two people accepting one invite at once, one wins.
     async fn claim_invite(&mut self, id: &str, user_id: &str) -> anyhow::Result<bool>;
