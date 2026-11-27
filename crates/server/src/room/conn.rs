@@ -1060,7 +1060,7 @@ mod tests {
         outbox.written();
         assert!(!outbox.is_frozen(since + 2 * after, after), "it wrote");
         assert_eq!(start_writing(&outbox), Some(2));
-        let again = Instant::now();
+        let again = Instant::now().max(outbox.lock().read_by.unwrap());
         assert!(!outbox.is_frozen(again + after / 2, after));
         assert!(outbox.is_frozen(again + after, after));
         outbox.close_now(close::TOO_SLOW, "too slow");
@@ -1113,7 +1113,9 @@ mod tests {
         }
         let at = outbox.lock().writing_since.unwrap();
         let behind = outbox.lock().behind_since.unwrap();
-        assert!(outbox.is_frozen(at.max(behind) + after, after));
+        // (The welcome's one byte is read in no time even at the slowest link.)
+        let welcome_read = outbox.lock().read_by.unwrap();
+        assert!(outbox.is_frozen(at.max(behind).max(welcome_read) + after, after));
     }
 
     #[test]
