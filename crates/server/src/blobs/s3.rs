@@ -27,7 +27,7 @@
 //!
 //! An upload holds at most `(parts_at_once + 2)` parts ([`S3Tuning`]): the first part, kept back
 //! until the length that goes in its header is known, the part being filled, and those on their
-//! way. A download holds what one read hands on (64 KiB) and the HTTP client's buffers. Removing
+//! way; each in a buffer of its own size (the one being filled: an eighth more). A download holds what one read hands on (64 KiB) and the HTTP client's buffers. Removing
 //! a prefix holds one page of the listing (1,000 keys).
 //!
 //! # Errors
@@ -652,6 +652,31 @@ impl Drop for Upload {
     }
 }
 
+/// The room the buffer an upload fills keeps beyond one part, so that what one write of the
+/// compressor adds past a part's end seldom makes it grow (an eighth of a part).
+fn fill_slack(part_size: usize) -> usize {
+    part_size / 8
+}
+
+/// The buffer an upload's compressed bytes gather in: the header's room, and space for a part
+/// and [`fill_slack`]. A `Vec` that outgrows its space doubles it, and a part cut from it would
+/// keep that (16 MiB held for a part of 8): [`cut_part`] gives every part exactly its size.
+fn filling_buffer(part_size: usize) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(part_size + fill_slack(part_size));
+    buffer.resize(HEADER_LEN, 0);
+    buffer
+}
+
+/// Cuts the first `part_size` bytes off `buffer` (which holds at least that many) into a buffer of
+/// exactly that size. `buffer` keeps the rest, and gives back any space it grew beyond a part and
+/// [`fill_slack`].
+fn cut_part(buffer: &mut Vec<u8>, part_size: usize) -> Vec<u8> {
+    let part = buffer[..part_size].to_vec();
+    buffer.drain(..part_size);
+    buffer.shrink_to(part_size + fill_slack(part_size));
+    part
+}
+
 #[async_trait]
 impl Blobs for S3Blobs {
     async fn put_stream(
@@ -665,7 +690,7 @@ impl Blobs for S3Blobs {
         let failed = |e: StoreError| self.secrets.error("storing", key, &e);
         // The compressed bytes gather here, after room for the header; whole parts are cut off the
         // front as they fill.
-        let mut encoder = ZstdEncoder::new(vec![0u8; HEADER_LEN]);
+        let mut encoder = ZstdEncoder::new(filling_buffer(part_size));
         let mut hasher = Sha256::new();
         let mut raw_len = 0u64;
         // The first part is kept back: the header in it holds the length, known at the end.
@@ -681,9 +706,7 @@ impl Blobs for S3Blobs {
             hasher.update(&chunk);
             encoder.write_all(&chunk).await?;
             while encoder.get_ref().len() >= part_size {
-                let buffer = encoder.get_mut();
-                let rest = buffer.split_off(part_size);
-                let part = std::mem::replace(buffer, rest);
+                let part = cut_part(encoder.get_mut(), part_size);
                 match &mut upload {
                     None => {
                         upload = Some(Upload::start(self, &path).await.map_err(failed)?);
@@ -706,6 +729,8 @@ impl Blobs for S3Blobs {
         drop(body);
         encoder.shutdown().await?;
         let mut last = encoder.into_inner();
+        // (What the compressor's end added may have made it grow.)
+        last.shrink_to_fit();
         // The body ended well (its digest and size are right, or it would have failed above): only
         // now does anything become visible under the key.
         match (upload, first) {
@@ -978,5 +1003,50 @@ mod tests {
         );
         let folder = super::super::LocalBlobs::new(tempfile::tempdir().unwrap().path()).unwrap();
         assert_eq!(folder.upload_memory(), 4 << 20);
+    }
+
+    #[tokio::test]
+    async fn every_part_is_held_in_a_buffer_of_its_own_size() {
+        const PART: usize = 1 << 20;
+        let margin = fill_slack(PART);
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                })
+                .collect()
+        };
+        // As `put_stream` fills and cuts: small writes, and writes far larger than a part, which
+        // make the buffer grow past its space.
+        let mut encoder = ZstdEncoder::new(filling_buffer(PART));
+        let mut parts = Vec::new();
+        for &size in [16 << 10, 64 << 10, 3 << 20, 7, 2 << 20, 100 << 10]
+            .iter()
+            .cycle()
+            .take(36)
+        {
+            encoder.write_all(&noise(size)).await.unwrap();
+            while encoder.get_ref().len() >= PART {
+                parts.push(cut_part(encoder.get_mut(), PART));
+            }
+            let filling = encoder.get_ref().capacity();
+            assert!(
+                filling <= PART + margin,
+                "the buffer being filled holds {filling}"
+            );
+        }
+        assert!(parts.len() > 20, "{}", parts.len());
+        for part in &parts {
+            assert_eq!(part.len(), PART);
+            assert!(
+                part.capacity() <= PART + margin,
+                "a part of {PART} bytes holds {}",
+                part.capacity()
+            );
+        }
     }
 }
