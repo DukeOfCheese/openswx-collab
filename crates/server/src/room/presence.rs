@@ -25,7 +25,9 @@
 //! too (a client skips its own `client_id`), and costs one allocation however many readers share
 //! it; it carries the peers' ids and names and at most 1 MiB more, however large their drafts
 //! and presence are. What it left out follows: the presence it had no room for, in frames of up to
-//! [`MAX_LIVE_ENTRIES`] (made once per tick for every reader at the same place), then each peer's
+//! [`MAX_LIVE_ENTRIES`] (made once per tick for every reader at the same place: a frame ends just
+//! before the reader's own entry and the next begins after it, so that none is made for one reader
+//! alone), then each peer's
 //! current draft as a `draft` frame (made once per draft and shared by every reader owed it),
 //! queued a few at a time while the reader has room to spare
 //! ([`super::conn::Outbox::push_soft_with_room`]), so that they never make it fall behind again. A
@@ -81,6 +83,73 @@ pub(super) type OwedList = Arc<[(ConnId, Owed)]>;
 fn names(owed: &[(ConnId, Owed)], conn: ConnId) -> bool {
     owed.iter()
         .any(|&(peer, kind)| peer == conn && kind == Owed::Presence)
+}
+
+/// Owed presence frames made at one tick, by the place they start at in a list (the list's address
+/// and the place): the place after each, the frame (none if it carries nothing) and how many
+/// entries it has. Several may start at one place, each ending before a different reader's own
+/// entry.
+type MadeFrames = HashMap<(usize, usize), Vec<(usize, Option<Bytes>, usize)>>;
+
+/// The owed presence frame for `to` at place `next` of `owed`: one already made at that place that
+/// does not name `to`, or else `make()`, which is then kept for the readers that come to that
+/// place after it.
+fn shared_frame(
+    made: &mut MadeFrames,
+    owed: &OwedList,
+    next: usize,
+    to: ConnId,
+    make: impl FnOnce() -> (usize, Option<Bytes>, usize),
+) -> (usize, Option<Bytes>, usize) {
+    // Its own entry: nothing, and on to the place after it.
+    if owed.get(next) == Some(&(to, Owed::Presence)) {
+        return (next + 1, None, 0);
+    }
+    let key = (Arc::as_ptr(owed).cast::<u8>() as usize, next);
+    let at = made.entry(key).or_default();
+    if let Some(frame) = at
+        .iter()
+        .find(|(after, _, _)| !names(&owed[next..*after], to))
+    {
+        return frame.clone();
+    }
+    let frame = make();
+    debug_assert!(!names(&owed[next..frame.0], to));
+    at.push(frame.clone());
+    frame
+}
+
+/// The presence entries one owed frame carries for `to` from place `from` of `owed`: up to the
+/// next draft owed or `to`'s own entry (a frame ends just before it; one that starts at it is that
+/// entry alone, and carries nothing), at most [`MAX_LIVE_ENTRIES`] ([`MAX_LIVE_BYTES`] of
+/// `len`), leaving out the peers `entry` has nothing for (gone, or no presence any more). Answers
+/// the place after them and the entries.
+fn presence_range<E>(
+    owed: &[(ConnId, Owed)],
+    from: usize,
+    to: ConnId,
+    entry: impl Fn(ConnId) -> Option<E>,
+    len: impl Fn(&E) -> usize,
+) -> (usize, Vec<E>) {
+    if owed.get(from) == Some(&(to, Owed::Presence)) {
+        return (from + 1, Vec::new());
+    }
+    let mut entries = Vec::new();
+    let mut bytes = 0;
+    let mut at = from;
+    while let Some(&(peer, Owed::Presence)) = owed.get(at) {
+        let full =
+            entries.len() >= MAX_LIVE_ENTRIES || (!entries.is_empty() && bytes >= MAX_LIVE_BYTES);
+        if full || peer == to {
+            break;
+        }
+        at += 1;
+        if let Some(e) = entry(peer) {
+            bytes += len(&e);
+            entries.push(e);
+        }
+    }
+    (at, entries)
 }
 
 /// Whether a message is presence or a draft.
@@ -316,7 +385,7 @@ impl Room {
     /// Catches up every connection behind on soft frames that has written everything it had and
     /// was not caught up in the last [`super::Hooks::catch_up_every`]: one `peer.list` for all of
     /// them, which is what the frames they missed came to (drafts aside: they are owed, and follow
-    /// in [`Room::send_owed_drafts`]). Closes those frozen behind.
+    /// in [`Room::send_owed`]). Closes those frozen behind.
     fn catch_up_behind(&mut self, now: Instant) {
         if self.behind.is_empty() {
             return;
@@ -403,15 +472,16 @@ impl Room {
     /// Sends the connections that caught up what they are owed, each peer's as it is now, as much
     /// as each has room for; the rest at a later tick. Presence goes in frames of up to
     /// [`MAX_LIVE_ENTRIES`] ([`MAX_LIVE_BYTES`]), made once per tick for every connection at the
-    /// same place in the same list; each draft as a `draft` frame made once while anyone is owed
-    /// it. A connection that fell behind again is owed nothing more (its next catch-up owes it
-    /// again), and nobody is sent its own.
+    /// same place in the same list (a frame ends just before the connection's own entry, and the
+    /// next begins after it, so every frame made may be sent to any connection at that place it
+    /// does not name); each draft as a `draft` frame made once while anyone is owed it. A
+    /// connection that fell behind again is owed nothing more (its next catch-up owes it again),
+    /// and nobody is sent its own.
     fn send_owed(&mut self) {
         if self.owing.is_empty() {
             return;
         }
-        // Presence frames made this tick: (list, first place) to (the place after, frame, entries).
-        let mut made: HashMap<(usize, usize), (usize, Option<Bytes>, usize)> = HashMap::new();
+        let mut made = MadeFrames::new();
         for id in self.owing.drain().collect::<Vec<_>>() {
             let Some(c) = self.conns.get_mut(&id) else {
                 continue;
@@ -425,23 +495,11 @@ impl Room {
             }
             let mut sent = 0;
             while let Some(&(peer, kind)) = owed.get(next) {
-                let (frame, after, entries) = match kind {
-                    Owed::Presence => {
-                        let key = (Arc::as_ptr(&owed).cast::<u8>() as usize, next);
-                        match made.get(&key) {
-                            Some((after, frame, n)) if !names(&owed[next..*after], id) => {
-                                (frame.clone(), *after, *n)
-                            }
-                            _ => {
-                                let (after, frame, n) = self.presence_frame(&owed, next, id);
-                                if !names(&owed[next..after], id) {
-                                    made.insert(key, (after, frame.clone(), n));
-                                }
-                                (frame, after, n)
-                            }
-                        }
-                    }
-                    Owed::Draft => (self.draft_frame(peer, id), next + 1, 1),
+                let (after, frame, entries) = match kind {
+                    Owed::Presence => shared_frame(&mut made, &owed, next, id, || {
+                        self.presence_frame(&owed, next, id)
+                    }),
+                    Owed::Draft => (next + 1, self.draft_frame(peer, id), 1),
                 };
                 let Some(frame) = frame else {
                     // Gone, itself, or nothing any more (it never knew the old one).
@@ -470,36 +528,20 @@ impl Room {
         }
     }
 
-    /// A frame of the presence owed from place `from` of `owed`, as it is now: the entries up to
-    /// the next draft owed, at most [`MAX_LIVE_ENTRIES`] ([`MAX_LIVE_BYTES`]), leaving out `to`'s
-    /// own and those of peers gone. Answers the place after them, the frame (none if every one
-    /// was left out) and how many entries it has.
+    /// A frame of the presence owed from place `from` of `owed`, as it is now
+    /// ([`presence_range`]: never `to`'s own, nor that of peers gone). Answers the place after it,
+    /// the frame (none if it carries nothing) and how many entries it has.
     fn presence_frame(
         &self,
         owed: &[(ConnId, Owed)],
         from: usize,
         to: ConnId,
     ) -> (usize, Option<Bytes>, usize) {
-        let mut entries = Vec::new();
-        let mut bytes = 0;
-        let mut at = from;
-        while let Some(&(peer, Owed::Presence)) = owed.get(at) {
-            if entries.len() >= MAX_LIVE_ENTRIES || (!entries.is_empty() && bytes >= MAX_LIVE_BYTES)
-            {
-                break;
-            }
-            at += 1;
-            if peer == to {
-                continue;
-            }
-            if let Some(p) = self.conns.get(&peer)
-                && let Some(data) = &p.presence
-            {
-                let entry = LiveEntry::new(&p.client, Some(data));
-                bytes += entry.encoded_len();
-                entries.push(entry);
-            }
-        }
+        let entry = |peer| {
+            let p = self.conns.get(&peer)?;
+            Some(LiveEntry::new(&p.client, Some(p.presence.as_ref()?)))
+        };
+        let (at, entries) = presence_range(owed, from, to, entry, LiveEntry::encoded_len);
         if entries.is_empty() {
             return (at, None, 0);
         }
@@ -626,6 +668,55 @@ mod tests {
             || panic!("not made"),
         );
         assert!(!done.list_made && done.caught_up.is_empty());
+    }
+
+    /// Readers owed the same presence, some of them in it: each is sent every entry but its own, in
+    /// order, in frames shared with every reader at the same place that they do not name; a frame
+    /// ends just before a reader's own entry, and none is made for one reader alone.
+    #[test]
+    fn owed_presence_frames_end_before_a_readers_own_entry_and_are_shared() {
+        // Peers 1 to 10 owed their presence, then two drafts.
+        let owed: OwedList = (1..=10)
+            .map(|p| (p, Owed::Presence))
+            .chain([(1, Owed::Draft), (2, Owed::Draft)])
+            .collect();
+        let mut made = MadeFrames::new();
+        let mut makes = 0;
+        let mut first = Vec::new();
+        for to in [3, 100, 7] {
+            let mut got = Vec::new();
+            let mut next = 0;
+            while let Some(&(_, Owed::Presence)) = owed.get(next) {
+                let (after, frame, n) = shared_frame(&mut made, &owed, next, to, || {
+                    makes += 1;
+                    let (after, peers) = presence_range(&owed, next, to, Some, |_| 1);
+                    let frame = Bytes::from(peers.iter().map(|&p| p as u8).collect::<Vec<_>>());
+                    (after, Some(frame).filter(|f| !f.is_empty()), peers.len())
+                });
+                if let Some(frame) = frame {
+                    assert_eq!(frame.len(), n);
+                    assert!(!frame.contains(&(to as u8)), "{to} sent its own");
+                    if next == 0 {
+                        first.push(frame.as_ptr());
+                    }
+                    got.extend_from_slice(&frame);
+                }
+                next = after;
+            }
+            assert_eq!(next, 10, "the drafts are not presence");
+            let want: Vec<u8> = (1..=10).filter(|&p| p != to).map(|p| p as u8).collect();
+            assert_eq!(got, want, "{to}");
+        }
+        // 3: 1-2, 4-10. 100: 1-2 (shared), 3-10. 7: 1-2 (shared), 3-6, 8-10.
+        assert_eq!(makes, 5);
+        assert!(first.iter().all(|&p| p == first[0]), "one frame for 1-2");
+        // Within one entry's room, a frame is cut at the most it may carry.
+        let many: OwedList = (1..=200).map(|p| (p, Owed::Presence)).collect();
+        let (after, peers) = presence_range(&many, 0, 0, Some, |_| 1);
+        assert_eq!((after, peers.len()), (MAX_LIVE_ENTRIES, MAX_LIVE_ENTRIES));
+        // Peers with nothing (gone) are passed over.
+        let (after, peers) = presence_range(&owed, 0, 0, |p| (p % 2 == 0).then_some(p), |_| 1);
+        assert_eq!((after, peers), (10, vec![2, 4, 6, 8, 10]));
     }
 
     #[test]
