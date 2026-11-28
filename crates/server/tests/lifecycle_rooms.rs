@@ -949,6 +949,56 @@ async fn a_room_that_panics_tells_its_connections_to_reconnect() {
     assert_eq!(edit(&mut b, 2).await, 2);
 }
 
+/// A connection whose client went while its room was stuck, and whose room then panicked before
+/// taking its `Leave`: its socket's place is given back all the same, and the server, which had
+/// room for that one document socket only, takes a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_whose_room_died_gives_back_its_place() {
+    let hooks = Arc::new(Hooks::default());
+    let h = hooks.clone();
+    let server = TestServer::start_custom(
+        |s| {
+            s.sweep_interval = 3600.0;
+            s.max_connections = 2;
+        },
+        move |s| s.room_hooks = h,
+    )
+    .await;
+    assert_eq!(server.state.settings.max_document_connections(), 1);
+    let world = World::new(&server).await.unwrap();
+    let doc = world.document(&server, None, None, None).await;
+    let before = server.state.hub.sockets();
+    let a = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(server.state.hub.sockets(), before + 1);
+    let room = server.room(&doc);
+    // The room stops at its next sweep, and panics when it goes on.
+    hooks.panic_on_sweep.lock().unwrap().insert(doc.clone());
+    hooks.stall.stall(&doc);
+    server.state.hub.sweep();
+    tokio::time::timeout(WAIT, hooks.stall.until_stopped(1))
+        .await
+        .expect("the room stopped");
+    // The client goes meanwhile: its reader ends and tells the room, which never takes it.
+    let closing = tokio::spawn(a.close());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    hooks.stall.release();
+    tokio::time::timeout(WAIT, room.ended())
+        .await
+        .expect("the room's task ended");
+    hooks.panic_on_sweep.lock().unwrap().clear();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.state.hub.sockets() != before {
+        assert!(
+            Instant::now() < deadline,
+            "the socket's place was not given back"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    closing.await.unwrap();
+    let mut b = Live::connect(&server, &doc, &world.admin).await;
+    assert_eq!(edit(&mut b, 1).await, 1);
+}
+
 // ------------------------------------------------------------------ shutdown
 
 #[tokio::test]

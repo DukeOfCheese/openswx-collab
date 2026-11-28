@@ -128,7 +128,8 @@ to version 2. A Python server's database is not opened by the Rust server, and t
   count an IPv6 client by its /64.
 - Document connections may take at most `MAX_CONNECTIONS` less an eighth (and less at least 256), so that
   they cannot leave REST without connections; one more is closed 4429 with the `error` code
-  `server_full`.
+  `server_full`. A document whose room stops unexpectedly gives back the places of all its connections,
+  those of clients leaving at that moment included.
 - The Rust Compose file raises the container's limit on open files to 65,536 (Docker's soft default has
   been 1,024 since version 25); the server raises its soft limit to the hard limit at start and warns
   when that is below what `MAX_CONNECTIONS` needs, and when out of descriptors closes an idle connection

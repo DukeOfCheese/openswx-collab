@@ -766,19 +766,26 @@ pub async fn read(
             }
         }
     }
-    room.leave(conn).await;
+    // The room closes the queue when it takes the `Leave`. If it ends first (a panic), or is gone
+    // already, nothing else will: the queue is closed here, so that the writer ends and the
+    // socket's place is given back.
+    if room.leave(conn).await {
+        tokio::select! {
+            _ = life.wait_for(|l| *l != Life::Open) => {}
+            () = room.ended() => {}
+        }
+    }
+    outbox.close(close::MOVED, "reconnect");
     // Let the close frame reach the client before the socket goes: read (and drop) what it still
     // sends until it answers the close or a few seconds pass.
-    if outbox.is_closed() {
-        let _ = tokio::time::timeout(LINGER, async {
-            while let Some(Ok(msg)) = stream.next().await {
-                if matches!(msg, Message::Close(_)) {
-                    break;
-                }
+    let _ = tokio::time::timeout(LINGER, async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
             }
-        })
-        .await;
-    }
+        }
+    })
+    .await;
 }
 
 /// The largest frame the WebSocket layer is told to read: one byte over the protocol's limit, so

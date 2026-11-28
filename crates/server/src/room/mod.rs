@@ -834,8 +834,10 @@ impl RoomHandle {
         let _ = self.send(RoomCmd::Notify(Box::new(msg))).await;
     }
 
-    pub(crate) async fn leave(&self, conn: ConnId) {
-        let _ = self.send(RoomCmd::Leave(conn)).await;
+    /// Tells the room a connection went (it then closes the connection's queue); `false` if the
+    /// room is gone, and nothing will close it.
+    pub(crate) async fn leave(&self, conn: ConnId) -> bool {
+        self.send(RoomCmd::Leave(conn)).await.is_ok()
     }
 
     /// The durable head, or `None` if the room is gone.
