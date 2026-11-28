@@ -350,8 +350,10 @@ async fn a_failure_that_passes_within_the_retries_is_not_seen() {
     b.fake.inject(2, Fault::Status(500), Seen::is_list);
     b.fake.inject(2, Fault::Status(500), Seen::is_batch_delete);
     b.blobs.delete_prefix("orgs/org1/").await.unwrap();
-    b.fake
-        .inject(2, Fault::Status(500), |r| r.method == "DELETE");
+    // One delete goes out as `DELETE /key` or, from object_store 0.14, as a batch of one.
+    b.fake.inject(2, Fault::Status(500), |r| {
+        r.method == "DELETE" || r.is_batch_delete()
+    });
     b.blobs.delete(snapshot).await.unwrap();
     b.fake.inject(2, Fault::Status(500), Seen::is_list);
     b.blobs.health().await.unwrap();
@@ -1084,8 +1086,9 @@ async fn a_server_starts_only_on_a_bucket_it_can_fully_use() {
         .inject(ALWAYS, Fault::Status(403), |r| r.method == "PUT");
     assert!(b.blobs.verify().await.is_err());
     b.fake.heal();
-    b.fake
-        .inject(ALWAYS, Fault::Status(403), |r| r.method == "DELETE");
+    b.fake.inject(ALWAYS, Fault::Status(403), |r| {
+        r.method == "DELETE" || r.is_batch_delete()
+    });
     assert!(b.blobs.verify().await.is_err());
     b.fake.heal();
     b.blobs.verify().await.unwrap();

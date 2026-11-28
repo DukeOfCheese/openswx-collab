@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -49,7 +49,7 @@ pub fn check_password_len(pw: &str) -> Result<(), ApiError> {
 }
 
 fn derive(pw: &[u8], salt: &[u8], log_n: u8, r: u32, p: u32) -> Option<[u8; KEY_LEN]> {
-    let params = scrypt::Params::new(log_n, r, p, KEY_LEN).ok()?;
+    let params = scrypt::Params::new(log_n, r, p).ok()?;
     let mut out = [0u8; KEY_LEN];
     scrypt::scrypt(pw, salt, &params, &mut out).ok()?;
     Some(out)
