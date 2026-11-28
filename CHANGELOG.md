@@ -68,6 +68,11 @@ to version 2. A Python server's database is not opened by the Rust server, and t
   `docker-compose.rust-postgres.yml` (PostgreSQL) and the existing `docker-compose.s3.yml` (Garage) on top;
   `tools/check_deploy_rust.py` checks them, and with `--docker` builds and runs each. The image's base
   images are pinned by digest. Building needs Rust 1.89 or later (`rust-version`).
+- Releases of the Rust server: binaries for Linux x86_64 and aarch64 (static, musl), Windows x86_64 and
+  macOS arm64 and x86_64, each with a `.sha256`, and the image `ghcr.io/dukeofcheese/openswx-collab-server`
+  (amd64 and arm64) tagged `<version>` and `<major>.<minor>`. The image's `latest` stays on the Python
+  server 0.1.x until openswx's client speaks protocol 2. The release build uses thin LTO and is stripped.
+  The dependencies are checked by cargo-deny (`deny.toml`: advisories, licences, sources) on every pull request.
 - Extensions (`crates/server/src/ext.rs`) replace `hooks.py`: a paid edition is a crate that depends on the
   server library and calls `oswx_serverd::run`; its migrations are `(id, sql)` pairs for each database. An
   extension's refusal answers 402; one that does not answer within 5 s, 409.

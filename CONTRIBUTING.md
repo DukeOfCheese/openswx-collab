@@ -100,6 +100,26 @@ tools/test_postgres.py` and `python tools/check_deploy.py`.
 
 How the code is organised and the rules for coding agents: [AGENTS.md](AGENTS.md).
 
+## Releasing
+
+A tag `v<version>` releases (`.github/workflows/release.yml`). A `v0.1.*` tag releases the Python line (0.1.x):
+its packages, PyPI, its image (which keeps `latest`) and the GitHub release. Any other `v*` tag releases the
+Rust server: binaries for Linux x86_64 and aarch64 (static), Windows x86_64 and macOS arm64 and x86_64, each
+an archive with a `.sha256`; the image `ghcr.io/dukeofcheese/openswx-collab-server` with the tags
+`<version>` and `<major>.<minor>` only (never `latest`); and the GitHub release. For the Rust server:
+
+1. Bump `version` in both `crates/server/Cargo.toml` and `crates/serverd/Cargo.toml` (they must agree,
+   and match the tag), and let `Cargo.lock` follow (`cargo build`).
+2. In `CHANGELOG.md`, move the version's notes out of `## Unreleased` into a section of their own headed
+   `## <version> (<date>)` (for 0.2.0: the `### 0.2.0 (not yet released)` heading becomes
+   `## 0.2.0 (<date>)`, and its subheadings move up a level). `python tools/release_notes.py <version>` prints
+   the release notes and fails if the section is missing.
+3. Merge that to `main`, then tag it there: `git tag -a v<version> -m "openswx-collab <version>"` and
+   `git push origin v<version>`.
+
+A run by hand from the Actions tab (`release`, on any branch) builds both lines without publishing
+anything, so a broken build shows before the tag.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md). Please report vulnerabilities privately, never in a public issue.

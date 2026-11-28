@@ -95,3 +95,10 @@ opt-level = 3
 
 [profile.dev.package.crc32fast]
 opt-level = 3
+
+# The released binaries and image. Never `panic = "abort"`: a room task that panics unwinds and ends,
+# and its connections notice and are given back (room/conn.rs); tower-http's catch-panic answers 500.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

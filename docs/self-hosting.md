@@ -2,7 +2,7 @@
 
 This is about the Rust server (`crates/serverd`, the program `openswx-collab-server`, version 0.2), which
 speaks protocol version 2. The Python server 0.1.x (protocol 1, the image
-`ghcr.io/dukeofcheese/openswx-collab-server` and `deploy/docker-compose.yml`) is still in the repository
+`ghcr.io/dukeofcheese/openswx-collab-server` at `latest` or a `0.1` tag, and `deploy/docker-compose.yml`) is still in the repository
 until openswx's client speaks version 2; its settings were the same where both have them, and
 [the end of this page](#the-python-server-01x) says what differs.
 
@@ -14,7 +14,11 @@ real mail relay with the Rust server.
 
 ## Smallest install
 
-Build the program (Rust 1.89 or later; `cargo` from [rustup](https://rustup.rs)):
+Download the program from a release on GitHub (from 0.2.0): an archive for Linux x86_64 or aarch64 (static,
+runs on any distribution), Windows x86_64 or macOS arm64 or x86_64, each with a `.sha256` to check it
+against. Or run the image `ghcr.io/dukeofcheese/openswx-collab-server:<version>` (amd64 and arm64; also
+tagged `<major>.<minor>`; its `latest` is the Python server until openswx's client speaks version 2). Or
+build the program (Rust 1.89 or later; `cargo` from [rustup](https://rustup.rs)):
 
 ```
 cargo build --release -p oswx-serverd             # target/release/openswx-collab-server
