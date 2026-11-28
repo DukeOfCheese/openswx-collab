@@ -56,8 +56,8 @@ use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    BackoffConfig, ClientOptions, Error as StoreError, GetResult, ObjectStore, PutPayload,
-    RetryConfig,
+    BackoffConfig, ClientOptions, Error as StoreError, GetResult, ObjectStore, ObjectStoreExt,
+    PutPayload, RetryConfig,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;

@@ -440,7 +440,9 @@ pub async fn list_uploads(config: &S3Config) -> Result<reqwest::Response, String
         .uri(url.as_str())
         .body(HttpRequestBody::empty())
         .map_err(|e| e.to_string())?;
-    AwsAuthorizer::new(&credential, "s3", &config.region).authorize(&mut signed, None);
+    AwsAuthorizer::new(&credential, "s3", &config.region)
+        .try_authorize(&mut signed, None)
+        .map_err(|e| e.to_string())?;
     let mut request = reqwest::Client::new().get(url);
     for (name, value) in signed.headers() {
         if name != "host" {

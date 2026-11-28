@@ -696,8 +696,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 
 /// A certificate authority nobody knows but this test.
 struct Authority {
-    cert: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl Authority {
@@ -713,8 +712,7 @@ impl Authority {
         ];
         let key = rcgen::KeyPair::generate().unwrap();
         Self {
-            cert: params.self_signed(&key).unwrap(),
-            key,
+            issuer: rcgen::CertifiedIssuer::self_signed(params, key).unwrap(),
         }
     }
 
@@ -722,7 +720,7 @@ impl Authority {
     fn issue(&self, host: &str) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
         let params = rcgen::CertificateParams::new(vec![host.to_owned()]).unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
         (
             cert.der().clone(),
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
@@ -863,8 +861,8 @@ async fn a_mail_server_is_trusted_by_the_machines_trust_store() {
     let dir = tempfile::TempDir::new().unwrap();
     let (ours, theirs) = (Authority::new("Our own CA"), Authority::new("Another CA"));
     let (our_pem, their_pem) = (dir.path().join("ours.pem"), dir.path().join("theirs.pem"));
-    std::fs::write(&our_pem, ours.cert.pem()).unwrap();
-    std::fs::write(&their_pem, theirs.cert.pem()).unwrap();
+    std::fs::write(&our_pem, ours.issuer.pem()).unwrap();
+    std::fs::write(&their_pem, theirs.issuer.pem()).unwrap();
     let (port, recipients) = tls_mail_server(&ours).await;
 
     // The relay's certificate comes from a CA in the machine's trust store: mail goes out.
