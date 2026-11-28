@@ -25,7 +25,9 @@ The image has version tags only ({tags}); `latest` stays on the Python server 0.
 
 Or the program alone: download the archive for your machine below (Linux x86_64 and aarch64, static;
 Windows x86_64; macOS arm64 and x86_64), check it against its `.sha256`, unpack it and run
-`openswx-collab-server serve`. Or with Compose, from a checkout of this tag: copy `deploy/.env.example` to
+`openswx-collab-server serve`. The macOS binaries are not signed: a download in a browser is quarantined
+by Gatekeeper, so download with `curl` or run `xattr -d com.apple.quarantine openswx-collab-server`.
+Or with Compose, from a checkout of this tag: copy `deploy/.env.example` to
 `deploy/.env`, fill it in, and `docker compose -f deploy/docker-compose.rust.yml --env-file deploy/.env up -d
 --build` (SQLite), adding `-f deploy/docker-compose.rust-postgres.yml` for PostgreSQL. The full guide is
 [docs/self-hosting.md](https://github.com/DukeOfCheese/openswx-collab/blob/v{v}/docs/self-hosting.md).
@@ -55,7 +57,8 @@ openswx-collab is an independent open-source project, not affiliated with Dassau
 
 def section(version: str, changelog: str) -> str:
     """The CHANGELOG section headed `## <version>` (up to the next `## `), without its heading."""
-    m = re.search(rf"^## {re.escape(version)}\b[^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
+    # (the lookahead keeps `## 0.2.0` from matching `## 0.2.0-rc.1`)
+    m = re.search(rf"^## {re.escape(version)}(?![\w.-])[^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
     if not m:
         raise SystemExit(f"CHANGELOG.md has no section for {version}")
     return m.group(1).strip()

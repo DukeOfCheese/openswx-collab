@@ -201,6 +201,8 @@ jobs:
             runner: ubuntu-24.04-arm
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            # The C runtime linked in, so the program starts without the VC++ redistributable.
+            rustflags: -C target-feature=+crt-static
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: x86_64-apple-darwin
@@ -214,6 +216,11 @@ jobs:
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
+      - name: The target's own compiler flags
+        if: matrix.rustflags
+        env:
+          FLAGS: ${{ matrix.rustflags }}
+        run: echo "RUSTFLAGS=$FLAGS" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

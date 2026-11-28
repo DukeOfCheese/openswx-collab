@@ -16,7 +16,8 @@ real mail relay with the Rust server.
 
 Download the program from a release on GitHub (from 0.2.0): an archive for Linux x86_64 or aarch64 (static,
 runs on any distribution), Windows x86_64 or macOS arm64 or x86_64, each with a `.sha256` to check it
-against. Or run the image `ghcr.io/dukeofcheese/openswx-collab-server:<version>` (amd64 and arm64; also
+against. The macOS binaries are not signed: a download in a browser is quarantined by Gatekeeper, so
+download with `curl` or run `xattr -d com.apple.quarantine openswx-collab-server`. Or run the image `ghcr.io/dukeofcheese/openswx-collab-server:<version>` (amd64 and arm64; also
 tagged `<major>.<minor>`; its `latest` is the Python server until openswx's client speaks version 2). Or
 build the program (Rust 1.89 or later; `cargo` from [rustup](https://rustup.rs)):
 
