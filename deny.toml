@@ -12,7 +12,17 @@ version = 2
 #   ignore = [{ id = "RUSTSEC-0000-0000", reason = "..." }]
 unmaintained = "all"
 yanked = "warn"
-ignore = []
+ignore = [
+    # quick-xml 0.38 (pinned by object_store 0.12): quadratic attribute check and unbounded namespace
+    # declarations. object_store parses only the XML replies of the S3 endpoint the operator configured,
+    # never anything a user sends. Goes when object_store moves to quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store: parses only the configured S3 endpoint's replies" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store: parses only the configured S3 endpoint's replies" },
+    # SQLite < 3.54 (libsqlite3-sys 0.30, pinned by sqlx-sqlite 0.8): uninitialised memory from a crafted
+    # database and -wal pair. The server opens only its own database in its own data directory; someone
+    # who can write files there already has the data. Goes when sqlx moves to libsqlite3-sys >= 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via sqlx: the server opens only its own database files" },
+]
 
 [licenses]
 version = 2
