@@ -2,9 +2,9 @@
 
 This is about the Rust server (`crates/serverd`, the program `openswx-collab-server`, version 0.2), which
 speaks protocol version 2. The Python server 0.1.x (protocol 1, the image
-`ghcr.io/dukeofcheese/openswx-collab-server` and `deploy/docker-compose.yml`) is still in the repository
-until openswx's client speaks version 2; its settings were the same where both have them, and
-[the end of this page](#the-python-server-01x) says what differs.
+`ghcr.io/dukeofcheese/openswx-collab-server` at `latest` or a `0.1` tag, and `deploy/docker-compose.yml`)
+is still in the repository until openswx's client speaks version 2; its settings were the same where
+both have them, and [the end of this page](#the-python-server-01x) says what differs.
 
 What has been run: the whole test suite on SQLite and on PostgreSQL 16, files in a folder and in an
 in-process S3 server; the image from `deploy/Dockerfile.rust` and the Compose files below (SQLite;
@@ -14,7 +14,13 @@ real mail relay with the Rust server.
 
 ## Smallest install
 
-Build the program (Rust 1.89 or later; `cargo` from [rustup](https://rustup.rs)):
+Download the program from a release on GitHub (from 0.2.0): an archive for Linux x86_64 or aarch64 (static,
+runs on any distribution), Windows x86_64 or macOS arm64 or x86_64, each with a `.sha256` to check it
+against. The macOS binaries are not signed: a download in a browser is quarantined by Gatekeeper, so
+download with `curl` or run `xattr -d com.apple.quarantine openswx-collab-server`. Or run the image
+`ghcr.io/dukeofcheese/openswx-collab-server:<version>` (amd64 and arm64; also tagged
+`<major>.<minor>`; its `latest` is the Python server until openswx's client speaks version 2). Or
+build the program (Rust 1.89 or later; `cargo` from [rustup](https://rustup.rs)):
 
 ```
 cargo build --release -p oswx-serverd             # target/release/openswx-collab-server
@@ -422,8 +428,8 @@ database that a running server is using, a long one (an extension adding an inde
 writes, live edits included, until it is done. Run `migrate` with the server stopped, or at a quiet time.
 Two servers creating an empty database at the same moment fail safely: start one first.
 
-A database from the Python server is not opened (the schema is different); an import tool comes with a
-later release.
+A database from the Python server is not opened (the schema is different), and there is no import:
+start the Rust server with a new database.
 
 ## Stopping
 

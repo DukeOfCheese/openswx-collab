@@ -2284,10 +2284,102 @@ mod scan_agrees_with_rmpv {
         (rest.is_empty() && v.is_map()).then(|| count(&v))
     }
 
+    /// A random step of a small generator, so that a failing seed reproduces.
+    fn step(state: &mut u64) -> usize {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as usize
+    }
+
+    /// Like `raw`, but each array, map and string takes a randomly chosen form that holds its
+    /// length: fix, 8, 16 or 32 bits (array16/32, map16/32, str8/16/32), not always the shortest.
+    fn wide(p: &Plain, state: &mut u64, out: &mut Vec<u8>) {
+        match p {
+            Plain::Array(items) => {
+                let n = items.len();
+                match step(state) % 3 {
+                    0 if n < 16 => out.push(0x90 | n as u8),
+                    1 if n <= 0xffff => {
+                        out.push(0xdc);
+                        out.extend_from_slice(&(n as u16).to_be_bytes());
+                    }
+                    _ => {
+                        out.push(0xdd);
+                        out.extend_from_slice(&(n as u32).to_be_bytes());
+                    }
+                }
+                items.iter().for_each(|i| wide(i, state, out));
+            }
+            Plain::Map(pairs) => {
+                let n = pairs.len();
+                match step(state) % 3 {
+                    0 if n < 16 => out.push(0x80 | n as u8),
+                    1 if n <= 0xffff => {
+                        out.push(0xde);
+                        out.extend_from_slice(&(n as u16).to_be_bytes());
+                    }
+                    _ => {
+                        out.push(0xdf);
+                        out.extend_from_slice(&(n as u32).to_be_bytes());
+                    }
+                }
+                for (k, v) in pairs {
+                    wide(k, state, out);
+                    wide(v, state, out);
+                }
+            }
+            Plain::String(text) => {
+                let b = text.as_bytes();
+                let n = b.len();
+                match step(state) % 4 {
+                    0 if n < 32 => out.push(0xa0 | n as u8),
+                    1 if n <= 0xff => out.extend_from_slice(&[0xd9, n as u8]),
+                    2 if n <= 0xffff => {
+                        out.push(0xda);
+                        out.extend_from_slice(&(n as u16).to_be_bytes());
+                    }
+                    _ => {
+                        out.push(0xdb);
+                        out.extend_from_slice(&(n as u32).to_be_bytes());
+                    }
+                }
+                out.extend_from_slice(b);
+            }
+            other => rmpv::encode::write_value(out, other).unwrap(),
+        }
+    }
+
+    fn raw_wide(p: &Plain, seed: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        wide(p, &mut { seed }, &mut out);
+        out
+    }
+
+    #[test]
+    fn the_wide_forms_are_all_emitted_and_read() {
+        // Every length form is read, as the same tree the short forms give.
+        let root = Plain::Map(vec![(
+            Plain::from("t"),
+            Plain::Array(vec![Plain::from("x"), Plain::Map(vec![])]),
+        )]);
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            let bytes = raw_wide(&root, seed);
+            seen.extend(bytes.iter().copied().filter(|b| matches!(b, 0xd9..=0xdf)));
+            assert_eq!(oswx_core::wire::scan(&bytes, None).unwrap().nodes, 5);
+            let mut rest = &bytes[..];
+            assert_eq!(rmpv::decode::read_value(&mut rest).unwrap(), root);
+        }
+        for form in [0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf] {
+            assert!(seen.contains(&form), "form {form:#x} never made");
+        }
+    }
+
     proptest! {
         #[test]
-        fn counts_nodes_like_a_recursive_walk(root in root()) {
-            let bytes = raw(&root);
+        fn counts_nodes_like_a_recursive_walk(root in root(), seed in any::<u64>()) {
+            let bytes = raw_wide(&root, seed);
             let scanned = oswx_core::wire::scan(&bytes, None).unwrap();
             prop_assert_eq!(scanned.nodes, count(&root));
             prop_assert_eq!(reference(&bytes), Some(count(&root)));
@@ -2300,8 +2392,9 @@ mod scan_agrees_with_rmpv {
             flip in any::<prop::sample::Index>(),
             bit in 0u8..8,
             tail in prop::option::of(any::<u8>()),
+            seed in any::<u64>(),
         ) {
-            let bytes = raw(&root);
+            let bytes = raw_wide(&root, seed);
             let mut variants = vec![bytes[..cut.index(bytes.len() + 1)].to_vec()];
             let mut flipped = bytes.clone();
             let at = flip.index(flipped.len());
@@ -2327,4 +2420,22 @@ mod scan_agrees_with_rmpv {
             }
         }
     }
+}
+
+#[test]
+fn nesting_at_max_is_read_and_one_more_is_refused() {
+    use oswx_core::wire::{MAX_NESTING, scan};
+    // The frame is a map ({"t": "ping", "x": ...}); `x` holds `inner` arrays, one inside the
+    // other, so the deepest container sits `inner + 1` levels down.
+    let frame = |inner: usize| {
+        let mut f = vec![0x82, 0xa1, b't', 0xa4, b'p', b'i', b'n', b'g', 0xa1, b'x'];
+        f.extend(std::iter::repeat_n(0x91, inner));
+        f.push(0xc0);
+        f
+    };
+    assert!(scan(&frame(MAX_NESTING - 1), None).is_ok());
+    assert!(matches!(
+        scan(&frame(MAX_NESTING), None),
+        Err(WireError::Invalid(_))
+    ));
 }

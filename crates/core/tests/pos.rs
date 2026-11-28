@@ -31,6 +31,30 @@ proptest! {
     }
 }
 
+/// A well-formed position: base-62 digits, not ending in `0`.
+fn arb_pos() -> impl Strategy<Value = Pos> {
+    "[0-9A-Za-z]{0,30}[1-9A-Za-z]".prop_map(|s| Pos::parse(&s).unwrap())
+}
+
+proptest! {
+    #[test]
+    fn between_any_well_formed_bounds_is_strictly_between(x in arb_pos(), y in arb_pos()) {
+        prop_assume!(x != y);
+        let (a, b) = if x < y { (x, y) } else { (y, x) };
+        for (lo, hi) in [(Some(&a), Some(&b)), (None, Some(&b)), (Some(&a), None), (None, None)] {
+            let p = Pos::between(lo, hi);
+            prop_assert_eq!(Pos::parse(p.as_str()), Some(p.clone()));
+            if let Some(lo) = lo {
+                prop_assert!(lo < &p, "{} !< {}", lo.as_str(), p.as_str());
+            }
+            if let Some(hi) = hi {
+                prop_assert!(&p < hi, "{} !< {}", p.as_str(), hi.as_str());
+            }
+            prop_assert_eq!(Pos::try_between(lo, hi), Some(p));
+        }
+    }
+}
+
 #[test]
 fn repeated_insert_at_front_stays_short() {
     let mut first = Pos::spread(1).remove(0);

@@ -135,6 +135,63 @@ async fn test_a_forgotten_password() {
     );
 }
 
+/// A reset whose commit fails (its outcome is not known to the request) must not lift the
+/// sign-in limits: the password may not have been set, and the attempts counted against the
+/// address stand. A later reset that commits lifts them.
+#[tokio::test]
+async fn an_uncertain_reset_keeps_the_sign_in_counts() {
+    let mailer = Arc::new(MemoryMailer::new(true));
+    let kept = mailer.clone();
+    let (server, flaky) = TestServer::start_flaky_full(
+        |s| {
+            s.smtp_host = "127.0.0.1".into();
+            s.smtp_from = "collab@example.org".into();
+        },
+        common::new_journal,
+        |s| s.mailer = kept,
+    )
+    .await;
+    server.register("ada@example.com").await;
+    assert_eq!(
+        reset(&server, "ada@example.com").await.0,
+        StatusCode::ACCEPTED
+    );
+    let (_, token) = link_in(&mailer.sent()[0].text);
+    let login = |password: &'static str| {
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/api/auth/login",
+                    None,
+                    json!({"email": "ada@example.com", "password": password}),
+                )
+                .await
+                .0
+        }
+    };
+    for _ in 0..10 {
+        assert_eq!(login("wrong").await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(login("wrong").await, StatusCode::TOO_MANY_REQUESTS);
+
+    flaky.fail_commit(true);
+    let (s, _) = confirm(&server, &token, "a brand new one").await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        login("a brand new one").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the counts stay after an uncertain reset"
+    );
+
+    flaky.fail_commit(false);
+    assert_eq!(
+        confirm(&server, &token, "a brand new one").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(login("a brand new one").await, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn test_only_the_newest_link_works_and_requests_are_limited() {
     let (server, mailer) = TestServer::start_mailing(|_| {}).await;

@@ -13,7 +13,7 @@ folder for a self-hosted install, or on PostgreSQL and an S3-compatible bucket. 
 proportion to the change, not to the document, and the server keeps up where the Python server fell
 behind. **Protocol version 2 is a clean break**: version 1 clients (openswx 0.4) are refused with close
 code 4426 and keep using the Python server (0.1.x, still in this repository) until openswx's client moves
-to version 2. A Python server's database is not opened by the Rust server; an import tool comes later.
+to version 2. A Python server's database is not opened by the Rust server, and there is no import.
 `docs/protocol.md` is rewritten as the contract; `docs/self-hosting.md` describes the new settings.
 
 #### Protocol 2
@@ -68,6 +68,11 @@ to version 2. A Python server's database is not opened by the Rust server; an im
   `docker-compose.rust-postgres.yml` (PostgreSQL) and the existing `docker-compose.s3.yml` (Garage) on top;
   `tools/check_deploy_rust.py` checks them, and with `--docker` builds and runs each. The image's base
   images are pinned by digest. Building needs Rust 1.89 or later (`rust-version`).
+- Releases of the Rust server: binaries for Linux x86_64 and aarch64 (static, musl), Windows x86_64 and
+  macOS arm64 and x86_64, each with a `.sha256`, and the image `ghcr.io/dukeofcheese/openswx-collab-server`
+  (amd64 and arm64) tagged `<version>` and `<major>.<minor>`. The image's `latest` stays on the Python
+  server 0.1.x until openswx's client speaks protocol 2. The release build uses thin LTO and is stripped.
+  The dependencies are checked by cargo-deny (`deny.toml`: advisories, licences, sources) on every pull request.
 - Extensions (`crates/server/src/ext.rs`) replace `hooks.py`: a paid edition is a crate that depends on the
   server library and calls `oswx_serverd::run`; its migrations are `(id, sql)` pairs for each database. An
   extension's refusal answers 402; one that does not answer within 5 s, 409.
@@ -124,11 +129,13 @@ to version 2. A Python server's database is not opened by the Rust server; an im
 - Sign-in attempts are counted before the password is checked, so parallel requests cannot get past the
   limit (10 in 10 minutes per email address and client); one email address also has 100 attempts an hour
   from anywhere. A completed password reset lifts both limits on the address, from every client, so
-  that nobody can keep an owner who reads their mail from signing in. Sign-in, reset and OAuth limits
-  count an IPv6 client by its /64.
+  that nobody can keep an owner who reads their mail from signing in; a reset whose commit failed with an
+  unknown outcome leaves them as they were. Sign-in, reset and OAuth limits count an IPv6 client by
+  its /64.
 - Document connections may take at most `MAX_CONNECTIONS` less an eighth (and less at least 256), so that
   they cannot leave REST without connections; one more is closed 4429 with the `error` code
-  `server_full`.
+  `server_full`. A document whose room stops unexpectedly gives back the places of all its connections,
+  those of clients leaving at that moment included.
 - The Rust Compose file raises the container's limit on open files to 65,536 (Docker's soft default has
   been 1,024 since version 25); the server raises its soft limit to the hard limit at start and warns
   when that is below what `MAX_CONNECTIONS` needs, and when out of descriptors closes an idle connection

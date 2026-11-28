@@ -197,6 +197,8 @@ pub struct Hooks {
     pub join_wait: Duration,
     /// Shut: a handshake whose join wait ran out stops here before it closes the connection.
     pub after_join_timeout: Arc<Gate>,
+    /// Shut: a connection that has stopped reading waits here before it tells its room it left.
+    pub before_leave: Arc<Gate>,
     /// Milliseconds the hub's `Revoked` waits before it is sent (0: sent at once), to force the
     /// connection's `Leave` to arrive first.
     pub revoke_delay_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -363,6 +365,7 @@ impl Default for Hooks {
             after_commit: Arc::default(),
             join_wait: JOIN_WAIT,
             after_join_timeout: Arc::default(),
+            before_leave: Arc::default(),
             revoke_delay_ms: Arc::default(),
             revoke_order: Arc::default(),
             snapshot_wait: SNAPSHOT_WAIT,
@@ -834,8 +837,11 @@ impl RoomHandle {
         let _ = self.send(RoomCmd::Notify(Box::new(msg))).await;
     }
 
-    pub(crate) async fn leave(&self, conn: ConnId) {
-        let _ = self.send(RoomCmd::Leave(conn)).await;
+    /// Tells the room a connection went (it then closes the connection's queue); `false` if the
+    /// room is gone, and nothing will close it.
+    pub(crate) async fn leave(&self, conn: ConnId) -> bool {
+        self.hooks.before_leave.pass().await;
+        self.send(RoomCmd::Leave(conn)).await.is_ok()
     }
 
     /// The durable head, or `None` if the room is gone.

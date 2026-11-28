@@ -1,0 +1,55 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/): the Rust dependencies' advisories, licences,
+# duplicates and sources. CI runs it (.github/workflows/rust.yml, job `deny`); locally:
+#   cargo install --locked cargo-deny && cargo deny check
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# A vulnerability always fails the check. Unmaintained crates are reported for the whole tree; the CI job
+# passes `--warn unmaintained`, so they warn instead of failing. An advisory that cannot be fixed yet goes
+# in `ignore` with its id and the reason, never silently:
+#   ignore = [{ id = "RUSTSEC-0000-0000", reason = "..." }]
+unmaintained = "all"
+yanked = "warn"
+ignore = [
+    # quick-xml 0.38 (pinned by object_store 0.12): quadratic attribute check and unbounded namespace
+    # declarations. object_store parses only the XML replies of the S3 endpoint the operator configured,
+    # never anything a user sends. Goes when object_store moves to quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store: parses only the configured S3 endpoint's replies" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store: parses only the configured S3 endpoint's replies" },
+    # SQLite < 3.54 (libsqlite3-sys 0.30, pinned by sqlx-sqlite 0.8): uninitialised memory from a crafted
+    # database and -wal pair. The server opens only its own database in its own data directory; someone
+    # who can write files there already has the data. Goes when sqlx moves to libsqlite3-sys >= 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via sqlx: the server opens only its own database files" },
+]
+
+[licenses]
+version = 2
+# Every licence a crate in Cargo.lock is published under today, as far as one of them is needed (a crate
+# under "MIT OR Apache-2.0" needs only one). A new crate under any other licence fails the check until it
+# is looked at and added here.
+allow = [
+    "0BSD",                # quoted_printable
+    "Apache-2.0",
+    "BSD-2-Clause",        # zstd-sys
+    "BSD-3-Clause",        # subtle, zstd, zstd-safe, zstd-sys, matchit
+    "BSL-1.0",             # xxhash-rust
+    "CDLA-Permissive-2.0", # webpki-roots (the Mozilla root certificates)
+    "ISC",                 # ring, rustls-webpki, untrusted
+    "MIT",
+    "MPL-2.0",             # colored, imbl, imbl-sized-chunks (MPL-2.0+)
+    "Unicode-3.0",         # ICU4X (icu_*, zerovec, yoke, ...) and unicode-*
+    "Zlib",                # foldhash, zlib-rs
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

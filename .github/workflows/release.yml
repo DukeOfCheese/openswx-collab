@@ -1,4 +1,8 @@
-# A release, on a version tag (v*): the Python packages, the Docker image and the GitHub release.
+# A release, on a version tag (v*). The tag picks the line:
+#   v0.1.*  the Python server (0.1.x): the Python packages (PyPI), the Python image (with `latest`) and the
+#           GitHub release; the jobs `packages`, `pypi-*`, `image` and `github-release`, as before.
+#   other   the Rust server (0.2 and later): binaries for five targets, the image (tags `<version>` and
+#           `<major>.<minor>` only, never `latest`) and the GitHub release; the jobs `rust-*`.
 #
 #   python tools/release_notes.py 0.2.0      # check the CHANGELOG section first
 #   git tag -a v0.2.0 -m "openswx-collab 0.2.0" && git push origin v0.2.0
@@ -11,8 +15,9 @@
 #      (PyPI allows one pending publisher per repository + workflow + environment, hence two environments.)
 #   2. On GitHub: the environments "pypi" and "pypi-server" (Settings -> Environments) and the repository
 #      variable PYPI_PUBLISH = true (Settings -> Secrets and variables -> Actions -> Variables).
-# The image goes to ghcr.io/dukeofcheese/openswx-collab-server with the GitHub token; nothing to set up.
-# Everything except publishing also runs by hand from the Actions tab, so a broken build shows before a tag.
+# Both images go to ghcr.io/dukeofcheese/openswx-collab-server with the GitHub token; nothing to set up.
+# Everything except publishing also runs by hand from the Actions tab (both lines), so a broken build
+# shows before a tag. CONTRIBUTING.md ("Releasing") has the steps.
 name: release
 
 on:
@@ -24,7 +29,10 @@ permissions:
   contents: read
 
 jobs:
+  # ---- The Python server (0.1.x): a v0.1.* tag, or a run by hand ----
+
   packages:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/v0.1.') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -61,7 +69,7 @@ jobs:
 
   pypi-protocol:
     needs: packages
-    if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true'
+    if: startsWith(github.ref, 'refs/tags/v0.1.') && vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -97,6 +105,7 @@ jobs:
           packages-dir: up/
 
   image:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/v0.1.') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,7 +145,7 @@ jobs:
 
   github-release:
     needs: [packages, image]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v0.1.')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -152,3 +161,256 @@ jobs:
         run: |
           python3 tools/release_notes.py "${GITHUB_REF_NAME}" > notes.md
           gh release create "${GITHUB_REF_NAME}" dist/* --title "openswx-collab ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
+
+  # ---- The Rust server (0.2 and later): any other v* tag, or a run by hand ----
+  # Publishing (the image's push, the GitHub release) happens only on a tag push.
+
+  rust-check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v0.1.') }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: The version (the tag matches both crates)
+        id: version
+        run: |
+          read_version() {
+            python3 -c "import tomllib, sys; print(tomllib.load(open(sys.argv[1], 'rb'))['package']['version'])" "$1"
+          }
+          server=$(read_version crates/server/Cargo.toml)
+          serverd=$(read_version crates/serverd/Cargo.toml)
+          test "$server" = "$serverd" || { echo "crates/server says $server but crates/serverd says $serverd"; exit 1; }
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+            test "v$server" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} but the crates say $server"; exit 1; }
+          fi
+          echo "version=$server" >> "$GITHUB_OUTPUT"
+      - name: The CHANGELOG has the version's section
+        if: github.event_name == 'push'
+        run: python3 tools/release_notes.py "${GITHUB_REF_NAME}" > /dev/null
+
+  rust-binaries:
+    needs: rust-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            # The C runtime linked in, so the program starts without the VC++ redistributable.
+            rustflags: -C target-feature=+crt-static
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.rust-check.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: The target's own compiler flags
+        if: matrix.rustflags
+        env:
+          FLAGS: ${{ matrix.rustflags }}
+        run: echo "RUSTFLAGS=$FLAGS" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: musl-gcc (ring, zstd and SQLite compile C)
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          # For the target's C code only; build scripts still use the runner's own compiler.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked -p oswx-serverd --target "$TARGET"
+      - name: The binary runs
+        run: |
+          exe=""
+          if [ "${RUNNER_OS}" = Windows ]; then exe=".exe"; fi
+          bin="target/$TARGET/release/openswx-collab-server$exe"
+          "$bin" --version | tee version.txt
+          grep -qF "$VERSION" version.txt
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+      - name: Static, and it serves (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          file "$BIN" | tee file.txt
+          grep -Eq 'statically linked|static-pie linked' file.txt
+          d="$RUNNER_TEMP/smoke"
+          mkdir -p "$d"
+          OSWX_COLLAB_DATABASE_URL="sqlite://$d/collab.db" OSWX_COLLAB_STORAGE_URL="$d/storage" \
+            OSWX_COLLAB_PUBLIC_URL=http://127.0.0.1:8787 "$BIN" serve --port 8787 & pid=$!
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/api/health; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid"
+          wait "$pid" || true
+          test -n "$ok" || { echo "no answer from /api/health within 30 s"; exit 1; }
+      - name: Archive and checksum
+        run: |
+          name="openswx-collab-server-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "$BIN" LICENSE NOTICE README.md "dist/$name/"
+          cd dist
+          if [ "${RUNNER_OS}" = Windows ]; then
+            archive="$name.zip"
+            7z a -tzip "$archive" "$name" > /dev/null
+          else
+            archive="$name.tar.gz"
+            tar -czf "$archive" "$name"
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+          rm -r "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  rust-image:
+    # Each architecture built on its own kind of machine (no emulation) and pushed by digest; the
+    # manifest list that names both is made in rust-image-manifest.
+    needs: rust-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/dukeofcheese/openswx-collab-server
+          labels: |
+            org.opencontainers.image.title=openswx-collab-server
+            org.opencontainers.image.description=Self-hostable live collaboration server for openswx
+            org.opencontainers.image.licenses=Apache-2.0
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.rust
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/dukeofcheese/openswx-collab-server,push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' }}
+          cache-from: type=gha,scope=rust-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=rust-image-${{ matrix.arch }}
+      - name: Keep the digest
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  rust-image-manifest:
+    needs: [rust-check, rust-image]
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v0.1.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/dukeofcheese/openswx-collab-server
+          # `latest` stays on the Python server's image (0.1.x) until openswx's client speaks protocol 2.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: The tags are version tags only
+        run: |
+          tags=$(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          echo "$tags"
+          test -n "$tags" || { echo "no tags"; exit 1; }
+          if grep -q ':latest$' <<< "$tags"; then echo "a Rust release never moves latest"; exit 1; fi
+      - name: One manifest list for both architectures
+        working-directory: digests
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.description=Self-hostable live collaboration server for openswx" \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/dukeofcheese/openswx-collab-server@sha256:%s ' *)
+          docker buildx imagetools inspect "ghcr.io/dukeofcheese/openswx-collab-server:$VERSION"
+
+  rust-release:
+    needs: [rust-check, rust-binaries, rust-image-manifest]
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v0.1.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+      - name: Release with the changelog section as its notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tools/release_notes.py "${GITHUB_REF_NAME}" > notes.md
+          pre=""
+          case "${GITHUB_REF_NAME}" in *-*) pre="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "openswx-collab ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md --verify-tag $pre

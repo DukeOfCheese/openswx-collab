@@ -477,6 +477,11 @@ fn reorder_case_holds(before: &Value, after: &Plain) -> Result<(), TestCaseError
         .count();
     let bound = survivors.len() - lis_len(&seq) + tied;
     prop_assert!(moves <= bound, "{moves} moves, bound {bound}: {ops:?}");
+    if tied == 0 {
+        // With no tied positions the bound is exact: one move for each item off the longest
+        // increasing run, no fewer and no more.
+        prop_assert_eq!(moves, bound, "{:?}", ops);
+    }
     Ok(())
 }
 
