@@ -26,6 +26,12 @@ services:
       OSWX_COLLAB_GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       OSWX_COLLAB_GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       OSWX_COLLAB_GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # The TLS proxy on the host reaches the server through the published port, so its connections
+      # come from this network's gateway. The Rust server (docker-compose.rust.yml) believes the client
+      # address the proxy appends to X-Forwarded-For only from this network. The Python server this
+      # file runs does not read the setting: it believes X-Forwarded-For only from 127.0.0.1, so here
+      # every client shares the gateway's address for its sign-in limit (docs/self-hosting.md).
+      OSWX_COLLAB_TRUSTED_PROXIES: ${NETWORK_SUBNET:-172.30.87.0/24}
     volumes:
       - storage:/data
     ports:
@@ -45,6 +51,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+# A fixed subnet, so that the server can be told which addresses are its proxy's (above). Change
+# NETWORK_SUBNET in deploy/.env if it overlaps a network this machine already has.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-172.30.87.0/24}
 
 volumes:
   storage:

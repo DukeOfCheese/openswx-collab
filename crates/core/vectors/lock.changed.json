@@ -1,0 +1,25 @@
+{
+  "direction": "s2c",
+  "hex": "83a174ac6c6f636b2e6368616e676564a56c6f636b739185a47061746892a86665617475726573a26631a9636c69656e745f6964ae75322e636c69656e742d30303032a7757365725f6964a27532a46e616d65a3426f62a86465746163686564c3a872656c65617365649191a7646973706c6179",
+  "json": {
+    "locks": [
+      {
+        "client_id": "u2.client-0002",
+        "detached": true,
+        "name": "Bob",
+        "path": [
+          "features",
+          "f1"
+        ],
+        "user_id": "u2"
+      }
+    ],
+    "released": [
+      [
+        "display"
+      ]
+    ],
+    "t": "lock.changed"
+  },
+  "name": "lock.changed"
+}

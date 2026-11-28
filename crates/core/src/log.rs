@@ -6,10 +6,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::apply::{Rules, apply_with};
+use crate::apply::{Rules, apply_judged, carried_items};
 use crate::index::{ClientId, Conflict, Index, Seq};
 use crate::limits::MAX_CHANGE_ID;
-use crate::op::{Op, OpError, removed, writes};
+use crate::op::{Op, OpError, Write, removed, writes};
 use crate::path::Path;
 use crate::value::{Id, Value};
 use crate::wire::RejectCode;
@@ -40,6 +40,23 @@ pub struct Accepted {
     pub index: Index,
     /// The operations that take the change back out of `doc`.
     pub inverse: Vec<Op>,
+    /// What the change writes (`writes(&change.ops)`), as recorded in `index`.
+    pub writes: BTreeSet<Write>,
+    /// The items it removes (`removed(&change.ops)`), as recorded in `index`.
+    pub removed: BTreeSet<Path>,
+    /// What it reads (the change's `reads`), as recorded in `index`.
+    pub reads: BTreeSet<Path>,
+}
+
+/// What the caller knows of an earlier change of the same client, named in `depends`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Known {
+    /// It was accepted.
+    Accepted,
+    /// It was refused.
+    Refused,
+    /// The caller has never seen it (or no longer knows it).
+    Unknown,
 }
 
 /// Why a change was refused.
@@ -93,18 +110,84 @@ impl From<OpError> for Refusal {
 
 /// Decide one change against the head. Pure; the caller persists and then adopts `Accepted`.
 ///
-/// `refused(change_id)` says whether that earlier change of the same client was refused. After
-/// checking that the change is well formed, the checks run in this order: a base below the index's
-/// floor is `TooOld`; a refused change in `depends` is `Dependency`; conflicts in the index are
-/// `Stale`; then the operations are applied under `rules`, new ids having to start with
-/// `"<client>."` unless they put back an item whose removal the index still remembers (see
-/// `apply_with`), and an error there is `NameTaken`, `IdTaken` or `Invalid`.
+/// `known(change_id)` says what the caller knows of that earlier change of the same client.
+/// `undo` is the kept inverse of the change `change.undo_of` names, when the caller has it; `None`
+/// otherwise. It is ignored unless `change.undo_of` is set. The caller must take it only from the
+/// stored inverse of an accepted change by the same client (the journal's `inverse` of the row
+/// `undo_of` names), never from anything the client sent: it decides which foreign ids may come
+/// back.
+///
+/// After checking that the change is well formed, the checks run in this order: a base below the
+/// index's floor is `TooOld`; a change in `depends` that is not known to be accepted (refused, or
+/// unknown) is `Dependency`; conflicts in the index are `Stale`; then the operations are applied
+/// under `rules`, new ids having to start with `"<client>."` unless they put back an item whose
+/// removal the index still remembers (see `apply_with`) or `undo` carries an item with that id at
+/// the same path (the undone change took it away from there), and an error there is `NameTaken`,
+/// `IdTaken` or `Invalid`.
 pub fn decide(
     head: &Head,
     client: &ClientId,
     change: &Change,
-    refused: &dyn Fn(&str) -> bool,
+    known: &dyn Fn(&str) -> Known,
+    undo: Option<&[Op]>,
     rules: &Rules,
+) -> Result<Accepted, Refusal> {
+    judge(head, client, client, change, known, undo, rules, true, true)
+}
+
+/// The client id under which the index records a change the server made (a restore, a revert from
+/// history). A real client is `<user id>.<client id>`, which never starts with `~`.
+pub const SERVER_CLIENT: &str = "~server";
+
+/// The identity a server-made change is checked for staleness as: one that matches no writer (real
+/// clients never start with `~`, and the server records under [`SERVER_CLIENT`]), so that every
+/// earlier write after its base counts, the server's own included.
+const CHECK_AS_NOBODY: &str = "~check";
+
+/// Decide a change the server makes itself (a restore, a revert from history), recorded in the
+/// index under [`SERVER_CLIENT`].
+///
+/// Unlike [`decide`], ids are not checked against a client prefix: a restore puts items back under
+/// their original ids, whoever made them and however long ago they were removed. The document's
+/// `rules` (unique names) still apply, and so do the shape checks. `depends` and `undo_of` are not
+/// consulted. Staleness (conflicts in the index after `change.base`, and a base below the index's
+/// floor) is checked only when `check_stale`, and then against every write after the base, the
+/// server's own earlier changes included (a revert from history does not silently undo a restore).
+pub fn decide_server(
+    head: &Head,
+    change: &Change,
+    rules: &Rules,
+    check_stale: bool,
+) -> Result<Accepted, Refusal> {
+    let client: ClientId = Arc::from(SERVER_CLIENT);
+    let check_as: ClientId = Arc::from(CHECK_AS_NOBODY);
+    judge(
+        head,
+        &client,
+        &check_as,
+        change,
+        &|_| Known::Accepted,
+        None,
+        rules,
+        check_stale,
+        false,
+    )
+}
+
+/// [`decide`] and [`decide_server`]: `client` is who the change is recorded under (and, with
+/// `client_ids`, whose prefix new ids must have and whose `depends` are consulted); `check_as` is
+/// whose own earlier writes do not conflict when `check_stale` judges the index.
+#[allow(clippy::too_many_arguments)]
+fn judge(
+    head: &Head,
+    client: &ClientId,
+    check_as: &ClientId,
+    change: &Change,
+    known: &dyn Fn(&str) -> Known,
+    undo: Option<&[Op]>,
+    rules: &Rules,
+    check_stale: bool,
+    client_ids: bool,
 ) -> Result<Accepted, Refusal> {
     let id_len = change.change_id.chars().count();
     if !(1..=MAX_CHANGE_ID).contains(&id_len) {
@@ -121,25 +204,34 @@ pub fn decide(
     if change.base > head.seq {
         return Err(Refusal::Invalid("base is ahead of the document".into()));
     }
-    if change.base < head.index.floor() {
+    if check_stale && change.base < head.index.floor() {
         return Err(Refusal::TooOld);
     }
-    if let Some(dep) = change.depends.iter().find(|d| refused(d)) {
+    if client_ids && let Some(dep) = change.depends.iter().find(|d| known(d) != Known::Accepted) {
         return Err(Refusal::Dependency(dep.clone()));
     }
     let writes = writes(&change.ops);
     let removed = removed(&change.ops);
-    let conflicts = head
-        .index
-        .check(change.base, client, &writes, &removed, &change.reads);
-    if !conflicts.is_empty() {
-        return Err(Refusal::Stale(conflicts));
+    if check_stale {
+        let conflicts = head
+            .index
+            .check(change.base, check_as, &writes, &removed, &change.reads);
+        if !conflicts.is_empty() {
+            return Err(Refusal::Stale(conflicts));
+        }
     }
     let prefix = format!("{client}.");
+    let id_prefix = client_ids.then_some(prefix.as_str());
     // An item whose removal the index still remembers may be put back by anyone (an undo, or a
     // restore of someone else's deleted item); once that removal is pruned, it may not.
     let existed = |p: &Path| head.index.removed_at(p);
-    let applied = apply_with(&head.doc, &change.ops, rules, Some(&prefix), &existed)?;
+    // Undoing a change that dropped a subtree may bring back the ids it held, at the same paths.
+    let carried = undo
+        .filter(|_| change.undo_of.is_some())
+        .map(carried_items)
+        .unwrap_or_default();
+    let kept = |p: &Path| carried.contains(p);
+    let applied = apply_judged(&head.doc, &change.ops, rules, id_prefix, &existed, &kept)?;
     let seq = head.seq + 1;
     Ok(Accepted {
         seq,
@@ -148,5 +240,8 @@ pub fn decide(
             .index
             .record(seq, client, &writes, &removed, &change.reads),
         inverse: applied.inverse,
+        writes,
+        removed,
+        reads: change.reads.clone(),
     })
 }

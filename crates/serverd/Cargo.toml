@@ -1,0 +1,41 @@
+[package]
+name = "oswx-serverd"
+version = "0.2.0-dev"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The library is the whole program, taking the extensions as an argument: the open-source binary
+# below runs it with none, and an edition with extensions is a `main` of its own that passes them.
+[lib]
+name = "oswx_serverd"
+
+[[bin]]
+name = "openswx-collab-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+oswx-server = { path = "../server" }
+rpassword.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+# The limit on open files is raised at start (a safe wrapper; already in the tree through tempfile).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+
+[dev-dependencies]
+futures-util.workspace = true
+oswx-core = { path = "../core" }
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

@@ -183,6 +183,9 @@ pub struct Report {
     pub errors: u64,
     pub protocol_errors: u64,
     pub dropped_connections: u64,
+    /// Connections closed under their peers, by WebSocket close code (`1006`: none was sent). `null` for
+    /// `v1`, which does not record it.
+    pub close_codes: Option<BTreeMap<String, u64>>,
     pub connect_failed: u64,
     /// What `latency_ms` measures: `edit` (send to `change.accepted`) or `open` (`hello` to `welcome`).
     pub latency_kind: String,

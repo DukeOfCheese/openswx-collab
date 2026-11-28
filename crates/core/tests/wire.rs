@@ -3,13 +3,17 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use common::{load, path, to_plain};
 use oswx_core::wire::{
-    MAX_DRAFT, MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
+    LiveEntry, MAX_BATCH_ENTRIES, MAX_CLIENT_ID, MAX_DRAFT, MAX_LIVE_CLIENT_ID, MAX_PEER_LIST,
+    MAX_PRESENCE, MAX_READS, MAX_REBUILD_ENTRIES, MAX_REBUILD_KEY, MAX_REBUILD_MESSAGE,
+    MAX_USER_ID, PeerRef, encode_live, encode_peer, encode_peer_list, encode_peer_list_within,
 };
 use oswx_core::{
-    Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, Lock, Op, Peer, Plain, Pos,
-    RejectCode, ServerMsg, WireError, decode_client, decode_server, encode_client, encode_server,
+    Broken, Change, ChangeEvent, ClientMsg, Conflict, ConflictKind, DenyReason, Lock, LockDenied,
+    Op, Peer, Plain, Pos, RejectCode, ServerMsg, WireError, decode_client, decode_server,
+    encode_client, encode_server,
 };
 use serde_json::{Value as Json, json};
 
@@ -166,6 +170,7 @@ fn peer(n: &str) -> Peer {
         user_id: "u1".into(),
         name: "Ada".into(),
         colour: "#ff0000".into(),
+        read_only: false,
         presence: Some(to_plain(json!({"tool": "line"}))),
         draft: None,
     }
@@ -181,6 +186,27 @@ fn event(seq: u64) -> ChangeEvent {
         ops: all_ops(),
         command: Arc::from("extrude"),
         undo_of: Some(Arc::from("c0")),
+        reverts: Some(seq - 1),
+    }
+}
+
+/// A change event as a revert from history has it: no change id, no `undo_of`, `reverts` set.
+fn revert_event(seq: u64) -> ChangeEvent {
+    ChangeEvent {
+        client_id: Arc::from("~server"),
+        change_id: Arc::from(""),
+        undo_of: None,
+        reverts: Some(2),
+        ..event(seq)
+    }
+}
+
+/// A plain change event: neither an undo nor a revert.
+fn plain_event(seq: u64) -> ChangeEvent {
+    ChangeEvent {
+        undo_of: None,
+        reverts: None,
+        ..event(seq)
     }
 }
 
@@ -188,7 +214,17 @@ fn lock() -> Lock {
     Lock {
         path: path(&["features", "f1"]),
         client_id: Arc::from("u1.client-01"),
+        user_id: "u1".into(),
         name: "Ada".into(),
+        detached: false,
+    }
+}
+
+fn detached_lock() -> Lock {
+    Lock {
+        path: path(&["features"]),
+        detached: true,
+        ..lock()
     }
 }
 
@@ -199,8 +235,10 @@ fn broken() -> BTreeMap<String, Broken> {
             Broken {
                 error: "no solution".into(),
                 by_seq: Some(3),
+                by_user: Some("u2".into()),
                 by_name: Some("Bob".into()),
                 command: Some("edit".into()),
+                since_seq: Some(2),
             },
         ),
         (
@@ -208,8 +246,10 @@ fn broken() -> BTreeMap<String, Broken> {
             Broken {
                 error: "x".into(),
                 by_seq: None,
+                by_user: None,
                 by_name: None,
                 command: None,
+                since_seq: None,
             },
         ),
     ])
@@ -223,8 +263,15 @@ fn welcome(content: bool, read_only: bool) -> ServerMsg {
         read_only,
         read_only_reason: read_only.then(|| "viewer role".to_string()),
         you: peer("client-01"),
-        peers: vec![peer("client-02")],
-        locks: vec![lock()],
+        peers: vec![
+            peer("client-02"),
+            Peer {
+                read_only: true,
+                draft: Some(to_plain(json!({"x": [1, 2]}))),
+                ..peer("client-03")
+            },
+        ],
+        locks: vec![lock(), detached_lock()],
         broken: broken(),
         content: content.then(|| load(json!({"features": [{"id": "f1", "name": "A"}]}))),
         changes: (!content).then(|| vec![event(4), event(5)]),
@@ -275,13 +322,27 @@ fn server_samples() -> Vec<ServerMsg> {
                 },
             ],
         },
+        ServerMsg::Rejected {
+            change_id: Arc::from("c2"),
+            code: RejectCode::Locked,
+            message: "being edited by Ada".into(),
+            conflicts: vec![Conflict {
+                path: path(&["features", "f1"]),
+                seq: 0,
+                by: Arc::from("u1.client-01"),
+                kind: ConflictKind::Locked,
+            }],
+        },
         ServerMsg::Change(event(9)),
+        ServerMsg::Change(revert_event(9)),
+        ServerMsg::Change(plain_event(9)),
         ServerMsg::RevertResult {
             request_id: "r1".into(),
             ok: true,
             seq: Some(10),
             ops: all_ops(),
             code: None,
+            message: None,
         },
         ServerMsg::RevertResult {
             request_id: "r1".into(),
@@ -289,11 +350,37 @@ fn server_samples() -> Vec<ServerMsg> {
             seq: None,
             ops: vec![],
             code: Some("stale".into()),
+            message: Some("someone changed it since".into()),
+        },
+        ServerMsg::LockResult {
+            request_id: "r1".into(),
+            granted: vec![path(&["a"]), path(&["b", "c"])],
+            denied: vec![
+                LockDenied {
+                    path: path(&["features", "f1", "params"]),
+                    why: DenyReason::Held,
+                    holder: Some(lock()),
+                },
+                LockDenied {
+                    path: path(&["missing"]),
+                    why: DenyReason::NotLockable,
+                    holder: None,
+                },
+            ],
+        },
+        ServerMsg::LockResult {
+            request_id: String::new(),
+            granted: vec![],
+            denied: vec![],
         },
         ServerMsg::LockChanged {
-            locks: vec![lock()],
+            locks: vec![lock(), detached_lock()],
+            released: vec![path(&["x", "y"])],
         },
-        ServerMsg::LockChanged { locks: vec![] },
+        ServerMsg::LockChanged {
+            locks: vec![],
+            released: vec![],
+        },
         ServerMsg::PeerJoined(peer("client-03")),
         ServerMsg::PeerLeft {
             client_id: Arc::from("u1.client-03"),
@@ -310,7 +397,35 @@ fn server_samples() -> Vec<ServerMsg> {
             client_id: Arc::from("u1.client-03"),
             data: None,
         },
-        ServerMsg::RebuildStatus { broken: broken() },
+        ServerMsg::PresenceBatch {
+            presence: vec![
+                (Arc::from("u1.client-03"), to_plain(json!({"x": 1}))),
+                (Arc::from("u2.client-04"), to_plain(json!({"y": [1, 2]}))),
+            ],
+            drafts: vec![
+                (Arc::from("u1.client-03"), None),
+                (Arc::from("u3.client-05"), Some(to_plain(json!({"z": "a"})))),
+            ],
+        },
+        ServerMsg::PresenceBatch {
+            presence: vec![],
+            drafts: vec![
+                (Arc::from("u1.client-03"), None),
+                (Arc::from("u3.client-05"), None),
+            ],
+        },
+        ServerMsg::PeerList {
+            peers: vec![peer("client-03"), peer("client-04")],
+        },
+        ServerMsg::PeerList { peers: vec![] },
+        ServerMsg::RebuildStatus {
+            seq: 4,
+            broken: broken(),
+        },
+        ServerMsg::RebuildStatus {
+            seq: 0,
+            broken: BTreeMap::new(),
+        },
         ServerMsg::VersionCreated {
             id: "v1".into(),
             name: "Release".into(),
@@ -1069,6 +1184,54 @@ fn decode_server_is_strict_about_types() {
 }
 
 #[test]
+fn decode_server_is_strict_about_undo_reverts_and_rebuilds() {
+    let change = || {
+        json!({"t": "change", "seq": 3, "client_id": "u.c", "author": "u", "author_name": "A",
+               "change_id": "c", "ops": [], "command": ""})
+    };
+    let got = decode_server(&with_server(change(), "reverts", json!(2))).unwrap();
+    assert!(matches!(
+        got,
+        ServerMsg::Change(ChangeEvent {
+            reverts: Some(2),
+            ..
+        })
+    ));
+    assert!(matches!(
+        decode_server(&with_server(change(), "reverts", Json::Null)).unwrap(),
+        ServerMsg::Change(ChangeEvent { reverts: None, .. })
+    ));
+    for v in [json!("2"), json!(-1), json!(1.5), json!([2])] {
+        assert!(
+            decode_server(&with_server(change(), "reverts", v.clone())).is_err(),
+            "{v}"
+        );
+    }
+
+    let result = || json!({"t": "change.revert.result", "request_id": "r", "ok": false, "ops": []});
+    assert!(decode_server(&with_server(result(), "message", json!("no"))).is_ok());
+    assert!(decode_server(&with_server(result(), "message", json!(1))).is_err());
+
+    let status = |seq: Json, entry: Json| {
+        frame(&json!({"t": "rebuild.status", "seq": seq, "broken": {"f1": entry}}))
+    };
+    let full = json!({"error": "e", "by_seq": 2, "by_user": "u", "by_name": "A", "command": "c",
+                      "since_seq": 1});
+    assert!(decode_server(&status(json!(2), full.clone())).is_ok());
+    assert!(decode_server(&frame(&json!({"t": "rebuild.status", "broken": {}}))).is_err());
+    assert!(decode_server(&status(json!("2"), full.clone())).is_err());
+    for (key, v) in [
+        ("by_user", json!(1)),
+        ("since_seq", json!("1")),
+        ("since_seq", json!(-1)),
+    ] {
+        let mut entry = full.clone();
+        entry[key] = v;
+        assert!(decode_server(&status(json!(2), entry)).is_err(), "{key}");
+    }
+}
+
+#[test]
 fn decode_server_checks_a_welcome_part_by_part() {
     let good = encode_server(&welcome(true, false));
     assert!(decode_server(&good).is_ok());
@@ -1104,6 +1267,121 @@ fn decode_server_checks_a_welcome_part_by_part() {
             "{key}"
         );
     }
+}
+
+#[test]
+fn decode_server_is_strict_about_locks_and_peers() {
+    let lock = || json!({"path": ["a"], "client_id": "u.c", "user_id": "u", "name": "Ada", "detached": false});
+    let changed = |locks: Json, released: Json| {
+        frame(&json!({"t": "lock.changed", "locks": locks, "released": released}))
+    };
+    assert!(decode_server(&changed(json!([lock()]), json!([["b"]]))).is_ok());
+    let mut bad_locks: Vec<Json> = ["path", "client_id", "user_id", "name", "detached"]
+        .into_iter()
+        .map(|key| without(lock(), key))
+        .collect();
+    bad_locks.push(with(lock(), "detached", json!(0)));
+    bad_locks.push(with(lock(), "path", json!([])));
+    bad_locks.push(with(lock(), "user_id", json!(1)));
+    for l in bad_locks {
+        assert!(
+            matches!(
+                decode_server(&changed(json!([l]), json!([]))),
+                Err(WireError::Invalid(_))
+            ),
+            "{l}"
+        );
+    }
+    for released in [json!(null), json!(["a"]), json!([[]]), json!({})] {
+        assert!(decode_server(&changed(json!([]), released)).is_err());
+    }
+    assert!(decode_server(&frame(&json!({"t": "lock.changed", "locks": []}))).is_err());
+
+    let result = |granted: Json, denied: Json| {
+        frame(&json!({"t": "lock.result", "request_id": "r", "granted": granted, "denied": denied}))
+    };
+    assert!(
+        decode_server(&result(
+            json!([["a"]]),
+            json!([{"path": ["b"], "why": "not_lockable"}])
+        ))
+        .is_ok()
+    );
+    let both = json!([{"path": ["b"], "why": "held", "holder": lock()},
+                      {"path": ["c"], "why": "rate", "holder": null}]);
+    assert!(decode_server(&result(json!([]), both)).is_ok());
+    for why in ["held", "not_lockable", "quota", "rate", "read_only"] {
+        let reason = DenyReason::parse(why).unwrap();
+        assert_eq!(reason.as_str(), why);
+    }
+    assert_eq!(DenyReason::parse("nope"), None);
+    for (granted, denied) in [
+        (json!(["a"]), json!([])),
+        (json!([]), json!([{"why": "held", "holder": lock()}])),
+        (
+            json!([]),
+            json!([{"path": ["b"], "why": "held", "holder": "Ada"}]),
+        ),
+        (
+            json!([]),
+            json!([{"path": ["b"], "why": "held", "holder": without(lock(), "name")}]),
+        ),
+        // A reason is required, known, and names a holder exactly when it is "held".
+        (json!([]), json!([{"path": ["b"]}])),
+        (json!([]), json!([{"path": ["b"], "why": "nope"}])),
+        (json!([]), json!([{"path": ["b"], "why": 1}])),
+        (json!([]), json!([{"path": ["b"], "why": "held"}])),
+        (
+            json!([]),
+            json!([{"path": ["b"], "why": "quota", "holder": lock()}]),
+        ),
+        (json!([]), json!({})),
+        (json!(null), json!([])),
+    ] {
+        assert!(
+            matches!(
+                decode_server(&result(granted.clone(), denied.clone())),
+                Err(WireError::Invalid(_))
+            ),
+            "{granted} {denied}"
+        );
+    }
+    let no_request_id = json!({"t": "lock.result", "granted": [], "denied": []});
+    assert!(decode_server(&frame(&no_request_id)).is_err());
+
+    // A peer's read_only is optional, but a boolean when present.
+    let joined = |peer: Json| frame(&json!({"t": "peer.joined", "peer": peer}));
+    let peer = || json!({"client_id": "u.c", "user_id": "u", "name": "Ada", "colour": "#000"});
+    let read_only = |frame: &[u8]| match decode_server(frame) {
+        Ok(ServerMsg::PeerJoined(p)) => p.read_only,
+        other => panic!("a peer, not {other:?}"),
+    };
+    assert!(!read_only(&joined(peer())));
+    assert!(read_only(&joined(with(peer(), "read_only", json!(true)))));
+    assert!(!read_only(&joined(with(peer(), "read_only", json!(null)))));
+    assert!(decode_server(&joined(with(peer(), "read_only", json!(1)))).is_err());
+}
+
+#[test]
+fn a_peer_that_may_edit_travels_without_read_only() {
+    let keys = |p: Peer| {
+        let bytes = encode_server(&ServerMsg::PeerJoined(p));
+        let Plain::Map(pairs) = rmpv::decode::read_value(&mut &bytes[..]).unwrap() else {
+            panic!("a map")
+        };
+        let Plain::Map(peer) = &pairs[1].1 else {
+            panic!("a peer map")
+        };
+        peer.iter()
+            .map(|(k, _)| k.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(!keys(peer("c")).contains(&"read_only".to_owned()));
+    let viewer = Peer {
+        read_only: true,
+        ..peer("c")
+    };
+    assert!(keys(viewer).contains(&"read_only".to_owned()));
 }
 
 // ---------------------------------------------------------------- strings that are not UTF-8
@@ -1210,6 +1488,439 @@ fn the_server_side_refuses_them_too() {
         decode_server(&corrupt(presence.to_vec())),
         Err(WireError::Invalid(_))
     ));
+}
+
+// --------------------------------------------------------------------- presence.batch, peer.list
+
+#[test]
+fn live_frames_from_encoded_entries_are_the_messages_encode_server_writes() {
+    let a = to_plain(json!({"pointer": [1, 2], "tool": "line"}));
+    let b = map_of_size(MAX_PRESENCE);
+    let entry = |c: &str, d: Option<&Plain>| LiveEntry::new(c, d);
+    let (pa, pb) = (entry("u1.a", Some(&a)), entry("u2.b", Some(&b)));
+    let (da, dn) = (entry("u1.a", Some(&a)), entry("u3.c", None));
+    // One entry: the plain message.
+    assert_eq!(
+        encode_live(&[&pa], &[]),
+        encode_server(&ServerMsg::Presence {
+            client_id: Arc::from("u1.a"),
+            data: a.clone()
+        })
+    );
+    assert_eq!(
+        encode_live(&[], &[&dn]),
+        encode_server(&ServerMsg::Draft {
+            client_id: Arc::from("u3.c"),
+            data: None
+        })
+    );
+    // More: a batch.
+    let batch = ServerMsg::PresenceBatch {
+        presence: vec![
+            (Arc::from("u1.a"), a.clone()),
+            (Arc::from("u2.b"), b.clone()),
+        ],
+        drafts: vec![
+            (Arc::from("u1.a"), Some(a.clone())),
+            (Arc::from("u3.c"), None),
+        ],
+    };
+    let bytes = encode_live(&[&pa, &pb], &[&da, &dn]);
+    assert_eq!(bytes, encode_server(&batch));
+    assert_eq!(decode_server(&bytes).unwrap(), batch);
+    // Big enough for 16-bit map headers.
+    let many: Vec<LiveEntry> = (0..MAX_BATCH_ENTRIES)
+        .map(|n| entry(&format!("u.{n}"), Some(&a)))
+        .collect();
+    let refs: Vec<&LiveEntry> = many.iter().collect();
+    let msg = ServerMsg::PresenceBatch {
+        presence: (0..MAX_BATCH_ENTRIES)
+            .map(|n| (Arc::from(format!("u.{n}")), a.clone()))
+            .collect(),
+        drafts: vec![],
+    };
+    assert_eq!(encode_live(&refs, &[]), encode_server(&msg));
+    // A peer list from encoded peers.
+    let peers = [peer("client-03"), peer("client-04")];
+    let encoded: Vec<Bytes> = peers.iter().map(encode_peer).collect();
+    let list = ServerMsg::PeerList {
+        peers: peers.to_vec(),
+    };
+    assert_eq!(
+        encode_peer_list(&encoded.iter().collect::<Vec<_>>()),
+        encode_server(&list)
+    );
+    let twenty: Vec<Peer> = (0..20).map(|n| peer(&format!("c{n}"))).collect();
+    let encoded: Vec<Bytes> = twenty.iter().map(encode_peer).collect();
+    assert_eq!(
+        encode_peer_list(&encoded.iter().collect::<Vec<_>>()),
+        encode_server(&ServerMsg::PeerList { peers: twenty })
+    );
+}
+
+/// A peer list encoded from borrowed peers: the bytes `encode_server` writes when every presence
+/// fits; past the budget, the peers from the first that does not fit go without.
+#[test]
+fn a_peer_list_from_borrowed_peers_carries_presence_within_its_budget() {
+    let mut peers: Vec<Peer> = (0..20).map(|n| peer(&format!("c{n}"))).collect();
+    peers[3].read_only = true;
+    peers[5].presence = None;
+    fn refs(peers: &[Peer]) -> Vec<PeerRef<'_>> {
+        peers
+            .iter()
+            .map(|p| PeerRef {
+                client_id: &p.client_id,
+                user_id: &p.user_id,
+                name: &p.name,
+                colour: &p.colour,
+                read_only: p.read_only,
+                presence: p.presence.as_ref(),
+            })
+            .collect()
+    }
+    let list = ServerMsg::PeerList {
+        peers: peers.clone(),
+    };
+    let (bytes, with) = encode_peer_list_within(&refs(&peers), usize::MAX);
+    assert_eq!(with, 20);
+    assert_eq!(bytes, encode_server(&list));
+    // Room for five presences, a little over: the first five peers carry theirs, the sixth has
+    // none, and the seventh's does not fit.
+    let one = raw(peers[0].presence.as_ref().unwrap()).len();
+    let (bytes, with) = encode_peer_list_within(&refs(&peers), 5 * one + 4);
+    assert_eq!(with, 6, "the seventh peer's presence does not fit");
+    let ServerMsg::PeerList { peers: got } = decode_server(&bytes).unwrap() else {
+        panic!("a peer list");
+    };
+    let mut want = peers.clone();
+    for p in &mut want[6..] {
+        p.presence = None;
+    }
+    assert_eq!(got, want);
+    // Nothing fits: every peer goes without, from the first.
+    let (bytes, with) = encode_peer_list_within(&refs(&peers), one - 1);
+    assert_eq!(with, 0);
+    let ServerMsg::PeerList { peers: got } = decode_server(&bytes).unwrap() else {
+        panic!("a peer list");
+    };
+    assert!(got.iter().all(|p| p.presence.is_none()));
+    assert_eq!(got.len(), 20);
+    // None at all.
+    let (bytes, with) = encode_peer_list_within(&[], 0);
+    assert_eq!(with, 0);
+    assert_eq!(bytes, encode_server(&ServerMsg::PeerList { peers: vec![] }));
+}
+
+#[test]
+fn decode_server_is_strict_about_a_presence_batch() {
+    let batch = |presence: Plain, drafts: Plain| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("presence.batch")),
+            pair("presence", presence),
+            pair("drafts", drafts),
+        ]))
+    };
+    let m = |pairs: Vec<(&str, Plain)>| {
+        Plain::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (Plain::from(k), v))
+                .collect(),
+        )
+    };
+    let data = || to_plain(json!({"x": 1}));
+    let good = batch(m(vec![("u.a", data())]), m(vec![("u.b", Plain::Nil)]));
+    assert!(decode_server(&good).is_ok());
+    let invalid = |frame: Vec<u8>, why: &str| {
+        assert!(
+            matches!(decode_server(&frame), Err(WireError::Invalid(_))),
+            "{why}"
+        );
+    };
+    invalid(
+        batch(m(vec![("u.a", data())]), m(vec![])),
+        "one entry is a presence message",
+    );
+    invalid(batch(m(vec![]), m(vec![])), "empty");
+    invalid(
+        batch(m(vec![("u.a", data()), ("u.a", data())]), m(vec![])),
+        "a client twice",
+    );
+    invalid(
+        batch(m(vec![("u.a", Plain::Nil), ("u.b", data())]), m(vec![])),
+        "presence is never nil",
+    );
+    for v in [json!([1]), json!("x"), json!(7), json!(true)] {
+        invalid(
+            batch(m(vec![("u.a", data())]), m(vec![("u.b", to_plain(v))])),
+            "a draft is a map or nil",
+        );
+    }
+    invalid(
+        batch(m(vec![("u.a", data()), ("", data())]), m(vec![])),
+        "an empty client id",
+    );
+    let numbered = Plain::Map(vec![(Plain::from(1), data()), (Plain::from("u.b"), data())]);
+    invalid(batch(numbered, m(vec![])), "client ids are strings");
+    invalid(
+        batch(Plain::Array(vec![data(), data()]), m(vec![])),
+        "presence is a map",
+    );
+    invalid(
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("presence.batch")),
+            pair("presence", m(vec![("u.a", data()), ("u.b", data())])),
+        ])),
+        "drafts is required",
+    );
+    // Sizes: an entry's data as a presence or draft may be; the entries in all.
+    invalid(
+        batch(
+            m(vec![
+                ("u.a", map_of_size(MAX_PRESENCE + 1)),
+                ("u.b", data()),
+            ]),
+            m(vec![]),
+        ),
+        "presence data over the presence limit",
+    );
+    assert!(
+        decode_server(&batch(
+            m(vec![("u.a", data())]),
+            m(vec![("u.b", map_of_size(MAX_DRAFT))])
+        ))
+        .is_ok()
+    );
+    invalid(
+        batch(
+            m(vec![("u.a", data())]),
+            m(vec![("u.b", map_of_size(MAX_DRAFT + 1))]),
+        ),
+        "draft data over the draft limit",
+    );
+    let half = MAX_BATCH_ENTRIES / 2 + 1;
+    let names: Vec<String> = (0..2 * half).map(|n| format!("u.{n}")).collect();
+    let too_many = m(names[..=MAX_BATCH_ENTRIES]
+        .iter()
+        .map(|n| (n.as_str(), data()))
+        .collect());
+    invalid(batch(too_many, m(vec![])), "too many entries");
+    let split = |range: std::ops::Range<usize>| {
+        m(names[range].iter().map(|n| (n.as_str(), data())).collect())
+    };
+    invalid(
+        batch(split(0..half), split(half..2 * half)),
+        "too many entries together",
+    );
+    // A key twice inside an entry's data.
+    let twice = Plain::Map(vec![pair("a", Plain::from(1)), pair("a", Plain::from(2))]);
+    invalid(
+        batch(m(vec![("u.a", twice), ("u.b", data())]), m(vec![])),
+        "a key twice in the data",
+    );
+    // The placeholder bytes of `corrupt` are no string.
+    let frame = encode_server(&ServerMsg::PresenceBatch {
+        presence: vec![
+            (Arc::from("u.a"), to_plain(json!({"k": "ZZZZ"}))),
+            (Arc::from("u.b"), data()),
+        ],
+        drafts: vec![],
+    });
+    invalid(corrupt(frame.to_vec()), "not UTF-8");
+}
+
+#[test]
+fn decode_server_is_strict_about_a_peer_list() {
+    let list = |peers: Json| frame(&json!({"t": "peer.list", "peers": peers}));
+    assert!(decode_server(&list(json!([]))).is_ok());
+    let good = json!({"client_id": "u.a", "user_id": "u", "name": "A", "colour": "#000"});
+    assert!(decode_server(&list(json!([good.clone()]))).is_ok());
+    for bad in [
+        json!({}),
+        json!([[good.clone()]]),
+        json!([{"client_id": "u.a"}]),
+        json!([with(good.clone(), "presence", json!([1]))]),
+        json!([with(good.clone(), "read_only", json!("yes"))]),
+    ] {
+        assert!(
+            matches!(
+                decode_server(&list(bad.clone())),
+                Err(WireError::Invalid(_))
+            ),
+            "{bad}"
+        );
+    }
+    assert!(decode_server(&frame(&json!({"t": "peer.list"}))).is_err());
+}
+
+/// What a hostile or broken server could send a client: client ids of any length in a batch, a
+/// peer named twice in a list, a list of any length. All refused.
+#[test]
+fn decode_server_bounds_live_client_ids_and_peer_lists() {
+    let data = || to_plain(json!({"x": 1}));
+    let batch = |id: &str| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("presence.batch")),
+            pair(
+                "presence",
+                Plain::Map(vec![
+                    (Plain::from(id), data()),
+                    (Plain::from("u.b"), data()),
+                ]),
+            ),
+            pair("drafts", Plain::Map(vec![])),
+        ]))
+    };
+    let longest = format!("{}.{}", "u".repeat(MAX_USER_ID), "c".repeat(MAX_CLIENT_ID));
+    assert_eq!(longest.len(), MAX_LIVE_CLIENT_ID);
+    assert!(decode_server(&batch(&longest)).is_ok());
+    assert!(matches!(
+        decode_server(&batch(&format!("{longest}x"))),
+        Err(WireError::Invalid(_))
+    ));
+    assert!(matches!(
+        decode_server(&batch(&"x".repeat(1 << 20))),
+        Err(WireError::Invalid(_))
+    ));
+
+    let peer_of = |id: &str| {
+        Plain::Map(vec![
+            pair("client_id", Plain::from(id)),
+            pair("user_id", Plain::from("u")),
+            pair("name", Plain::from("A")),
+            pair("colour", Plain::from("#000")),
+        ])
+    };
+    let list = |peers: Vec<Plain>| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("peer.list")),
+            pair("peers", Plain::Array(peers)),
+        ]))
+    };
+    assert!(decode_server(&list(vec![peer_of("u.a"), peer_of("u.b")])).is_ok());
+    assert!(
+        matches!(
+            decode_server(&list(vec![peer_of("u.a"), peer_of("u.b"), peer_of("u.a")])),
+            Err(WireError::Invalid(_))
+        ),
+        "a peer twice"
+    );
+    let many = |n: usize| list((0..n).map(|i| peer_of(&format!("u.{i}"))).collect());
+    assert!(decode_server(&many(MAX_PEER_LIST)).is_ok());
+    assert!(
+        matches!(
+            decode_server(&many(MAX_PEER_LIST + 1)),
+            Err(WireError::Invalid(_))
+        ),
+        "too many peers"
+    );
+}
+
+/// What a hostile or broken server could send a client: a peer, a presence, a draft or a
+/// departure naming a client id of any length; a welcome naming any number of peers, or one twice.
+/// All refused.
+#[test]
+fn decode_server_bounds_peer_client_ids_and_welcome_peers() {
+    let longest = format!("{}.{}", "u".repeat(MAX_USER_ID), "c".repeat(MAX_CLIENT_ID));
+    let too_long = format!("{longest}x");
+    let refused = |frame: Vec<u8>, why: &str| {
+        assert!(
+            matches!(decode_server(&frame), Err(WireError::Invalid(_))),
+            "{why}"
+        );
+    };
+    let peer_of = |id: &str| {
+        Plain::Map(vec![
+            pair("client_id", Plain::from(id)),
+            pair("user_id", Plain::from("u")),
+            pair("name", Plain::from("A")),
+            pair("colour", Plain::from("#000")),
+        ])
+    };
+    let message = |t: &str, fields: Vec<(&str, Plain)>| {
+        let mut pairs = vec![pair("t", Plain::from(t))];
+        pairs.extend(fields.into_iter().map(|(k, v)| pair(k, v)));
+        raw(&Plain::Map(pairs))
+    };
+    let data = || to_plain(json!({"x": 1}));
+    // Each message that names a client.
+    let joined = |id: &str| message("peer.joined", vec![("peer", peer_of(id))]);
+    let left = |id: &str| message("peer.left", vec![("client_id", Plain::from(id))]);
+    let presence = |id: &str| {
+        message(
+            "presence",
+            vec![("client_id", Plain::from(id)), ("data", data())],
+        )
+    };
+    let draft = |id: &str| {
+        message(
+            "draft",
+            vec![("client_id", Plain::from(id)), ("data", data())],
+        )
+    };
+    let welcome = |you: Plain, peers: Vec<Plain>| {
+        message(
+            "welcome",
+            vec![
+                ("seq", Plain::from(0)),
+                ("project_id", Plain::from("p")),
+                ("role", Plain::from("editor")),
+                ("read_only", Plain::from(false)),
+                ("you", you),
+                ("peers", Plain::Array(peers)),
+                ("locks", Plain::Array(vec![])),
+                ("broken", Plain::Map(vec![])),
+            ],
+        )
+    };
+    let in_list = |id: &str| {
+        raw(&Plain::Map(vec![
+            pair("t", Plain::from("peer.list")),
+            pair("peers", Plain::Array(vec![peer_of(id)])),
+        ]))
+    };
+    let you_are = |id: &str| welcome(peer_of(id), vec![]);
+    let among = |id: &str| welcome(peer_of("u.me"), vec![peer_of(id)]);
+    type Make<'a> = &'a dyn Fn(&str) -> Vec<u8>;
+    let makers: [(&str, Make); 7] = [
+        ("peer.joined", &joined),
+        ("peer.left", &left),
+        ("presence", &presence),
+        ("draft", &draft),
+        ("peer.list", &in_list),
+        ("welcome you", &you_are),
+        ("welcome peers", &among),
+    ];
+    for (what, make) in makers {
+        assert!(
+            decode_server(&make(&longest)).is_ok(),
+            "{what}: the longest"
+        );
+        refused(make(&too_long), &format!("{what}: one character more"));
+        refused(make(&"x".repeat(1 << 20)), &format!("{what}: a megabyte"));
+        refused(make(""), &format!("{what}: empty"));
+    }
+    // A welcome's peers: each once, and at most as many as a peer list names.
+    assert!(
+        decode_server(&welcome(
+            peer_of("u.me"),
+            vec![peer_of("u.a"), peer_of("u.b")]
+        ))
+        .is_ok()
+    );
+    refused(
+        welcome(
+            peer_of("u.me"),
+            vec![peer_of("u.a"), peer_of("u.b"), peer_of("u.a")],
+        ),
+        "a peer twice",
+    );
+    let many = |n: usize| (0..n).map(|i| peer_of(&format!("u.{i}"))).collect();
+    assert!(decode_server(&welcome(peer_of("u.me"), many(MAX_PEER_LIST))).is_ok());
+    refused(
+        welcome(peer_of("u.me"), many(MAX_PEER_LIST + 1)),
+        "too many peers",
+    );
 }
 
 // -------------------------------------------------------------------------------- duplicates

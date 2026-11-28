@@ -46,6 +46,41 @@ server plan (1b), the import/docs plan (1c) and the client project. Nothing here
   already under a Set's path may be rearranged within that Set.
 - Reject codes: `stale`, `locked`, `dependency`, `name_taken`, `id_taken`, `invalid`, `missing_blob`,
   `read_only`, `too_old`, `server_error`.
+- Presence and drafts (from 1b Task 19b): the server relays them at most every 50 ms per document,
+  each peer's latest only. A lone entry comes as `presence` / `draft`; several come as
+  `presence.batch {presence: {client_id: data}, drafts: {client_id: data | nil}}` (2 to 256 entries,
+  each client at most once per kind; apply each entry as the message it stands for). A client never
+  gets its own back.
+- `peer.joined`, `peer.left`, `presence`, `draft` and `presence.batch` may be dropped for a client
+  that does not read fast enough (it is not closed for them). Once it has read everything the
+  server had for it, it is sent `peer.list {peers: [peer]}` (at most once a second), which
+  replaces what it knew of the others:
+  - it names **every** peer as it is now, **the recipient included** (one list is shared by every
+    client caught up at once): skip the entry whose `client_id` is your own;
+  - it carries **no drafts** (`draft` is absent): forget the drafts you had; each peer's current
+    draft follows, as a `draft` message, after the list;
+  - it carries the peers' presence up to 1 MiB of it in all, in the order they joined; a peer past
+    that comes **without** `presence` (absent does not mean it has none), and its presence follows
+    after the list, in `presence` or `presence.batch` messages like any other.
+  At most 65,536 peers, each `client_id` once; a `presence.batch` client id is at most 129
+  characters (user id, a dot, the hello's client id).
+- Changes, answers and lock messages are never dropped; a client too slow for those is closed with
+  4408. So is one that stays behind on the soft messages while it reads nothing at all for 30 s
+  beyond the time a 16 KiB/s link would take to read everything it was sent, presence and drafts
+  included (a slow link taking a big welcome, change or batch of drafts is not closed for it). That
+  time is never more than 256 s (4 MiB at 16 KiB/s) after it stopped taking frames, plus the time of
+  what it was handed since, so a client that read a busy session quickly and then froze is closed at
+  most 30 s + 4 MiB / 16 KiB/s (under 5 minutes) after it stopped taking frames (plus the time of
+  anything it was handed since).
+- Until a `peer.list` arrives, a client that fell behind may get `lock.changed` / `lock.result`
+  frames naming a `client_id` it was never told about (a `peer.joined` it missed) or one that has
+  left (a `peer.left` it missed): show the lock anyway, with the name the lock carries, and do not
+  expect the peer to be in your list.
+- Presence and drafts can arrive up to a tick (50 ms) after a later message of the same peer that
+  is never delayed: a draft cleared just after its change was committed may come after that
+  change, and so may a draft the peer sent just before it. When a peer's change arrives
+  (`change`), clear that peer's draft yourself; a draft that still comes within the tick is applied
+  as it says, and the peer's own clear follows it.
 
 `CHANGELOG.md` needs the same list when v2 ships. The import tool must give legacy documents with an
 empty-string key or id a valid name (no client operation can address `""`).

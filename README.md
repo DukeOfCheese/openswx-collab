@@ -13,59 +13,88 @@ source it is `pip install openswx[collab]`.
 
 ## Status
 
-**0.1.2 is released** (2026-11-24): `pip install openswx-collab-server`, or the Docker image
-`ghcr.io/dukeofcheese/openswx-collab-server` (amd64 and arm64). See the
-[release](https://github.com/DukeOfCheese/openswx-collab/releases/tag/v0.1.2) and [CHANGELOG.md](CHANGELOG.md).
+**0.1.2 is released** (2026-11-24), the Python server: `pip install openswx-collab-server`, or the Docker
+image `ghcr.io/dukeofcheese/openswx-collab-server` (amd64 and arm64). It speaks protocol 1, which openswx
+0.4 uses. See the [release](https://github.com/DukeOfCheese/openswx-collab/releases/tag/v0.1.2) and
+[CHANGELOG.md](CHANGELOG.md).
+
+**0.2 is the Rust server** (`crates/`), not released yet: the same features, rebuilt so that a change costs
+work in proportion to the change rather than the document, with protocol 2 (MessagePack over the
+WebSocket, edits at any depth, offline-friendly ids, undo as an ordinary change). openswx's client moves to
+it in its next rework; until then the Python server stays here for openswx 0.4.
 
 | Piece | State |
 |---|---|
-| Shared protocol (`protocol/`, on PyPI) | Done, tested |
-| Accounts: email + password, Google/GitHub sign-in, organisations, invites, project roles | Done, tested. Google and GitHub also checked by hand with real OAuth apps through openswx: first sign-in, refusal of an address takeover, adding a provider to an account with and without a password |
-| Live documents: ordering, locks, id hand-out, conflicts, reconnect, presence | Done, tested |
+| Document model and protocol 2 (`crates/core`) | Done, tested: operations, conflict index, wire codec with test vectors, convergence tests |
+| Accounts: email + password, Google/GitHub sign-in, organisations, invites, project roles, folders | Done, tested (Rust); Google and GitHub checked by hand with real OAuth apps against the Python server |
+| Live documents: ordering, locks, conflicts, reconnect, presence | Done, tested; under load (`bench/results/README.md`) 200 editors in one document p99 10 to 18 ms, Python 3.2 s |
 | History: undo/revert, who-broke-what, named versions, restore, snapshots | Done, tested |
 | Assembly documents (components pinned to a part's version, where-used, update notices) | Done, tested on the server. The openswx side of assemblies is not designed yet |
-| Leaving: account and organisation deletion, data export | Done, tested |
+| Leaving: account and organisation deletion (two-step), data export | Done, tested |
 | Email (invites, password reset), optional SMTP | Done, tested against a local SMTP server |
-| Database migrations (Alembic) | Done; the server upgrades on start |
-| Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Whole suite passes on both databases; S3 tested with a fake and with Garage |
-| Docker deployment (`deploy/`) | Published image; Compose stack run on a Raspberry Pi (arm64) and in CI on every change |
-| openswx client (toggle, sync, cursors, previews) | Shipped in openswx 0.4.0, refined in 0.4.1: Home → Cloud tab (sign-in, organisations, projects, team), New Cloud Part and Collaborate → Move to Cloud, live pointers, feature locks, history and named versions |
-| Hosted service extras (seat limits, Stripe billing) | In a separate private package; billing not yet tried against Stripe's test mode |
-| Assemblies in openswx, company SSO, browser-only viewers | Later |
+| Storage: SQLite or PostgreSQL 16; files in a folder or S3 | Done, tested: the suite runs on both (latest runs: no failures; a few timing-sensitive tests have failed now and then under load on PostgreSQL); S3 tested with an in-process server and with Garage |
+| Operations: `/metrics`, JSON logs, health and readiness, orderly stop, connection and upload limits | Done, tested |
+| Docker deployment (`deploy/`) | Rust image and Compose files (SQLite; PostgreSQL; + Garage) run on a Raspberry Pi (arm64) (a CI job for them is written but has not had a green run yet); the published image is still the Python server |
+| openswx client (toggle, sync, cursors, previews) | Shipped in openswx 0.4.0, refined in 0.4.1, against the Python server (protocol 1); the protocol 2 client is the next project |
+| Hosted service extras (seat limits, Stripe billing) | In a separate private crate through the `Extensions` trait; billing not yet tried against Stripe's test mode |
+| Several server machines, assemblies in openswx, company SSO | Later |
 
 ## How it works
 
 Each person's openswx applies an edit locally and sends the resulting change to the document, not the
 command. The server checks locks and conflicts, gives the change the next sequence number, stores it and
 sends it to everyone else, who apply it and rebuild locally. The server never runs a geometry kernel, so
-it is small and cheap to host. Design: `docs/2026-11-23-live-collaboration-design.md`. Protocol:
-`docs/protocol.md`.
+it is small and cheap to host. Design: `docs/superpowers/specs/2026-11-25-collab-rebuild-design.md` (and,
+for the Python server, `docs/2026-11-23-live-collaboration-design.md`). Protocol: `docs/protocol.md`.
 
 ## Run it
+
+```
+cargo run --release -p oswx-serverd -- serve                         # http://127.0.0.1:8787, SQLite and files in ./data
+cargo test --workspace -j 2                                         # the whole suite on SQLite
+.venv/Scripts/python tools/test_postgres_rust.py                    # the server's suite on a throwaway PostgreSQL
+.venv/Scripts/python tools/check_deploy_rust.py                     # the Rust Dockerfile and Compose files
+docker compose -f deploy/docker-compose.rust.yml --env-file deploy/.env up -d --build    # in Docker
+```
+
+The Rust server (`crates/server`) tests its S3 storage against an S3 server inside the test process, so
+`cargo test` needs nothing else. To run its tests with every file kept in S3, or against a real store:
+
+```
+OSWX_TEST_STORAGE=s3 cargo test -p oswx-server                        # every test server on S3 (in-process)
+# Against a store you have. The bucket must exist; each test works under a prefix of its own (t-<id>).
+# For Garage as deploy/docker-compose.s3.yml sets it up, start just Garage with its S3 port published:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.s3.yml --env-file deploy/.env \
+#     run -d -p 127.0.0.1:3900:3900 garage
+OSWX_TEST_S3_URL=http://127.0.0.1:3900 OSWX_TEST_S3_BUCKET=openswx-collab OSWX_TEST_S3_REGION=garage \
+OSWX_TEST_S3_ACCESS_KEY=<S3_ACCESS_KEY> OSWX_TEST_S3_SECRET_KEY=<S3_SECRET_KEY> \
+  cargo test -p oswx-server --test storage_s3                         # add OSWX_TEST_STORAGE=s3 for the other tests
+```
+
+The Python server (0.1.x):
 
 ```
 python -m venv .venv
 .venv/Scripts/python -m pip install -e protocol -e "server[dev]"      # bin/ instead of Scripts/ on Linux and macOS
 .venv/Scripts/python -m openswx_collab_server serve                   # http://127.0.0.1:8787, SQLite in ./data
-.venv/Scripts/python -m pytest                                        # the whole suite on SQLite
-.venv/Scripts/python -m pip install -e "server[test]"                 # extra tools for the three checks below
-.venv/Scripts/python tools/test_postgres.py                           # the same tests on a throwaway PostgreSQL
-.venv/Scripts/python tools/check_deploy.py                            # the Dockerfile and Compose settings, without Docker
+.venv/Scripts/python -m pytest                                        # its suite on SQLite
+.venv/Scripts/python tools/check_deploy.py                            # its Dockerfile and Compose settings
 .venv/Scripts/python tools/e2e_two_peers.py ../openswx                # needs an openswx checkout with its .venv
 ```
 
 The first account created on a server is its admin; everyone else joins through an invite link.
-Self-hosting with Docker, Postgres, TLS and Google/GitHub sign-in: `docs/self-hosting.md`.
+Self-hosting with Docker, PostgreSQL, S3, TLS and Google/GitHub sign-in: `docs/self-hosting.md`.
 
 ## Layout
 
-- `protocol/` — `openswx_collab_protocol`: document operations (diff, apply) and message formats, used by
-  the server and the client
-- `server/` — `openswx_collab_server`: the FastAPI app
-- `deploy/` — Dockerfile and Compose files
-- `tools/` — the end-to-end check, the PostgreSQL test runner and the deployment check
+- `crates/core/` — the document model, operations and the protocol 2 wire codec (no I/O)
+- `crates/server/` — the server as a library: rooms, journal, store, storage, accounts, REST and WebSocket
+- `crates/serverd/` — the program `openswx-collab-server`
+- `crates/loadgen/` — the load generator; results in `bench/results/`
+- `deploy/` — Dockerfiles and Compose files (Rust: `*.rust*`; Python: the others)
+- `tools/` — the PostgreSQL test runners, the deployment checks and the end-to-end check
+- `protocol/`, `server/`, `tests/` — the Python server 0.1.x and its protocol 1 library
 - `spike/` — the throwaway experiment that proved the approach; kept for reference
-- `tests/`
 
 ## Contributing and security
 
@@ -76,5 +105,5 @@ can be acted on. Vulnerabilities are reported privately: [SECURITY.md](SECURITY.
 ## Licence
 
 Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). The server is complete as it is here. What a
-hosted service adds on top (seat limits so far) is a separate package that plugs in through
-`server/openswx_collab_server/hooks.py`.
+hosted service adds on top (seat limits so far) is a separate crate that plugs in through the
+`Extensions` trait (`crates/server/src/ext.rs`).

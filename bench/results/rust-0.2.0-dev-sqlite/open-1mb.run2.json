@@ -1,0 +1,48 @@
+{
+  "scenario": "open",
+  "params": {
+    "doc_bytes": 1000000,
+    "features": 100,
+    "times": 20
+  },
+  "dialect": "v2",
+  "server": "openswx-collab 0.2.0-dev (protocol 2)",
+  "database": "sqlite",
+  "loadgen_commit": "50cdc48",
+  "started_at": "2026-11-26T17:42:57Z",
+  "note": "scenario open-1mb run 2 - rust server 0.2.0-dev on sqlite - server and loadgen on same machine",
+  "host": {
+    "os": "Windows 11 Education",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "cpu_threads": 16,
+    "ram_bytes": 16964685824
+  },
+  "duration_s": 0.1218151,
+  "document_bytes": 1000770,
+  "changes_sent": 0,
+  "accepted": 0,
+  "rejected": {},
+  "timeouts": 0,
+  "errors": 0,
+  "protocol_errors": 0,
+  "dropped_connections": 0,
+  "close_codes": {},
+  "connect_failed": 0,
+  "latency_kind": "open",
+  "latency_ms": {
+    "count": 19,
+    "p50": 3.999,
+    "p90": 13.279,
+    "p99": 14.487,
+    "max": 14.487
+  },
+  "latency_from_schedule_ms": null,
+  "latency_note": "latency_ms is service time: from just before an edit is sent until its answer arrives. latency_from_schedule_ms is measured from the slot the edit was scheduled for (a fixed interval per editor), so a stalled server also shows as waiting for the edits queued behind the stall; no slot is skipped. An edit with no answer after 30 s counts as a timeout and enters both as 30000 ms. For `open`, first_open_ms is the first, cold sample and latency_ms covers the remaining ones.",
+  "first_open_ms": 8.3418,
+  "welcome_bytes": {
+    "min": 997982,
+    "max": 997983
+  },
+  "accepted_per_s": 0.0,
+  "server_rss_bytes": null
+}

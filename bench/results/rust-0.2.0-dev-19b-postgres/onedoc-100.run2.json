@@ -1,0 +1,54 @@
+{
+  "scenario": "one-doc",
+  "params": {
+    "editors": 100,
+    "features": 200,
+    "rate": 2.0
+  },
+  "dialect": "v2",
+  "server": "openswx-collab 0.2.0-dev (protocol 2)",
+  "database": "postgres",
+  "loadgen_commit": "b4299cb",
+  "started_at": "2026-11-27T00:10:01Z",
+  "note": "scenario onedoc-100 run 2 - rust server 0.2.0-dev on postgres - server and loadgen on same machine",
+  "host": {
+    "os": "Windows 11 Education",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "cpu_threads": 16,
+    "ram_bytes": 16964685824
+  },
+  "duration_s": 60.0094722,
+  "document_bytes": 23370,
+  "changes_sent": 12000,
+  "accepted": 12000,
+  "rejected": {},
+  "timeouts": 0,
+  "errors": 0,
+  "protocol_errors": 0,
+  "dropped_connections": 0,
+  "close_codes": {},
+  "connect_failed": 0,
+  "latency_kind": "edit",
+  "latency_ms": {
+    "count": 12000,
+    "p50": 2.205,
+    "p90": 3.137,
+    "p99": 4.583,
+    "max": 49.535
+  },
+  "latency_from_schedule_ms": {
+    "count": 12000,
+    "p50": 7.159,
+    "p90": 13.783,
+    "p99": 17.055,
+    "max": 50.047
+  },
+  "latency_note": "latency_ms is service time: from just before an edit is sent until its answer arrives. latency_from_schedule_ms is measured from the slot the edit was scheduled for (a fixed interval per editor), so a stalled server also shows as waiting for the edits queued behind the stall; no slot is skipped. An edit with no answer after 30 s counts as a timeout and enters both as 30000 ms. For `open`, first_open_ms is the first, cold sample and latency_ms covers the remaining ones.",
+  "first_open_ms": null,
+  "welcome_bytes": {
+    "min": 18284,
+    "max": 31048
+  },
+  "accepted_per_s": 199.9684309838006,
+  "server_rss_bytes": null
+}

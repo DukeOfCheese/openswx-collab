@@ -1,0 +1,29 @@
+# Optional, with deploy/docker-compose.rust.yml: the database in PostgreSQL instead of SQLite. Files stay in
+# the server's volume (or go to a bucket with deploy/docker-compose.s3.yml as well).
+#   docker compose -f deploy/docker-compose.rust.yml -f deploy/docker-compose.rust-postgres.yml \
+#     --env-file deploy/.env up -d --build
+services:
+  server:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      OSWX_COLLAB_DATABASE_URL: postgres://collab:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db/collab
+
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: collab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: collab
+    volumes:
+      - rust-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collab"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  rust-db:

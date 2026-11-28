@@ -40,6 +40,15 @@ pub const MAX_DRAFT: usize = 128 * 1024;
 pub const MAX_REBUILD_ENTRIES: usize = 500;
 pub const MAX_REBUILD_KEY: usize = 200;
 pub const MAX_REBUILD_MESSAGE: usize = 500;
+/// Most entries (presence and drafts together) a `presence.batch` may carry.
+pub const MAX_BATCH_ENTRIES: usize = 256;
+/// Longest user id a client takes from the server (the server's ids are 32 hex characters; this
+/// leaves room).
+pub const MAX_USER_ID: usize = 64;
+/// Longest client id in a `presence.batch`: `<user id>.<client id of the hello>`.
+pub const MAX_LIVE_CLIENT_ID: usize = MAX_USER_ID + 1 + MAX_CLIENT_ID;
+/// Most peers a `peer.list` may name (more connections than one server holds in one document).
+pub const MAX_PEER_LIST: usize = 65_536;
 
 /// Most containers (maps and lists) a frame may have open at once. A value may be `MAX_DEPTH`
 /// levels deep, but a keyed list costs one level and three wire containers (`{"$list": [[pos, item]]}`)
@@ -157,6 +166,30 @@ impl fmt::Debug for ClientMsg {
     }
 }
 
+/// Every `code` a failed `change.revert.result` may carry:
+///
+/// - `read_only`: the connection may only look;
+/// - `not_found`: there is no such change (seq 0 is the document as created; nothing beyond the
+///   head);
+/// - `already_reverted`: something already took that change back;
+/// - `stale`: something wrote what the revert writes since that change;
+/// - `locked`: another client holds a lock on what it writes;
+/// - `invalid`: it no longer applies, it has nothing to take back, or the change is older than the
+///   history the server keeps (it can never be reverted);
+/// - `name_taken`, `id_taken`: putting it back would repeat a feature name or an item id;
+/// - `server_error`: the server could not read or write the history; try again.
+pub const REVERT_CODES: [&str; 9] = [
+    "read_only",
+    "not_found",
+    "already_reverted",
+    "stale",
+    "locked",
+    "invalid",
+    "name_taken",
+    "id_taken",
+    "server_error",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectCode {
     Stale,
@@ -203,24 +236,83 @@ pub struct Peer {
     pub user_id: String,
     pub name: String,
     pub colour: String,
+    /// The peer may only look. On the wire only when true (absent means false).
+    pub read_only: bool,
     pub presence: Option<Plain>,
     pub draft: Option<Plain>,
 }
 
+/// A lock on a document path and who holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lock {
     pub path: Path,
     pub client_id: ClientId,
+    pub user_id: String,
     pub name: String,
+    /// The holder's connection is gone; the lock waits (the grace period) for it to come back.
+    pub detached: bool,
 }
 
-/// A feature that does not rebuild, and the change that broke it if known.
+/// A path `lock.acquire` did not get.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LockDenied {
+    pub path: Path,
+    pub why: DenyReason,
+    /// The lock in the way (its path may be above or under this one): present exactly when `why`
+    /// is [`DenyReason::Held`].
+    pub holder: Option<Lock>,
+}
+
+/// Why `lock.acquire` did not get a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenyReason {
+    /// Another client holds a lock in the way (`holder`).
+    Held,
+    /// The path cannot be locked (not in the document, derived data, a key the server owns).
+    NotLockable,
+    /// The client, its user or the document holds as many locks as it may.
+    Quota,
+    /// Too many lock requests: try again shortly.
+    Rate,
+    /// The connection may only look.
+    ReadOnly,
+}
+
+const DENY_REASONS: [(DenyReason, &str); 5] = [
+    (DenyReason::Held, "held"),
+    (DenyReason::NotLockable, "not_lockable"),
+    (DenyReason::Quota, "quota"),
+    (DenyReason::Rate, "rate"),
+    (DenyReason::ReadOnly, "read_only"),
+];
+
+impl DenyReason {
+    pub fn as_str(self) -> &'static str {
+        DENY_REASONS
+            .iter()
+            .find(|(r, _)| *r == self)
+            .map_or("held", |(_, s)| s)
+    }
+
+    pub fn parse(s: &str) -> Option<DenyReason> {
+        DENY_REASONS.iter().find(|(_, n)| *n == s).map(|(r, _)| *r)
+    }
+}
+
+/// A feature that does not rebuild, and the change that broke it if known. The blame fields are
+/// all present (a feature that broke after a baseline report) or all absent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Broken {
     pub error: String,
+    /// The change blamed for it.
     pub by_seq: Option<Seq>,
+    /// Its author's user id.
+    pub by_user: Option<String>,
     pub by_name: Option<String>,
     pub command: Option<String>,
+    /// The first seq after the last good report: the break came in somewhere in
+    /// `since_seq..=by_seq`.
+    pub since_seq: Option<Seq>,
 }
 
 /// An accepted change as the server tells everyone about it.
@@ -234,7 +326,10 @@ pub struct ChangeEvent {
     pub change_id: Arc<str>,
     pub ops: Vec<Op>,
     pub command: Arc<str>,
+    /// For a client's undo: the change id (of the same client) it undoes.
     pub undo_of: Option<Arc<str>>,
+    /// The seq of the change it takes back (a client's undo, or a revert from history).
+    pub reverts: Option<Seq>,
 }
 
 // A welcome is sent once per connection; boxing its fields would only complicate every caller.
@@ -270,15 +365,27 @@ pub enum ServerMsg {
         conflicts: Vec<Conflict>,
     },
     Change(ChangeEvent),
+    /// The answer to a `change.revert`: `seq` and the applied `ops` when `ok`, otherwise `code` (one
+    /// of [`REVERT_CODES`]) and `message`.
     RevertResult {
         request_id: String,
         ok: bool,
         seq: Option<Seq>,
         ops: Vec<Op>,
         code: Option<String>,
+        message: Option<String>,
     },
+    /// The answer to a `lock.acquire`.
+    LockResult {
+        request_id: String,
+        granted: Vec<Path>,
+        denied: Vec<LockDenied>,
+    },
+    /// `locks`: locks that are new or whose holder changed (detached, attached again); `released`:
+    /// paths that are no longer locked.
     LockChanged {
         locks: Vec<Lock>,
+        released: Vec<Path>,
     },
     PeerJoined(Peer),
     PeerLeft {
@@ -292,7 +399,28 @@ pub enum ServerMsg {
         client_id: ClientId,
         data: Option<Plain>,
     },
+    /// The latest presence and drafts of several peers at once: what `presence` and `draft`
+    /// messages would have said, each peer at most once per kind (the server coalesces a peer's
+    /// updates to the latest). A draft of `None` clears it. At most [`MAX_BATCH_ENTRIES`] entries
+    /// in all, and at least two; client ids at most [`MAX_LIVE_CLIENT_ID`] long.
+    PresenceBatch {
+        presence: Vec<(ClientId, Plain)>,
+        drafts: Vec<(ClientId, Option<Plain>)>,
+    },
+    /// Every peer as it is now, with **no draft**: replaces what the client knew of the others
+    /// (the server sends it to a client that fell behind on `peer.joined`, `peer.left`,
+    /// `presence` and `draft`, which it then stopped sending to it). One list is shared by every
+    /// client caught up at once, so it names the recipient too: a client skips its own
+    /// `client_id`. It carries the peers' presence up to a budget (1 MiB on the server); the peers
+    /// past it come without, and their presence follows, as `presence` or `presence.batch`
+    /// messages. The peers' drafts follow, as `draft` messages. At most [`MAX_PEER_LIST`] peers,
+    /// each once.
+    PeerList {
+        peers: Vec<Peer>,
+    },
+    /// What does not rebuild, after the report about state `seq` changed it.
     RebuildStatus {
+        seq: Seq,
         broken: BTreeMap<String, Broken>,
     },
     VersionCreated {
@@ -917,6 +1045,9 @@ fn peer_to_wire(p: &Peer) -> Plain {
         ("name", s(&p.name)),
         ("colour", s(&p.colour)),
     ];
+    if p.read_only {
+        pairs.push(("read_only", Plain::from(true)));
+    }
     if let Some(v) = &p.presence {
         pairs.push(("presence", v.clone()));
     }
@@ -929,10 +1060,14 @@ fn peer_to_wire(p: &Peer) -> Plain {
 fn peer_from_wire(p: &Plain) -> Result<Peer, WireError> {
     let f = Fields::new(p, "a peer")?;
     Ok(Peer {
-        client_id: shared(f.req("client_id")?, "client_id", 0, usize::MAX)?,
+        client_id: shared(f.req("client_id")?, "client_id", 1, MAX_LIVE_CLIENT_ID)?,
         user_id: string(f.req("user_id")?, "user_id")?,
         name: string(f.req("name")?, "name")?,
         colour: string(f.req("colour")?, "colour")?,
+        read_only: match f.opt("read_only")? {
+            Some(p) => flag(p, "read_only")?,
+            None => false,
+        },
         presence: f
             .opt("presence")?
             .map(|p| opaque_map(p, "presence", None))
@@ -944,11 +1079,243 @@ fn peer_from_wire(p: &Plain) -> Result<Peer, WireError> {
     })
 }
 
+/// The peers of a `welcome` or a `peer.list`: at most [`MAX_PEER_LIST`], each client once.
+fn peers_from_wire(p: &Plain) -> Result<Vec<Peer>, WireError> {
+    let peers: Vec<Peer> = list(p, "peers", 0, MAX_PEER_LIST)?
+        .iter()
+        .map(peer_from_wire)
+        .collect::<Result<_, _>>()?;
+    let mut seen = BTreeSet::new();
+    if !peers.iter().all(|p| seen.insert(&p.client_id)) {
+        return invalid("peers names a client twice");
+    }
+    Ok(peers)
+}
+
+/// The entries of a `presence.batch` map: client id to data, `nil` (a cleared draft) only where
+/// `nil_clears`. A client id at most once.
+fn live_map(
+    p: &Plain,
+    field: &str,
+    max: usize,
+    nil_clears: bool,
+) -> Result<Vec<(ClientId, Option<Plain>)>, WireError> {
+    let Plain::Map(pairs) = p else {
+        return invalid(format!("{field} must be a map"));
+    };
+    if pairs.len() > MAX_BATCH_ENTRIES {
+        return invalid(format!("{field} has too many entries"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let client_id = shared(k, field, 1, MAX_LIVE_CLIENT_ID)?;
+        if !seen.insert(client_id.clone()) {
+            return invalid(format!("{field} names a client twice"));
+        }
+        let data = match v {
+            Plain::Nil if nil_clears => None,
+            v => Some(opaque_map(v, field, Some(max))?),
+        };
+        out.push((client_id, data));
+    }
+    Ok(out)
+}
+
+/// A peer's presence or draft, encoded once to be relayed to many: its client id and its data as
+/// MessagePack, ready to be written into a `presence`, `draft` or `presence.batch` frame by
+/// [`encode_live`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveEntry {
+    client_id: Bytes,
+    data: Bytes,
+}
+
+impl LiveEntry {
+    /// `data` of `None`: a cleared draft.
+    pub fn new(client_id: &str, data: Option<&Plain>) -> LiveEntry {
+        let mut id = Vec::new();
+        let _ = rmpv::encode::write_value(&mut id, &s(client_id));
+        let mut bytes = Vec::new();
+        let _ = rmpv::encode::write_value(&mut bytes, data.unwrap_or(&Plain::Nil));
+        LiveEntry {
+            client_id: Bytes::from(id),
+            data: Bytes::from(bytes),
+        }
+    }
+
+    /// The bytes it adds to a frame.
+    pub fn encoded_len(&self) -> usize {
+        self.client_id.len() + self.data.len()
+    }
+}
+
+/// A MessagePack map header for `n` pairs, as rmpv writes it.
+fn map_header(buf: &mut Vec<u8>, n: usize) {
+    match (u8::try_from(n), u16::try_from(n)) {
+        (Ok(small), _) if small < 16 => buf.push(0x80 | small),
+        (_, Ok(n)) => {
+            buf.push(0xde);
+            buf.extend_from_slice(&n.to_be_bytes());
+        }
+        _ => {
+            buf.push(0xdf);
+            buf.extend_from_slice(&u32::try_from(n).unwrap_or(u32::MAX).to_be_bytes());
+        }
+    }
+}
+
+/// A MessagePack array header for `n` items, as rmpv writes it.
+fn array_header(buf: &mut Vec<u8>, n: usize) {
+    match (u8::try_from(n), u16::try_from(n)) {
+        (Ok(small), _) if small < 16 => buf.push(0x90 | small),
+        (_, Ok(n)) => {
+            buf.push(0xdc);
+            buf.extend_from_slice(&n.to_be_bytes());
+        }
+        _ => {
+            buf.push(0xdd);
+            buf.extend_from_slice(&u32::try_from(n).unwrap_or(u32::MAX).to_be_bytes());
+        }
+    }
+}
+
+fn put_str(buf: &mut Vec<u8>, v: &str) {
+    let _ = rmpv::encode::write_value(buf, &s(v));
+}
+
+/// One frame relaying the `presence` and `drafts` entries (each client at most once per kind): a
+/// `presence` or `draft` message when there is one entry in all, a `presence.batch` when there
+/// are more (at most [`MAX_BATCH_ENTRIES`]). The bytes are those [`encode_server`] writes for the
+/// same message; only the entries' sizes are added up, nothing is encoded again.
+pub fn encode_live(presence: &[&LiveEntry], drafts: &[&LiveEntry]) -> Bytes {
+    let size: usize = presence.iter().chain(drafts).map(|e| e.encoded_len()).sum();
+    let mut buf = Vec::with_capacity(size + 48);
+    map_header(&mut buf, 3);
+    put_str(&mut buf, "t");
+    match (presence, drafts) {
+        ([one], []) | ([], [one]) => {
+            put_str(
+                &mut buf,
+                if presence.is_empty() {
+                    "draft"
+                } else {
+                    "presence"
+                },
+            );
+            put_str(&mut buf, "client_id");
+            buf.extend_from_slice(&one.client_id);
+            put_str(&mut buf, "data");
+            buf.extend_from_slice(&one.data);
+        }
+        _ => {
+            put_str(&mut buf, "presence.batch");
+            for (field, entries) in [("presence", presence), ("drafts", drafts)] {
+                put_str(&mut buf, field);
+                map_header(&mut buf, entries.len());
+                for e in entries {
+                    buf.extend_from_slice(&e.client_id);
+                    buf.extend_from_slice(&e.data);
+                }
+            }
+        }
+    }
+    Bytes::from(buf)
+}
+
+/// A peer as `peer.list` carries it, encoded once (for [`encode_peer_list`]).
+pub fn encode_peer(p: &Peer) -> Bytes {
+    let mut buf = Vec::new();
+    let _ = rmpv::encode::write_value(&mut buf, &peer_to_wire(p));
+    Bytes::from(buf)
+}
+
+/// A `peer.list` frame of peers from [`encode_peer`], written as they are: the bytes
+/// [`encode_server`] writes for the same message.
+pub fn encode_peer_list(peers: &[&Bytes]) -> Bytes {
+    let size: usize = peers.iter().map(|p| p.len()).sum();
+    let mut buf = Vec::with_capacity(size + 32);
+    map_header(&mut buf, 2);
+    put_str(&mut buf, "t");
+    put_str(&mut buf, "peer.list");
+    put_str(&mut buf, "peers");
+    array_header(&mut buf, peers.len());
+    for p in peers {
+        buf.extend_from_slice(p);
+    }
+    Bytes::from(buf)
+}
+
+/// A peer as `peer.list` carries it (no draft), borrowed from wherever it is kept, for
+/// [`encode_peer_list_within`].
+#[derive(Clone, Copy, Debug)]
+pub struct PeerRef<'a> {
+    pub client_id: &'a str,
+    pub user_id: &'a str,
+    pub name: &'a str,
+    pub colour: &'a str,
+    pub read_only: bool,
+    pub presence: Option<&'a Plain>,
+}
+
+/// A `peer.list` frame of `peers`, encoded from what they borrow (nothing is copied but into the
+/// frame), carrying their presence up to `presence_budget` bytes of it in all: from the first peer
+/// whose presence does not fit, every peer goes without. Answers the frame and how many of the
+/// peers came first, with their presence (those after it that have some went without). With
+/// every presence in, the bytes are those [`encode_server`] writes for the same message.
+pub fn encode_peer_list_within(peers: &[PeerRef<'_>], presence_budget: usize) -> (Bytes, usize) {
+    let mut buf = Vec::with_capacity(64 * peers.len() + 32);
+    map_header(&mut buf, 2);
+    put_str(&mut buf, "t");
+    put_str(&mut buf, "peer.list");
+    put_str(&mut buf, "peers");
+    array_header(&mut buf, peers.len());
+    let mut left = presence_budget;
+    let mut with_presence = peers.len();
+    let mut presence = Vec::new();
+    for (i, p) in peers.iter().enumerate() {
+        presence.clear();
+        if i < with_presence
+            && let Some(data) = p.presence
+        {
+            let _ = rmpv::encode::write_value(&mut presence, data);
+            if presence.len() <= left {
+                left -= presence.len();
+            } else {
+                presence.clear();
+                with_presence = i;
+            }
+        }
+        let pairs = 4 + usize::from(p.read_only) + usize::from(!presence.is_empty());
+        map_header(&mut buf, pairs);
+        for (k, v) in [
+            ("client_id", p.client_id),
+            ("user_id", p.user_id),
+            ("name", p.name),
+            ("colour", p.colour),
+        ] {
+            put_str(&mut buf, k);
+            put_str(&mut buf, v);
+        }
+        if p.read_only {
+            put_str(&mut buf, "read_only");
+            let _ = rmpv::encode::write_value(&mut buf, &Plain::from(true));
+        }
+        if !presence.is_empty() {
+            put_str(&mut buf, "presence");
+            buf.extend_from_slice(&presence);
+        }
+    }
+    (Bytes::from(buf), with_presence)
+}
+
 fn lock_to_wire(l: &Lock) -> Plain {
     map_of(vec![
         ("path", path::to_wire(&l.path)),
         ("client_id", s(&l.client_id)),
+        ("user_id", s(&l.user_id)),
         ("name", s(&l.name)),
+        ("detached", Plain::from(l.detached)),
     ])
 }
 
@@ -957,8 +1324,39 @@ fn lock_from_wire(p: &Plain) -> Result<Lock, WireError> {
     Ok(Lock {
         path: one_path(f.req("path")?, "path")?,
         client_id: shared(f.req("client_id")?, "client_id", 0, usize::MAX)?,
+        user_id: string(f.req("user_id")?, "user_id")?,
         name: string(f.req("name")?, "name")?,
+        detached: flag(f.req("detached")?, "detached")?,
     })
+}
+
+fn denied_to_wire(d: &LockDenied) -> Plain {
+    let mut pairs = vec![("path", path::to_wire(&d.path)), ("why", s(d.why.as_str()))];
+    if let Some(h) = &d.holder {
+        pairs.push(("holder", lock_to_wire(h)));
+    }
+    map_of(pairs)
+}
+
+fn denied_from_wire(p: &Plain) -> Result<LockDenied, WireError> {
+    let f = Fields::new(p, "a denied lock")?;
+    let why = match DenyReason::parse(text(f.req("why")?, "why", 0, usize::MAX)?) {
+        Some(why) => why,
+        None => return invalid("unknown reason a lock was denied"),
+    };
+    let holder = f.opt("holder")?.map(lock_from_wire).transpose()?;
+    if holder.is_some() != (why == DenyReason::Held) {
+        return invalid("a denied lock names its holder exactly when it is held");
+    }
+    Ok(LockDenied {
+        path: one_path(f.req("path")?, "path")?,
+        why,
+        holder,
+    })
+}
+
+fn path_list(items: &[Path]) -> Plain {
+    arr(items, path::to_wire)
 }
 
 fn locks_from_wire(p: &Plain) -> Result<Vec<Lock>, WireError> {
@@ -973,11 +1371,17 @@ fn broken_to_wire(b: &Broken) -> Plain {
     if let Some(v) = b.by_seq {
         pairs.push(("by_seq", Plain::from(v)));
     }
+    if let Some(v) = &b.by_user {
+        pairs.push(("by_user", s(v)));
+    }
     if let Some(v) = &b.by_name {
         pairs.push(("by_name", s(v)));
     }
     if let Some(v) = &b.command {
         pairs.push(("command", s(v)));
+    }
+    if let Some(v) = b.since_seq {
+        pairs.push(("since_seq", Plain::from(v)));
     }
     map_of(pairs)
 }
@@ -987,6 +1391,10 @@ fn broken_from_wire(p: &Plain) -> Result<Broken, WireError> {
     Ok(Broken {
         error: string(f.req("error")?, "error")?,
         by_seq: f.opt("by_seq")?.map(|p| uint(p, "by_seq")).transpose()?,
+        by_user: f
+            .opt("by_user")?
+            .map(|p| string(p, "by_user"))
+            .transpose()?,
         by_name: f
             .opt("by_name")?
             .map(|p| string(p, "by_name"))
@@ -994,6 +1402,10 @@ fn broken_from_wire(p: &Plain) -> Result<Broken, WireError> {
         command: f
             .opt("command")?
             .map(|p| string(p, "command"))
+            .transpose()?,
+        since_seq: f
+            .opt("since_seq")?
+            .map(|p| uint(p, "since_seq"))
             .transpose()?,
     })
 }
@@ -1029,6 +1441,9 @@ fn event_pairs(e: &ChangeEvent) -> Vec<(&'static str, Plain)> {
     if let Some(u) = &e.undo_of {
         pairs.push(("undo_of", s(u)));
     }
+    if let Some(r) = e.reverts {
+        pairs.push(("reverts", Plain::from(r)));
+    }
     pairs
 }
 
@@ -1045,6 +1460,7 @@ fn event_from_fields(f: &Fields) -> Result<ChangeEvent, WireError> {
             .opt("undo_of")?
             .map(|p| shared(p, "undo_of", 0, usize::MAX))
             .transpose()?,
+        reverts: f.opt("reverts")?.map(|p| uint(p, "reverts")).transpose()?,
     })
 }
 
@@ -1053,6 +1469,7 @@ fn conflict_to_wire(c: &Conflict) -> Plain {
         ConflictKind::Written => "written",
         ConflictKind::Removed => "removed",
         ConflictKind::Read => "read",
+        ConflictKind::Locked => "locked",
     };
     map_of(vec![
         ("path", path::to_wire(&c.path)),
@@ -1068,6 +1485,7 @@ fn conflict_from_wire(p: &Plain) -> Result<Conflict, WireError> {
         "written" => ConflictKind::Written,
         "removed" => ConflictKind::Removed,
         "read" => ConflictKind::Read,
+        "locked" => ConflictKind::Locked,
         _ => return invalid("unknown conflict kind"),
     };
     Ok(Conflict {
@@ -1145,15 +1563,27 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
             seq,
             ops,
             code,
+            message,
         } => Out::new("change.revert.result")
             .put("request_id", s(request_id))
             .put("ok", *ok)
             .put_opt("seq", seq.map(Plain::from))
             .put("ops", op_list(ops))
             .put_opt("code", opt_s(code))
+            .put_opt("message", opt_s(message))
             .bytes(),
-        ServerMsg::LockChanged { locks } => Out::new("lock.changed")
+        ServerMsg::LockResult {
+            request_id,
+            granted,
+            denied,
+        } => Out::new("lock.result")
+            .put("request_id", s(request_id))
+            .put("granted", path_list(granted))
+            .put("denied", arr(denied, denied_to_wire))
+            .bytes(),
+        ServerMsg::LockChanged { locks, released } => Out::new("lock.changed")
             .put("locks", arr(locks, lock_to_wire))
+            .put("released", path_list(released))
             .bytes(),
         ServerMsg::PeerJoined(p) => Out::new("peer.joined").put("peer", peer_to_wire(p)).bytes(),
         ServerMsg::PeerLeft { client_id } => {
@@ -1167,7 +1597,26 @@ pub fn encode_server(msg: &ServerMsg) -> Bytes {
             .put("client_id", s(client_id))
             .put("data", data.clone().unwrap_or(Plain::Nil))
             .bytes(),
-        ServerMsg::RebuildStatus { broken } => Out::new("rebuild.status")
+        ServerMsg::PresenceBatch { presence, drafts } => Out::new("presence.batch")
+            .put(
+                "presence",
+                Plain::Map(presence.iter().map(|(c, d)| (s(c), d.clone())).collect()),
+            )
+            .put(
+                "drafts",
+                Plain::Map(
+                    drafts
+                        .iter()
+                        .map(|(c, d)| (s(c), d.clone().unwrap_or(Plain::Nil)))
+                        .collect(),
+                ),
+            )
+            .bytes(),
+        ServerMsg::PeerList { peers } => Out::new("peer.list")
+            .put("peers", arr(peers, peer_to_wire))
+            .bytes(),
+        ServerMsg::RebuildStatus { seq, broken } => Out::new("rebuild.status")
+            .put("seq", *seq)
             .put("broken", broken_map_to_wire(broken))
             .bytes(),
         ServerMsg::VersionCreated { id, name, seq } => Out::new("version.created")
@@ -1193,7 +1642,8 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
     let root = parse(frame)?;
     let f = Fields::new(&root, "a frame")?;
     let t = text(f.req("t")?, "t", 0, MAX_NAME_OF_T)?;
-    let client_id = |key: &str| shared(f.req(key)?, key, 0, usize::MAX);
+    // A peer's client id (`peer.left`, `presence`, `draft`): `<user id>.<client id of the hello>`.
+    let client_id = |key: &str| shared(f.req(key)?, key, 1, MAX_LIVE_CLIENT_ID);
     match t {
         "welcome" => Ok(ServerMsg::Welcome {
             seq: uint(f.req("seq")?, "seq")?,
@@ -1205,10 +1655,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 .map(|p| string(p, "read_only_reason"))
                 .transpose()?,
             you: peer_from_wire(f.req("you")?)?,
-            peers: list(f.req("peers")?, "peers", 0, usize::MAX)?
-                .iter()
-                .map(peer_from_wire)
-                .collect::<Result<_, _>>()?,
+            peers: peers_from_wire(f.req("peers")?)?,
             locks: locks_from_wire(f.req("locks")?)?,
             broken: broken_map_from_wire(f.req("broken")?)?,
             content: f
@@ -1261,9 +1708,22 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
             seq: f.opt("seq")?.map(|p| uint(p, "seq")).transpose()?,
             ops: ops(f.req("ops")?, "ops", 0, usize::MAX)?,
             code: f.opt("code")?.map(|p| string(p, "code")).transpose()?,
+            message: f
+                .opt("message")?
+                .map(|p| string(p, "message"))
+                .transpose()?,
+        }),
+        "lock.result" => Ok(ServerMsg::LockResult {
+            request_id: string(f.req("request_id")?, "request_id")?,
+            granted: paths(f.req("granted")?, "granted", usize::MAX)?,
+            denied: list(f.req("denied")?, "denied", 0, usize::MAX)?
+                .iter()
+                .map(denied_from_wire)
+                .collect::<Result<_, _>>()?,
         }),
         "lock.changed" => Ok(ServerMsg::LockChanged {
             locks: locks_from_wire(f.req("locks")?)?,
+            released: paths(f.req("released")?, "released", usize::MAX)?,
         }),
         "peer.joined" => Ok(ServerMsg::PeerJoined(peer_from_wire(f.req("peer")?)?)),
         "peer.left" => Ok(ServerMsg::PeerLeft {
@@ -1280,7 +1740,29 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
                 .map(|p| opaque_map(p, "data", None))
                 .transpose()?,
         }),
+        "presence.batch" => {
+            let presence = live_map(f.req("presence")?, "presence", MAX_PRESENCE, false)?;
+            let drafts = live_map(f.req("drafts")?, "drafts", MAX_DRAFT, true)?;
+            let n = presence.len() + drafts.len();
+            if !(2..=MAX_BATCH_ENTRIES).contains(&n) {
+                return invalid(format!(
+                    "a presence.batch has 2 to {MAX_BATCH_ENTRIES} entries"
+                ));
+            }
+            Ok(ServerMsg::PresenceBatch {
+                // (Presence is never nil: `live_map` gave every entry data.)
+                presence: presence
+                    .into_iter()
+                    .filter_map(|(c, d)| d.map(|d| (c, d)))
+                    .collect(),
+                drafts,
+            })
+        }
+        "peer.list" => Ok(ServerMsg::PeerList {
+            peers: peers_from_wire(f.req("peers")?)?,
+        }),
         "rebuild.status" => Ok(ServerMsg::RebuildStatus {
+            seq: uint(f.req("seq")?, "seq")?,
             broken: broken_map_from_wire(f.req("broken")?)?,
         }),
         "version.created" => Ok(ServerMsg::VersionCreated {

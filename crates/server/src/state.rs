@@ -1,0 +1,460 @@
+//! What every handler can reach.
+
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use crate::blobs::{self, Blobs, LocalBlobs, S3Blobs, S3Config};
+use crate::clock::Clock;
+use crate::config::{Settings, Storage};
+use crate::error::ApiError;
+use crate::export::Exports;
+use crate::ext::{Extensions, NoExtensions};
+use crate::hub::Hub;
+use crate::journal::{self, JournalWriter};
+use crate::mail::{MailSends, Mailer, MemoryMailer, SmtpMailer};
+use crate::metrics::HttpStats;
+use crate::oauth::{HttpProviders, NoProviders, OAuthHttp};
+use crate::org_queue::{OrgQueue, OrgTurn};
+use crate::purge::Purger;
+use crate::sessions::Sessions;
+use crate::store::{Store, Tx, new_id};
+use crate::uploads::Uploads;
+
+/// The server's shared state. Cloning is cheap: every field is shared.
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Arc<dyn Store>,
+    pub blobs: Arc<dyn Blobs>,
+    pub hub: Hub,
+    pub mailer: Arc<dyn Mailer>,
+    pub ext: Arc<dyn Extensions>,
+    pub settings: Arc<Settings>,
+    pub sessions: Sessions,
+    pub clock: Clock,
+    /// Google and GitHub, for browser sign-in ([`HttpProviders`] in a running server).
+    pub oauth: Arc<dyn OAuthHttp>,
+    /// Makes accepted changes durable; started on `store` by [`AppState::new`].
+    pub journal: JournalWriter,
+    /// This process, as room leases name it: random per process.
+    pub node_id: String,
+    /// Knobs of the rooms that tests turn (defaults otherwise).
+    #[doc(hidden)]
+    pub room_hooks: Arc<crate::room::Hooks>,
+    /// The steps after REST commits still running ([`AppState::after_commit`]).
+    pub after_commits: Arc<InFlight>,
+    /// How many exports run at once, and how patient they are ([`Exports`]).
+    pub exports: Arc<Exports>,
+    /// Removes what was marked deleted, in the background ([`crate::purge`]).
+    pub purger: Purger,
+    /// Whose turn it is to change each organisation ([`crate::org_queue`]).
+    pub org_queue: OrgQueue,
+    /// How many blob uploads run at once ([`Uploads`]). Made for the `blobs` the state was built
+    /// with: one that replaces `blobs` and holds more for an upload replaces this too.
+    pub uploads: Arc<Uploads>,
+    /// What the serving loop counts ([`crate::serve`]).
+    pub http: Arc<HttpStats>,
+    /// The emails on their way to the mail server ([`MailSends`]).
+    pub mail: Arc<MailSends>,
+    /// How long an answer of `/api/ready` is given again ([`crate::routes::meta::READY_CACHE`];
+    /// tests change it).
+    pub ready_cache: Duration,
+}
+
+/// What the revoking steps of [`AppState::commit_then`] know of the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Committed {
+    /// It took effect.
+    Yes,
+    /// It reported an error: it may or may not have taken effect. A step that closes connections
+    /// then says "reconnect" (4410) rather than "sign in again": the sessions may still be valid.
+    Uncertain,
+}
+
+impl Committed {
+    /// The close code and reason for connections whose sessions the commit ended: 4401 `sign in
+    /// again` when it took effect, 4410 `reconnect` when that is uncertain (a reconnect finds out).
+    pub fn session_close(self) -> (u16, &'static str) {
+        match self {
+            Self::Yes => (crate::room::close::SIGN_IN, "sign in again"),
+            Self::Uncertain => (crate::room::close::MOVED, "reconnect"),
+        }
+    }
+}
+
+/// What [`AppState::commit_then`] commits: a transaction, and the turn of the organisation it
+/// changes if the request took one. Made from `tx`, `(tx, turn)` or `(tx, Option<turn>)`.
+pub struct Commit {
+    tx: Box<dyn Tx>,
+    turn: Option<OrgTurn>,
+}
+
+impl From<Box<dyn Tx>> for Commit {
+    fn from(tx: Box<dyn Tx>) -> Self {
+        Self { tx, turn: None }
+    }
+}
+
+impl From<(Box<dyn Tx>, OrgTurn)> for Commit {
+    fn from((tx, turn): (Box<dyn Tx>, OrgTurn)) -> Self {
+        Self {
+            tx,
+            turn: Some(turn),
+        }
+    }
+}
+
+impl From<(Box<dyn Tx>, Option<OrgTurn>)> for Commit {
+    fn from((tx, turn): (Box<dyn Tx>, Option<OrgTurn>)) -> Self {
+        Self { tx, turn }
+    }
+}
+
+/// How long shutdown waits for the purger to end by itself before it is aborted.
+const PURGER_WAIT: Duration = Duration::from_secs(2);
+
+/// How long shutdown waits for the steps after REST commits that are still running.
+const AFTER_COMMIT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long shutdown waits, once the journal is written out, for emails on their way.
+const MAIL_WAIT_AT_STOP: Duration = Duration::from_secs(5);
+
+/// Counts work that runs detached from whoever started it, so that shutdown can wait for it.
+#[derive(Debug, Default)]
+pub struct InFlight {
+    running: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl InFlight {
+    /// How many are running.
+    pub fn running(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Counts one more as running, until what this answers is dropped.
+    pub(crate) fn start(self: &Arc<Self>) -> Running {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        Running(self.clone())
+    }
+
+    /// Waits until none is running.
+    pub async fn idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.running() == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+/// One running piece of [`InFlight`] work; it ends when this is dropped.
+pub(crate) struct Running(Arc<InFlight>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if self.0.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl AppState {
+    /// State over a store and blob storage, with no extensions, the system clock, no sign-in
+    /// providers ([`NoProviders`]: every call to one fails) and a
+    /// [`MemoryMailer`] (which keeps messages rather than sending them; it reports itself as
+    /// configured exactly when the settings name a mail server and a sender). Replace any public
+    /// field afterwards to change it (after replacing `store`, start a new `journal` on it). A
+    /// running server is built with [`AppState::from_settings`].
+    ///
+    /// Starts the journal writer, so it must be called inside a tokio runtime.
+    pub fn new(settings: Settings, store: Arc<dyn Store>, blobs: Arc<dyn Blobs>) -> Self {
+        let mailer = Arc::new(MemoryMailer::new(settings.email_configured()));
+        let journal = JournalWriter::start(store.clone(), journal::MAX_BATCH, journal::MAX_WAIT);
+        let uploads = Uploads::new(
+            settings.upload_memory,
+            blobs.upload_memory(),
+            settings.max_blob_uploads_per_org,
+            settings.max_blob_uploads_per_user,
+        );
+        let exports = Arc::new(Exports::from_settings(&settings));
+        Self {
+            uploads: Arc::new(uploads),
+            http: Arc::default(),
+            mail: Arc::new(MailSends::new(settings.max_mail_sends)),
+            journal,
+            node_id: new_id(),
+            store,
+            blobs,
+            hub: Hub::default(),
+            mailer,
+            ext: Arc::new(NoExtensions),
+            settings: Arc::new(settings),
+            sessions: Sessions::default(),
+            clock: Clock::system(),
+            oauth: Arc::new(NoProviders),
+            room_hooks: Arc::default(),
+            after_commits: Arc::default(),
+            exports,
+            purger: Purger::default(),
+            org_queue: OrgQueue::default(),
+            ready_cache: crate::routes::meta::READY_CACHE,
+        }
+    }
+
+    /// The turn to change something in the organisation `org`, taken before the request opens
+    /// its transaction: requests that change one organisation run their transactions one at a
+    /// time, and those that wait hold no database connection ([`crate::org_queue`]). 503 when too
+    /// many already wait, or the turn does not come in time.
+    ///
+    /// Hand it to [`AppState::commit_then`] with the transaction (`(tx, turn)`): it is given up as
+    /// soon as the commit has been made, **before** the steps that follow it (closing
+    /// connections, mail, extension hooks, which may take seconds), so the next request's
+    /// transaction does not wait for them. A request that ends before it commits gives the turn
+    /// up by dropping it.
+    pub async fn org_turn(&self, org: &str) -> Result<OrgTurn, ApiError> {
+        self.org_queue.turn(org).await
+    }
+
+    /// Tells the purger that something was marked deleted (or that the server has just started).
+    pub fn wake_purger(&self) {
+        self.purger.wake(self.store.clone(), self.blobs.clone());
+    }
+
+    /// Commits a request's transaction and runs what follows it, all in a task of its own that
+    /// the request awaits but does not own: if the request is dropped (its client went away)
+    /// once this is called, the commit and every step after it still run. Shutdown waits (a
+    /// while) for such tasks.
+    ///
+    /// The steps come in two kinds, in this order:
+    ///
+    /// - `revoking`: forgetting sessions and the hub's drops and closes, made from what the commit
+    ///   was ([`Committed`]). They run after the commit **whether it succeeded or reported an
+    ///   error** (an error can come after the commit
+    ///   took effect: a connection lost during `COMMIT`). That is safe: [`Hub::drop_user`] reads
+    ///   the roles again and drops nobody whose role did not change, and the other drops cost at
+    ///   worst a reconnect.
+    /// - `announcing`: mail, extension notifications and events. They run only after a commit
+    ///   that succeeded; their answer is the request's.
+    ///
+    /// A commit error is answered as the error (500) after the revoking steps.
+    ///
+    /// `tx` is the transaction, or the transaction and the organisation's turn the request holds
+    /// ([`AppState::org_turn`]), which is given up between the commit and the steps.
+    ///
+    /// # Which hub call a route makes
+    ///
+    /// Every route whose commit takes away access calls one of these among its revoking steps
+    /// (after any `sessions.forget_*`):
+    ///
+    /// | the commit | revoking step |
+    /// |---|---|
+    /// | ends every session of an account (password changed or reset, account disabled or deleted, signed out everywhere) | `sessions.forget_user`, then [`Hub::drop_account`] |
+    /// | ends one session (sign-out) | `sessions.forget_token`, then [`Hub::drop_session`] |
+    /// | changes or removes a role in an organisation or one of its projects (member role, member removal, project member set or removed) | [`Hub::drop_user`] for that user and organisation |
+    /// | deletes a document, or a project or organisation with its documents | [`Hub::close_document`] for each document |
+    ///
+    /// Files in storage that a commit orphans (an organisation's blobs and snapshots) are removed
+    /// among the `announcing` steps, never the `revoking` ones: only a commit known to have taken
+    /// effect may remove them.
+    ///
+    /// # Panics
+    ///
+    /// If the steps panic (the panic is passed on to the request).
+    pub async fn commit_then<T, F, R, A>(
+        &self,
+        tx: impl Into<Commit>,
+        revoking: F,
+        announcing: A,
+    ) -> Result<T, ApiError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Committed) -> R + Send + 'static,
+        R: Future<Output = ()> + Send + 'static,
+        A: Future<Output = T> + Send + 'static,
+    {
+        let gate = self.room_hooks.after_commit.clone();
+        let Commit { tx, turn } = tx.into();
+        self.detached(async move {
+            let committed = tx.commit().await;
+            // The organisation's next request may begin: what follows holds no transaction.
+            drop(turn);
+            gate.pass().await;
+            let outcome = if committed.is_ok() {
+                Committed::Yes
+            } else {
+                Committed::Uncertain
+            };
+            revoking(outcome).await;
+            match committed {
+                Ok(()) => Ok(announcing.await),
+                Err(e) => Err(ApiError::Internal(e)),
+            }
+        })
+        .await
+    }
+
+    /// Runs what follows a write that has no transaction for the request to commit (a restore,
+    /// written by the room's journal; a document creation, whose commit has its own handling of an
+    /// uncertain outcome) to completion in a task of its own, as [`AppState::commit_then`] runs
+    /// its steps, and answers what it answers.
+    ///
+    /// # Panics
+    ///
+    /// If the steps panic (the panic is passed on to the request).
+    pub async fn after_commit<T, F>(&self, steps: F) -> T
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let gate = self.room_hooks.after_commit.clone();
+        self.detached(async move {
+            gate.pass().await;
+            steps.await
+        })
+        .await
+    }
+
+    /// Runs `work` in a tracked task of its own, which a dropped caller does not cancel.
+    async fn detached<T, F>(&self, work: F) -> T
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let running = self.after_commits.start();
+        let task = tokio::spawn(async move {
+            let _running = running;
+            work.await
+        });
+        match task.await {
+            Ok(answer) => answer,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => panic!("the steps after a commit were cancelled"),
+        }
+    }
+
+    /// The state of a running server: the database `settings.database_url` names (opened, and its
+    /// schema brought up to date as [`SqliteStore::open`] and [`PgStore::open`] do), the blob storage
+    /// `settings.storage_url` names (a folder, [`LocalBlobs`], whose abandoned temporary files are
+    /// swept now and every hour; or a bucket, [`S3Blobs`], which must take a write, a read and a
+    /// removal before the server starts), mail through the operator's SMTP server ([`SmtpMailer`]) and the real Google and GitHub
+    /// ([`HttpProviders`]).
+    pub async fn from_settings(settings: Settings) -> anyhow::Result<Self> {
+        Self::from_settings_with(settings, Arc::new(NoExtensions)).await
+    }
+
+    /// [`AppState::from_settings`] for a server with the extension `ext`: its migrations are
+    /// applied after the server's own (as `auto_migrate` allows; [`crate::admin::Db::open`]), and
+    /// it is the state's `ext`.
+    pub async fn from_settings_with(
+        settings: Settings,
+        ext: Arc<dyn Extensions>,
+    ) -> anyhow::Result<Self> {
+        let store = crate::admin::Db::open(&settings, ext.as_ref())
+            .await?
+            .store();
+        let blobs: Arc<dyn Blobs> = match settings.storage()? {
+            Storage::Local(folder) => {
+                let local = Arc::new(LocalBlobs::new(folder)?);
+                // (Detached: the sweeper ends by itself once the storage is dropped.)
+                drop(local.start_sweeper(blobs::TEMP_SWEEP_EVERY, blobs::TEMP_MAX_AGE));
+                local
+            }
+            Storage::S3 { .. } => {
+                let config =
+                    S3Config::from_settings(&settings)?.expect("the storage URL names a bucket");
+                Arc::new(S3Blobs::open(config).await?)
+            }
+        };
+        let mailer = Arc::new(SmtpMailer::new(&settings)?);
+        let oauth = Arc::new(HttpProviders::new(&settings)?);
+        let mut state = Self::new(settings, store, blobs);
+        state.mailer = mailer;
+        state.oauth = oauth;
+        state.ext = ext;
+        Ok(state)
+    }
+
+    /// The orderly end of a server, once it has stopped accepting requests: tells the purger to
+    /// stop (without waiting for it: it may be inside a slow storage call), closes the rooms and
+    /// connections (each room waits briefly for the journal's answers to its changes in flight,
+    /// closes its sockets with 1001 and writes a final snapshot of its durable head), waits (a
+    /// while) for the steps after REST commits still running, writes what the journal still has
+    /// queued and stops it, and last waits a moment for the purger and aborts it if it has not
+    /// ended (what it has not removed stays marked, for the next start). Calling it again does
+    /// no harm.
+    ///
+    /// Requests waiting for their mail stop waiting at once (an invite then says `emailed:
+    /// false`); the messages on their way are waited for (a while) only after the journal is
+    /// written out.
+    pub async fn shutdown(&self) {
+        self.shutdown_with(AFTER_COMMIT_WAIT, PURGER_WAIT, MAIL_WAIT_AT_STOP)
+            .await;
+    }
+
+    /// [`AppState::shutdown`] for a server that has `bound` to stop in ([`crate::serve`]): the
+    /// same steps in the same order, with the waits for others' work cut to fit, so that the
+    /// journal is still written out and stopped inside `bound`: the steps after REST commits get
+    /// at most half of it, the purger and the mail on its way at most a tenth each. (Closing the
+    /// rooms is not cut short here; the caller's own clock runs beside this.)
+    pub async fn shutdown_within(&self, bound: Duration) {
+        self.shutdown_with(
+            AFTER_COMMIT_WAIT.min(bound / 2),
+            PURGER_WAIT.min(bound / 10),
+            MAIL_WAIT_AT_STOP.min(bound / 10),
+        )
+        .await;
+    }
+
+    async fn shutdown_with(
+        &self,
+        after_commit_wait: Duration,
+        purger_wait: Duration,
+        mail_wait: Duration,
+    ) {
+        self.purger.signal_stop();
+        // (So that no step after a commit waits for a mail server while the journal waits.)
+        self.mail.stop_waiting();
+        self.hub.shutdown().await;
+        if tokio::time::timeout(after_commit_wait, self.after_commits.idle())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{} requests were still finishing after their commits at shutdown",
+                self.after_commits.running()
+            );
+        }
+        self.journal.close().await;
+        if tokio::time::timeout(mail_wait, self.mail.idle())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{} emails were still on their way to the mail server at shutdown; they may not \
+                 have been sent",
+                self.mail.sending()
+            );
+        }
+        self.purger.stop(purger_wait).await;
+    }
+}
+
+/// The whole HTTP application for this state.
+///
+/// Serve it with [`crate::serve::serve`], which gives every request its peer's address (sign-in
+/// and password reset limits are kept per client address, and without it every client shares
+/// one), cuts off clients that stop sending or reading, and stops in order.
+///
+/// Building it also wakes the purger ([`crate::purge`]), which goes on with whatever an earlier
+/// run of the server marked deleted and did not finish removing; so it must be called inside a
+/// tokio runtime.
+pub fn app(state: AppState) -> axum::Router {
+    state.wake_purger();
+    crate::routes::router(state)
+}

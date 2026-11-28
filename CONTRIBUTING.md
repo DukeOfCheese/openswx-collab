@@ -26,9 +26,10 @@ another product's code, protocol captures or documentation.
 ## What is open and what is not
 
 Everything in this repository is Apache-2.0. What a hosted service adds on top (seat limits today; single
-sign-on and billing later) lives in a separate, private package that plugs in through
-`server/openswx_collab_server/hooks.py`. The open server must stay complete and useful by itself: a change
-that moves existing behaviour behind a hook will not be merged.
+sign-on and billing later) lives in a separate, private crate that depends on the server library and
+plugs in through the `Extensions` trait (`crates/server/src/ext.rs`), building its own binary with
+`oswx_serverd::run`. The open server must stay complete and useful by itself: a change that moves existing
+behaviour behind an extension point will not be merged.
 
 ## Reporting: issues
 
@@ -37,11 +38,12 @@ Open an issue with one of the forms at
 
 What makes a server report quick to act on:
 
-1. **What you ran**: the server version (`GET /api/server`), how it is deployed (plain Python, Docker
-   Compose), the database (SQLite or PostgreSQL) and where files are stored (folder or S3).
+1. **What you ran**: the server version (`GET /api/server`), how it is deployed (the binary, Docker
+   Compose; the Rust server 0.2 or the Python server 0.1), the database (SQLite or PostgreSQL) and where
+   files are stored (folder or S3).
 2. **A reproduction as requests.** The REST calls and WebSocket messages that show the problem, as text
-   (`docs/protocol.md` describes them). For a sync problem, the `change` messages each client sent, in
-   order, and what each received.
+   (`docs/protocol.md` describes them; WebSocket frames are MessagePack, so show them decoded). For a
+   sync problem, the `change` messages each client sent, in order, and what each received.
 3. **Expected vs actual**, with the response or message you got.
 4. **Server log lines** around the time, as text. Remove tokens, email addresses and document content you
    do not want public before posting.
@@ -59,14 +61,19 @@ issue: see [SECURITY.md](SECURITY.md).
 - Link the issue (`Fixes #123`). For anything bigger than a bug fix, agree the approach in the issue first.
 - **Tests come with the change.** For anything a client can send, include the hostile version too: the
   malformed message, the wrong role, the other organisation's document.
-- **A change to the protocol** (`protocol/`, message or operation shapes, REST routes, close codes) updates
-  `docs/protocol.md` in the same pull request and says whether older clients keep working. Bump
-  `PROTOCOL_VERSION` when they do not.
-- **A change to the tables** (`server/openswx_collab_server/db.py`) comes with an Alembic revision in
-  `server/openswx_collab_server/migrations/versions/` (AGENTS.md says how to make one).
+- **A change to the protocol** (`crates/core/src/wire.rs`, `op.rs`, REST routes, close codes) updates
+  `docs/protocol.md` in the same pull request (a test fails when a message, field or code is missing from
+  it) and says whether older clients keep working. Bump `PROTOCOL_VERSION` when they do not.
+- **A change to the tables** comes with a new migration in `crates/server/migrations/sqlite/` and
+  `crates/server/migrations/postgres/` (AGENTS.md says what else to watch). Released migrations are never
+  edited.
+- **A new setting** goes in `crates/server/src/config.rs`, the `--help` text of `crates/serverd` (a test
+  holds the two together) and `docs/self-hosting.md`.
 - **The server never runs a geometry kernel** and never depends on openswx. Anything that needs geometry
   belongs in the openswx client.
-- CI must pass: the suite on SQLite and PostgreSQL, and the Docker image build.
+- CI must pass: `cargo fmt`, `clippy` and the tests on Linux, Windows and macOS, the server's suite on
+  PostgreSQL and with files on Garage (S3), and the Docker image built and run. The Python server's suite
+  runs too while that line is kept.
 - Fill in the pull request template; the checklist is the review checklist.
 
 Commit messages: a short summary line in the imperative or as a noun phrase, a blank line, then what changed
@@ -74,15 +81,22 @@ and why. Pull requests are squash-merged, so the PR title becomes the commit sum
 
 ## Development
 
+The server is Rust (stable, from [rustup](https://rustup.rs)):
+
 ```bash
-python -m venv .venv
-.venv/bin/pip install -e protocol -e "server[test]"      # Windows: .venv\Scripts\pip
-python -m pytest -q                                      # the whole suite on SQLite, about a minute
-python tools/test_postgres.py                            # the same on a throwaway PostgreSQL
-python tools/check_deploy.py                             # the Dockerfile and Compose settings, without Docker
-python -m openswx_collab_server serve                    # http://127.0.0.1:8787
-python tools/e2e_two_peers.py ../openswx                 # two real openswx processes; needs an openswx checkout
+cargo run -p oswx-serverd -- serve                       # http://127.0.0.1:8787, SQLite and files in ./data
+cargo fmt --check
+cargo clippy --workspace --all-targets -j 2 -- -D warnings
+cargo test --workspace -j 2                              # everything on SQLite (S3 tests use an in-process server)
+python tools/test_postgres_rust.py                       # the server's suite on a throwaway PostgreSQL
+                                                         #   (pip install pixeltable-pgserver first)
+python tools/check_deploy_rust.py                        # the Rust Dockerfile and Compose files (pip install pyyaml)
+python tools/check_deploy_rust.py --docker               # ... built and run, where Docker is available
 ```
+
+`-j 2` keeps a full test build within 16 GB of memory. The Python server (the 0.1 line) still has its own
+suite: `pip install -e protocol -e "server[test]"`, then `python -m pytest -q`, `python
+tools/test_postgres.py` and `python tools/check_deploy.py`.
 
 How the code is organised and the rules for coding agents: [AGENTS.md](AGENTS.md).
 
