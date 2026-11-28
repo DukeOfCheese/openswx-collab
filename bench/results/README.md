@@ -9,8 +9,8 @@ found and removed the causes of the first set's findings (before and after table
 # Baseline: Python server 0.1.2 on SQLite
 
 These are the "before" numbers for the Rust rewrite: the current Python collaboration server, measured with
-`loadgen` (`crates/loadgen`, dialect `v1`) on one machine. One run per scenario, 60 s each. The raw reports are
-in [`python-0.1.2-sqlite/`](python-0.1.2-sqlite/), one JSON file per run, plus a `*.server-rss.txt` file
+`loadgen` (`crates/loadgen`, dialect `v1`) on one machine. One run per scenario, 60 s each. The raw reports
+are in [`python-0.1.2-sqlite/`](python-0.1.2-sqlite/), one JSON file per run, plus a `*.server-rss.txt` file
 with the server's memory (see "Server memory").
 
 ## What was measured
@@ -58,8 +58,9 @@ with the number of connected peers.
 
 File names in the same order: `onedoc-10`, `onedoc-40`, `onedoc-100`, `onedoc-200`, `onedoc-40-conflict`,
 `onedoc-10-rate20`, `manydocs-200x3`, `open-100kb`, `open-1mb`, `open-5mb`, `idle-500`, `idle-1000`,
-`idle-2000`. `idle-500` and `idle-1000` were run after `idle-2000` failed, as the fallback sizes. The many-docs
-documents have 20 features each (loadgen default). The `open` runs use loadgen's default of 100 features.
+`idle-2000`. `idle-500` and `idle-1000` were run after `idle-2000` failed, as the fallback sizes. The
+many-docs documents have 20 features each (loadgen default). The `open` runs use loadgen's default of 100
+features.
 
 ## Where it fell over
 
@@ -106,15 +107,15 @@ idle-2000 see the two bullets above.
 
 ## Server memory
 
-Loadgen reports the server's memory itself only for `idle`, so for every run the `*.server-rss.txt` file holds a
-reading taken by the run script: the server (listener) process's Windows working set (the same measure as
+Loadgen reports the server's memory itself only for `idle`, so for every run the `*.server-rss.txt` file holds
+a reading taken by the run script: the server (listener) process's Windows working set (the same measure as
 `idle`'s `server_rss_bytes`) before loadgen started, the highest value sampled once a second during the run,
-and the value at the end. Peaks between samples are not seen. The end value can exceed the peak, because the last reading is taken after
-the sampling loop; for runs shorter than a second (the `open` runs) the peak is not meaningful. The `idle` JSON
-files also carry loadgen's own `server_rss_bytes`; its before-connect figure differs from the table's before
-figure because it is a different reading taken by a different tool at a later moment (after loadgen had
-registered and set up). The files are in bytes; the table is in MB
-(10^6 bytes). The files are UTF-16 text.
+and the value at the end. Peaks between samples are not seen. The end value can exceed the peak, because the
+last reading is taken after the sampling loop; for runs shorter than a second (the `open` runs) the peak is
+not meaningful. The `idle` JSON files also carry loadgen's own `server_rss_bytes`; its before-connect figure
+differs from the table's before figure because it is a different reading taken by a different tool at a later
+moment (after loadgen had registered and set up). The files are in bytes; the table is in MB (10^6 bytes). The
+files are UTF-16 text.
 
 ## Caveats
 
@@ -123,14 +124,15 @@ registered and set up). The files are in bytes; the table is in MB
 - All peers use one account's token with distinct client ids; per-user costs on the server may be
   under-represented (untested).
 - In the unloaded runs the from-schedule figure is 4-7 ms above service time at p50 and 10-13 ms at p99; the
-  load generator's timer wake-up lateness (0-15.6 ms on Windows with the default timer resolution) is
-  included in it.
+  load generator's timer wake-up lateness (0-15.6 ms on Windows with the default timer resolution) is included
+  in it.
 - Rejected edits (`stale`) are in neither latency histogram.
-- A run can overrun its deadline by any backlog: each editor sends every scheduled slot, so a slow server makes
-  the run last longer than 60 s (`run s` shows it), and `accepted per s` is accepted edits over the actual run
-  time.
-- SQLite only. The PostgreSQL baseline is deliberately not recorded yet: the only PostgreSQL host available to this machine is a
-  Raspberry Pi reached over a private network link, which would measure the network rather than the server.
+- A run can overrun its deadline by any backlog: each editor sends every scheduled slot, so a slow server
+  makes the run last longer than 60 s (`run s` shows it), and `accepted per s` is accepted edits over the
+  actual run time.
+- SQLite only. The PostgreSQL baseline is deliberately not recorded yet: the only PostgreSQL host available to
+  this machine is a Raspberry Pi reached over a private network link, which would measure the network rather
+  than the server.
 - A single 60 s run per scenario, no repetition, no warm-up phase: small differences between runs are not
   significant. The 2000-connection failure was seen once.
 - In `idle` each peer sends presence every 5 s and a ping every 15 s; `open` opens connections one after

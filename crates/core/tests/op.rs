@@ -368,3 +368,21 @@ fn pos_is_kept() {
     };
     assert_eq!(pos, Pos::parse("V").unwrap());
 }
+
+#[test]
+fn an_item_id_of_dollar_list_is_refused() {
+    // On the wire.
+    invalid(Op::from_wire(&insert(arr(&["l"]), item("$list"), s("V"))));
+    // Hand-built: `$list` is no item id, so the insert claims no write (`apply` refuses it);
+    // a similar id is an ordinary one.
+    let insert_of = |id: &str| Op::Insert {
+        list: p(&["l"]),
+        item: Value::from_plain(&item(id)).unwrap_or_else(|_| {
+            // `from_plain` refuses a keyed list of `$list`, not a lone map.
+            unreachable!()
+        }),
+        pos: Pos::parse("V").unwrap(),
+    };
+    assert_eq!(writes(&[insert_of("$lists")]).len(), 1);
+    assert!(writes(&[insert_of("$list")]).is_empty());
+}

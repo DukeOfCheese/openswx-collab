@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use imbl::{OrdMap, OrdSet};
+use imbl::OrdMap;
 
 use crate::limits::{MAX_DEPTH, MAX_NAME};
 use crate::pos::Pos;
@@ -49,10 +49,29 @@ pub enum ValueError {
 }
 
 /// Items with ids, in the order of their positions.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub struct KeyedList {
     items: OrdMap<Id, (Pos, Value)>,
-    order: OrdSet<(Pos, Id)>,
+    /// The same items in order, each with its value, so that iterating needs no lookup. A value
+    /// is shared between the two maps (cloning one is O(1)); every change updates both.
+    order: OrdMap<(Pos, Id), Value>,
+}
+
+/// `items` is a function of `order`, so comparing and printing `order` alone says everything. (Both
+/// hold each value: going through both would visit a nested list's contents twice per level, and a
+/// document nested 31 lists deep would take 2^31 steps to compare.)
+impl PartialEq for KeyedList {
+    fn eq(&self, other: &KeyedList) -> bool {
+        self.order == other.order
+    }
+}
+
+impl std::fmt::Debug for KeyedList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.order.iter().map(|((pos, id), v)| ((pos, id), v)))
+            .finish()
+    }
 }
 
 impl KeyedList {
@@ -70,10 +89,7 @@ impl KeyedList {
 
     /// In order: by position, then id.
     pub fn iter(&self) -> impl Iterator<Item = (&Id, &Pos, &Value)> {
-        self.order.iter().filter_map(|(_, id)| {
-            let (k, (p, v)) = self.items.get_key_value(id)?;
-            Some((k, p, v))
-        })
+        self.order.iter().map(|((p, id), v)| (id, p, v))
     }
 
     pub fn len(&self) -> usize {
@@ -90,7 +106,7 @@ impl KeyedList {
             Some((rest, _, _)) => rest,
             None => self.clone(),
         };
-        out.order.insert((pos.clone(), id.clone()));
+        out.order.insert((pos.clone(), id.clone()), value.clone());
         out.items.insert(id, (pos, value));
         out
     }
@@ -110,7 +126,10 @@ impl KeyedList {
 
     pub fn updated(&self, id: &str, value: Value) -> Option<KeyedList> {
         let mut out = self.clone();
-        out.items.get_mut(id)?.1 = value;
+        let (pos, slot) = out.items.get_mut(id)?;
+        *slot = value.clone();
+        let key = (pos.clone(), Arc::from(id));
+        out.order.insert(key, value);
         Some(out)
     }
 }

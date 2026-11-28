@@ -138,13 +138,22 @@ fn process_rss(pid: u32) -> Option<u64> {
     sys.process(pid).map(|p| p.memory())
 }
 
+/// The short commit of the working tree, with `-dirty` after it when the tree has uncommitted
+/// changes (so a report from a modified build says so).
 fn git_commit() -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    let s = String::from_utf8(out.stdout).ok()?;
-    (out.status.success() && !s.trim().is_empty()).then(|| s.trim().to_owned())
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        let s = String::from_utf8(out.stdout).ok()?;
+        out.status.success().then_some(s)
+    };
+    let commit = git(&["rev-parse", "--short", "HEAD"])?.trim().to_owned();
+    if commit.is_empty() {
+        return None;
+    }
+    match git(&["status", "--porcelain"]) {
+        Some(status) if !status.trim().is_empty() => Some(format!("{commit}-dirty")),
+        _ => Some(commit),
+    }
 }
 
 fn positive(name: &str, n: usize) -> Result<()> {

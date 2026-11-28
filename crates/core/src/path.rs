@@ -48,12 +48,18 @@ pub(crate) fn from_wire(p: &Plain, what: &str) -> Result<Path, OpError> {
     let Plain::Array(items) = p else {
         return Err(OpError::Invalid(format!("{what} must be a list")));
     };
-    if items.is_empty() || items.len() > MAX_DEPTH {
-        return Err(OpError::Invalid(format!(
-            "{what} must have 1 to {MAX_DEPTH} segments"
-        )));
-    }
-    items.iter().map(|s| name(s, "a path segment")).collect()
+    // Reading one more than `MAX_DEPTH` is enough for `check` to refuse a path that is too long.
+    let path: Path = items
+        .iter()
+        .take(MAX_DEPTH + 1)
+        .map(|s| {
+            s.as_str()
+                .map(Arc::from)
+                .ok_or_else(|| OpError::Invalid("a path segment must be a string".to_owned()))
+        })
+        .collect::<Result<_, _>>()?;
+    check(&path, what)?;
+    Ok(path)
 }
 
 pub(crate) fn to_wire(path: &Path) -> Plain {

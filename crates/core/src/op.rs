@@ -102,11 +102,11 @@ fn parse_value(p: &Plain) -> Result<Value, OpError> {
     Value::from_wire(p).map_err(|e| OpError::Invalid(format!("bad value: {e}")))
 }
 
-/// The id of an inserted item, if it is a map with a string `id` of 1..=`MAX_NAME` characters.
+/// The id of an inserted item, if it is a map with a string `id` that is a name (`check_name`).
 fn item_id(item: &Value) -> Option<&Id> {
     match item {
         Value::Map(m) => match m.get("id") {
-            Some(Value::Str(id)) if (1..=MAX_NAME).contains(&id.chars().count()) => Some(id),
+            Some(Value::Str(id)) if path::check_name(id, "an item id").is_ok() => Some(id),
             _ => None,
         },
         _ => None,
