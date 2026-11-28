@@ -150,7 +150,7 @@ fn git_commit() -> Option<String> {
     if commit.is_empty() {
         return None;
     }
-    match git(&["status", "--porcelain"]) {
+    match git(&["status", "--porcelain", "--untracked-files=no"]) {
         Some(status) if !status.trim().is_empty() => Some(format!("{commit}-dirty")),
         _ => Some(commit),
     }

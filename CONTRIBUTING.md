@@ -112,9 +112,12 @@ an archive with a `.sha256`; the image `ghcr.io/dukeofcheese/openswx-collab-serv
    and match the tag), and let `Cargo.lock` follow (`cargo build`).
 2. In `CHANGELOG.md`, move the version's notes out of `## Unreleased` into a section of their own headed
    `## <version> - <date>`, as the earlier ones are (`## 0.1.2 - 2026-11-24`; for 0.2.0: the
-   `### 0.2.0 (not yet released)` heading becomes `## 0.2.0 - <date>`, and its subheadings move up a level). `python tools/release_notes.py <version>` prints
-   the release notes and fails if the section is missing.
-3. Merge that to `main`, then tag it there: `git tag -a v<version> -m "openswx-collab <version>"` and
+   `### 0.2.0 (not yet released)` heading becomes `## 0.2.0 - <date>`, and its subheadings move up a
+   level). `python tools/release_notes.py <version>` prints the release notes and fails if the section
+   is missing.
+3. Before tagging, run the release workflow by hand on the version-bump branch
+   (`gh workflow run release.yml --ref <branch>`) and check that every build job passes.
+4. Merge that to `main`, then tag it there: `git tag -a v<version> -m "openswx-collab <version>"` and
    `git push origin v<version>`.
 
 A run by hand from the Actions tab (`release`, on any branch) builds both lines without publishing

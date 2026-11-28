@@ -128,14 +128,12 @@ async fn the_first_presence_goes_at_once_and_the_next_within_the_tick_waits() {
 const QUIET_TICK: Duration = Duration::from_millis(100);
 /// A quiet spell longer than the tick (a sleep lasts at least as long as asked).
 const QUIET_SPELL: Duration = Duration::from_millis(QUIET_TICK.as_millis() as u64 * 3 / 2);
-/// A presence sent after the quiet spell arrives within one tick of being sent.
-const AT_ONCE_LIMIT: Duration = QUIET_TICK;
-/// What the test's own round trips (the barriers) may add, on a busy machine.
-const QUIET_SLACK: Duration = Duration::from_millis(900);
 
 /// After a relay and a quiet spell longer than the tick, a presence goes out at once, not at the
 /// next tick. Each sender's `drain` is a barrier: its pong comes after the room handled its
-/// presence, and what the room relayed then reaches the watcher before the watcher's own pong.
+/// presence, and what the room relayed then reaches the watcher before the watcher's own pong. That
+/// barrier is what proves the presence went at once (a presence held to the next tick would not be
+/// there yet); the test does not time it.
 #[tokio::test]
 async fn a_presence_after_a_quiet_spell_past_the_tick_goes_at_once() {
     let tick = QUIET_TICK;
@@ -162,15 +160,9 @@ async fn a_presence_after_a_quiet_spell_past_the_tick_goes_at_once() {
     assert!(presence(&seen, 0), "the first goes at once: {seen:?}");
     // A quiet spell past the tick (a sleep lasts at least as long as asked).
     tokio::time::sleep(QUIET_SPELL).await;
-    let sent = Instant::now();
     a.presence(json!({"n": 1})).await;
     a.drain().await;
     let seen = watcher.drain().await;
-    assert!(
-        sent.elapsed() < AT_ONCE_LIMIT + QUIET_SLACK,
-        "the presence took {:?} to arrive",
-        sent.elapsed()
-    );
     assert!(
         presence(&seen, 1),
         "after the quiet spell, at once: {seen:?}"

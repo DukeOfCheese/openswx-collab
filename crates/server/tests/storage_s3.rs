@@ -718,23 +718,40 @@ async fn an_upload_whose_parts_are_held_up_holds_no_more_than_it_is_charged() {
         let (blobs, key) = (b.blobs.clone(), key.clone());
         tokio::spawn(async move { blobs.put_stream(&key, body, u64::MAX).await })
     };
-    // Fed until the upload stops taking the body: two parts on their way, and it waits.
+    // Fed until two parts are at the store and the upload then stops taking the body. A reserve
+    // that times out alone proves nothing (the uploader may only be starved of CPU), so each
+    // time one does, wait for the second part to reach the store and only then ask again.
+    const WAIT: Duration = Duration::from_secs(20);
     let mut chunks = data.chunks(100_000).peekable();
     let mut blocked = false;
     while let Some(chunk) = chunks.peek() {
         let Ok(room) = tokio::time::timeout(Duration::from_millis(500), feed.reserve()).await
         else {
-            blocked = true;
-            break;
+            let deadline = Instant::now() + WAIT;
+            while b.fake.count(Seen::is_part) < 2 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if b.fake.count(Seen::is_part) < 2 {
+                break;
+            }
+            // Two parts are held; the upload must now take no more.
+            blocked = tokio::time::timeout(Duration::from_millis(500), feed.reserve())
+                .await
+                .is_err();
+            if blocked {
+                break;
+            }
+            continue;
         };
         room.unwrap().send(Ok(Bytes::copy_from_slice(chunk)));
         chunks.next();
     }
+    let parts = b.fake.count(Seen::is_part);
     assert!(
         blocked,
-        "the upload took the whole body while its parts were held"
+        "the upload did not stop taking the body with two parts held ({parts} at the store)"
     );
-    assert_eq!(b.fake.count(Seen::is_part), 2, "two parts at once");
+    assert_eq!(parts, 2, "two parts at once");
     // At its peak, held up: exactly what the upload is charged for its parts (the rest of the
     // charge is the compressor's).
     let held = b.blobs.peak_buffered() as u64;

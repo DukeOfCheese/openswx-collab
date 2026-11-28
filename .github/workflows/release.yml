@@ -387,6 +387,7 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.description=Self-hostable live collaboration server for openswx" \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'ghcr.io/dukeofcheese/openswx-collab-server@sha256:%s ' *)
           docker buildx imagetools inspect "ghcr.io/dukeofcheese/openswx-collab-server:$VERSION"
