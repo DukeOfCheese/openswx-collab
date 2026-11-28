@@ -1942,23 +1942,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oswx-import"
-version = "0.2.0-dev"
-dependencies = [
- "anyhow",
- "flate2",
- "futures-util",
- "hex",
- "oswx-core",
- "oswx-server",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "oswx-loadgen"
 version = "0.0.0"
 dependencies = [
