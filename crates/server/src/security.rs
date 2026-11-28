@@ -86,8 +86,7 @@ async fn gated<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Opt
 pub async fn hash_password(pw: &str) -> String {
     let pw = pw.to_owned();
     gated(move || {
-        let mut salt = [0u8; SALT_LEN];
-        rand::rng().fill(&mut salt[..]);
+        let salt: [u8; SALT_LEN] = rand::random();
         let key = derive(pw.as_bytes(), &salt, LOG_N, R, P)
             .expect("the fixed scrypt parameters are valid");
         format!(

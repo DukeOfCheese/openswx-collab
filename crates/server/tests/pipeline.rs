@@ -824,14 +824,18 @@ async fn a_long_standing_client_stays_complete_through_thousands_of_changes() {
         a.change(vec![var("a", 0)], vec![], vec![]).await,
         Outcome::Accepted(_)
     ));
-    // Someone else makes more changes than the room used to keep before a snapshot.
+    // Someone else makes more changes than the room used to keep before a snapshot. `a` reads
+    // after every 400 (a client that read nothing for 5,200 would pass `MAX_QUEUED` wherever the
+    // socket's buffers are small, as on macOS, and be closed as too slow).
     let mut b = Live::connect(&server, &doc, &world.admin).await;
-    many_changes(&mut b, 5200, "b").await;
+    for round in 0..13 {
+        many_changes(&mut b, 400, &format!("b{round}-")).await;
+        a.drain().await;
+    }
     assert!(
         server.room_status(&doc).await.snapshot_seq >= 1000,
         "snapshots were written"
     );
-    a.drain().await;
     let lookups = flaky.change_lookups();
     assert!(matches!(
         a.change(vec![var("a", 1)], vec![], vec![]).await,

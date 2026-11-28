@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
 
   postgres:
     # the server's suite again, on PostgreSQL (every test in a schema of its own, dropped when it ends)
@@ -48,7 +48,7 @@ jobs:
           OSWX_TEST_DATABASE_URL: postgres://collab:collab@127.0.0.1:5432/collab
         # Four tests at a time: each test server holds up to six connections (and a test may start
         # two servers), well inside the service's default max_connections of 100.
-        run: cargo test -p oswx-server -- --test-threads=4
+        run: cargo test -p oswx-server --no-fail-fast -- --test-threads=4
 
   s3:
     # The storage tests again, with every test server keeping its files in a real S3-compatible
@@ -98,7 +98,7 @@ jobs:
           OSWX_TEST_S3_BUCKET: oswx-test
           OSWX_TEST_S3_REGION: garage
         run: >-
-          cargo test -p oswx-server
+          cargo test -p oswx-server --no-fail-fast
           --test storage_s3 --test storage --test documents --test lifecycle
           --test journal --test pipeline --test live
       - name: Garage's log

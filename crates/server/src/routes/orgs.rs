@@ -464,7 +464,7 @@ async fn create_invite(
             "an invite gives roles in at most {GRANTS_MAX} projects"
         )));
     }
-    let mut grants = Vec::with_capacity(body.projects.len());
+    let mut grants = Vec::new();
     for g in &body.projects {
         if g.project_id.chars().count() > ID_MAX {
             return Err(ApiError::Unprocessable(format!(

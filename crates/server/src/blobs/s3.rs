@@ -653,8 +653,14 @@ impl Drop for Upload {
             return;
         };
         runtime.spawn(async move {
-            // The parts on their way are stopped first: a part that lands after the abort would
-            // stay behind.
+            // The parts on their way are let finish first (for as long as the abort itself may
+            // take): a part that lands after the abort would stay behind, and cancelling a part
+            // here does not stop the endpoint storing what it already received. Only parts still
+            // going after that are cut off.
+            let _ = tokio::time::timeout(wait, async {
+                while in_flight.join_next().await.is_some() {}
+            })
+            .await;
             in_flight.shutdown().await;
             let aborted = tokio::time::timeout(wait, store.abort_multipart(&path, &id)).await;
             let why = match aborted {

@@ -297,15 +297,24 @@ async fn a_body_over_1_mib_without_a_length_is_413_too() {
     let server = with_extension().await;
     let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
         (0..32).map(|_| Ok(vec![b' '; 64 * 1024])).collect();
-    let r = reqwest::Client::new()
+    let sent = reqwest::Client::new()
         .post(server.url("/api/test/echo"))
         .header("content-type", "application/json")
         .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
             chunks,
         )))
         .send()
-        .await
-        .unwrap();
+        .await;
+    // The server answers once it has read 1 MiB and closes without reading the rest. Where the
+    // client is still writing then, Windows resets the connection and the answer is lost to it:
+    // the body was refused all the same.
+    let r = match sent {
+        Ok(r) => r,
+        Err(e) if cfg!(windows) && e.is_request() && format!("{e:?}").contains("BodyWrite") => {
+            return;
+        }
+        Err(e) => panic!("{e:?}"),
+    };
     assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         r.json::<Value>().await.unwrap(),
