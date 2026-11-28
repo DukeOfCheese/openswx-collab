@@ -978,9 +978,15 @@ async fn a_connection_whose_room_died_gives_back_its_place() {
     tokio::time::timeout(WAIT, hooks.stall.until_stopped(1))
         .await
         .expect("the room stopped");
-    // The client goes meanwhile: its reader ends and tells the room, which never takes it.
+    // The client goes meanwhile: its reader leaves its read loop (held before it tells the room)
+    // while the room is still there, then tells the room, which never takes it: the room panics
+    // with the `Leave` queued, or before it is sent.
+    hooks.before_leave.shut();
     let closing = tokio::spawn(a.close());
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(WAIT, hooks.before_leave.until_waiting(1))
+        .await
+        .expect("the reader stopped reading");
+    hooks.before_leave.open();
     hooks.stall.release();
     tokio::time::timeout(WAIT, room.ended())
         .await

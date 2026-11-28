@@ -766,9 +766,9 @@ pub async fn read(
             }
         }
     }
-    // The room closes the queue when it takes the `Leave`. If it ends first (a panic), or is gone
-    // already, nothing else will: the queue is closed here, so that the writer ends and the
-    // socket's place is given back.
+    // The room closes the queue when it takes the `Leave`. But the room may end (a panic) before
+    // it takes a `Leave` already queued, or be gone already; then nothing else will close it: it
+    // is closed here, so that the writer ends and the socket's place is given back.
     if room.leave(conn).await {
         tokio::select! {
             _ = life.wait_for(|l| *l != Life::Open) => {}
