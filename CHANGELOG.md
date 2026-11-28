@@ -13,7 +13,7 @@ folder for a self-hosted install, or on PostgreSQL and an S3-compatible bucket. 
 proportion to the change, not to the document, and the server keeps up where the Python server fell
 behind. **Protocol version 2 is a clean break**: version 1 clients (openswx 0.4) are refused with close
 code 4426 and keep using the Python server (0.1.x, still in this repository) until openswx's client moves
-to version 2. A Python server's database is not opened by the Rust server; an import tool comes later.
+to version 2. A Python server's database is not opened by the Rust server, and there is no import.
 `docs/protocol.md` is rewritten as the contract; `docs/self-hosting.md` describes the new settings.
 
 #### Protocol 2

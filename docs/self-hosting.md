@@ -422,8 +422,8 @@ database that a running server is using, a long one (an extension adding an inde
 writes, live edits included, until it is done. Run `migrate` with the server stopped, or at a quiet time.
 Two servers creating an empty database at the same moment fail safely: start one first.
 
-A database from the Python server is not opened (the schema is different); an import tool comes with a
-later release.
+A database from the Python server is not opened (the schema is different), and there is no import:
+start the Rust server with a new database.
 
 ## Stopping
 
