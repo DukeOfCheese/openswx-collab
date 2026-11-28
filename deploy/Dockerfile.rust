@@ -7,7 +7,7 @@
 # The base images are pinned by digest (the multi-architecture index, as Docker Hub served the tag on
 # 2026-11-27), so a rebuild uses the same bytes; to move on, look up the tag's current digest
 # (`docker buildx imagetools inspect <image>:<tag>`) and replace it here.
-FROM rust:1.99-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS build
+FROM rust:1.100-slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS build
 # (Read by cargo when given; unset: as many jobs as the machine has cores.)
 ARG CARGO_BUILD_JOBS
 WORKDIR /src
