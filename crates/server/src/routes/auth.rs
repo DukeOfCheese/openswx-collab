@@ -679,7 +679,11 @@ async fn confirm_reset(
             tx,
             move |committed: Committed| async move {
                 let (code, reason) = committed.session_close();
-                limits.forget_sign_in_failures(&signed_in_as);
+                // Only when the password is known to be set: after an uncertain commit it may not
+                // be, and the counts then stand (a later reset that commits lifts them).
+                if matches!(committed, Committed::Yes) {
+                    limits.forget_sign_in_failures(&signed_in_as);
+                }
                 revoker.sessions.forget_user(&revoked);
                 revoker.hub.drop_account_with(&revoked, code, reason).await;
             },

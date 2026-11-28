@@ -40,7 +40,8 @@ async fn a_broadcast_is_encoded_once_for_everyone() {
 
 /// Presence in a busy room goes out once per tick, each peer's latest only and many peers to a
 /// frame, and nobody gets their own back. In a quiet room a presence goes out at once, as it came
-/// (see also the two quiet-spell tests below).
+/// (see also [`the_first_presence_goes_at_once_and_the_next_within_the_tick_waits`] and
+/// [`a_presence_after_a_quiet_spell_past_the_tick_goes_at_once`] below).
 #[tokio::test]
 async fn presence_is_relayed_as_each_peers_latest_many_to_a_frame() {
     let (server, world) = world().await;
@@ -123,12 +124,21 @@ async fn the_first_presence_goes_at_once_and_the_next_within_the_tick_waits() {
     );
 }
 
+/// The tick of the quiet-spell test.
+const QUIET_TICK: Duration = Duration::from_millis(100);
+/// A quiet spell longer than the tick (a sleep lasts at least as long as asked).
+const QUIET_SPELL: Duration = Duration::from_millis(QUIET_TICK.as_millis() as u64 * 3 / 2);
+/// A presence sent after the quiet spell arrives within one tick of being sent.
+const AT_ONCE_LIMIT: Duration = QUIET_TICK;
+/// What the test's own round trips (the barriers) may add, on a busy machine.
+const QUIET_SLACK: Duration = Duration::from_millis(900);
+
 /// After a relay and a quiet spell longer than the tick, a presence goes out at once, not at the
 /// next tick. Each sender's `drain` is a barrier: its pong comes after the room handled its
 /// presence, and what the room relayed then reaches the watcher before the watcher's own pong.
 #[tokio::test]
 async fn a_presence_after_a_quiet_spell_past_the_tick_goes_at_once() {
-    let tick = Duration::from_millis(100);
+    let tick = QUIET_TICK;
     let hooks = oswx_server::room::Hooks {
         live_tick: tick,
         ..Default::default()
@@ -151,10 +161,16 @@ async fn a_presence_after_a_quiet_spell_past_the_tick_goes_at_once() {
     let seen = watcher.drain().await;
     assert!(presence(&seen, 0), "the first goes at once: {seen:?}");
     // A quiet spell past the tick (a sleep lasts at least as long as asked).
-    tokio::time::sleep(tick + tick / 2).await;
+    tokio::time::sleep(QUIET_SPELL).await;
+    let sent = Instant::now();
     a.presence(json!({"n": 1})).await;
     a.drain().await;
     let seen = watcher.drain().await;
+    assert!(
+        sent.elapsed() < AT_ONCE_LIMIT + QUIET_SLACK,
+        "the presence took {:?} to arrive",
+        sent.elapsed()
+    );
     assert!(
         presence(&seen, 1),
         "after the quiet spell, at once: {seen:?}"

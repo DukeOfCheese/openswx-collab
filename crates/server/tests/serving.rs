@@ -202,8 +202,15 @@ async fn an_upload_that_keeps_moving_outlives_the_request_timeout() {
 
 #[tokio::test]
 async fn a_request_that_takes_too_long_is_answered_503() {
-    let server = TestServer::start_with(|s| s.request_timeout = 0.5).await;
+    // The world is made under the default limit (registering hashes a password, which takes
+    // long on a busy machine); only then is the server served again with the short one.
+    let mut server = TestServer::start().await;
     let w = World::new(&server).await.unwrap();
+    server.state.settings = Arc::new(oswx_server::Settings {
+        request_timeout: 0.5,
+        ..(*server.state.settings).clone()
+    });
+    let (_stop, _serving) = serve_again(&mut server).await;
     // A body that is announced and never finished, on a route that reads it whole.
     let mut socket = TcpStream::connect(addr(&server)).await.unwrap();
     let head = format!(
@@ -1736,10 +1743,15 @@ async fn a_stop_that_cannot_finish_ends_at_its_bound_with_the_rooms_closed_first
     // The request gets half the bound to finish (it never does); then the room is closed and
     // snapshotted, whatever else is stuck.
     assert_eq!(live.closed().await.0, 1001);
+    let closed_after = started.elapsed();
     assert!(
-        started.elapsed() >= Duration::from_millis(1400),
-        "the room was closed {:?} after the stop, before the request had its time",
-        started.elapsed()
+        closed_after >= Duration::from_millis(1400),
+        "the room was closed {closed_after:?} after the stop, before the request had its time"
+    );
+    // Half the bound (1.5 s), and 700 ms for the close itself.
+    assert!(
+        closed_after <= Duration::from_millis(2200),
+        "the room was closed {closed_after:?} after the stop, later than half the bound plus 700 ms"
     );
     while snapshot_seq(&server, &doc, 1).await != 1 {
         assert!(
