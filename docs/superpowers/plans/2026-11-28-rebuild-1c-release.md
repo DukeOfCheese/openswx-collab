@@ -149,7 +149,7 @@ gains a monthly `cargo` entry for `/`.
   builds without publishing); every Rust build job passes and uploads its archive. (Ask the owner before
   this run if the plan is executed without standing approval to run CI on the branch.)
 - [ ] **Step 5: Docs.** CONTRIBUTING "Releasing": bump both crate versions, move the CHANGELOG section to
-  `## <version> (<date>)`, tag `v<version>`; `v0.1.*` tags release the Python line.
+  `## <version> - <date>`, tag `v<version>`; `v0.1.*` tags release the Python line.
 - [ ] **Step 6: Commit** — `release: Rust binaries and image; cargo-deny; dependabot for cargo`.
 
 ### Task 8: Small core and loadgen items
