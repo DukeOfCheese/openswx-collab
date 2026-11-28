@@ -85,8 +85,11 @@ impl Client {
         Arc::from(format!("{}.{}", self.id, self.next_item))
     }
 
+    /// Whether any change of this client still waits for its answer: a pending one, or one dropped
+    /// with a refused change it depended on (the server refuses it too, and that answer may still be
+    /// on its way).
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.dropped.is_empty()
     }
 
     /// Makes an edit the user did on `live`: applies it locally at once and returns the change to
